@@ -115,11 +115,13 @@ description = """
 
 If context feels heavy (multi-hour session, large recent diffs, or you notice
 yourself taking shortcuts or summarizing prematurely), pour and assign the next
-wisp, burn the current wisp, then request a restart:
+wisp, burn the current wisp, then request a restart. Note `--include-infra` on
+every wisp lookup below: wisps are infra beads and `gc bd list` hides them by
+default, so without it the lookup returns empty and the wisp leaks:
 ```bash
 CURRENT_WISP=${GC_BEAD_ID:-}
 if [ -z "$CURRENT_WISP" ]; then
-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
+  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
 fi
 NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
 if [ -z "$NEXT" ]; then
@@ -242,7 +244,7 @@ gc bd update $WORK \
 ```bash
 CURRENT_WISP=${GC_BEAD_ID:-}
 if [ -z "$CURRENT_WISP" ]; then
-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
+  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
 fi
 NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
 if [ -z "$NEXT" ]; then
@@ -343,7 +345,7 @@ TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_bran
      ```bash
      CURRENT_WISP=${GC_BEAD_ID:-}
      if [ -z "$CURRENT_WISP" ]; then
-       CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
+       CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
      fi
      NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
      if [ -z "$NEXT" ]; then
@@ -435,7 +437,7 @@ Branch: $BRANCH
 Target: $TARGET"
   CURRENT_WISP=${GC_BEAD_ID:-}
   if [ -z "$CURRENT_WISP" ]; then
-    CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
+    CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
   fi
   if [ -z "$CURRENT_WISP" ]; then
     echo "Could not resolve current wisp; not burning."
@@ -1107,7 +1109,9 @@ why and what state was left.
 
 This summary is not stored separately — it lives in the wisp's
 closing reason. The next session can find it via `gc bd list --type=molecule
---status=closed --limit=5` if it needs predecessor context."""
+--include-infra --status=closed --limit=5` if it needs predecessor context
+(`--include-infra` is required — wisps are infra beads and are hidden without
+it)."""
 
 [[steps]]
 id = "next-iteration"
@@ -1143,7 +1147,7 @@ If auto_land = "false": skip this entirely.
 ```bash
 CURRENT_WISP=${GC_BEAD_ID:-}
 if [ -z "$CURRENT_WISP" ]; then
-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
+  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
 fi
 NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
 if [ -z "$NEXT" ]; then
