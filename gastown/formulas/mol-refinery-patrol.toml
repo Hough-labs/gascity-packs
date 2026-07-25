@@ -123,16 +123,24 @@ CURRENT_WISP=${GC_BEAD_ID:-}
 if [ -z "$CURRENT_WISP" ]; then
   CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
 fi
-NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
+# Reconcile queued wisps before pouring: reuse one if present, burn the surplus.
+OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r '.[].id')
+NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
+for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
+  gc bd mol burn "$extra" --force
+done
 if [ -z "$NEXT" ]; then
-  echo "Could not pour next refinery wisp; not requesting restart."
-  gc runtime drain-ack
-  exit 1
-fi
-if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
-  echo "Could not assign next refinery wisp; not requesting restart."
-  gc runtime drain-ack
-  exit 1
+  NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
+  if [ -z "$NEXT" ]; then
+    echo "Could not pour next refinery wisp; not requesting restart."
+    gc runtime drain-ack
+    exit 1
+  fi
+  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+    echo "Could not assign next refinery wisp; not requesting restart."
+    gc runtime drain-ack
+    exit 1
+  fi
 fi
 if [ -n "$CURRENT_WISP" ]; then
   gc bd mol burn "$CURRENT_WISP" --force
@@ -246,16 +254,24 @@ CURRENT_WISP=${GC_BEAD_ID:-}
 if [ -z "$CURRENT_WISP" ]; then
   CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
 fi
-NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
+# Reconcile queued wisps before pouring: reuse one if present, burn the surplus.
+OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r '.[].id')
+NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
+for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
+  gc bd mol burn "$extra" --force
+done
 if [ -z "$NEXT" ]; then
-  echo "Could not pour next refinery wisp; not burning."
-  gc runtime drain-ack
-  exit 1
-fi
-if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
-  echo "Could not assign next refinery wisp; not burning."
-  gc runtime drain-ack
-  exit 1
+  NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
+  if [ -z "$NEXT" ]; then
+    echo "Could not pour next refinery wisp; not burning."
+    gc runtime drain-ack
+    exit 1
+  fi
+  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+    echo "Could not assign next refinery wisp; not burning."
+    gc runtime drain-ack
+    exit 1
+  fi
 fi
 if [ -n "$CURRENT_WISP" ]; then
   gc bd mol burn "$CURRENT_WISP" --force
@@ -347,16 +363,24 @@ TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_bran
      if [ -z "$CURRENT_WISP" ]; then
        CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
      fi
-     NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
+     # Reconcile queued wisps before pouring: reuse one, burn the surplus.
+     OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r '.[].id')
+     NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
+     for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
+       gc bd mol burn "$extra" --force
+     done
      if [ -z "$NEXT" ]; then
-       echo "Could not pour next refinery wisp; not burning."
-       gc runtime drain-ack
-       exit 1
-     fi
-     if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
-       echo "Could not assign next refinery wisp; not burning."
-       gc runtime drain-ack
-       exit 1
+       NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
+       if [ -z "$NEXT" ]; then
+         echo "Could not pour next refinery wisp; not burning."
+         gc runtime drain-ack
+         exit 1
+       fi
+       if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+         echo "Could not assign next refinery wisp; not burning."
+         gc runtime drain-ack
+         exit 1
+       fi
      fi
      if [ -n "$CURRENT_WISP" ]; then
        gc bd mol burn "$CURRENT_WISP" --force
@@ -446,7 +470,15 @@ Target: $TARGET"
     gc runtime drain-ack
     exit 1
   fi
-  NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
+  # Reconcile queued wisps before pouring: reuse one, burn the surplus.
+  OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r '.[].id')
+  NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
+  for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
+    gc bd mol burn "$extra" --force
+  done
+  if [ -z "$NEXT" ]; then
+    NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
+  fi
   if [ -z "$NEXT" ]; then
     echo "Could not pour next refinery wisp; not burning."
     gc runtime drain-ack
@@ -1149,16 +1181,24 @@ CURRENT_WISP=${GC_BEAD_ID:-}
 if [ -z "$CURRENT_WISP" ]; then
   CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
 fi
-NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
+# Reconcile queued wisps before pouring: reuse one if present, burn the surplus.
+OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r '.[].id')
+NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
+for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
+  gc bd mol burn "$extra" --force
+done
 if [ -z "$NEXT" ]; then
-  echo "Could not pour next refinery wisp; not burning."
-  gc runtime drain-ack
-  exit 1
-fi
-if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
-  echo "Could not assign next refinery wisp; not burning."
-  gc runtime drain-ack
-  exit 1
+  NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
+  if [ -z "$NEXT" ]; then
+    echo "Could not pour next refinery wisp; not burning."
+    gc runtime drain-ack
+    exit 1
+  fi
+  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+    echo "Could not assign next refinery wisp; not burning."
+    gc runtime drain-ack
+    exit 1
+  fi
 fi
 if [ -n "$CURRENT_WISP" ]; then
   gc bd mol burn "$CURRENT_WISP" --force

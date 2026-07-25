@@ -465,16 +465,28 @@ if [ -z "$CURRENT_WISP" ]; then
   CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
 fi
 
-NEXT=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix='{{binding_prefix}}' --json | jq -r '.new_epic_id // empty')
+# Reconcile before pouring. A prior cycle may have poured a next wisp without
+# burning, or a restart may have raced — reuse an already-queued wisp instead of
+# adding another, and burn any surplus. Pouring unconditionally is what turns a
+# single race into permanent accumulation.
+OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r '.[].id')
+NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
+for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
+  gc bd mol burn "$extra" --force
+done
+
 if [ -z "$NEXT" ]; then
-  echo "Could not pour next deacon wisp; not burning."
-  gc runtime drain-ack
-  exit 1
-fi
-if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
-  echo "Could not assign next deacon wisp; not burning."
-  gc runtime drain-ack
-  exit 1
+  NEXT=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix='{{binding_prefix}}' --json | jq -r '.new_epic_id // empty')
+  if [ -z "$NEXT" ]; then
+    echo "Could not pour next deacon wisp; not burning."
+    gc runtime drain-ack
+    exit 1
+  fi
+  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+    echo "Could not assign next deacon wisp; not burning."
+    gc runtime drain-ack
+    exit 1
+  fi
 fi
 ```
 
