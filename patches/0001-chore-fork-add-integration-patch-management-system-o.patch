@@ -1,0 +1,439 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 24 Jul 2026 20:34:15 -0400
+Subject: [PATCH 1/4] chore(fork): add integration patch-management system on
+ pinned upstream baseline
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Lifts the patches workflow used in gascity/gastown/beads, adapted for the
+packs repo:
+
+- integration branch = pinned BASELINE (upstream/main @ f69ec02b3) + fork
+  patches; deliberately NOT a moving branch ref.
+- make patches       — export BASELINE..HEAD divergence to patches/,
+  excluding patches/ itself (no recursive self-inclusion).
+- make upgrade       — reset integration to BASELINE and replay patches via
+  git am --3way (scripts/upgrade-integration.sh); copies patches/ to a tmpdir
+  before the reset since the baseline does not track it, then regenerates.
+- make check-patches — fail if patches/ drifts from the divergence; wired into
+  the integration-branch pre-push as validation-only (never amends).
+
+Two deliberate departures from the gascity original, both documented:
+BASELINE pins an upstream main SHA rather than a release tag (the newest tag
+here is ~190 commits stale), and there is no BASELINE_VERSION because this
+repo builds no binary to stamp.
+
+Workflow: docs/fork-patches.md
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .githooks/pre-push             |  28 +++++++
+ Makefile                       |  74 +++++++++++++++++++
+ docs/fork-patches.md           | 126 +++++++++++++++++++++++++++++++
+ scripts/upgrade-integration.sh | 131 +++++++++++++++++++++++++++++++++
+ 4 files changed, 359 insertions(+)
+ create mode 100755 .githooks/pre-push
+ create mode 100644 docs/fork-patches.md
+ create mode 100755 scripts/upgrade-integration.sh
+
+diff --git a/.githooks/pre-push b/.githooks/pre-push
+new file mode 100755
+index 0000000..5ec2ee3
+--- /dev/null
++++ b/.githooks/pre-push
+@@ -0,0 +1,28 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++# ── Fork: refuse to push a stale patches/ to the integration branch ──────────
++# Keyed off the refs actually being pushed — git feeds
++# "<local ref> <local sha> <remote ref> <remote sha>" per ref on stdin — rather
++# than off HEAD. A push from a detached worktree, or one using an explicit
++# `HEAD:integration` refspec, updates integration without ever having it as its
++# symbolic HEAD, and a HEAD-keyed check would wave both through.
++#
++# Validation only — it never amends. (An amend after git has already captured
++# the push range causes perpetual local/origin SHA drift.) Bypass with
++# `git push --no-verify`. See docs/fork-patches.md.
++#
++# Armed by core.hooksPath=.githooks, which any `make` invocation sets.
++
++zero="0000000000000000000000000000000000000000"
++
++while read -r _local_ref local_sha remote_ref _remote_sha; do
++  if [ "$remote_ref" != "refs/heads/integration" ]; then
++    continue
++  fi
++  # Branch deletion — no tree to validate.
++  if [ "$local_sha" = "$zero" ]; then
++    continue
++  fi
++  make -s check-patches
++done
+diff --git a/Makefile b/Makefile
+index 2a9fcf7..8d1c9a2 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,3 +1,22 @@
++# ── Fork integration baseline ────────────────────────────────────────────────
++# The `integration` branch carries fork-local patches on top of a pinned
++# upstream gascity-packs commit. BASELINE is the exact commit those patches
++# replay onto, so a fork build of the pack set is reproducible. To move to a
++# newer upstream commit, bump BASELINE (here and in the standalone default in
++# scripts/upgrade-integration.sh), then run `make upgrade`.
++# Full workflow: docs/fork-patches.md
++BASELINE ?= f69ec02b39e04b1febc3ced4c47fd4972f706e91
++
++# git does not honour in-repo hooks on clone, so the pre-push staleness guard
++# below would sit inert in a fresh checkout until somebody remembered a setup
++# step — and the one thing it guards (a stale patches/ export) is exactly what
++# a newcomer to the fork is most likely to push. Arm it at parse time instead:
++# any make invocation in this repo makes the guard real. Idempotent and
++# local-only, and it never overrides a core.hooksPath already set by the user
++# or a global hooks manager — run `make hooks` to force it in that case.
++_ARM_HOOKS := $(shell cur=$$(git config --get core.hooksPath 2>/dev/null || true); \
++	if [ -z "$$cur" ]; then git config core.hooksPath .githooks 2>/dev/null; fi)
++
+ GC ?= gc
+ PYTHON ?= python3
+ REGISTRY ?= registry.toml
+@@ -23,6 +42,12 @@ registry-help:
+ 	@printf '%s\n' '  make registry-validate-all GC=/path/to/gc'
+ 	@printf '%s\n' '  make registry-publish GC=/path/to/gc PACK=<name> VERSION=<semver> DESCRIPTION="..." [PACK_PATH=<path>] [PACK_DESCRIPTION="..."]'
+ 	@printf '%s\n' '  make registry-withdraw PACK=<name> VERSION=<semver> REASON="..."'
++	@printf '%s\n' ''
++	@printf '%s\n' 'Fork patch targets (integration branch):'
++	@printf '%s\n' '  make patches'
++	@printf '%s\n' '  make check-patches'
++	@printf '%s\n' '  make upgrade'
++	@printf '%s\n' '  make hooks            (auto-armed by any make run)'
+ 
+ registry-format-validate:
+ 	$(PYTHON) validate_registry.py $(REGISTRY)
+@@ -60,3 +85,52 @@ registry-withdraw:
+ 		--pack "$(PACK)" \
+ 		--version "$(VERSION)" \
+ 		--reason "$(REASON)"
++
++# ── Fork patch management (integration branch) ───────────────────────────────
++# patches/ is a DERIVED artifact: the `git format-patch BASELINE..HEAD` export
++# of the fork's divergence, EXCLUDING patches/ itself (so it can't recursively
++# include its own exports). Regenerate with `make patches` after adding or
++# editing a fork commit. See docs/fork-patches.md.
++.PHONY: patches upgrade check-patches hooks
++
++hooks:
++	@git config core.hooksPath .githooks
++	@echo "core.hooksPath = $$(git config --get core.hooksPath)"
++
++patches:
++	@echo "Exporting patches from $(BASELINE) -> HEAD divergence..."
++	@rm -f patches/*.patch
++	@git format-patch --zero-commit $(BASELINE)..HEAD --output-directory patches/ -- . ':!patches/'
++	@echo "Patches written to patches/:"
++	@ls patches/*.patch 2>/dev/null | sed 's|patches/||' || echo "  (none)"
++
++upgrade:
++	@BASELINE=$(BASELINE) bash scripts/upgrade-integration.sh
++
++check-patches:
++	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
++		git format-patch --zero-commit $(BASELINE)..HEAD --output-directory "$$tmp" -- . ':!patches/' >/dev/null 2>&1; \
++		expected=$$(ls "$$tmp"/*.patch 2>/dev/null | wc -l | tr -d ' '); \
++		actual=$$(ls patches/*.patch 2>/dev/null | wc -l | tr -d ' '); \
++		if [ "$$expected" != "$$actual" ]; then \
++			echo "patches/ is stale: $$actual present, $$expected expected."; \
++			echo "  Run: make patches && git add patches && git commit"; \
++			exit 1; \
++		fi; \
++		for f in "$$tmp"/*.patch; do \
++			[ -e "$$f" ] || continue; \
++			b=$$(basename "$$f"); \
++			if [ ! -f "patches/$$b" ]; then \
++				echo "patches/ is stale: missing $$b."; \
++				echo "  Run: make patches && git add patches && git commit"; \
++				exit 1; \
++			fi; \
++			tail -n +2 "patches/$$b" > "$$tmp/.committed"; \
++			tail -n +2 "$$f"          > "$$tmp/.regen"; \
++			if ! cmp -s "$$tmp/.committed" "$$tmp/.regen"; then \
++				echo "patches/ is stale: content drift in $$b."; \
++				echo "  Run: make patches && git add patches && git commit"; \
++				exit 1; \
++			fi; \
++		done; \
++		echo "patches/ up to date ($$actual patches)"
+diff --git a/docs/fork-patches.md b/docs/fork-patches.md
+new file mode 100644
+index 0000000..fcf4745
+--- /dev/null
++++ b/docs/fork-patches.md
+@@ -0,0 +1,126 @@
++# Fork patch management (the `integration` branch)
++
++This fork carries a small set of fork-local changes on top of a **pinned
++upstream `gastownhall/gascity-packs` commit**. The mechanism is a
++`git format-patch` / `git am` patch stack, lifted from the same system used in
++`gascity`, `gastown`, and `beads`.
++
++## The model
++
++- **`integration`** — the branch that carries the fork. It is
++  `BASELINE` + the commits in `patches/`, in order.
++- **`BASELINE`** — a pinned upstream commit, defined in the `Makefile`. The
++  fork's patches are always replayed onto exactly this commit, so the pack set
++  a fork build ships is reproducible.
++- **`patches/`** — a **derived artifact**: the `git format-patch BASELINE..HEAD`
++  export of the fork's divergence, excluding `patches/` itself. It is committed
++  so the divergence is reviewable and replayable, but it is regenerated, never
++  hand-edited.
++
++### Why the baseline is a commit SHA, not a release tag
++
++In `gascity` the baseline is deliberately a pinned upstream **release tag** SHA,
++so the fork tracks an LTS line rather than a moving `main`. This repo has no
++comparable release cadence — its newest tag (`v0.3.0`) is ~190 commits behind
++`upstream/main`, so pinning there would replay the fork onto a pack set nothing
++in production actually uses. The baseline here is therefore an upstream `main`
++commit, still pinned **by SHA** so it can never move under the fork. When this
++repo starts cutting meaningful releases, move `BASELINE` onto a release SHA and
++this section becomes a note about how it used to work.
++
++There is also no `BASELINE_VERSION` here. That value exists in `gascity` to
++stamp `gc version` on a fork binary; this repo builds no binary, so a version
++string nothing reads would be dead weight. Pack versions are carried by
++`registry.toml`.
++
++## Setup in a fresh clone
++
++Nothing to remember. The pre-push guard lives in `.githooks/`, which git does not
++consult by default, so the `Makefile` arms it at parse time — any `make`
++invocation in this repo points `core.hooksPath` at `.githooks` and the guard
++becomes real. This is as automatic as git safely allows: it deliberately runs
++nothing of its own from a freshly cloned repo.
++
++Arming never overrides a `core.hooksPath` you already set (a global hooks manager,
++say). In that case, or to set it explicitly:
++
++```bash
++make hooks
++```
++
++The guard is advisory either way — `git push --no-verify` bypasses it, and a clone
++that never runs `make` is never armed. `make check-patches` is the authoritative
++check; run it in CI if the fork ever grows one.
++
++Remotes follow the same convention as the `gascity` fork — `origin` is the fork,
++`upstream` is the source repo:
++
++```bash
++git remote -v
++# origin    git@github.com:Hough-labs/gascity-packs.git
++# upstream  git@github.com:gastownhall/gascity-packs.git
++```
++
++## Everyday workflow — adding or changing a fork patch
++
++```bash
++git switch integration
++# ... make your change ...
++git commit -m "fix(scope): what and why"
++
++make patches                       # regenerate patches/ from the divergence
++git add patches/
++git commit --amend --no-edit       # fold the export into the same commit
++```
++
++`make check-patches` (run automatically by the pre-push hook on this branch)
++fails the push if `patches/` does not match the current `BASELINE..HEAD`
++divergence, so the export can never silently drift from the commits.
++
++## Upgrading the baseline (moving to a newer upstream commit)
++
++1. Pick the new upstream commit (`git fetch upstream`, then resolve it with
++   `git rev-parse upstream/main`) and update **both** `BASELINE` in the
++   `Makefile` and the standalone default in `scripts/upgrade-integration.sh` —
++   the two must agree.
++2. **Fold that bump into the patch that introduces it** — the patch-management
++   patch (`0001`) is what creates the `Makefile` block and the upgrade script,
++   so a bump committed on top would just be a patch rewriting a line an earlier
++   patch had written, and the stack would grow by one such patch per upgrade
++   forever. Amend it into `0001` instead, so the stack stays at the fork's real
++   changes:
++
++   ```bash
++   git commit --fixup <sha-of-patch-0001-commit>
++   GIT_SEQUENCE_EDITOR=true git rebase --autosquash --onto <old-baseline> <old-baseline>
++   make patches && git add patches/ && git commit --amend --no-edit
++   ```
++
++   This is the one exception to the everyday "commit it like any other fork
++   patch" flow.
++3. Run the guided upgrade:
++
++   ```bash
++   make upgrade
++   ```
++
++   It fetches `upstream`, copies `patches/` to a tmpdir (the reset would wipe
++   it), resets `integration` to `BASELINE`, replays the patches with
++   `git am --3way`, and regenerates `patches/`.
++4. On a conflict, `git am` stops with instructions: resolve, `git add`,
++   `git am --continue` — or `git am --abort` to bail.
++5. Re-validate the pack set against the new baseline:
++
++   ```bash
++   make registry-format-validate
++   make registry-validate GC=/path/to/gc
++   ```
++
++## Why patches/ is excluded from its own export
++
++`git format-patch BASELINE..HEAD -- . ':!patches/'` excludes the `patches/`
++pathspec. Without the exclusion the export would recursively include previous
++exports, ballooning every patch. A commit that touches only `patches/` is
++therefore omitted from the export entirely (history simplification treats it as
++empty), which is why the everyday flow folds `patches/` back into the source
++commit with `--amend`.
+diff --git a/scripts/upgrade-integration.sh b/scripts/upgrade-integration.sh
+new file mode 100755
+index 0000000..3f628bd
+--- /dev/null
++++ b/scripts/upgrade-integration.sh
+@@ -0,0 +1,131 @@
++#!/usr/bin/env bash
++# scripts/upgrade-integration.sh — reset the `integration` branch to the pinned
++# upstream BASELINE and replay the fork's patches/ on top.
++#
++# Usage: make upgrade   (the Makefile passes BASELINE in via the environment)
++#
++# What it does:
++#   1. Guards: on the integration branch, clean tree, patches/ non-empty
++#   2. Fetches upstream so BASELINE is reachable
++#   3. Copies patches/ to a tmpdir FIRST — `git reset` wipes it, because the
++#      upstream baseline does not track patches/
++#   4. Shows what the baseline brings in beyond the current tree
++#   5. Resets integration to BASELINE
++#   6. Replays the patches via `git am --3way`
++#   7. Regenerates patches/ from the freshly replayed commits (it is excluded
++#      from the export, so `git am` does not restore it) and commits if changed
++#   8. On conflict: prints clear resume/abort instructions and exits 1
++
++set -euo pipefail
++
++# BASELINE is normally injected by `make upgrade`; keep a default so the script
++# is runnable standalone. Must match the Makefile's BASELINE.
++BASELINE="${BASELINE:-f69ec02b39e04b1febc3ced4c47fd4972f706e91}"
++
++RED='\033[0;31m'
++GRN='\033[0;32m'
++YLW='\033[0;33m'
++BLU='\033[0;34m'
++DIM='\033[2m'
++RST='\033[0m'
++
++info()  { echo -e "${BLU}▸${RST} $*"; }
++ok()    { echo -e "${GRN}✓${RST} $*"; }
++warn()  { echo -e "${YLW}⚠${RST} $*"; }
++die()   { echo -e "${RED}✗${RST} $*" >&2; exit 1; }
++dim()   { echo -e "${DIM}$*${RST}"; }
++
++# ── Guards ───────────────────────────────────────────────────────────────────
++
++BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null) || die "Not on a git branch"
++[ "$BRANCH" = "integration" ] || die "Must be on the integration branch (currently on: $BRANCH)"
++
++if ! git diff --quiet || ! git diff --cached --quiet; then
++    die "Working tree is dirty. Commit or stash changes before upgrading."
++fi
++
++PATCH_COUNT=$(find patches/ -maxdepth 1 -name '*.patch' 2>/dev/null | wc -l | tr -d ' ')
++[ "$PATCH_COUNT" -gt 0 ] || die "No patches found in patches/ — run 'make patches' first"
++
++# ── Fetch and locate baseline ────────────────────────────────────────────────
++
++info "Fetching upstream..."
++git fetch upstream --quiet --tags || warn "fetch failed (offline?); using local objects"
++
++git rev-parse --quiet --verify "$BASELINE^{commit}" >/dev/null 2>&1 \
++    || die "BASELINE $BASELINE not found locally — fetch it before upgrading."
++
++TARGET_SHORT=$(git rev-parse --short "$BASELINE")
++TARGET_SUBJ=$(git log -1 --format='%s' "$BASELINE")
++
++# ── Copy patches out before the reset wipes them ─────────────────────────────
++
++PATCH_TMPDIR=$(mktemp -d)
++trap 'rm -rf "$PATCH_TMPDIR"' EXIT
++cp -f patches/*.patch "$PATCH_TMPDIR/"
++
++INCOMING=$(git log --oneline "HEAD..$BASELINE" 2>/dev/null || true)
++if [ -n "$INCOMING" ]; then
++    INCOMING_COUNT=$(printf '%s\n' "$INCOMING" | grep -c . || true)
++    echo ""
++    echo -e "${BLU}Baseline $TARGET_SHORT brings in $INCOMING_COUNT commit(s) not in the current tree:${RST}"
++    printf '%s\n' "$INCOMING" | while read -r line; do dim "  $line"; done
++    echo ""
++else
++    dim "Baseline unchanged vs the current tree — re-materializing patches."
++fi
++
++# ── Reset and replay ─────────────────────────────────────────────────────────
++
++info "Resetting integration to $TARGET_SHORT ($TARGET_SUBJ)..."
++git reset --hard "$BASELINE" --quiet
++ok "Reset to $TARGET_SHORT"
++
++echo ""
++info "Replaying $PATCH_COUNT fork patches..."
++PATCH_NUM=0
++for patch in "$PATCH_TMPDIR"/*.patch; do
++    PATCH_NUM=$((PATCH_NUM + 1))
++    SUBJECT=$(grep -m1 '^Subject:' "$patch" | sed 's/Subject: \[PATCH[^]]*\] //')
++    printf "  ${DIM}%d/%d %s${RST}\n" "$PATCH_NUM" "$PATCH_COUNT" "$SUBJECT"
++done
++echo ""
++
++if ! git am --3way "$PATCH_TMPDIR"/*.patch; then
++    echo ""
++    die "$(cat <<EOF
++Patch conflict — resolve then continue:
++
++  1. Edit the conflicting file(s)
++  2. git add <file>
++  3. git am --continue
++
++To bail out entirely:
++  git am --abort
++  git reset --hard $BASELINE
++EOF
++)"
++fi
++
++ok "All $PATCH_COUNT patches applied — integration at $(git rev-parse --short HEAD)"
++
++# ── Restore patches/ ─────────────────────────────────────────────────────────
++# The reset wiped patches/ and `git am` did not restore it (patches/ is excluded
++# from the export). Regenerate it from the replayed commits so the tree once
++# again satisfies the invariant `make check-patches` enforces.
++echo ""
++info "Regenerating patches/ from the replayed commits..."
++make -s patches >/dev/null
++# The reset wiped patches/, so after replay it is untracked — stage first, then
++# check the index (a plain `git diff` would not see untracked files).
++git add patches/
++if ! git diff --cached --quiet -- patches/; then
++    git commit --quiet -m "build(patches): refresh export after upgrade to $TARGET_SHORT"
++    ok "patches/ refreshed and committed"
++else
++    ok "patches/ unchanged"
++fi
++
++echo ""
++ok "Upgrade complete."
++dim "  Validate the packs against the new baseline: make registry-format-validate"
+-- 
+2.50.1 (Apple Git-155)
+

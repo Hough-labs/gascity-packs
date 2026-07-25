@@ -1,0 +1,788 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sat, 25 Jul 2026 19:16:42 -0400
+Subject: [PATCH 3/4] fix(gastown): make a patrol cycle burn only the wisp it
+ actually holds
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Consolidates the wisp-lifecycle work that was previously spread across three
+commits, each fixing the previous one's blast radius. Replaces them with one
+statement of the invariant and one shape applied at every site.
+
+THE INVARIANT
+
+  A cycle may burn only a wisp it actually holds — $GC_BEAD_ID, or one it
+  resolved as `in_progress`. A wisp in `open` is NOT held. It is live work
+  queued for the claim protocol, and the only correct response to "I hold
+  nothing and a wisp is queued" is to pour nothing, burn nothing, and let
+  `gc hook` claim it.
+
+WHAT THE SUPERSEDED COMMITS GOT WRONG
+
+Reconciling queued wisps before pouring (correct, kept) was introduced without
+any notion of which wisp the cycle owns, so a cycle could elect its own wisp as
+its successor and then burn it. The follow-up fixed that by excluding
+$CURRENT_WISP (correct, kept) but ALSO widened $CURRENT_WISP resolution from
+`in_progress` to `in_progress,open` so a never-claimed wisp "still resolves".
+
+Every one of those sites ends in an unconditional `gc bd mol burn
+"$CURRENT_WISP"`. The widening therefore turned "adopt the queued wisp as your
+successor" into "adopt the queued wisp and destroy it":
+
+  GC_BEAD_ID is exported only by the convergence runner, so it is empty in
+  exactly the fresh sessions these fallbacks exist to serve. With one open,
+  assigned, never-claimed wisp W1 and nothing in progress:
+
+    CURRENT_WISP <- W1        (widening admits `open`)
+    OPEN_WISPS   <- {} minus W1, empty
+    NEXT empty   -> pour W2, assign W2
+    burn CURRENT_WISP         -> W1 destroyed, no work ever ran
+    exit -> W2 open+assigned -> namedWorkReady re-wakes the session -> repeat
+
+  One burn, one pour, zero patrol work, ~40s per cycle, stable at exactly one
+  wisp so it reads as a healthy queue to anything counting depth. It is also an
+  attractor: once in "queued but never claimed", every wake burns the thing it
+  was supposed to pick up, so the state cannot self-clear. Before the widening
+  the same state merely stalled non-destructively.
+
+A third commit diagnosed this exactly and wrote the rule down -- "resolve from
+in_progress ONLY -- never in_progress,open ... step 3 burns unconditionally" --
+then applied it to mol-witness-patrol.toml alone, leaving the other ten sites
+widened.
+
+WHAT THIS COMMIT DOES
+
+- All 10 CURRENT_WISP sites + witness THIS_WISP resolve from `in_progress`
+  only, unbounded and oldest-first for determinism.
+- The held wisp stays excluded from successor candidates.
+- Queued wisps reconcile to exactly one; surplus is burned.
+- "Hold nothing, one queued" is handled explicitly everywhere. In the deacon
+  and witness prompts the existing three-branch shape already handles it by
+  falling through to `gc hook`; the widening was the only thing defeating it,
+  and a state table now records why no branch may claim it. The refinery and
+  formula sites get an explicit stop.
+- The reconcile query fails CLOSED. It previously could not distinguish a
+  failed lookup from an empty queue, so any transient error poured another
+  wisp -- reaching the unbounded accumulation the first commit set out to
+  prevent, through its own error path.
+- boot's watchdog gains a wisp-visible view ALONGSIDE its original query,
+  which is restored verbatim. Widening is safe there and only there, because
+  boot reads and never burns.
+
+Verified: all gastown formulas re-parse; gascity's examples/gastown suite run
+against these packs via a local replace fails exactly the 13 tests that
+pristine upstream f69ec02 already fails (that suite pins packs at 33d3a430,
+~190 commits behind our BASELINE) -- byte-identical failure sets, so this adds
+zero regressions. The superseded stack failed 15.
+
+Refs gc-10x, gc-mgn, gc-a6d, gc-p0j, gc-5bc
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ gastown/agents/boot/prompt.template.md     |  23 +-
+ gastown/agents/deacon/prompt.template.md   |  33 ++-
+ gastown/agents/refinery/prompt.template.md |  90 ++++++--
+ gastown/agents/witness/prompt.template.md  |  35 ++-
+ gastown/formulas/mol-deacon-patrol.toml    |  47 ++++-
+ gastown/formulas/mol-refinery-patrol.toml  | 235 ++++++++++++++++++---
+ gastown/formulas/mol-witness-patrol.toml   |  41 +++-
+ 7 files changed, 434 insertions(+), 70 deletions(-)
+
+diff --git a/gastown/agents/boot/prompt.template.md b/gastown/agents/boot/prompt.template.md
+index eb1ddc7..873e780 100644
+--- a/gastown/agents/boot/prompt.template.md
++++ b/gastown/agents/boot/prompt.template.md
+@@ -39,15 +39,34 @@ restart dead agents.
+ # Deacon's current patrol wisp — how fresh is it?
+ gc bd list --assignee={{ .BindingPrefix }}deacon --status=in_progress --json --limit=5
+ 
++# The same question, but able to see the answer. Patrol wisps are infra beads
++# living in the wisps table, which `gc bd list` hides unless --include-infra is
++# passed — so the query above returns [] no matter how healthy the deacon is,
++# and every wake reads as "deacon has no work".
++#
++# This one also admits `open`. A wisp that was poured and assigned stays `open`
++# until it is claimed, so an in_progress-only view cannot tell a DEAD deacon
++# (no wisps at all) from a STUCK-AT-CLAIM one (wisps queued, never claimed) —
++# opposite diagnoses needing opposite responses. Widening is safe here only
++# because boot merely reads; a patrol agent must never widen it, because a
++# patrol agent BURNS what it resolves.
++gc bd list --assignee={{ .BindingPrefix }}deacon --status=in_progress,open --type=molecule --include-infra --json --limit=5 \
++  | jq -r '.[] | "\(.id)\t\(.status)\t\(.updated_at)"'
++
+ # Does the deacon have unread mail? (may explain idle state)
+ gc mail count {{ .BindingPrefix }}deacon 2>/dev/null
+ ```
+ 
+-Read the wisp timestamps and pane output. Build a picture:
++Read the wisp statuses, timestamps, and pane output. Build a picture:
+ - Recent burned wisp -> normal patrol loop
+ - Active pane output -> working
+ - Young in-progress wisp with idle pane -> likely backoff wait
+ - Very stale in-progress wisp with idle/error pane -> likely stuck
++- No wisps at all -> the loop has no next iteration; the deacon cannot
++  self-recover and needs a restart
++- Open wisps piling up with none in_progress -> poured but never claimed. The
++  deacon is restarting before it claims. Restarting it again just adds another
++  wisp; read the pane for why the claim is failing before acting.
+ - Idle with unread mail -> may need a nudge
+ 
+ ### Step 3: Decide
+@@ -112,7 +131,7 @@ with a fresh provider context.
+ | Want to... | Correct command |
+ |------------|----------------|
+ | View deacon output | `{{ cmd }} session peek {{ .BindingPrefix }}deacon --lines 30` |
+-| Check deacon work | `gc bd list --assignee={{ .BindingPrefix }}deacon --status=in_progress --json` |
++| Check deacon work | `gc bd list --assignee={{ .BindingPrefix }}deacon --status=in_progress,open --type=molecule --include-infra --json` |
+ | Nudge deacon | `{{ cmd }} session nudge {{ .BindingPrefix }}deacon "message"` |
+ | File stuck warrant | `gc bd create --type=task --label=warrant --metadata '{"target":"{{ .BindingPrefix }}deacon","reason":"...","requester":"boot","gc.routed_to":"{{ .BindingPrefix }}dog"}'` |
+ | Check active sessions | `{{ cmd }} session list` |
+diff --git a/gastown/agents/deacon/prompt.template.md b/gastown/agents/deacon/prompt.template.md
+index cf248ae..45d92ba 100644
+--- a/gastown/agents/deacon/prompt.template.md
++++ b/gastown/agents/deacon/prompt.template.md
+@@ -92,9 +92,38 @@ If `next-iteration` already ran, do not pour again; run `gc hook`.
+ # queued", pours a fresh one, and leaks the predecessor on every restart.
+ CURRENT_WISP=${GC_BEAD_ID:-}
+ if [ -z "$CURRENT_WISP" ]; then
+-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
++  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=0 --json | jq -r 'sort_by(.created_at) | .[0].id // empty')
+ fi
+-ASSIGNED_WISP=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
++# Reconcile queued (open) patrol wisps to exactly one: keep the oldest, burn
++# the surplus. Wisp roots are molecules (never --type=wisp, which is not a
++# valid gc bd type and matches nothing) and infra beads — without
++# --include-infra this returns [] and the surplus-burn can never fire.
++#
++# $CURRENT_WISP is EXCLUDED. A wisp this cycle holds is not a candidate to be
++# its own successor; adopting it and then burning it destroys the iteration.
++#
++# Fail CLOSED: a query that errors must not read as "queue is empty", which
++# pours on every transient failure and turns one race into unbounded growth.
++OPEN_JSON=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json) || OPEN_JSON=
++if ! printf '%s' "$OPEN_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
++  echo "Could not list queued wisps; not pouring and not burning."
++  exit 1
++fi
++OPEN_WISPS=$(printf '%s' "$OPEN_JSON" | jq -r --arg cur "$CURRENT_WISP" 'sort_by(.created_at) | .[] | select(.id != $cur) | .id')
++ASSIGNED_WISP=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
++for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
++  gc bd mol burn "$extra" --force
++done
++
++# Four states below, and the one that is NOT a branch matters most:
++#   hold a wisp, none queued  -> pour a successor, then burn ours
++#   hold a wisp, one queued   -> burn ours; the queued one IS the successor
++#   hold nothing, none queued -> bootstrap: pour one, burn nothing
++#   hold nothing, one queued  -> FALL THROUGH: pour nothing, burn nothing.
++#     That wisp is live work waiting to be claimed, and `gc hook` below claims
++#     it. Treating it as "current" and burning it leaves the agent with no
++#     work, namedWorkReady re-wakes the session, and that is a wake/drain loop
++#     rather than a patrol.
+ if [ -n "$CURRENT_WISP" ] && [ -z "$ASSIGNED_WISP" ]; then
+   NEXT=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id // empty')
+   if [ -z "$NEXT" ]; then
+diff --git a/gastown/agents/refinery/prompt.template.md b/gastown/agents/refinery/prompt.template.md
+index f1f4d33..1dd58c7 100644
+--- a/gastown/agents/refinery/prompt.template.md
++++ b/gastown/agents/refinery/prompt.template.md
+@@ -71,16 +71,47 @@ CURRENT_WISP=${GC_BEAD_ID:-}
+ if [ -z "$CURRENT_WISP" ]; then
+   # --include-infra is required: wisps are infra beads and gc bd list hides
+   # them by default, so without it this returns empty and the wisp leaks.
+-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
++  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=0 --json | jq -r 'sort_by(.created_at) | .[0].id // empty')
+ fi
+-NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id // empty')
+-if [ -z "$NEXT" ]; then
+-  echo "Could not pour next refinery wisp; not burning."
++# Reconcile queued (open) patrol wisps to exactly one: keep the oldest, burn
++# the surplus. Wisp roots are molecules (never --type=wisp, which is not a
++# valid gc bd type and matches nothing) and infra beads — without
++# --include-infra this returns [] and the surplus-burn can never fire.
++#
++# $CURRENT_WISP is EXCLUDED. A wisp this cycle holds is not a candidate to be
++# its own successor; adopting it and then burning it destroys the iteration.
++#
++# Fail CLOSED: a query that errors must not read as "queue is empty", which
++# pours on every transient failure and turns one race into unbounded growth.
++OPEN_JSON=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json) || OPEN_JSON=
++if ! printf '%s' "$OPEN_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
++  echo "Could not list queued wisps; not pouring and not burning."
+   exit 1
+ fi
+-if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+-  echo "Could not assign next refinery wisp; not burning."
+-  exit 1
++OPEN_WISPS=$(printf '%s' "$OPEN_JSON" | jq -r --arg cur "$CURRENT_WISP" 'sort_by(.created_at) | .[] | select(.id != $cur) | .id')
++NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
++for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
++  gc bd mol burn "$extra" --force
++done
++# Hold nothing, but a wisp is already queued: that wisp is live work waiting
++# for the claim protocol, not this cycle's to burn. Stop. Pouring would add a
++# second wisp; burning would destroy the iteration. Either leaves the session
++# with no work, namedWorkReady re-wakes it, and that is a wake/drain loop
++# rather than a patrol. `gc hook` claims it on the next pass.
++if [ -z "$CURRENT_WISP" ] && [ -n "$NEXT" ]; then
++  echo "Wisp $NEXT is queued and unclaimed; not pouring and not burning."
++  exit 0
++fi
++if [ -z "$NEXT" ]; then
++  NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id // empty')
++  if [ -z "$NEXT" ]; then
++    echo "Could not pour next refinery wisp; not burning."
++    exit 1
++  fi
++  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
++    echo "Could not assign next refinery wisp; not burning."
++    exit 1
++  fi
+ fi
+ if [ -n "$CURRENT_WISP" ]; then
+   gc bd mol burn "$CURRENT_WISP" --force
+@@ -118,16 +149,47 @@ CURRENT_WISP=${GC_BEAD_ID:-}
+ if [ -z "$CURRENT_WISP" ]; then
+   # --include-infra is required: wisps are infra beads and gc bd list hides
+   # them by default, so without it this returns empty and the wisp leaks.
+-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
++  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=0 --json | jq -r 'sort_by(.created_at) | .[0].id // empty')
+ fi
+-NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id // empty')
+-if [ -z "$NEXT" ]; then
+-  echo "Could not pour next refinery wisp; not requesting restart."
++# Reconcile queued (open) patrol wisps to exactly one: keep the oldest, burn
++# the surplus. Wisp roots are molecules (never --type=wisp, which is not a
++# valid gc bd type and matches nothing) and infra beads — without
++# --include-infra this returns [] and the surplus-burn can never fire.
++#
++# $CURRENT_WISP is EXCLUDED. A wisp this cycle holds is not a candidate to be
++# its own successor; adopting it and then burning it destroys the iteration.
++#
++# Fail CLOSED: a query that errors must not read as "queue is empty", which
++# pours on every transient failure and turns one race into unbounded growth.
++OPEN_JSON=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json) || OPEN_JSON=
++if ! printf '%s' "$OPEN_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
++  echo "Could not list queued wisps; not pouring and not burning."
+   exit 1
+ fi
+-if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+-  echo "Could not assign next refinery wisp; not requesting restart."
+-  exit 1
++OPEN_WISPS=$(printf '%s' "$OPEN_JSON" | jq -r --arg cur "$CURRENT_WISP" 'sort_by(.created_at) | .[] | select(.id != $cur) | .id')
++NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
++for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
++  gc bd mol burn "$extra" --force
++done
++# Hold nothing, but a wisp is already queued: that wisp is live work waiting
++# for the claim protocol, not this cycle's to burn. Stop. Pouring would add a
++# second wisp; burning would destroy the iteration. Either leaves the session
++# with no work, namedWorkReady re-wakes it, and that is a wake/drain loop
++# rather than a patrol. `gc hook` claims it on the next pass.
++if [ -z "$CURRENT_WISP" ] && [ -n "$NEXT" ]; then
++  echo "Wisp $NEXT is queued and unclaimed; not pouring and not burning."
++  exit 0
++fi
++if [ -z "$NEXT" ]; then
++  NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id // empty')
++  if [ -z "$NEXT" ]; then
++    echo "Could not pour next refinery wisp; not requesting restart."
++    exit 1
++  fi
++  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
++    echo "Could not assign next refinery wisp; not requesting restart."
++    exit 1
++  fi
+ fi
+ if [ -n "$CURRENT_WISP" ]; then
+   gc bd mol burn "$CURRENT_WISP" --force
+diff --git a/gastown/agents/witness/prompt.template.md b/gastown/agents/witness/prompt.template.md
+index fc7d47d..1242a75 100644
+--- a/gastown/agents/witness/prompt.template.md
++++ b/gastown/agents/witness/prompt.template.md
+@@ -209,19 +209,38 @@ If `next-iteration` already ran, do not pour again; run `gc hook`.
+ ```bash
+ CURRENT_WISP=${GC_BEAD_ID:-}
+ if [ -z "$CURRENT_WISP" ]; then
+-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
++  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=0 --json | jq -r 'sort_by(.created_at) | .[0].id // empty')
+ fi
+-# Reconcile queued (open) patrol wisps to exactly one. A prior cycle may have
+-# poured a next wisp without burning, or a restart may have raced — keep the
+-# first and burn the surplus so wisps never accumulate. Wisp roots are
+-# molecules (never --type=wisp, which is not a valid gc bd type and matches
+-# nothing), and infra beads — without --include-infra this returns [] and the
+-# surplus-burn below can never fire.
+-OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r '.[].id')
++# Reconcile queued (open) patrol wisps to exactly one: keep the oldest, burn
++# the surplus. Wisp roots are molecules (never --type=wisp, which is not a
++# valid gc bd type and matches nothing) and infra beads — without
++# --include-infra this returns [] and the surplus-burn can never fire.
++#
++# $CURRENT_WISP is EXCLUDED. A wisp this cycle holds is not a candidate to be
++# its own successor; adopting it and then burning it destroys the iteration.
++#
++# Fail CLOSED: a query that errors must not read as "queue is empty", which
++# pours on every transient failure and turns one race into unbounded growth.
++OPEN_JSON=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json) || OPEN_JSON=
++if ! printf '%s' "$OPEN_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
++  echo "Could not list queued wisps; not pouring and not burning."
++  exit 1
++fi
++OPEN_WISPS=$(printf '%s' "$OPEN_JSON" | jq -r --arg cur "$CURRENT_WISP" 'sort_by(.created_at) | .[] | select(.id != $cur) | .id')
+ ASSIGNED_WISP=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
+ for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
+   gc bd mol burn "$extra" --force
+ done
++
++# Four states below, and the one that is NOT a branch matters most:
++#   hold a wisp, none queued  -> pour a successor, then burn ours
++#   hold a wisp, one queued   -> burn ours; the queued one IS the successor
++#   hold nothing, none queued -> bootstrap: pour one, burn nothing
++#   hold nothing, one queued  -> FALL THROUGH: pour nothing, burn nothing.
++#     That wisp is live work waiting to be claimed, and `gc hook` below claims
++#     it. Treating it as "current" and burning it leaves the agent with no
++#     work, namedWorkReady re-wakes the session, and that is a wake/drain loop
++#     rather than a patrol.
+ if [ -n "$CURRENT_WISP" ] && [ -z "$ASSIGNED_WISP" ]; then
+   NEXT=$(gc bd mol wisp mol-witness-patrol --root-only --var binding_prefix='{{ .BindingPrefix }}' --json | jq -r '.new_epic_id // empty')
+   if [ -z "$NEXT" ]; then
+diff --git a/gastown/formulas/mol-deacon-patrol.toml b/gastown/formulas/mol-deacon-patrol.toml
+index 0559a90..6b59e05 100644
+--- a/gastown/formulas/mol-deacon-patrol.toml
++++ b/gastown/formulas/mol-deacon-patrol.toml
+@@ -462,19 +462,52 @@ CURRENT_WISP=${GC_BEAD_ID:-}
+ if [ -z "$CURRENT_WISP" ]; then
+   # --include-infra is required: wisps are infra beads, hidden from gc bd list
+   # by default. Without it this returns empty and the wisp leaks every restart.
+-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
++  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=0 --json | jq -r 'sort_by(.created_at) | .[0].id // empty')
+ fi
+ 
+-NEXT=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix='{{binding_prefix}}' --json | jq -r '.new_epic_id // empty')
+-if [ -z "$NEXT" ]; then
+-  echo "Could not pour next deacon wisp; not burning."
++# Reconcile queued (open) patrol wisps to exactly one: keep the oldest, burn
++# the surplus. Wisp roots are molecules (never --type=wisp, which is not a
++# valid gc bd type and matches nothing) and infra beads — without
++# --include-infra this returns [] and the surplus-burn can never fire.
++#
++# $CURRENT_WISP is EXCLUDED. A wisp this cycle holds is not a candidate to be
++# its own successor; adopting it and then burning it destroys the iteration.
++#
++# Fail CLOSED: a query that errors must not read as "queue is empty", which
++# pours on every transient failure and turns one race into unbounded growth.
++OPEN_JSON=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json) || OPEN_JSON=
++if ! printf '%s' "$OPEN_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
++  echo "Could not list queued wisps; not pouring and not burning."
+   gc runtime drain-ack
+   exit 1
+ fi
+-if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+-  echo "Could not assign next deacon wisp; not burning."
++OPEN_WISPS=$(printf '%s' "$OPEN_JSON" | jq -r --arg cur "$CURRENT_WISP" 'sort_by(.created_at) | .[] | select(.id != $cur) | .id')
++NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
++for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
++  gc bd mol burn "$extra" --force
++done
++# Hold nothing, but a wisp is already queued: that wisp is live work waiting
++# for the claim protocol, not this cycle's to burn. Stop. Pouring would add a
++# second wisp; burning would destroy the iteration. Either leaves the session
++# with no work, namedWorkReady re-wakes it, and that is a wake/drain loop
++# rather than a patrol. `gc hook` claims it on the next pass.
++if [ -z "$CURRENT_WISP" ] && [ -n "$NEXT" ]; then
++  echo "Wisp $NEXT is queued and unclaimed; not pouring and not burning."
+   gc runtime drain-ack
+-  exit 1
++  exit 0
++fi
++if [ -z "$NEXT" ]; then
++  NEXT=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix='{{binding_prefix}}' --json | jq -r '.new_epic_id // empty')
++  if [ -z "$NEXT" ]; then
++    echo "Could not pour next deacon wisp; not burning."
++    gc runtime drain-ack
++    exit 1
++  fi
++  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
++    echo "Could not assign next deacon wisp; not burning."
++    gc runtime drain-ack
++    exit 1
++  fi
+ fi
+ ```
+ 
+diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
+index d23083d..b3a6ec7 100644
+--- a/gastown/formulas/mol-refinery-patrol.toml
++++ b/gastown/formulas/mol-refinery-patrol.toml
+@@ -121,18 +121,51 @@ default, so without it the lookup returns empty and the wisp leaks:
+ ```bash
+ CURRENT_WISP=${GC_BEAD_ID:-}
+ if [ -z "$CURRENT_WISP" ]; then
+-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
++  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=0 --json | jq -r 'sort_by(.created_at) | .[0].id // empty')
+ fi
+-NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
+-if [ -z "$NEXT" ]; then
+-  echo "Could not pour next refinery wisp; not requesting restart."
++# Reconcile queued (open) patrol wisps to exactly one: keep the oldest, burn
++# the surplus. Wisp roots are molecules (never --type=wisp, which is not a
++# valid gc bd type and matches nothing) and infra beads — without
++# --include-infra this returns [] and the surplus-burn can never fire.
++#
++# $CURRENT_WISP is EXCLUDED. A wisp this cycle holds is not a candidate to be
++# its own successor; adopting it and then burning it destroys the iteration.
++#
++# Fail CLOSED: a query that errors must not read as "queue is empty", which
++# pours on every transient failure and turns one race into unbounded growth.
++OPEN_JSON=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json) || OPEN_JSON=
++if ! printf '%s' "$OPEN_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
++  echo "Could not list queued wisps; not pouring and not burning."
+   gc runtime drain-ack
+   exit 1
+ fi
+-if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+-  echo "Could not assign next refinery wisp; not requesting restart."
++OPEN_WISPS=$(printf '%s' "$OPEN_JSON" | jq -r --arg cur "$CURRENT_WISP" 'sort_by(.created_at) | .[] | select(.id != $cur) | .id')
++NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
++for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
++  gc bd mol burn "$extra" --force
++done
++# Hold nothing, but a wisp is already queued: that wisp is live work waiting
++# for the claim protocol, not this cycle's to burn. Stop. Pouring would add a
++# second wisp; burning would destroy the iteration. Either leaves the session
++# with no work, namedWorkReady re-wakes it, and that is a wake/drain loop
++# rather than a patrol. `gc hook` claims it on the next pass.
++if [ -z "$CURRENT_WISP" ] && [ -n "$NEXT" ]; then
++  echo "Wisp $NEXT is queued and unclaimed; not pouring and not burning."
+   gc runtime drain-ack
+-  exit 1
++  exit 0
++fi
++if [ -z "$NEXT" ]; then
++  NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
++  if [ -z "$NEXT" ]; then
++    echo "Could not pour next refinery wisp; not requesting restart."
++    gc runtime drain-ack
++    exit 1
++  fi
++  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
++    echo "Could not assign next refinery wisp; not requesting restart."
++    gc runtime drain-ack
++    exit 1
++  fi
+ fi
+ if [ -n "$CURRENT_WISP" ]; then
+   gc bd mol burn "$CURRENT_WISP" --force
+@@ -244,18 +277,51 @@ gc bd update $WORK \
+ ```bash
+ CURRENT_WISP=${GC_BEAD_ID:-}
+ if [ -z "$CURRENT_WISP" ]; then
+-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
++  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=0 --json | jq -r 'sort_by(.created_at) | .[0].id // empty')
+ fi
+-NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
+-if [ -z "$NEXT" ]; then
+-  echo "Could not pour next refinery wisp; not burning."
++# Reconcile queued (open) patrol wisps to exactly one: keep the oldest, burn
++# the surplus. Wisp roots are molecules (never --type=wisp, which is not a
++# valid gc bd type and matches nothing) and infra beads — without
++# --include-infra this returns [] and the surplus-burn can never fire.
++#
++# $CURRENT_WISP is EXCLUDED. A wisp this cycle holds is not a candidate to be
++# its own successor; adopting it and then burning it destroys the iteration.
++#
++# Fail CLOSED: a query that errors must not read as "queue is empty", which
++# pours on every transient failure and turns one race into unbounded growth.
++OPEN_JSON=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json) || OPEN_JSON=
++if ! printf '%s' "$OPEN_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
++  echo "Could not list queued wisps; not pouring and not burning."
+   gc runtime drain-ack
+   exit 1
+ fi
+-if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+-  echo "Could not assign next refinery wisp; not burning."
++OPEN_WISPS=$(printf '%s' "$OPEN_JSON" | jq -r --arg cur "$CURRENT_WISP" 'sort_by(.created_at) | .[] | select(.id != $cur) | .id')
++NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
++for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
++  gc bd mol burn "$extra" --force
++done
++# Hold nothing, but a wisp is already queued: that wisp is live work waiting
++# for the claim protocol, not this cycle's to burn. Stop. Pouring would add a
++# second wisp; burning would destroy the iteration. Either leaves the session
++# with no work, namedWorkReady re-wakes it, and that is a wake/drain loop
++# rather than a patrol. `gc hook` claims it on the next pass.
++if [ -z "$CURRENT_WISP" ] && [ -n "$NEXT" ]; then
++  echo "Wisp $NEXT is queued and unclaimed; not pouring and not burning."
+   gc runtime drain-ack
+-  exit 1
++  exit 0
++fi
++if [ -z "$NEXT" ]; then
++  NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
++  if [ -z "$NEXT" ]; then
++    echo "Could not pour next refinery wisp; not burning."
++    gc runtime drain-ack
++    exit 1
++  fi
++  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
++    echo "Could not assign next refinery wisp; not burning."
++    gc runtime drain-ack
++    exit 1
++  fi
+ fi
+ if [ -n "$CURRENT_WISP" ]; then
+   gc bd mol burn "$CURRENT_WISP" --force
+@@ -345,18 +411,51 @@ TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_bran
+      ```bash
+      CURRENT_WISP=${GC_BEAD_ID:-}
+      if [ -z "$CURRENT_WISP" ]; then
+-       CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
++       CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=0 --json | jq -r 'sort_by(.created_at) | .[0].id // empty')
+      fi
+-     NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
+-     if [ -z "$NEXT" ]; then
+-       echo "Could not pour next refinery wisp; not burning."
++     # Reconcile queued (open) patrol wisps to exactly one: keep the oldest, burn
++     # the surplus. Wisp roots are molecules (never --type=wisp, which is not a
++     # valid gc bd type and matches nothing) and infra beads — without
++     # --include-infra this returns [] and the surplus-burn can never fire.
++     #
++     # $CURRENT_WISP is EXCLUDED. A wisp this cycle holds is not a candidate to be
++     # its own successor; adopting it and then burning it destroys the iteration.
++     #
++     # Fail CLOSED: a query that errors must not read as "queue is empty", which
++     # pours on every transient failure and turns one race into unbounded growth.
++     OPEN_JSON=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json) || OPEN_JSON=
++     if ! printf '%s' "$OPEN_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
++       echo "Could not list queued wisps; not pouring and not burning."
+        gc runtime drain-ack
+        exit 1
+      fi
+-     if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+-       echo "Could not assign next refinery wisp; not burning."
++     OPEN_WISPS=$(printf '%s' "$OPEN_JSON" | jq -r --arg cur "$CURRENT_WISP" 'sort_by(.created_at) | .[] | select(.id != $cur) | .id')
++     NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
++     for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
++       gc bd mol burn "$extra" --force
++     done
++     # Hold nothing, but a wisp is already queued: that wisp is live work waiting
++     # for the claim protocol, not this cycle's to burn. Stop. Pouring would add a
++     # second wisp; burning would destroy the iteration. Either leaves the session
++     # with no work, namedWorkReady re-wakes it, and that is a wake/drain loop
++     # rather than a patrol. `gc hook` claims it on the next pass.
++     if [ -z "$CURRENT_WISP" ] && [ -n "$NEXT" ]; then
++       echo "Wisp $NEXT is queued and unclaimed; not pouring and not burning."
+        gc runtime drain-ack
+-       exit 1
++       exit 0
++     fi
++     if [ -z "$NEXT" ]; then
++       NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
++       if [ -z "$NEXT" ]; then
++         echo "Could not pour next refinery wisp; not burning."
++         gc runtime drain-ack
++         exit 1
++       fi
++       if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
++         echo "Could not assign next refinery wisp; not burning."
++         gc runtime drain-ack
++         exit 1
++       fi
+      fi
+      if [ -n "$CURRENT_WISP" ]; then
+        gc bd mol burn "$CURRENT_WISP" --force
+@@ -437,7 +536,7 @@ Branch: $BRANCH
+ Target: $TARGET"
+   CURRENT_WISP=${GC_BEAD_ID:-}
+   if [ -z "$CURRENT_WISP" ]; then
+-    CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
++    CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=0 --json | jq -r 'sort_by(.created_at) | .[0].id // empty')
+   fi
+   if [ -z "$CURRENT_WISP" ]; then
+     echo "Could not resolve current wisp; not burning."
+@@ -446,16 +545,49 @@ Target: $TARGET"
+     gc runtime drain-ack
+     exit 1
+   fi
+-  NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
+-  if [ -z "$NEXT" ]; then
+-    echo "Could not pour next refinery wisp; not burning."
++  # Reconcile queued (open) patrol wisps to exactly one: keep the oldest, burn
++  # the surplus. Wisp roots are molecules (never --type=wisp, which is not a
++  # valid gc bd type and matches nothing) and infra beads — without
++  # --include-infra this returns [] and the surplus-burn can never fire.
++  #
++  # $CURRENT_WISP is EXCLUDED. A wisp this cycle holds is not a candidate to be
++  # its own successor; adopting it and then burning it destroys the iteration.
++  #
++  # Fail CLOSED: a query that errors must not read as "queue is empty", which
++  # pours on every transient failure and turns one race into unbounded growth.
++  OPEN_JSON=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json) || OPEN_JSON=
++  if ! printf '%s' "$OPEN_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
++    echo "Could not list queued wisps; not pouring and not burning."
+     gc runtime drain-ack
+     exit 1
+   fi
+-  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+-    echo "Could not assign next refinery wisp; not burning."
++  OPEN_WISPS=$(printf '%s' "$OPEN_JSON" | jq -r --arg cur "$CURRENT_WISP" 'sort_by(.created_at) | .[] | select(.id != $cur) | .id')
++  NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
++  for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
++    gc bd mol burn "$extra" --force
++  done
++  # Hold nothing, but a wisp is already queued: that wisp is live work waiting
++  # for the claim protocol, not this cycle's to burn. Stop. Pouring would add a
++  # second wisp; burning would destroy the iteration. Either leaves the session
++  # with no work, namedWorkReady re-wakes it, and that is a wake/drain loop
++  # rather than a patrol. `gc hook` claims it on the next pass.
++  if [ -z "$CURRENT_WISP" ] && [ -n "$NEXT" ]; then
++    echo "Wisp $NEXT is queued and unclaimed; not pouring and not burning."
+     gc runtime drain-ack
+-    exit 1
++    exit 0
++  fi
++  if [ -z "$NEXT" ]; then
++    NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
++    if [ -z "$NEXT" ]; then
++      echo "Could not pour next refinery wisp; not burning."
++      gc runtime drain-ack
++      exit 1
++    fi
++    if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
++      echo "Could not assign next refinery wisp; not burning."
++      gc runtime drain-ack
++      exit 1
++    fi
+   fi
+   if [ -n "$CURRENT_WISP" ]; then
+     gc bd mol burn "$CURRENT_WISP" --force
+@@ -1147,18 +1279,51 @@ If auto_land = "false": skip this entirely.
+ ```bash
+ CURRENT_WISP=${GC_BEAD_ID:-}
+ if [ -z "$CURRENT_WISP" ]; then
+-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
++  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=0 --json | jq -r 'sort_by(.created_at) | .[0].id // empty')
+ fi
+-NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
+-if [ -z "$NEXT" ]; then
+-  echo "Could not pour next refinery wisp; not burning."
++# Reconcile queued (open) patrol wisps to exactly one: keep the oldest, burn
++# the surplus. Wisp roots are molecules (never --type=wisp, which is not a
++# valid gc bd type and matches nothing) and infra beads — without
++# --include-infra this returns [] and the surplus-burn can never fire.
++#
++# $CURRENT_WISP is EXCLUDED. A wisp this cycle holds is not a candidate to be
++# its own successor; adopting it and then burning it destroys the iteration.
++#
++# Fail CLOSED: a query that errors must not read as "queue is empty", which
++# pours on every transient failure and turns one race into unbounded growth.
++OPEN_JSON=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json) || OPEN_JSON=
++if ! printf '%s' "$OPEN_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
++  echo "Could not list queued wisps; not pouring and not burning."
+   gc runtime drain-ack
+   exit 1
+ fi
+-if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+-  echo "Could not assign next refinery wisp; not burning."
++OPEN_WISPS=$(printf '%s' "$OPEN_JSON" | jq -r --arg cur "$CURRENT_WISP" 'sort_by(.created_at) | .[] | select(.id != $cur) | .id')
++NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
++for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
++  gc bd mol burn "$extra" --force
++done
++# Hold nothing, but a wisp is already queued: that wisp is live work waiting
++# for the claim protocol, not this cycle's to burn. Stop. Pouring would add a
++# second wisp; burning would destroy the iteration. Either leaves the session
++# with no work, namedWorkReady re-wakes it, and that is a wake/drain loop
++# rather than a patrol. `gc hook` claims it on the next pass.
++if [ -z "$CURRENT_WISP" ] && [ -n "$NEXT" ]; then
++  echo "Wisp $NEXT is queued and unclaimed; not pouring and not burning."
+   gc runtime drain-ack
+-  exit 1
++  exit 0
++fi
++if [ -z "$NEXT" ]; then
++  NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
++  if [ -z "$NEXT" ]; then
++    echo "Could not pour next refinery wisp; not burning."
++    gc runtime drain-ack
++    exit 1
++  fi
++  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
++    echo "Could not assign next refinery wisp; not burning."
++    gc runtime drain-ack
++    exit 1
++  fi
+ fi
+ if [ -n "$CURRENT_WISP" ]; then
+   gc bd mol burn "$CURRENT_WISP" --force
+diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
+index c80458d..7105a0f 100644
+--- a/gastown/formulas/mol-witness-patrol.toml
++++ b/gastown/formulas/mol-witness-patrol.toml
+@@ -532,12 +532,43 @@ Wisp roots are `issue_type=molecule` (never `--type=wisp`, which is not a
+ valid gc bd type and matches nothing). They are also infra beads, which
+ `gc bd list` hides unless `--include-infra` is passed — omit it and this
+ returns `[]`, the surplus-burn never fires, and wisps accumulate unbounded.
++
++`THIS_WISP` must be resolved and EXCLUDED before picking `NEXT`, and it resolves
++from `in_progress` ONLY — never `in_progress,open`. A poured and assigned wisp
++stays `open` until the claim protocol takes it, so without the exclusion this
++cycle's own wisp is a candidate for `NEXT`: the cycle adopts itself as its own
++successor, burns the genuine successor as "surplus", and step 3 then burns the
++wisp it just elected. And widening to `open` is the mirror-image failure — a
++fresh session (`GC_BEAD_ID` is exported only by the convergence runner) would
++adopt a never-claimed wisp that is live queued work and step 3 would destroy it.
++Either way nothing survives the cycle, `namedWorkReady` re-wakes the session,
++and that is a self-sustaining wake/drain loop rather than a patrol.
++
++If nothing is in progress, `THIS_WISP` is empty, the exclusion is a no-op, and
++step 3 correctly burns nothing.
+ ```bash
+-OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r '.[].id')
++THIS_WISP=${GC_BEAD_ID:-}
++if [ -z "$THIS_WISP" ]; then
++  THIS_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=0 --json | jq -r 'sort_by(.created_at) | .[0].id // empty')
++fi
++# Fail CLOSED: a query that errors must not read as "queue is empty", which
++# pours on every transient failure and turns one race into unbounded growth.
++OPEN_JSON=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json) || OPEN_JSON=
++if ! printf '%s' "$OPEN_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
++  echo "Could not list queued wisps; not pouring and not burning."
++  exit 1
++fi
++OPEN_WISPS=$(printf '%s' "$OPEN_JSON" | jq -r --arg cur "$THIS_WISP" 'sort_by(.created_at) | .[] | select(.id != $cur) | .id')
+ NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
+ for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
+   gc bd mol burn "$extra" --force
+ done
++# Hold nothing, but a wisp is already queued: it is live work waiting for the
++# claim protocol, not this cycle's to burn. Pour nothing and burn nothing.
++if [ -z "$THIS_WISP" ] && [ -n "$NEXT" ]; then
++  echo "Wisp $NEXT is queued and unclaimed; not pouring and not burning."
++  exit 0
++fi
+ if [ -z "$NEXT" ]; then
+   NEXT=$(gc bd mol wisp mol-witness-patrol --root-only --var binding_prefix='{{binding_prefix}}' --json | jq -r '.new_epic_id')
+   gc bd update "$NEXT" --assignee="$GC_AGENT"
+@@ -545,8 +576,14 @@ fi
+ ```
+ 
+ **3. Burn this wisp:**
++
++Burn the resolved `THIS_WISP`, not a hand-substituted id — step 2 has already
++guaranteed it is excluded from `NEXT`. If it is empty this cycle never held a
++wisp, and there is nothing to burn.
+ ```bash
+-gc bd mol burn <this-wisp-id> --force
++if [ -n "$THIS_WISP" ]; then
++  gc bd mol burn "$THIS_WISP" --force
++fi
+ ```
+ 
+ **4. Exit this turn:**
+-- 
+2.50.1 (Apple Git-155)
+

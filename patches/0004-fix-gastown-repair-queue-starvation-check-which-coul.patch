@@ -1,0 +1,127 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sat, 25 Jul 2026 15:47:46 -0400
+Subject: [PATCH 4/4] fix(gastown): repair queue-starvation-check, which could
+ never fire
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The deacon's queue-starvation-check step was dead code. Four independent
+defects stacked, each sufficient on its own to make every session report a
+zero-length queue — so the step that exists to catch "active polling, wrong
+filter, queue silently piling up" was itself doing exactly that.
+
+1. `gc agents list` is not a command. It fails with json_command_not_found,
+   the piped jq gets an error object, the `while read` loop body never runs,
+   and the pipeline still exits 0.
+2. The per-alias prefilter `--assignee="$AGENT"` assumes one identity form.
+   A session is addressed by at least three depending on what assigned the
+   work: agent alias (molecule wisps), session bead id (mail), and session
+   name (polecat claims). Any single guess reports zero.
+3. `--include-infra` was absent, so wisps, molecules, sessions and messages —
+   nearly everything a coordination session holds — were invisible.
+4. The hq/city store is not addressable as `gc bd --rig=<name>`; that form
+   errors with `rig "<name>" not found` and exits 0, silently contributing an
+   empty queue for the entire city.
+
+Replaces the per-alias prefilter with an identity-agnostic join: read the
+actual assignee strings out of the bead data, then match each active session
+on any of its identity forms. Verified against a live 6-session city — the
+old query returned 0 for every session; the new one returns deacon 3,
+refinery 3, witness 2, and the witness count only lands because the join
+catches a mail bead assigned by session bead id.
+
+Also surfaces unmatched assignees as orphaned work in the same pass.
+
+The join matches identities EXACTLY. The obvious `[.assignee] | inside($ids)`
+is wrong: jq's `inside` reduces to `contains`, which on strings is substring
+matching, so assignee `gc-t` matches session id `gc-ttk` and `deacon` matches
+`gastown.deacon`. Verified both directions with jq — `inside` returns two
+matches where the exact form returns one. A step whose entire job is catching a
+wrong queue count must not itself report a wrong one, so this uses
+`.assignee as $a | $ids | index($a)`. The QUEUES capture also fails closed: an
+empty capture makes --argjson a parse error rather than a zero-queue report.
+
+The naive per-alias form is named literally in the prose, both so the
+anti-pattern is greppable and because the pack contract asserts on it.
+
+Refs: gc-8gh (defect 1), gc-98n (defect 2)
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ gastown/formulas/mol-deacon-patrol.toml | 55 ++++++++++++++++++++++---
+ 1 file changed, 49 insertions(+), 6 deletions(-)
+
+diff --git a/gastown/formulas/mol-deacon-patrol.toml b/gastown/formulas/mol-deacon-patrol.toml
+index 6b59e05..d5499b7 100644
+--- a/gastown/formulas/mol-deacon-patrol.toml
++++ b/gastown/formulas/mol-deacon-patrol.toml
+@@ -205,15 +205,58 @@ closes that gap.
+ - `A` = count of open beads assigned to the session's agent identity
+ - `B` = the most recent bead.updated_at across those beads (work signal)
+ 
++Read the ACTUAL assignee strings out of the bead data and join them against
++every identity form a session carries. Never pre-filter the naive way —
++
++    gc bd list --status=open --assignee=<one guessed identity>
++
++— because a session is addressed by at least three
++different strings depending on what assigned the work: the agent alias
++(`gastown.deacon`, on molecule wisps), the session bead id (`gc-ttk`, on mail
++messages), and the session name (`gastown__polecat-gc-qkw`, on polecat
++claims). Filtering by any single one silently reports zero — which is the
++very failure mode this step exists to catch.
++
++Match identities EXACTLY. `[.assignee] | inside($ids)` looks right and is not:
++jq's `inside` reduces to `contains`, which on strings is substring matching, so
++assignee `gc-t` matches session id `gc-ttk` and `deacon` matches
++`gastown.deacon`. A step whose whole job is catching a wrong queue count must
++not report a wrong queue count. `$ids | index($a)` is the exact-match form.
++
++Two more things this query gets right, both of which returned a flat zero for
++every session before:
++- `--include-infra` is REQUIRED. Wisps, molecules, sessions and messages live
++  in the wisps table and are invisible without it — that is nearly everything
++  a coordination session is ever assigned.
++- The hq/city store is NOT addressable as `gc bd --rig=<name>`, even though
++  `gc rig list` reports it. That form fails with `rig "<name>" not found` AND
++  exits 0, so it silently contributes an empty queue. Read the city with a
++  bare `gc bd list` and iterate only non-hq rigs.
++
+ ```bash
+-gc agents list --json --active | jq -r '.[] | .agent_id' | while read -r AGENT; do
+-    ASSIGNED=$(gc bd list --status=open --assignee="$AGENT" --json --limit=0 | jq 'length')
+-    LATEST=$(gc bd list --status=open --assignee="$AGENT" --json --limit=0 \\
+-        | jq -r '[.[].updated_at] | max // ""')
+-    printf '%s\\t%s\\t%s\\n' "$AGENT" "$ASSIGNED" "$LATEST"
+-done
++QUEUES=$(
++  { gc bd list --status=open --include-infra --json --limit=0
++    for RIG in $(gc rig list --json | jq -r '.rigs[] | select(.hq != true) | .name'); do
++        gc bd --rig="$RIG" list --status=open --include-infra --json --limit=0
++    done
++  } | jq -s 'add | map(select((.assignee // "") != ""))'
++)
++
++# Fail closed: an empty $QUEUES makes --argjson a parse error, not an empty
++# queue report.
++printf '%s' "$QUEUES" | jq -e 'type == "array"' >/dev/null 2>&1 || QUEUES='[]'
++
++gc session list --state active --json | jq -r --argjson q "$QUEUES" '
++  .sessions[] as $s
++  | [ $s.agent_name, ($s.id // ""), ($s.alias // ""), ($s.session_name // "") ] as $ids
++  | ($q | map(select(.assignee as $a | $ids | index($a)))) as $mine
++  | [ $s.agent_name, ($mine | length), ($mine | map(.updated_at) | max // "") ]
++  | @tsv'
+ ```
+ 
++Any assignee in `$QUEUES` that matches no active session is orphaned work —
++a queue whose owner is gone. Worth a look in the same pass.
++
+ The latest bead.updated_at is the cheapest proxy for "did this session
+ move work recently?" — every claim, status transition, metadata update,
+ or note bumps it.
+-- 
+2.50.1 (Apple Git-155)
+
