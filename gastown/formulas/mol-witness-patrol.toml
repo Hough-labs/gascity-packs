@@ -532,12 +532,43 @@ Wisp roots are `issue_type=molecule` (never `--type=wisp`, which is not a
 valid gc bd type and matches nothing). They are also infra beads, which
 `gc bd list` hides unless `--include-infra` is passed — omit it and this
 returns `[]`, the surplus-burn never fires, and wisps accumulate unbounded.
+
+`THIS_WISP` must be resolved and EXCLUDED before picking `NEXT`, and it resolves
+from `in_progress` ONLY — never `in_progress,open`. A poured and assigned wisp
+stays `open` until the claim protocol takes it, so without the exclusion this
+cycle's own wisp is a candidate for `NEXT`: the cycle adopts itself as its own
+successor, burns the genuine successor as "surplus", and step 3 then burns the
+wisp it just elected. And widening to `open` is the mirror-image failure — a
+fresh session (`GC_BEAD_ID` is exported only by the convergence runner) would
+adopt a never-claimed wisp that is live queued work and step 3 would destroy it.
+Either way nothing survives the cycle, `namedWorkReady` re-wakes the session,
+and that is a self-sustaining wake/drain loop rather than a patrol.
+
+If nothing is in progress, `THIS_WISP` is empty, the exclusion is a no-op, and
+step 3 correctly burns nothing.
 ```bash
-OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r '.[].id')
+THIS_WISP=${GC_BEAD_ID:-}
+if [ -z "$THIS_WISP" ]; then
+  THIS_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=0 --json | jq -r 'sort_by(.created_at) | .[0].id // empty')
+fi
+# Fail CLOSED: a query that errors must not read as "queue is empty", which
+# pours on every transient failure and turns one race into unbounded growth.
+OPEN_JSON=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json) || OPEN_JSON=
+if ! printf '%s' "$OPEN_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
+  echo "Could not list queued wisps; not pouring and not burning."
+  exit 1
+fi
+OPEN_WISPS=$(printf '%s' "$OPEN_JSON" | jq -r --arg cur "$THIS_WISP" 'sort_by(.created_at) | .[] | select(.id != $cur) | .id')
 NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
 for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
   gc bd mol burn "$extra" --force
 done
+# Hold nothing, but a wisp is already queued: it is live work waiting for the
+# claim protocol, not this cycle's to burn. Pour nothing and burn nothing.
+if [ -z "$THIS_WISP" ] && [ -n "$NEXT" ]; then
+  echo "Wisp $NEXT is queued and unclaimed; not pouring and not burning."
+  exit 0
+fi
 if [ -z "$NEXT" ]; then
   NEXT=$(gc bd mol wisp mol-witness-patrol --root-only --var binding_prefix='{{binding_prefix}}' --json | jq -r '.new_epic_id')
   gc bd update "$NEXT" --assignee="$GC_AGENT"
@@ -545,8 +576,14 @@ fi
 ```
 
 **3. Burn this wisp:**
+
+Burn the resolved `THIS_WISP`, not a hand-substituted id — step 2 has already
+guaranteed it is excluded from `NEXT`. If it is empty this cycle never held a
+wisp, and there is nothing to burn.
 ```bash
-gc bd mol burn <this-wisp-id> --force
+if [ -n "$THIS_WISP" ]; then
+  gc bd mol burn "$THIS_WISP" --force
+fi
 ```
 
 **4. Exit this turn:**
