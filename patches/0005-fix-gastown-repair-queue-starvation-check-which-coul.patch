@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sat, 25 Jul 2026 15:47:46 -0400
-Subject: [PATCH 5/5] fix(gastown): repair queue-starvation-check, which could
+Subject: [PATCH 5/6] fix(gastown): repair queue-starvation-check, which could
  never fire
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

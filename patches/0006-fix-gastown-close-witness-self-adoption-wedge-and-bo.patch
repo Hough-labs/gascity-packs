@@ -1,0 +1,169 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sat, 25 Jul 2026 16:38:55 -0400
+Subject: [PATCH 6/6] fix(gastown): close witness self-adoption wedge and
+ boot's wisp blindness
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two fixes for the wake/drain loop, both in surfaces patch 0004 left alone.
+
+## mol-witness-patrol.toml — the structural fix 0004 deferred
+
+0004 fixed 10 CURRENT_WISP + 10 OPEN_WISPS sites but explicitly skipped this
+formula: it had no CURRENT_WISP variable (it burned via an LLM-supplied
+<this-wisp-id> placeholder), so the exclusion had nothing to reference. The
+wedge 0003 introduced therefore survived here in full.
+
+A poured-and-assigned wisp stays `open` until claimed, so this cycle's own
+wisp was a candidate for NEXT: the cycle elected itself as its own successor,
+burned the genuine successor as "surplus", then step 3 burned the wisp it had
+just elected. Nothing survived, every cycle ended with no assigned work, and
+namedWorkReady re-woke the session — the self-sustaining loop measured at 80
+stop/wake cycles at ~40s intervals on 2026-07-24.
+
+Introduces THIS_WISP so the exclusion has a referent, and burns that variable
+instead of a hand-substituted id.
+
+THIS_WISP resolves from `in_progress` ONLY — deliberately NOT the
+`in_progress,open` widening 0004 applied elsewhere. Step 3 burns THIS_WISP
+unconditionally, so admitting `open` would let a fresh session (GC_BEAD_ID is
+exported only by the convergence runner) adopt a never-claimed wisp that is
+live queued work and destroy it — the same failure family, one step removed.
+Empty THIS_WISP makes the exclusion a no-op and step 3 burn nothing, which is
+the correct behaviour for a cycle that holds no wisp.
+
+Verified against the live throwaway rig by simulating a cycle holding an open
+never-claimed wisp: pre-fix elects itself as successor and burns both wisps,
+leaving no next iteration; patched elects the other wisp and burns only its
+own.
+
+## boot/prompt.template.md — watchdog blind to the thing it watches
+
+Boot's deacon-health query omitted --include-infra. Patrol wisps are infra
+beads in the wisps table, hidden from `gc bd list` by default, so the query
+returned [] no matter how healthy the deacon was. The deacon watchdog read
+"deacon has no work" on every single wake. Confirmed live: the old query
+returns 0 while the deacon holds 4 open patrol wisps.
+
+Also widens to `in_progress,open` (safe here — boot only reads, never burns).
+An in_progress-only query cannot distinguish a DEAD deacon (no wisps at all)
+from one STUCK AT CLAIM (wisps queued, never claimed) — opposite diagnoses
+needing opposite responses, and the live city is in the second state. Adds
+--type=molecule to scope to patrol wisps, and two triage bullets so a
+never-claimed pile-up is not treated as a reason to restart the deacon again,
+which only pours another wisp.
+
+Refs: gc-5bc (the --include-infra class), gc-a6d
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ gastown/agents/boot/prompt.template.md   | 24 ++++++++++++++++----
+ gastown/formulas/mol-witness-patrol.toml | 29 ++++++++++++++++++++++--
+ 2 files changed, 47 insertions(+), 6 deletions(-)
+
+diff --git a/gastown/agents/boot/prompt.template.md b/gastown/agents/boot/prompt.template.md
+index eb1ddc7..bf84c3b 100644
+--- a/gastown/agents/boot/prompt.template.md
++++ b/gastown/agents/boot/prompt.template.md
+@@ -36,19 +36,35 @@ restart dead agents.
+ # Recent pane output — is the deacon actively working?
+ {{ cmd }} session peek {{ .BindingPrefix }}deacon --lines 30
+ 
+-# Deacon's current patrol wisp — how fresh is it?
+-gc bd list --assignee={{ .BindingPrefix }}deacon --status=in_progress --json --limit=5
++# Deacon's patrol wisps — status AND freshness.
++#
++# --include-infra is REQUIRED. Patrol wisps are infra beads living in the wisps
++# table, which `gc bd list` hides by default; without the flag this returns []
++# no matter how healthy the deacon is, so every wake reads as "deacon has no
++# work" and the watchdog acts on a deacon that is fine.
++#
++# Query in_progress AND open. A wisp that was poured and assigned stays `open`
++# until the deacon claims it, so an in_progress-only query cannot tell a DEAD
++# deacon (no wisps at all) apart from a STUCK-AT-CLAIM one (wisps queued, never
++# claimed) — opposite diagnoses that need opposite responses.
++gc bd list --assignee={{ .BindingPrefix }}deacon --status=in_progress,open --type=molecule --include-infra --json --limit=5 \
++  | jq -r '.[] | "\(.id)\t\(.status)\t\(.updated_at)"'
+ 
+ # Does the deacon have unread mail? (may explain idle state)
+ gc mail count {{ .BindingPrefix }}deacon 2>/dev/null
+ ```
+ 
+-Read the wisp timestamps and pane output. Build a picture:
++Read the wisp statuses, timestamps, and pane output. Build a picture:
+ - Recent burned wisp -> normal patrol loop
+ - Active pane output -> working
+ - Young in-progress wisp with idle pane -> likely backoff wait
+ - Very stale in-progress wisp with idle/error pane -> likely stuck
+ - Idle with unread mail -> may need a nudge
++- No wisps at all -> the loop has no next iteration; the deacon cannot
++  self-recover and needs a restart
++- Open wisps piling up with none in_progress -> poured but never claimed. The
++  deacon is restarting before it claims. Restarting it again just adds another
++  wisp; read the pane for why the claim is failing before acting.
+ 
+ ### Step 3: Decide
+ 
+@@ -112,7 +128,7 @@ with a fresh provider context.
+ | Want to... | Correct command |
+ |------------|----------------|
+ | View deacon output | `{{ cmd }} session peek {{ .BindingPrefix }}deacon --lines 30` |
+-| Check deacon work | `gc bd list --assignee={{ .BindingPrefix }}deacon --status=in_progress --json` |
++| Check deacon work | `gc bd list --assignee={{ .BindingPrefix }}deacon --status=in_progress,open --type=molecule --include-infra --json` |
+ | Nudge deacon | `{{ cmd }} session nudge {{ .BindingPrefix }}deacon "message"` |
+ | File stuck warrant | `gc bd create --type=task --label=warrant --metadata '{"target":"{{ .BindingPrefix }}deacon","reason":"...","requester":"boot","gc.routed_to":"{{ .BindingPrefix }}dog"}'` |
+ | Check active sessions | `{{ cmd }} session list` |
+diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
+index c80458d..7e8f55f 100644
+--- a/gastown/formulas/mol-witness-patrol.toml
++++ b/gastown/formulas/mol-witness-patrol.toml
+@@ -532,8 +532,27 @@ Wisp roots are `issue_type=molecule` (never `--type=wisp`, which is not a
+ valid gc bd type and matches nothing). They are also infra beads, which
+ `gc bd list` hides unless `--include-infra` is passed — omit it and this
+ returns `[]`, the surplus-burn never fires, and wisps accumulate unbounded.
++
++`THIS_WISP` must be resolved and EXCLUDED before picking `NEXT`. A poured and
++assigned wisp stays `open` until something claims it, so without the exclusion
++this cycle's own wisp is a candidate for `NEXT` — the cycle adopts itself as
++its own successor, burns the genuine successor as "surplus", and step 3 then
++burns the wisp it just elected. Nothing survives, so every cycle ends with no
++assigned work; `namedWorkReady` re-wakes the session, and that is a
++self-sustaining wake/drain loop rather than a patrol.
++
++Resolve `THIS_WISP` from `in_progress` ONLY — never `in_progress,open`. Step 3
++burns `THIS_WISP` unconditionally, so widening it to `open` would let a fresh
++session (where `GC_BEAD_ID` is unset, since only the convergence runner exports
++it) adopt a never-claimed wisp that is live queued work and destroy it. If
++nothing is in progress, `THIS_WISP` is empty, the exclusion is a no-op, and
++step 3 correctly burns nothing.
+ ```bash
+-OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r '.[].id')
++THIS_WISP=${GC_BEAD_ID:-}
++if [ -z "$THIS_WISP" ]; then
++  THIS_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=0 --json | jq -r 'sort_by(.created_at) | .[0].id // empty')
++fi
++OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r --arg cur "$THIS_WISP" 'sort_by(.created_at) | .[] | select(.id != $cur) | .id')
+ NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
+ for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
+   gc bd mol burn "$extra" --force
+@@ -545,8 +564,14 @@ fi
+ ```
+ 
+ **3. Burn this wisp:**
++
++Burn the resolved `THIS_WISP`, not a hand-substituted id — step 2 has already
++guaranteed it is excluded from `NEXT`. If it is empty this cycle never held a
++wisp, and there is nothing to burn.
+ ```bash
+-gc bd mol burn <this-wisp-id> --force
++if [ -n "$THIS_WISP" ]; then
++  gc bd mol burn "$THIS_WISP" --force
++fi
+ ```
+ 
+ **4. Exit this turn:**
+-- 
+2.50.1 (Apple Git-155)
+
