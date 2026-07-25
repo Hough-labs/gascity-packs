@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ── Fork: refuse to push a stale patches/ to the integration branch ──────────
+# Keyed off the refs actually being pushed — git feeds
+# "<local ref> <local sha> <remote ref> <remote sha>" per ref on stdin — rather
+# than off HEAD. A push from a detached worktree, or one using an explicit
+# `HEAD:integration` refspec, updates integration without ever having it as its
+# symbolic HEAD, and a HEAD-keyed check would wave both through.
+#
+# Validation only — it never amends. (An amend after git has already captured
+# the push range causes perpetual local/origin SHA drift.) Bypass with
+# `git push --no-verify`. See docs/fork-patches.md.
+#
+# Armed by core.hooksPath=.githooks, which any `make` invocation sets.
+
+zero="0000000000000000000000000000000000000000"
+
+while read -r _local_ref local_sha remote_ref _remote_sha; do
+  if [ "$remote_ref" != "refs/heads/integration" ]; then
+    continue
+  fi
+  # Branch deletion — no tree to validate.
+  if [ "$local_sha" = "$zero" ]; then
+    continue
+  fi
+  make -s check-patches
+done
