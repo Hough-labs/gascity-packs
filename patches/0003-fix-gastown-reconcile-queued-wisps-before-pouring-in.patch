@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 24 Jul 2026 20:46:44 -0400
-Subject: [PATCH 3/4] fix(gastown): reconcile queued wisps before pouring in
+Subject: [PATCH 3/5] fix(gastown): reconcile queued wisps before pouring in
  deacon and refinery
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

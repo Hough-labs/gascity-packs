@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 24 Jul 2026 23:14:26 -0400
-Subject: [PATCH 4/4] fix(gastown): stop patrol wisps adopting themselves as
+Subject: [PATCH 4/5] fix(gastown): stop patrol wisps adopting themselves as
  their own successor
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

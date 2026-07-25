@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 24 Jul 2026 20:23:00 -0400
-Subject: [PATCH 2/4] fix(gastown): pass --include-infra on every wisp
+Subject: [PATCH 2/5] fix(gastown): pass --include-infra on every wisp
  reconciliation lookup
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
