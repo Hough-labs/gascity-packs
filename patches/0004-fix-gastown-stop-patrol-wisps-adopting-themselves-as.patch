@@ -1,0 +1,216 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 24 Jul 2026 23:14:26 -0400
+Subject: [PATCH 4/4] fix(gastown): stop patrol wisps adopting themselves as
+ their own successor
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Patch 0003 replaced the unconditional pour with "reuse the first open
+assigned wisp", but never excluded the wisp the cycle is about to burn.
+A poured+assigned wisp stays `open` until something claims it, and
+GC_BEAD_ID is exported only by the convergence runner — so on a fresh
+session CURRENT_WISP resolved empty, the live wisp was adopted as NEXT,
+any genuine successor was burned as "surplus", and step 4 then had
+nothing to burn: `gc runtime drain-ack; exit 1` on every cycle.
+
+Because namedWorkReady re-wakes any session with an assigned bead, that
+is a self-sustaining wake/drain loop. Observed live 2026-07-24: 80
+stop/wake cycles at ~40s intervals across deacon and witness.
+
+Two changes at each site:
+
+  - CURRENT_WISP now matches `in_progress,open` and prefers in_progress,
+    then oldest, so a never-claimed wisp still resolves.
+  - OPEN_WISPS excludes $CURRENT_WISP, so the wisp being burned can no
+    longer be mistaken for its own replacement.
+
+10 CURRENT_WISP + 10 OPEN_WISPS sites across the deacon/refinery/witness
+formulas and prompt templates. mol-witness-patrol.toml is intentionally
+untouched: it has no CURRENT_WISP variable (it burns via an LLM-supplied
+<this-wisp-id> placeholder), so the exclusion has nothing to reference
+there — that formula needs a separate structural fix.
+
+Refs: gc-a6d, gc-p0j
+---
+ gastown/agents/deacon/prompt.template.md   |  4 ++--
+ gastown/agents/refinery/prompt.template.md |  8 ++++----
+ gastown/agents/witness/prompt.template.md  |  4 ++--
+ gastown/formulas/mol-deacon-patrol.toml    |  4 ++--
+ gastown/formulas/mol-refinery-patrol.toml  | 20 ++++++++++----------
+ 5 files changed, 20 insertions(+), 20 deletions(-)
+
+diff --git a/gastown/agents/deacon/prompt.template.md b/gastown/agents/deacon/prompt.template.md
+index e11bd78..3863fef 100644
+--- a/gastown/agents/deacon/prompt.template.md
++++ b/gastown/agents/deacon/prompt.template.md
+@@ -92,12 +92,12 @@ If `next-iteration` already ran, do not pour again; run `gc hook`.
+ # queued", pours a fresh one, and leaks the predecessor on every restart.
+ CURRENT_WISP=${GC_BEAD_ID:-}
+ if [ -z "$CURRENT_WISP" ]; then
+-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
++  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress,open --type=molecule --include-infra --limit=0 --json | jq -r 'sort_by((if .status == "in_progress" then 0 else 1 end), .created_at) | .[0].id // empty')
+ fi
+ # Collect ALL queued wisps, keep the first, burn the rest. --limit=1 would only
+ # ever surface one, so a surplus (from a race, or accumulated while the lookup
+ # above was infra-blind) could never be seen, reported, or cleaned up.
+-OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r '.[].id')
++OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r --arg cur "$CURRENT_WISP" 'sort_by(.created_at) | .[] | select(.id != $cur) | .id')
+ ASSIGNED_WISP=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
+ for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
+   gc bd mol burn "$extra" --force
+diff --git a/gastown/agents/refinery/prompt.template.md b/gastown/agents/refinery/prompt.template.md
+index 0583830..5a1d142 100644
+--- a/gastown/agents/refinery/prompt.template.md
++++ b/gastown/agents/refinery/prompt.template.md
+@@ -71,13 +71,13 @@ CURRENT_WISP=${GC_BEAD_ID:-}
+ if [ -z "$CURRENT_WISP" ]; then
+   # --include-infra is required: wisps are infra beads and gc bd list hides
+   # them by default, so without it this returns empty and the wisp leaks.
+-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
++  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress,open --type=molecule --include-infra --limit=0 --json | jq -r 'sort_by((if .status == "in_progress" then 0 else 1 end), .created_at) | .[0].id // empty')
+ fi
+ # Reconcile queued wisps BEFORE pouring: reuse one if it exists, burn any
+ # surplus. Without this the pour is unconditional, so a single race (or a crash
+ # between pour and burn) leaves a wisp that is never seen again and never
+ # cleaned up.
+-OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r '.[].id')
++OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r --arg cur "$CURRENT_WISP" 'sort_by(.created_at) | .[] | select(.id != $cur) | .id')
+ NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
+ for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
+   gc bd mol burn "$extra" --force
+@@ -129,11 +129,11 @@ CURRENT_WISP=${GC_BEAD_ID:-}
+ if [ -z "$CURRENT_WISP" ]; then
+   # --include-infra is required: wisps are infra beads and gc bd list hides
+   # them by default, so without it this returns empty and the wisp leaks.
+-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
++  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress,open --type=molecule --include-infra --limit=0 --json | jq -r 'sort_by((if .status == "in_progress" then 0 else 1 end), .created_at) | .[0].id // empty')
+ fi
+ # Reconcile before pouring — same rule as Rule 1 above. Reuse a queued wisp if
+ # one exists; burn any surplus.
+-OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r '.[].id')
++OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r --arg cur "$CURRENT_WISP" 'sort_by(.created_at) | .[] | select(.id != $cur) | .id')
+ NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
+ for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
+   gc bd mol burn "$extra" --force
+diff --git a/gastown/agents/witness/prompt.template.md b/gastown/agents/witness/prompt.template.md
+index fc7d47d..47b0516 100644
+--- a/gastown/agents/witness/prompt.template.md
++++ b/gastown/agents/witness/prompt.template.md
+@@ -209,7 +209,7 @@ If `next-iteration` already ran, do not pour again; run `gc hook`.
+ ```bash
+ CURRENT_WISP=${GC_BEAD_ID:-}
+ if [ -z "$CURRENT_WISP" ]; then
+-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
++  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress,open --type=molecule --include-infra --limit=0 --json | jq -r 'sort_by((if .status == "in_progress" then 0 else 1 end), .created_at) | .[0].id // empty')
+ fi
+ # Reconcile queued (open) patrol wisps to exactly one. A prior cycle may have
+ # poured a next wisp without burning, or a restart may have raced — keep the
+@@ -217,7 +217,7 @@ fi
+ # molecules (never --type=wisp, which is not a valid gc bd type and matches
+ # nothing), and infra beads — without --include-infra this returns [] and the
+ # surplus-burn below can never fire.
+-OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r '.[].id')
++OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r --arg cur "$CURRENT_WISP" 'sort_by(.created_at) | .[] | select(.id != $cur) | .id')
+ ASSIGNED_WISP=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
+ for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
+   gc bd mol burn "$extra" --force
+diff --git a/gastown/formulas/mol-deacon-patrol.toml b/gastown/formulas/mol-deacon-patrol.toml
+index f6a8ab1..39e3144 100644
+--- a/gastown/formulas/mol-deacon-patrol.toml
++++ b/gastown/formulas/mol-deacon-patrol.toml
+@@ -462,14 +462,14 @@ CURRENT_WISP=${GC_BEAD_ID:-}
+ if [ -z "$CURRENT_WISP" ]; then
+   # --include-infra is required: wisps are infra beads, hidden from gc bd list
+   # by default. Without it this returns empty and the wisp leaks every restart.
+-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
++  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress,open --type=molecule --include-infra --limit=0 --json | jq -r 'sort_by((if .status == "in_progress" then 0 else 1 end), .created_at) | .[0].id // empty')
+ fi
+ 
+ # Reconcile before pouring. A prior cycle may have poured a next wisp without
+ # burning, or a restart may have raced — reuse an already-queued wisp instead of
+ # adding another, and burn any surplus. Pouring unconditionally is what turns a
+ # single race into permanent accumulation.
+-OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r '.[].id')
++OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r --arg cur "$CURRENT_WISP" 'sort_by(.created_at) | .[] | select(.id != $cur) | .id')
+ NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
+ for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
+   gc bd mol burn "$extra" --force
+diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
+index 34a2d98..c36f224 100644
+--- a/gastown/formulas/mol-refinery-patrol.toml
++++ b/gastown/formulas/mol-refinery-patrol.toml
+@@ -121,10 +121,10 @@ default, so without it the lookup returns empty and the wisp leaks:
+ ```bash
+ CURRENT_WISP=${GC_BEAD_ID:-}
+ if [ -z "$CURRENT_WISP" ]; then
+-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
++  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress,open --type=molecule --include-infra --limit=0 --json | jq -r 'sort_by((if .status == "in_progress" then 0 else 1 end), .created_at) | .[0].id // empty')
+ fi
+ # Reconcile queued wisps before pouring: reuse one if present, burn the surplus.
+-OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r '.[].id')
++OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r --arg cur "$CURRENT_WISP" 'sort_by(.created_at) | .[] | select(.id != $cur) | .id')
+ NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
+ for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
+   gc bd mol burn "$extra" --force
+@@ -252,10 +252,10 @@ gc bd update $WORK \
+ ```bash
+ CURRENT_WISP=${GC_BEAD_ID:-}
+ if [ -z "$CURRENT_WISP" ]; then
+-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
++  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress,open --type=molecule --include-infra --limit=0 --json | jq -r 'sort_by((if .status == "in_progress" then 0 else 1 end), .created_at) | .[0].id // empty')
+ fi
+ # Reconcile queued wisps before pouring: reuse one if present, burn the surplus.
+-OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r '.[].id')
++OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r --arg cur "$CURRENT_WISP" 'sort_by(.created_at) | .[] | select(.id != $cur) | .id')
+ NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
+ for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
+   gc bd mol burn "$extra" --force
+@@ -361,10 +361,10 @@ TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_bran
+      ```bash
+      CURRENT_WISP=${GC_BEAD_ID:-}
+      if [ -z "$CURRENT_WISP" ]; then
+-       CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
++       CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress,open --type=molecule --include-infra --limit=0 --json | jq -r 'sort_by((if .status == "in_progress" then 0 else 1 end), .created_at) | .[0].id // empty')
+      fi
+      # Reconcile queued wisps before pouring: reuse one, burn the surplus.
+-     OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r '.[].id')
++     OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r --arg cur "$CURRENT_WISP" 'sort_by(.created_at) | .[] | select(.id != $cur) | .id')
+      NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
+      for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
+        gc bd mol burn "$extra" --force
+@@ -461,7 +461,7 @@ Branch: $BRANCH
+ Target: $TARGET"
+   CURRENT_WISP=${GC_BEAD_ID:-}
+   if [ -z "$CURRENT_WISP" ]; then
+-    CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
++    CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress,open --type=molecule --include-infra --limit=0 --json | jq -r 'sort_by((if .status == "in_progress" then 0 else 1 end), .created_at) | .[0].id // empty')
+   fi
+   if [ -z "$CURRENT_WISP" ]; then
+     echo "Could not resolve current wisp; not burning."
+@@ -471,7 +471,7 @@ Target: $TARGET"
+     exit 1
+   fi
+   # Reconcile queued wisps before pouring: reuse one, burn the surplus.
+-  OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r '.[].id')
++  OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r --arg cur "$CURRENT_WISP" 'sort_by(.created_at) | .[] | select(.id != $cur) | .id')
+   NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
+   for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
+     gc bd mol burn "$extra" --force
+@@ -1179,10 +1179,10 @@ If auto_land = "false": skip this entirely.
+ ```bash
+ CURRENT_WISP=${GC_BEAD_ID:-}
+ if [ -z "$CURRENT_WISP" ]; then
+-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
++  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress,open --type=molecule --include-infra --limit=0 --json | jq -r 'sort_by((if .status == "in_progress" then 0 else 1 end), .created_at) | .[0].id // empty')
+ fi
+ # Reconcile queued wisps before pouring: reuse one if present, burn the surplus.
+-OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r '.[].id')
++OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r --arg cur "$CURRENT_WISP" 'sort_by(.created_at) | .[] | select(.id != $cur) | .id')
+ NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
+ for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
+   gc bd mol burn "$extra" --force
+-- 
+2.50.1 (Apple Git-155)
+
