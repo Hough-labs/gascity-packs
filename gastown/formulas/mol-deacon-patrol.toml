@@ -205,14 +205,44 @@ closes that gap.
 - `A` = count of open beads assigned to the session's agent identity
 - `B` = the most recent bead.updated_at across those beads (work signal)
 
+Read the ACTUAL assignee strings out of the bead data and join them against
+every identity form a session carries — never pre-filter with
+`--assignee=<one guessed identity>`. A session is addressed by at least three
+different strings depending on what assigned the work: the agent alias
+(`gastown.deacon`, on molecule wisps), the session bead id (`gc-ttk`, on mail
+messages), and the session name (`gastown__polecat-gc-qkw`, on polecat
+claims). Filtering by any single one silently reports zero — which is the
+very failure mode this step exists to catch.
+
+Two more things this query gets right, both of which returned a flat zero for
+every session before:
+- `--include-infra` is REQUIRED. Wisps, molecules, sessions and messages live
+  in the wisps table and are invisible without it — that is nearly everything
+  a coordination session is ever assigned.
+- The hq/city store is NOT addressable as `gc bd --rig=<name>`, even though
+  `gc rig list` reports it. That form fails with `rig "<name>" not found` AND
+  exits 0, so it silently contributes an empty queue. Read the city with a
+  bare `gc bd list` and iterate only non-hq rigs.
+
 ```bash
-gc agents list --json --active | jq -r '.[] | .agent_id' | while read -r AGENT; do
-    ASSIGNED=$(gc bd list --status=open --assignee="$AGENT" --json --limit=0 | jq 'length')
-    LATEST=$(gc bd list --status=open --assignee="$AGENT" --json --limit=0 \\
-        | jq -r '[.[].updated_at] | max // ""')
-    printf '%s\\t%s\\t%s\\n' "$AGENT" "$ASSIGNED" "$LATEST"
-done
+QUEUES=$(
+  { gc bd list --status=open --include-infra --json --limit=0
+    for RIG in $(gc rig list --json | jq -r '.rigs[] | select(.hq != true) | .name'); do
+        gc bd --rig="$RIG" list --status=open --include-infra --json --limit=0
+    done
+  } | jq -s 'add | map(select((.assignee // "") != ""))'
+)
+
+gc session list --state active --json | jq -r --argjson q "$QUEUES" '
+  .sessions[] as $s
+  | [ $s.agent_name, ($s.id // ""), ($s.alias // ""), ($s.session_name // "") ] as $ids
+  | ($q | map(select([.assignee] | inside($ids)))) as $mine
+  | [ $s.agent_name, ($mine | length), ($mine | map(.updated_at) | max // "") ]
+  | @tsv'
 ```
+
+Any assignee in `$QUEUES` that matches no active session is orphaned work —
+a queue whose owner is gone. Worth a look in the same pass.
 
 The latest bead.updated_at is the cheapest proxy for "did this session
 move work recently?" — every claim, status transition, metadata update,
