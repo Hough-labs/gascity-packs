@@ -532,8 +532,27 @@ Wisp roots are `issue_type=molecule` (never `--type=wisp`, which is not a
 valid gc bd type and matches nothing). They are also infra beads, which
 `gc bd list` hides unless `--include-infra` is passed — omit it and this
 returns `[]`, the surplus-burn never fires, and wisps accumulate unbounded.
+
+`THIS_WISP` must be resolved and EXCLUDED before picking `NEXT`. A poured and
+assigned wisp stays `open` until something claims it, so without the exclusion
+this cycle's own wisp is a candidate for `NEXT` — the cycle adopts itself as
+its own successor, burns the genuine successor as "surplus", and step 3 then
+burns the wisp it just elected. Nothing survives, so every cycle ends with no
+assigned work; `namedWorkReady` re-wakes the session, and that is a
+self-sustaining wake/drain loop rather than a patrol.
+
+Resolve `THIS_WISP` from `in_progress` ONLY — never `in_progress,open`. Step 3
+burns `THIS_WISP` unconditionally, so widening it to `open` would let a fresh
+session (where `GC_BEAD_ID` is unset, since only the convergence runner exports
+it) adopt a never-claimed wisp that is live queued work and destroy it. If
+nothing is in progress, `THIS_WISP` is empty, the exclusion is a no-op, and
+step 3 correctly burns nothing.
 ```bash
-OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r '.[].id')
+THIS_WISP=${GC_BEAD_ID:-}
+if [ -z "$THIS_WISP" ]; then
+  THIS_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=0 --json | jq -r 'sort_by(.created_at) | .[0].id // empty')
+fi
+OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r --arg cur "$THIS_WISP" 'sort_by(.created_at) | .[] | select(.id != $cur) | .id')
 NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
 for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
   gc bd mol burn "$extra" --force
@@ -545,8 +564,14 @@ fi
 ```
 
 **3. Burn this wisp:**
+
+Burn the resolved `THIS_WISP`, not a hand-substituted id — step 2 has already
+guaranteed it is excluded from `NEXT`. If it is empty this cycle never held a
+wisp, and there is nothing to burn.
 ```bash
-gc bd mol burn <this-wisp-id> --force
+if [ -n "$THIS_WISP" ]; then
+  gc bd mol burn "$THIS_WISP" --force
+fi
 ```
 
 **4. Exit this turn:**

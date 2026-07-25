@@ -36,19 +36,35 @@ restart dead agents.
 # Recent pane output — is the deacon actively working?
 {{ cmd }} session peek {{ .BindingPrefix }}deacon --lines 30
 
-# Deacon's current patrol wisp — how fresh is it?
-gc bd list --assignee={{ .BindingPrefix }}deacon --status=in_progress --json --limit=5
+# Deacon's patrol wisps — status AND freshness.
+#
+# --include-infra is REQUIRED. Patrol wisps are infra beads living in the wisps
+# table, which `gc bd list` hides by default; without the flag this returns []
+# no matter how healthy the deacon is, so every wake reads as "deacon has no
+# work" and the watchdog acts on a deacon that is fine.
+#
+# Query in_progress AND open. A wisp that was poured and assigned stays `open`
+# until the deacon claims it, so an in_progress-only query cannot tell a DEAD
+# deacon (no wisps at all) apart from a STUCK-AT-CLAIM one (wisps queued, never
+# claimed) — opposite diagnoses that need opposite responses.
+gc bd list --assignee={{ .BindingPrefix }}deacon --status=in_progress,open --type=molecule --include-infra --json --limit=5 \
+  | jq -r '.[] | "\(.id)\t\(.status)\t\(.updated_at)"'
 
 # Does the deacon have unread mail? (may explain idle state)
 gc mail count {{ .BindingPrefix }}deacon 2>/dev/null
 ```
 
-Read the wisp timestamps and pane output. Build a picture:
+Read the wisp statuses, timestamps, and pane output. Build a picture:
 - Recent burned wisp -> normal patrol loop
 - Active pane output -> working
 - Young in-progress wisp with idle pane -> likely backoff wait
 - Very stale in-progress wisp with idle/error pane -> likely stuck
 - Idle with unread mail -> may need a nudge
+- No wisps at all -> the loop has no next iteration; the deacon cannot
+  self-recover and needs a restart
+- Open wisps piling up with none in_progress -> poured but never claimed. The
+  deacon is restarting before it claims. Restarting it again just adds another
+  wisp; read the pane for why the claim is failing before acting.
 
 ### Step 3: Decide
 
@@ -112,7 +128,7 @@ with a fresh provider context.
 | Want to... | Correct command |
 |------------|----------------|
 | View deacon output | `{{ cmd }} session peek {{ .BindingPrefix }}deacon --lines 30` |
-| Check deacon work | `gc bd list --assignee={{ .BindingPrefix }}deacon --status=in_progress --json` |
+| Check deacon work | `gc bd list --assignee={{ .BindingPrefix }}deacon --status=in_progress,open --type=molecule --include-infra --json` |
 | Nudge deacon | `{{ cmd }} session nudge {{ .BindingPrefix }}deacon "message"` |
 | File stuck warrant | `gc bd create --type=task --label=warrant --metadata '{"target":"{{ .BindingPrefix }}deacon","reason":"...","requester":"boot","gc.routed_to":"{{ .BindingPrefix }}dog"}'` |
 | Check active sessions | `{{ cmd }} session list` |
