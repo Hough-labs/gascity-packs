@@ -92,12 +92,12 @@ If `next-iteration` already ran, do not pour again; run `gc hook`.
 # queued", pours a fresh one, and leaks the predecessor on every restart.
 CURRENT_WISP=${GC_BEAD_ID:-}
 if [ -z "$CURRENT_WISP" ]; then
-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
+  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress,open --type=molecule --include-infra --limit=0 --json | jq -r 'sort_by((if .status == "in_progress" then 0 else 1 end), .created_at) | .[0].id // empty')
 fi
 # Collect ALL queued wisps, keep the first, burn the rest. --limit=1 would only
 # ever surface one, so a surplus (from a race, or accumulated while the lookup
 # above was infra-blind) could never be seen, reported, or cleaned up.
-OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r '.[].id')
+OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r --arg cur "$CURRENT_WISP" 'sort_by(.created_at) | .[] | select(.id != $cur) | .id')
 ASSIGNED_WISP=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
 for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
   gc bd mol burn "$extra" --force
