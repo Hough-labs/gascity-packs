@@ -90,8 +90,12 @@ default = "false"
 [vars.review_agent]
 description = """
 Optional agent address to nudge when the approval gate parks a bead awaiting
-review, e.g. `specialists.iris` (the rig prefix is added automatically). Empty
-= no nudge, and the reviewer is expected to find the parked bead another way.
+review, e.g. `specialists.iris`. A bare name is tried rig-scoped first and then
+town-level, so both a rig-local reviewer and a town agent such as
+`gastown.mayor` are reachable without the operator having to know which scope
+owns the session. Write `rig/agent` to pin another rig, or a leading `/`
+(`/gastown.mayor`) to force town-level and skip the rig attempt. Empty = no
+nudge, and the reviewer is expected to find the parked bead another way.
 From rig `formula_vars`."""
 default = ""
 
@@ -552,6 +556,49 @@ run_approval_gate() {
   bash "$APPROVAL_GATE" "$@"
 }
 
+# Reviewer addressing. review_agent is written unqualified in the rig's
+# formula_vars (`specialists.iris`, `gastown.mayor`) and the rig prefix used to
+# be pasted on unconditionally. That is right for a rig-scoped reviewer and
+# wrong for a town-level one: gascity-packs names `gastown.mayor`, whose only
+# session address is the bare name, so every park nudged
+# `gascity-packs/gastown.mayor`, got "session not found", and — fire-and-forget,
+# with no retry and no marker — never told the reviewer anything. On a rig whose
+# whole point is a review gate, that turns "reviewed merges" into "merges that
+# wait forever" (gcp-a22).
+#
+# So resolve rather than assume. A bare name is tried rig-scoped first and then
+# town-level: the rig attempt stays first so a rig-local reviewer is never
+# shadowed by a town agent that happens to share its name. An address the
+# operator already qualified (`otherrig/agent`) is taken verbatim, and a leading
+# `/` forces town-level and skips the rig attempt.
+nudge_review_agent() {
+  # $1 = message. Echoes the address that accepted it, or — on return 1 — a
+  # flattened diagnostic naming every scope that refused.
+  nra_msg="$1"
+  nra_addr="{{review_agent}}"
+  case "$nra_addr" in
+    /*) set -- "${nra_addr#/}" ;;
+    */*) set -- "$nra_addr" ;;
+    *)
+      if [ -n "${GC_RIG:-}" ]; then
+        set -- "$GC_RIG/$nra_addr" "$nra_addr"
+      else
+        set -- "$nra_addr"
+      fi
+      ;;
+  esac
+  nra_errors=""
+  for nra_try in "$@"; do
+    if nra_out=$(gc session nudge "$nra_try" "$nra_msg" 2>&1); then
+      printf '%s' "$nra_try"
+      return 0
+    fi
+    nra_errors="${nra_errors:+$nra_errors; }$nra_try: $(printf '%s' "$nra_out" | tr '\n' ' ')"
+  done
+  printf '%s' "$nra_errors"
+  return 1
+}
+
 park_awaiting_review() {
   # A refused merge is not a failure and not an incident: the branch is fine,
   # the reviewer simply has not approved THIS commit. Leave the bead open and
@@ -567,7 +614,19 @@ park_awaiting_review() {
     echo "WARN could not record the gate refusal on $WORK; the bead stays open and unmerged regardless."
   fi
   if [ -n "{{review_agent}}" ]; then
-    gc session nudge "${GC_RIG:+$GC_RIG/}{{review_agent}}" "REVIEW NEEDED: $WORK — ${PR_URL:-$BRANCH} awaiting merge approval. Record a verdict with record-merge-approval.sh (--pr + --sha of the live head)."
+    # The nudge is the only thing that tells the reviewer this bead is waiting,
+    # so its outcome goes into durable state either way — a failure visible only
+    # in a patrol transcript is exactly how gcp-a22 stayed invisible. One field,
+    # rewritten on every park, so a later delivery cannot leave a stale failure
+    # standing behind it.
+    if ag_nudge=$(nudge_review_agent "REVIEW NEEDED: $WORK — ${PR_URL:-$BRANCH} awaiting merge approval. Record a verdict with record-merge-approval.sh (--pr + --sha of the live head)."); then
+      gc bd update "$WORK" --set-metadata merge_approval_nudge="delivered: $ag_nudge" ||
+        echo "WARN could not record the review nudge delivery on $WORK."
+    else
+      echo "WARN review nudge for $WORK reached no reviewer session: $ag_nudge"
+      gc bd update "$WORK" --set-metadata merge_approval_nudge="failed: $ag_nudge" ||
+        echo "WARN could not record the review nudge failure on $WORK; it is visible only in this transcript."
+    fi
   fi
   echo "APPROVAL GATE REFUSED: $WORK — $1"
   echo "Bead left open and assigned to the refinery; skip the merge and run patrol-summary + next-iteration."

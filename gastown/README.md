@@ -44,6 +44,18 @@ require_merge_approval = "true"
 review_agent = "specialists.iris"   # optional: nudged when a bead parks
 ```
 
+`review_agent` is resolved, not assumed. A bare name is nudged at rig scope
+first (`<rig>/specialists.iris`) and then town-level (`gastown.mayor`), so a
+rig-local reviewer and a town agent are both reachable without the operator
+having to know which scope owns the session; the rig attempt stays first so a
+rig-local reviewer is never shadowed by a town agent of the same name. Write
+`otherrig/agent` to pin another rig, or a leading `/` (`/gastown.mayor`) to go
+straight to town level. Whichever way it resolves, the outcome is written to the
+work bead as `merge_approval_nudge`: either `delivered:` and the address that
+took it, or `failed:` and every scope that refused. The nudge is fire-and-forget
+and a failed one never blocks the park, so without that marker an unreachable
+reviewer is a silent failure — the bead parks correctly and nobody is ever told.
+
 gc cannot emit a formal GitHub review event, so the approval signal is
 gc-native: it lives in the work bead's own metadata, keyed to the PR number
 and the exact head SHA the reviewer read.
@@ -55,6 +67,9 @@ and the exact head SHA the reviewer read.
 | `merge_approval.head_sha` | Full 40-hex commit the reviewer read |
 | `merge_approval.reviewer` | Approving reviewer identity |
 | `merge_approval.recorded_at` | UTC timestamp |
+| `merge_approval_state` | `awaiting_review` while the gate has the bead parked |
+| `merge_approval_gate_reason` | Why the gate refused this commit |
+| `merge_approval_nudge` | Whether the reviewer was actually reached |
 
 A reviewer agent produces the signal:
 

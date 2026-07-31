@@ -829,6 +829,11 @@ PY
 # write_formula_gc_stub writes a `gc` that answers `formula list --json` with
 # $2 as mol-refinery-patrol's source path (empty = formula not found), logs
 # every bead-write and nudge invocation, and records a `runtime drain-ack`.
+#
+# Nudge delivery is modelled after the real session router: when
+# STUB_NUDGE_OK_ADDR is set, only that exact address resolves and every other
+# one fails the way gc does ("session not found", exit 1). Unset = every address
+# resolves, which is what the tests written before the addressing fix assume.
 write_formula_gc_stub() {
     local bin="$1" source_path="$2"
     mkdir -p "$bin"
@@ -848,8 +853,17 @@ case "${1:-}" in
         fi
         exit 0
         ;;
-    bd|session)
+    bd)
         printf '%s\n' "$*" >>"${STUB_UPDATE_LOG:-/dev/null}"
+        exit 0
+        ;;
+    session)
+        printf '%s\n' "$*" >>"${STUB_UPDATE_LOG:-/dev/null}"
+        if [ "${2:-}" = "nudge" ] && [ -n "${STUB_NUDGE_OK_ADDR+x}" ] &&
+            [ "${3:-}" != "$STUB_NUDGE_OK_ADDR" ]; then
+            printf 'gc session nudge: session not found: "%s"\n' "${3:-}" >&2
+            exit 1
+        fi
         exit 0
         ;;
     runtime)
@@ -1041,6 +1055,115 @@ test_resolved_gate_parks_an_unapproved_bead_instead_of_stopping() {
     rm -rf "$tmp"
 }
 
+# park_with_reviewer parks an unapproved bead with review_agent = $1, against a
+# session router where only address $2 resolves, in rig $3. Sets PARK_STATUS,
+# PARK_OUTPUT, PARK_LOG and PARK_TMP (the caller removes PARK_TMP).
+park_with_reviewer() {
+    local review_agent="$1" ok_addr="$2" rig="$3"
+    local tmp bin wiring pack source bead
+    tmp=$(mktemp -d)
+    PARK_TMP="$tmp"
+    bin="$tmp/bin"
+    wiring="$tmp/wiring.sh"
+    pack="$tmp/pack/gastown"
+    PARK_LOG="$tmp/update.log"
+    bead="$tmp/bead.json"
+    source=$(plant_pack_tree "$pack")
+    extract_gate_wiring "$wiring" true "$review_agent"
+    write_formula_gc_stub "$bin" "$source"
+    bead_json "$bead" "pr_url=https://github.com/acme/widgets/pull/7"
+
+    set +e
+    PARK_OUTPUT=$(PATH="$bin:$PATH" STUB_UPDATE_LOG="$PARK_LOG" STUB_BEAD_JSON="$bead" \
+        STUB_NUDGE_OK_ADDR="$ok_addr" GC_RIG="$rig" \
+        GC_CITY="$tmp/city" GC_CITY_PATH="$tmp/city" \
+        bash -c '
+            unset GC_PACK_DIR
+            APPROVAL_REQUIRED=1
+            WORK=wb-1
+            BRANCH=polecat/wb-1
+            . "$1"
+            gate_output=$(run_approval_gate "$2" 2>&1)
+            park_awaiting_review "$gate_output"
+        ' _ "$wiring" "$SHA_APPROVED" 2>&1)
+    PARK_STATUS=$?
+    set -e
+}
+
+# nudge_attempts echoes the addresses the park path actually nudged, one per
+# line, in the order it tried them.
+nudge_attempts() {
+    sed -n 's/^session nudge \([^ ]*\) .*$/\1/p' "$PARK_LOG"
+}
+
+test_review_nudge_falls_back_to_a_town_level_reviewer() {
+    # gascity-packs names `gastown.mayor`, a TOWN-level agent: the rig-scoped
+    # address it used to be given does not exist, so the reviewer was never told
+    # a bead had parked. The fallback must reach the bare address (gcp-a22).
+    park_with_reviewer "gastown.mayor" "gastown.mayor" "gascity-packs"
+
+    [ "$PARK_STATUS" -eq 0 ] ||
+        fail "parking with a town-level reviewer should not abort, got exit $PARK_STATUS: $PARK_OUTPUT"
+    [ "$(nudge_attempts)" = "gascity-packs/gastown.mayor
+gastown.mayor" ] ||
+        fail "expected the rig scope tried first then town-level, got: $(nudge_attempts)"
+    grep -F "merge_approval_nudge=delivered: gastown.mayor" "$PARK_LOG" >/dev/null ||
+        fail "expected the delivery recorded on the bead, log: $(cat "$PARK_LOG")"
+    rm -rf "$PARK_TMP"
+}
+
+test_review_nudge_prefers_the_rig_scoped_reviewer() {
+    # The fallback must not weaken the rig-scoped case it was added around: a
+    # rig-local session must never be shadowed by a town agent that shares its
+    # name, so a successful rig-scoped nudge ends the search.
+    park_with_reviewer "specialists.iris" "gascity-packs/specialists.iris" "gascity-packs"
+
+    [ "$(nudge_attempts)" = "gascity-packs/specialists.iris" ] ||
+        fail "a rig-scoped reviewer must be nudged once, at rig scope, got: $(nudge_attempts)"
+    grep -F "merge_approval_nudge=delivered: gascity-packs/specialists.iris" "$PARK_LOG" >/dev/null ||
+        fail "expected the delivery recorded on the bead, log: $(cat "$PARK_LOG")"
+    rm -rf "$PARK_TMP"
+}
+
+test_explicit_town_level_address_skips_the_rig_scope() {
+    # A leading "/" is the operator's escape hatch: address this reviewer at
+    # town level and do not spend a doomed rig-scoped attempt on it.
+    park_with_reviewer "/gastown.mayor" "gastown.mayor" "gascity-packs"
+
+    [ "$(nudge_attempts)" = "gastown.mayor" ] ||
+        fail "a leading-slash address must be nudged once, town-level, got: $(nudge_attempts)"
+    grep -F "merge_approval_nudge=delivered: gastown.mayor" "$PARK_LOG" >/dev/null ||
+        fail "expected the delivery recorded on the bead, log: $(cat "$PARK_LOG")"
+    rm -rf "$PARK_TMP"
+}
+
+test_undeliverable_review_nudge_is_recorded_on_the_bead() {
+    # The failure that made gcp-a22 invisible: fire-and-forget, no retry, no
+    # marker. An undeliverable nudge must still park the bead AND leave the
+    # failure in durable state, naming every scope that refused.
+    park_with_reviewer "gastown.mayor" "__no-session__" "gascity-packs"
+
+    [ "$PARK_STATUS" -eq 0 ] ||
+        fail "an undeliverable nudge must not abort the iteration, got exit $PARK_STATUS: $PARK_OUTPUT"
+    grep -F "APPROVAL GATE REFUSED" <<<"$PARK_OUTPUT" >/dev/null ||
+        fail "expected the bead to still park, got: $PARK_OUTPUT"
+    grep -F "merge_approval_state=awaiting_review" "$PARK_LOG" >/dev/null ||
+        fail "expected the bead parked as awaiting_review, log: $(cat "$PARK_LOG")"
+    grep -F "merge_approval_nudge=failed:" "$PARK_LOG" >/dev/null ||
+        fail "an undeliverable nudge must leave a durable marker, log: $(cat "$PARK_LOG")"
+    local marker
+    marker=$(grep -F "merge_approval_nudge=failed:" "$PARK_LOG")
+    grep -F "gascity-packs/gastown.mayor" <<<"$marker" >/dev/null ||
+        fail "the marker must name the rig scope that refused, got: $marker"
+    grep -F "session not found" <<<"$marker" >/dev/null ||
+        fail "the marker must carry the router's diagnostic, got: $marker"
+    [ "$(wc -l <<<"$marker" | tr -d ' ')" = "1" ] ||
+        fail "the marker must be a single metadata line, got: $marker"
+    grep -F "WARN review nudge for wb-1 reached no reviewer session" <<<"$PARK_OUTPUT" >/dev/null ||
+        fail "expected the undeliverable nudge reported in the patrol output, got: $PARK_OUTPUT"
+    rm -rf "$PARK_TMP"
+}
+
 test_producer_records_complete_signal
 test_producer_rejects_invalid_input
 test_producer_surfaces_write_failure
@@ -1063,5 +1186,9 @@ test_gate_resolver_works_for_a_sha_pinned_pack
 test_gate_resolver_falls_back_to_the_city_scripts_dir
 test_gate_wiring_still_fails_closed_when_nothing_resolves
 test_resolved_gate_parks_an_unapproved_bead_instead_of_stopping
+test_review_nudge_falls_back_to_a_town_level_reviewer
+test_review_nudge_prefers_the_rig_scoped_reviewer
+test_explicit_town_level_address_skips_the_rig_scope
+test_undeliverable_review_nudge_is_recorded_on_the_bead
 
 echo "merge approval gate tests passed"
