@@ -227,15 +227,18 @@ CURRENT_WISP=${GC_BEAD_ID:-}
 if [ -z "$CURRENT_WISP" ]; then
   CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
 fi
-# Reconcile queued (open) patrol wisps to exactly one. A prior cycle may have
-# poured a next wisp without burning, or a restart may have raced — keep the
-# first and burn the surplus so wisps never accumulate. Wisp roots are
+# Reconcile your other patrol wisps to exactly one successor. A prior cycle may
+# have poured a next wisp without burning, or a restart may have raced — keep
+# the first and burn the surplus so wisps never accumulate. Wisp roots are
 # molecules (never --type=wisp, which is not a valid gc bd type and matches
-# nothing), and they are ephemeral, so --include-infra is required here too —
-# gc bd list hides the wisps tier without it.
-OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r '.[].id')
-ASSIGNED_WISP=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
-for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
+# nothing), and they live in the wisps table, so `--include-infra` is REQUIRED
+# or the query returns nothing and every cycle leaks a wisp. Query
+# open,in_progress — a successor a crashed session already claimed is still
+# yours to resume — and exclude the wisp you are on so it is never burned here.
+SURPLUS_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json \
+  | jq -r --arg cur "$CURRENT_WISP" '.[] | select(.id != $cur) | .id')
+ASSIGNED_WISP=$(printf '%s\n' $SURPLUS_WISPS | sed -n '1p')
+for extra in $(printf '%s\n' $SURPLUS_WISPS | sed '1d'); do
   gc bd mol burn "$extra" --force
 done
 if [ -n "$CURRENT_WISP" ] && [ -z "$ASSIGNED_WISP" ]; then
