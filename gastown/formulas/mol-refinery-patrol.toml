@@ -461,19 +461,66 @@ if [ "$APPROVAL_REQUIRED" -eq 1 ] && [ "$MERGE_STRATEGY" = "direct" ]; then
   echo "require_merge_approval is on; a reviewed merge needs a pull request — using merge_strategy=mr."
   MERGE_STRATEGY="mr"
 fi
-APPROVAL_GATE=""
-if [ "$APPROVAL_REQUIRED" -eq 1 ]; then
-  for cand in \
-    "${GC_PACK_DIR:-}/assets/scripts/checks/merge-approval-gate.sh" \
+# >>> merge-approval-gate-wiring >>>
+# Everything between these markers is executed verbatim by
+# gastown/tests/test_merge_approval_gate.sh, so the resolution and refusal
+# behaviour asserted there is the behaviour the refinery actually runs. Keep
+# the block self-contained: its only inputs are APPROVAL_REQUIRED, WORK, and
+# the formula vars.
+#
+# Locate merge-approval-gate.sh from the context this formula actually runs in:
+# the agent's own shell, not a `gc` pack-command invocation.
+#
+# The primary anchor is this formula's own resolved source path. The gate ships
+# beside the formula in the same pack tree, so that path is the one candidate
+# guaranteed to be (a) present whenever the formula itself is and (b) version-
+# coherent with it — a formula from pin X can never reach a gate from pin Y.
+# `gc formula list --json` reports it for every formula gc can see, including
+# packs pinned to a SHA (gc checks the pin out into the pack cache and reports
+# the cache path), and it needs no environment beyond the city.
+#
+# The env-var and city-scripts candidates stay as fallbacks for cities that do
+# materialize checks into `.gc/scripts/checks/`, but none of them can be the
+# primary: GC_PACK_DIR is exported only when gc invokes a *pack command* and is
+# unset in every agent process, and nothing materializes pack check scripts
+# into the city scripts dir today. Depending on them alone made the gate
+# permanently unresolvable, which turned fail-closed into fail-forever
+# (gcp-amo).
+resolve_approval_gate() {
+  rag_rel="assets/scripts/checks/merge-approval-gate.sh"
+  rag_city="${GC_CITY:-${GC_CITY_PATH:-}}"
+  if [ -n "$rag_city" ]; then
+    rag_json=$(gc formula list --city "$rag_city" --json 2>/dev/null)
+  else
+    rag_json=$(gc formula list --json 2>/dev/null)
+  fi
+  rag_src=$(printf '%s' "$rag_json" \
+    | jq -r '.formulas[]? | select(.name == "mol-refinery-patrol") | .source // empty' 2>/dev/null \
+    | head -1)
+  if [ -n "$rag_src" ]; then
+    # <pack>/formulas/mol-refinery-patrol.toml -> <pack>
+    rag_pack=$(dirname "$(dirname "$rag_src")")
+    if [ -f "$rag_pack/$rag_rel" ]; then
+      printf '%s\n' "$rag_pack/$rag_rel"
+      return 0
+    fi
+  fi
+  for rag_cand in \
+    "${GC_PACK_DIR:-}/$rag_rel" \
     "${GC_CITY:-}/.gc/scripts/checks/merge-approval-gate.sh" \
     "${GC_CITY_PATH:-}/.gc/scripts/checks/merge-approval-gate.sh" \
     ".gc/scripts/checks/merge-approval-gate.sh"
   do
-    if [ -f "$cand" ]; then
-      APPROVAL_GATE="$cand"
-      break
+    if [ -f "$rag_cand" ]; then
+      printf '%s\n' "$rag_cand"
+      return 0
     fi
   done
+  return 1
+}
+APPROVAL_GATE=""
+if [ "$APPROVAL_REQUIRED" -eq 1 ]; then
+  APPROVAL_GATE=$(resolve_approval_gate)
   if [ -z "$APPROVAL_GATE" ]; then
     echo "require_merge_approval is on but merge-approval-gate.sh was not found. STOP. Do not mutate bead state."
     echo "An unreadable gate is not an approval."
@@ -513,6 +560,7 @@ park_awaiting_review() {
   echo "APPROVAL GATE REFUSED: $WORK — $1"
   echo "Bead left open and assigned to the refinery; skip the merge and run patrol-summary + next-iteration."
 }
+# <<< merge-approval-gate-wiring <<<
 
 block_existing_pr() {
   reason="$1"
@@ -775,7 +823,8 @@ without a gc-native approval signal recorded on the work bead. The signal lives
 in `merge_approval.*` metadata — verdict, PR number, head SHA, reviewer,
 timestamp — written by a reviewer agent via
 `assets/scripts/record-merge-approval.sh` and read here by
-`assets/scripts/checks/merge-approval-gate.sh`.
+`assets/scripts/checks/merge-approval-gate.sh`, resolved from this formula's
+own pack tree (see `resolve_approval_gate` above).
 
 The head SHA is the whole point. An approval authorizes one commit, not a
 branch: the gate re-reads the live PR head and refuses anything else, so

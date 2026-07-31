@@ -71,6 +71,17 @@ invalidates it. Every other outcome refuses, including the ones the gate cannot
 explain (unreadable bead, PR lookup failure, unresolvable head SHA): a tool
 error is a suspect, not a licence to merge.
 
+The patrol formula locates that script through its own resolved source path —
+`gc formula list --json` reports where gc loaded `mol-refinery-patrol.toml`
+from, and the gate sits beside it in the same pack tree. That anchor is the
+only one that holds in the context the formula actually runs in (the agent's
+own shell, where `GC_PACK_DIR` is unset — gc exports it for pack *commands*
+only) and it is version-coherent by construction: a formula from one pin can
+never reach a gate from another. `$GC_CITY/.gc/scripts/checks/` and
+`GC_PACK_DIR` remain fallbacks for cities that stage checks themselves. If none
+resolve, patrol stops without touching bead state — an unreadable gate is not
+an approval.
+
 Turning the gate on implies the pull-request lane. `merge_strategy=direct` is
 promoted to `mr`, because a reviewed merge needs a PR to review; PR publication
 becomes the start of review instead of the terminal handoff, and a refused
