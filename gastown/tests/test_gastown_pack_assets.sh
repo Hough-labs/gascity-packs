@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# These are contract tests over pack files: nearly every assertion greps for a
+# literal shell snippet, so single-quoted `$VAR` is the point, not an error.
+# shellcheck disable=SC2016
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -216,8 +219,55 @@ if verify >= metadata:
 PY
 }
 
+test_post_merge_worktree_teardown_has_an_owner() {
+    local reaper="$GASTOWN/assets/scripts/polecat-worktree-reap.sh"
+    local witness_cfg="$GASTOWN/agents/witness/agent.toml"
+    local witness_prompt="$GASTOWN/agents/witness/prompt.template.md"
+    local patrol="$GASTOWN/formulas/mol-witness-patrol.toml"
+    local polecat="$GASTOWN/formulas/mol-polecat-work.toml"
+
+    [[ -f "$reaper" ]] || fail "missing post-merge worktree reaper script"
+    [[ -x "$reaper" ]] || fail "worktree reaper must be executable"
+    parse_toml "$witness_cfg" "$patrol" "$polecat"
+
+    # The reaper needs a wiring that actually fires. A formula step cannot name
+    # it (pack assets install into a content-hashed cache), so pre_start with
+    # the config-dir template is the only stable handle.
+    grep -F 'pre_start = ["{{.ConfigDir}}/assets/scripts/polecat-worktree-reap.sh {{.RigRoot}} --rig {{.Rig}}"]' \
+        "$witness_cfg" >/dev/null ||
+        fail "witness must run the worktree reaper from pre_start with rig root and rig name"
+
+    # Ownership must be stated where each role reads it, or teardown drifts
+    # back to nobody.
+    grep -F 'id = "reap-merged-worktrees"' "$patrol" >/dev/null ||
+        fail "witness patrol should own a post-merge worktree teardown step"
+    grep -F 'needs = ["reap-merged-worktrees"]' "$patrol" >/dev/null ||
+        fail "the teardown step must be wired into the patrol chain, not orphaned"
+    grep -F 'Reap per-bead polecat worktrees once their bead closes' "$witness_prompt" >/dev/null ||
+        fail "witness prompt should list post-merge worktree teardown as a duty"
+    grep -F 'Do NOT delete this worktree yourself' "$polecat" >/dev/null ||
+        fail "polecat formula should point worktree teardown at the witness"
+
+    # The gates are the safety contract; losing any one of them silently turns
+    # housekeeping into data loss.
+    grep -F '*/polecats/*/worktrees/*' "$reaper" >/dev/null ||
+        fail "reaper must restrict candidates to per-bead polecat worktrees"
+    grep -F '[ "$STATUS" != "closed" ]' "$reaper" >/dev/null ||
+        fail "reaper must reap only closed beads"
+    grep -F 'git -C "$WT" status --porcelain' "$reaper" >/dev/null ||
+        fail "reaper must refuse to remove a worktree with uncommitted work"
+    grep -F 'session_is_live "$OWNER"' "$reaper" >/dev/null ||
+        fail "reaper must defer while a live session still owns the bead"
+
+    # The reaper cleans up around the canonical checkout; it must never write
+    # into it.
+    ! grep -F 'LOG_DIR="$RIG_ROOT' "$reaper" >/dev/null ||
+        fail "reaper must not default its log inside the rig repo"
+}
+
 test_dog_assets_are_pack_local
 test_retired_dog_formulas_are_not_reintroduced
+test_post_merge_worktree_teardown_has_an_owner
 test_shutdown_dance_contracts_are_executable
 test_shutdown_dance_lifecycle_and_audit_contracts
 test_composition_is_documented

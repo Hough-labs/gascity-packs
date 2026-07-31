@@ -115,6 +115,12 @@ Worktrees are scoped to the work bead (not the agent name) so that:
 - Multiple orphaned worktrees can coexist without collision
 - The witness cleans them independently per-bead
 
+Do NOT delete this worktree yourself, not even after `submit-and-exit`. You
+are standing in it, and on a PR-review rig you may still need it for
+FIX_NEEDED rework. Teardown is the witness's job at both ends of the
+lifecycle: `mol-witness-patrol` `recover-orphaned-beads` if you crash, and
+`reap-merged-worktrees` once the refinery closes the bead.
+
 **3. Ensure branch exists.**
 
 Check if `metadata.branch` already records a branch:

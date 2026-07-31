@@ -1,6 +1,15 @@
 scope = "rig"
 wake_mode = "fresh"
 work_dir = ".gc/agents/{{.Rig}}/witness"
+# Post-merge teardown of per-bead polecat worktrees. The witness owns both ends
+# of the worktree lifecycle — the crash path via mol-witness-patrol's
+# recover-orphaned-beads step, and the happy path here. Wired as pre_start
+# because pack assets live in a content-hashed cache directory that a formula
+# step cannot name; {{.ConfigDir}} is the only stable handle on the script.
+# The reaper is read-mostly, idempotent, and refuses to touch a worktree that
+# is dirty, not closed, or still owned by a live session — see the script
+# header for all four gates.
+pre_start = ["{{.ConfigDir}}/assets/scripts/polecat-worktree-reap.sh {{.RigRoot}} --rig {{.Rig}}"]
 nudge = "Run 'gc prime' to check worker status and begin patrol cycle."
 idle_timeout = "1h"
 # Preemptively cycle the witness before the typical provider cred-cache

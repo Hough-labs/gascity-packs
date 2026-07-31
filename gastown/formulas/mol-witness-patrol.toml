@@ -25,9 +25,12 @@ monitors the WORK layer:
 
 1. **Orphaned bead recovery** — beads assigned to agents that won't spawn
    (pool max changed, agent removed from config). This is the core job.
-2. **Refinery queue health** — work beads assigned to refinery, staleness.
-3. **Polecat health** — detect stuck polecats, file warrants for dog pool.
-4. **Help mail** — triage HELP/escalation requests from polecats.
+2. **Per-bead worktree teardown** — reap polecat worktrees whose bead has
+   closed. The witness owns BOTH ends of the worktree lifecycle: the crash
+   path (orphan recovery) and the happy path (post-merge teardown).
+3. **Refinery queue health** — work beads assigned to refinery, staleness.
+4. **Polecat health** — detect stuck polecats, file warrants for dog pool.
+5. **Help mail** — triage HELP/escalation requests from polecats.
 
 Gate checks and convoy/swarm completion are town-wide concerns handled by
 the deacon, not the per-rig witness.
@@ -46,6 +49,14 @@ the previous location is disposable:
 The witness's core recovery job: when a bead is orphaned (agent won't
 come back), ensure the work reaches the branch (push), then clean up
 the worktree. This makes the work schedulable again.
+
+The same rule applies when nothing went wrong. A CLOSED bead means the
+refinery already verified the merge or the PR handoff, so its per-bead
+polecat worktree is disposable too. Nobody else is positioned to remove
+it — in `direct` mode the refinery and the polecat are both gone by the
+time the bead closes, and in `mr`/`pr` mode the bead closes at PR
+creation while the polecat is still available for FIX_NEEDED rework.
+That teardown is the witness's job: `reap-merged-worktrees`.
 
 ## What the witness does NOT do
 
@@ -443,14 +454,97 @@ gc bd update <bead> --set-metadata recovered=true
 ```
 
 **Exit criteria:** All orphaned beads recovered, worktrees cleaned.
-Or no orphans found. Continue to `check-refinery` — do NOT exit the
-wisp here. The `next-iteration` step is the only place that pours the
-next wisp and burns this one."""
+Or no orphans found. Continue to `reap-merged-worktrees` — do NOT exit
+the wisp here. The `next-iteration` step is the only place that pours
+the next wisp and burns this one."""
+
+[[steps]]
+id = "reap-merged-worktrees"
+title = "Review post-merge worktree teardown"
+needs = ["recover-orphaned-beads"]
+description = """
+The previous step cleans up worktrees on the CRASH path. This step covers
+the HAPPY path — and the witness owns both ends.
+
+`mol-polecat-work` workspace-setup creates one worktree per work bead at
+`<polecat-home>/worktrees/<bead-id>` and records it in `metadata.work_dir`.
+Until this teardown existed, nothing removed it once the bead closed, so a
+rig accumulated exactly one abandoned worktree — and its full checkout —
+per completed bead.
+
+**Why the witness and not the refinery or the polecat:**
+
+| Merge strategy | State when the bead closes | Who could reap |
+|---|---|---|
+| `direct` | Refinery merged and exited; polecat drained long before | Neither — only a later patrol |
+| `mr` / `pr` | Refinery closed the bead at PR creation; the polecat is still available for FIX_NEEDED rework and still needs its worktree | Only an agent that can wait for the polecat to drain |
+
+The witness is the one agent that patrols after both have gone.
+
+**You do not run the reaper by hand.** `assets/scripts/polecat-worktree-reap.sh`
+is wired as the witness `pre_start` in `agents/witness/agent.toml`, so it
+has already run for this session:
+
+```
+<pack-config-dir>/assets/scripts/polecat-worktree-reap.sh <rig-root> --rig <rig>
+```
+
+It lives in `pre_start` rather than in a command here because pack assets
+are installed into a content-hashed cache directory that a formula step
+cannot name; the agent config's config-dir template is the only stable
+handle on the script. Your job in this step is to read what it decided and
+act on anything that is not routine. Re-run it by hand (adding `--dry-run`
+to preview) only when clearing an incident.
+
+**What it will and will not remove.** All four gates must hold:
+
+1. The path is a per-bead polecat worktree
+   (`.../polecats/<agent>/worktrees/<bead-id>`). A polecat's persistent
+   agent-home worktree has no `worktrees/` parent segment and is never a
+   candidate, nor is the rig root or the refinery's temporary merge worktree.
+2. The bead is `closed`. `open`/`in_progress` worktrees belong to a live
+   polecat or to the orphan-recovery step above.
+3. `git status --porcelain` in the worktree is empty. Uncommitted work is
+   never discarded — a dirty worktree is logged as `worktree_dirty_kept`
+   and left for you to salvage using the Case C/D recipes above.
+4. No live session owns the bead (`metadata.polecat_session`). This is what
+   defers the reap in `mr`/`pr` mode until the polecat actually drains.
+
+It deliberately does NOT require every commit to be on a remote: a
+rebase-merging refinery rewrites hashes and then deletes the merged branch,
+so a genuinely merged worktree always looks like it holds unpublished
+commits. Bead closure is the refinery's own proof that the work landed.
+
+**Review the log.** Every decision lands in
+`$GC_CITY/.gc/runtime/logs/polecat-worktree-reap.log` as one JSON line
+(`$LOG_DIR` overrides the location; the reaper never writes inside the rig
+repo). Read this cycle's lines:
+
+```bash
+tail -n 50 "${LOG_DIR:-$GC_CITY/.gc/runtime/logs}/polecat-worktree-reap.log"
+```
+
+| Event | Meaning | Action |
+|---|---|---|
+| `worktree_reaped` | Removed. Routine. | Log only |
+| `worktree_dirty_kept` | Closed bead, uncommitted changes on disk | Salvage per Case C/D, then re-run |
+| `worktree_owner_live` | Closed bead, polecat still alive (PR rework) | None — expected; next cycle retries |
+| `worktree_bead_unreadable` | `gc bd show` returned nothing | If it persists, check Dolt health |
+| `worktree_reap_failed` | Directory survived removal | Investigate permissions/mounts, mail mayor |
+
+A `worktree_dirty_kept` that repeats across cycles means real work is
+stranded on disk under a bead that is already closed. Mail the mayor —
+that is a lost-work signal, not routine housekeeping.
+
+**Exit criteria:** Reaper log reviewed and any non-routine event acted on.
+Continue to `check-refinery` — do NOT exit the wisp here. The
+`next-iteration` step is the only place that pours the next wisp and burns
+this one."""
 
 [[steps]]
 id = "check-refinery"
 title = "Check refinery queue health"
-needs = ["recover-orphaned-beads"]
+needs = ["reap-merged-worktrees"]
 description = """
 Ensure the refinery is processing work and the queue is healthy.
 
