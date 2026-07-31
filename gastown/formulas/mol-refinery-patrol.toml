@@ -420,24 +420,36 @@ BRANCH=$(gc bd show $WORK --json | jq -r '.[0].metadata.branch')
 TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_branch}}"')
 MERGE_STRATEGY=$(gc bd show $WORK --json | jq -r '.[0].metadata.merge_strategy // "direct"')
 EXISTING_PR=$(gc bd show $WORK --json | jq -r '.[0].metadata.existing_pr // empty')
+# --- origin-repo-resolution:begin ---
+# The repository that matters here is the one this worktree PUSHES to: origin.
+# `gh repo view` answers with gh's own base-repo heuristic, which on a fork that
+# also carries an `upstream` remote resolves to the PARENT — so a fork-based rig
+# would create and look up its pull requests in a repo its branches were never
+# pushed to (gastownhall/gascity-packs#... — the mr lane could not see PR #1 on
+# the fork). Parse origin directly; gh is a fallback only for remotes this
+# parser cannot read (GitHub Enterprise hosts, ssh config aliases).
+ORIGIN_REPO=""
 ORIGIN_REPO_ERROR=""
-if command -v gh >/dev/null 2>&1; then
-  if ! ORIGIN_REPO=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>&1); then
-    ORIGIN_REPO_ERROR="gh repo view failed while resolving origin repository: $ORIGIN_REPO"
-    ORIGIN_REPO=""
+ORIGIN_URL=$(git remote get-url origin 2>/dev/null || true)
+case "$ORIGIN_URL" in
+  git@github.com:*|https://github.com/*|ssh://git@github.com/*)
+    ORIGIN_REPO=$(printf '%s\n' "$ORIGIN_URL" \
+      | sed -E 's#^ssh://git@github.com/##; s#^git@github.com:##; s#^https://github.com/##; s#\\.git$##')
+    ;;
+esac
+if [ -z "$ORIGIN_REPO" ]; then
+  if command -v gh >/dev/null 2>&1; then
+    if ! ORIGIN_REPO=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>&1); then
+      ORIGIN_REPO_ERROR="gh repo view failed while resolving origin repository: $ORIGIN_REPO"
+      ORIGIN_REPO=""
+    fi
+  elif [ -z "$ORIGIN_URL" ]; then
+    ORIGIN_REPO_ERROR="Could not read the origin remote (git remote get-url origin failed); cannot resolve the repository for pull-request handoff."
+  else
+    ORIGIN_REPO_ERROR="GitHub REST fallback supports only github.com origin remotes; install gh for $ORIGIN_URL."
   fi
-else
-  ORIGIN_URL=$(git remote get-url origin)
-  case "$ORIGIN_URL" in
-    git@github.com:*|https://github.com/*)
-      ORIGIN_REPO=$(printf '%s\n' "$ORIGIN_URL" \
-        | sed -E 's#^git@github.com:##; s#^https://github.com/##; s#\\.git$##')
-      ;;
-    *)
-      ORIGIN_REPO_ERROR="GitHub REST fallback supports only github.com origin remotes; install gh for $ORIGIN_URL."
-      ;;
-  esac
 fi
+# --- origin-repo-resolution:end ---
 if [ "$MERGE_STRATEGY" = "pr" ]; then
   MERGE_STRATEGY="mr"
 fi
@@ -724,8 +736,18 @@ curl_gh_api() {
 lookup_pr_info() {
   ref="$1"
   err_file="$2"
+  # An unscoped lookup is what let this lane read the wrong repository in the
+  # first place. Without a resolved origin there is nothing safe to scope to,
+  # so refuse rather than fall back to gh's base-repo guess.
+  if [ -z "$ORIGIN_REPO" ]; then
+    {
+      [ -n "$ORIGIN_REPO_ERROR" ] && echo "$ORIGIN_REPO_ERROR"
+      echo "Could not resolve the origin repository; refusing an unscoped pull request lookup for $ref."
+    } >"$err_file"
+    return 1
+  fi
   if command -v gh >/dev/null 2>&1; then
-    gh pr view --json url,number,state,headRefName,baseRefName,headRepositoryOwner,headRepository -- "$ref" 2>"$err_file"
+    gh pr view --repo "$ORIGIN_REPO" --json url,number,state,headRefName,baseRefName,headRepositoryOwner,headRepository -- "$ref" 2>"$err_file"
     return $?
   fi
   if ! init_github_rest 2>"$err_file"; then
@@ -1068,13 +1090,14 @@ if [ -n "$EXISTING_PR" ]; then
 else
   if command -v gh >/dev/null 2>&1; then
     PR_URL=$(gh pr create \
+      --repo "$ORIGIN_REPO" \
       --base "$TARGET" \
       --head "$BRANCH" \
       --title "$ISSUE_TITLE ($WORK)" \
       --body-file "$PR_BODY_FILE" 2>/dev/null || true)
 
     if [ -z "$PR_URL" ]; then
-      PR_URL=$(gh pr view "$BRANCH" --json url -q '.url')
+      PR_URL=$(gh pr view "$BRANCH" --repo "$ORIGIN_REPO" --json url -q '.url')
     fi
   else
     PR_ERR=$(mktemp)
