@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 31 Jul 2026 15:19:41 -0400
+Subject: [PATCH 4/4] fix(refinery): flatten and guard the approval-gate
+ refusal metadata write (gcp-dc8)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Self-review touch-up on park_awaiting_review in mol-refinery-patrol.
+
+Two residual defects in the parked-bead path:
+
+- The gate reports on stderr and can emit more than one line (an
+  undecidable followed by its detail). Bead metadata is a single-line
+  store, so the raw multi-line reason was written unflattened. Collapse
+  newlines to spaces before the write.
+
+- The `gc bd update` recording the refusal was unchecked. If it failed,
+  the step continued silently as though the refusal had been recorded.
+  Check it and WARN — the bead stays open and unmerged either way, so a
+  failed breadcrumb write must not read as a successful one.
+---
+ gastown/formulas/mol-refinery-patrol.toml | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
+index 82f784c..18a0b17 100644
+--- a/gastown/formulas/mol-refinery-patrol.toml
++++ b/gastown/formulas/mol-refinery-patrol.toml
+@@ -499,9 +499,14 @@ park_awaiting_review() {
+   # assigned to the refinery with the refusal recorded, nudge the reviewer if
+   # the rig named one, and let the next patrol iteration re-check. Never
+   # close, never escalate, never retry the merge in this iteration.
+-  gc bd update "$WORK" \
++  # The gate reports on stderr and can emit more than one line; metadata is a
++  # single-line store, so flatten before writing.
++  ag_reason=$(printf '%s' "$1" | tr '\n' ' ')
++  if ! gc bd update "$WORK" \
+     --set-metadata merge_approval_state=awaiting_review \
+-    --set-metadata merge_approval_gate_reason="$1"
++    --set-metadata merge_approval_gate_reason="$ag_reason"; then
++    echo "WARN could not record the gate refusal on $WORK; the bead stays open and unmerged regardless."
++  fi
+   if [ -n "{{review_agent}}" ]; then
+     gc session nudge "${GC_RIG:+$GC_RIG/}{{review_agent}}" "REVIEW NEEDED: $WORK — ${PR_URL:-$BRANCH} awaiting merge approval. Record a verdict with record-merge-approval.sh (--pr + --sha of the live head)."
+   fi
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,1071 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 31 Jul 2026 15:13:48 -0400
+Subject: [PATCH 2/4] feat(refinery): add a gc-native merge approval signal and
+ fail-closed gate (gcp-dc8)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+gascity-packs keeps review BLOCKING, but the gc town has no producer of a
+merge approval signal, so three merge-ready beads (gcp-xbl, gcp-g98, gcp-z2z)
+have been parked with nothing able to release them. The gt-town refinery-merge
+skill that leaked into this rig merges only on a formal GitHub review event
+with state APPROVED, and nothing in gc emits one; gc's own review lane records
+a verdict that is keyed to neither a PR nor a head SHA, so the refinery cannot
+consume it either. This is a missing producer, not a missing town.
+
+This commit adds both halves. record-merge-approval.sh is the producer: a
+reviewer agent records verdict, PR number, head SHA, reviewer identity and
+timestamp on the work bead in one bd update, so a half-written signal — a
+verdict with no SHA to scope it — cannot exist. It refuses abbreviated SHAs,
+unknown verdicts, unparseable PR references and anonymous approvals, writing
+nothing on any of them.
+
+checks/merge-approval-gate.sh is the consumer. It re-reads the LIVE PR head
+from GitHub and permits a merge only when the approved SHA is still the head,
+which is what makes the signal safe: an approval authorizes one commit, not a
+branch, so commits pushed after review do not inherit it. Every other outcome
+refuses, and the refusals split into two exit codes that never collapse into a
+merge — exit 1 for a signal read and found wanting (missing, incomplete,
+non-approving, wrong PR, stale SHA, PR closed or on another branch), exit 2 for
+a verdict it could not reach at all (unreadable bead, PR lookup failure,
+unresolvable head SHA). The opt-in switch itself fails closed: only recognized
+off values disable the gate, so a typo in a rig's formula_vars enables review
+rather than silently skipping it. A gh-less REST fallback mirrors the patrol
+formula's own split, because a gate that cannot look up a PR would leave those
+rigs permanently deadlocked — fail-closed, but exactly the failure this ends.
+
+Validation: 15 test cases in gastown/tests/test_merge_approval_gate.sh, mostly
+fail-closed coverage. Two red->green cycles confirmed the suite has teeth —
+stubbing out the stale-SHA comparison, and making the opt-in fail open on an
+unrecognized value, each turn the suite red. The REST path is exercised over a
+hermetic PATH so the host's real gh cannot satisfy the lookup.
+
+Formula wiring lands in the next commit.
+---
+ .../scripts/checks/merge-approval-gate.sh     | 257 ++++++++
+ .../assets/scripts/record-merge-approval.sh   | 123 ++++
+ gastown/tests/test_merge_approval_gate.sh     | 616 ++++++++++++++++++
+ 3 files changed, 996 insertions(+)
+ create mode 100755 gastown/assets/scripts/checks/merge-approval-gate.sh
+ create mode 100755 gastown/assets/scripts/record-merge-approval.sh
+ create mode 100755 gastown/tests/test_merge_approval_gate.sh
+
+diff --git a/gastown/assets/scripts/checks/merge-approval-gate.sh b/gastown/assets/scripts/checks/merge-approval-gate.sh
+new file mode 100755
+index 0000000..bc36721
+--- /dev/null
++++ b/gastown/assets/scripts/checks/merge-approval-gate.sh
+@@ -0,0 +1,257 @@
++#!/usr/bin/env bash
++# Consumer for the gc-native merge approval signal — the refinery's merge gate.
++#
++# Reads the signal that record-merge-approval.sh wrote on the work bead and
++# decides whether the refinery may land the branch. The signal names a PR number
++# and a head SHA; this script re-reads the LIVE PR head from GitHub and permits
++# the merge only when the approved SHA is still the head. New commits after
++# approval therefore invalidate it — an approval authorizes one commit, not a
++# branch.
++#
++# FAIL CLOSED. Every path that is not a positive, current, matching approval
++# refuses the merge, including the paths where the gate cannot tell: a bead it
++# cannot read, a PR it cannot resolve, a head SHA GitHub will not return. A
++# tool error is a suspect, not a licence to merge.
++#
++# Usage:
++#   merge-approval-gate.sh --bead <id> [--required <true|false>] [--merge-sha <sha>]
++#
++#   --required   Opt-in switch, normally the rig's require_merge_approval
++#                formula var. Unset/empty/false/0/no/off = gate disabled (exit 0).
++#                ANY other value enables it, so a typo enables the gate rather
++#                than silently disabling it. Falls back to
++#                $GC_REQUIRE_MERGE_APPROVAL.
++#   --merge-sha  The commit the refinery is about to merge (`git rev-parse temp`).
++#                When given it must equal the approved SHA, which closes the gap
++#                where the local branch tip has drifted from the reviewed PR head.
++#
++# Exit codes:
++#   0  merge permitted (approved and current), or gate not enabled
++#   1  REFUSE — missing, incomplete, non-approving, mismatched, or stale signal
++#   2  REFUSE — cannot evaluate (unreadable bead, PR lookup failure, no token)
++
++set -uo pipefail
++
++SELF=$(basename "$0")
++
++usage() {
++    echo "usage: $SELF --bead <id> [--required <true|false>] [--merge-sha <sha>]" >&2
++}
++
++# A refusal the gate can explain: the signal was read and found wanting.
++refuse() {
++    echo "GATE: refused reason=$1" >&2
++    exit 1
++}
++
++# A refusal the gate cannot explain: it never got to a verdict. Same outcome,
++# different exit code so the caller can tell "reviewer said no" from "the gate
++# is broken" without the two ever collapsing into a merge.
++undecidable() {
++    echo "GATE: undecidable reason=$1" >&2
++    exit 2
++}
++
++die_usage() {
++    echo "ERROR: $*" >&2
++    usage
++    exit 2
++}
++
++BEAD=""
++REQUIRED=""
++REQUIRED_SET=0
++MERGE_SHA=""
++
++need_value() {
++    [ "$1" -ge 2 ] || die_usage "$2 requires a value"
++}
++
++while [ "$#" -gt 0 ]; do
++    case "$1" in
++        --bead) need_value "$#" --bead; BEAD="$2"; shift 2 ;;
++        --bead=*) BEAD="${1#*=}"; shift ;;
++        --required) need_value "$#" --required; REQUIRED="$2"; REQUIRED_SET=1; shift 2 ;;
++        --required=*) REQUIRED="${1#*=}"; REQUIRED_SET=1; shift ;;
++        --merge-sha) need_value "$#" --merge-sha; MERGE_SHA="$2"; shift 2 ;;
++        --merge-sha=*) MERGE_SHA="${1#*=}"; shift ;;
++        -h|--help) usage; exit 0 ;;
++        *) die_usage "unknown argument: $1" ;;
++    esac
++done
++
++if [ "$REQUIRED_SET" -eq 0 ]; then
++    REQUIRED="${GC_REQUIRE_MERGE_APPROVAL:-}"
++fi
++
++# Opt-in: rigs that do not require review are unaffected. Only the recognized
++# off values disable the gate; anything unrecognized turns it ON.
++case "$(printf '%s' "$REQUIRED" | tr '[:upper:]' '[:lower:]')" in
++    ''|false|0|no|off)
++        echo "GATE: not-required"
++        exit 0
++        ;;
++esac
++
++[ -n "$BEAD" ] || die_usage "--bead is required"
++
++# json_payload strips any non-JSON prefix line (bd emits a
++# `warning: beads.role not configured` diagnostic on stdout ahead of the real
++# payload). Same guard the sibling review check scripts use.
++json_payload() {
++    awk 'found || /^[[:space:]]*[[{]/{ found=1; print }'
++}
++
++read_bead() {
++    local attempt=0 output=""
++    while [ "$attempt" -lt 5 ]; do
++        output=$(gc bd show "$BEAD" --json 2>/dev/null | json_payload)
++        if [ -n "$output" ] && printf '%s' "$output" | jq -e 'type == "array" or type == "object"' >/dev/null 2>&1; then
++            printf '%s' "$output"
++            return 0
++        fi
++        attempt=$((attempt + 1))
++        sleep 0.2
++    done
++    return 1
++}
++
++BEAD_JSON=$(read_bead) || undecidable "bead_unreadable bead=$BEAD"
++
++meta() {
++    printf '%s' "$BEAD_JSON" |
++        jq -r --arg key "$1" '
++            (if type == "array" then .[0] else . end)
++            | (.metadata[$key] // "")
++            | tostring
++        ' 2>/dev/null
++}
++
++SIG_VERDICT=$(meta merge_approval.verdict)
++SIG_PR=$(meta merge_approval.pr_number)
++SIG_SHA=$(printf '%s' "$(meta merge_approval.head_sha)" | tr '[:upper:]' '[:lower:]')
++SIG_REVIEWER=$(meta merge_approval.reviewer)
++SIG_AT=$(meta merge_approval.recorded_at)
++BEAD_BRANCH=$(meta branch)
++BEAD_PR=$(meta pr_number)
++if [ -z "$BEAD_PR" ]; then
++    BEAD_PR=$(printf '%s\n' "$(meta pr_url)" |
++        sed -nE 's|^[Hh][Tt][Tt][Pp][Ss]?://[^/]+/[^/]+/[^/]+/pull/([0-9]+)/?$|\1|p' | head -n 1)
++fi
++
++if [ -z "$SIG_VERDICT" ] && [ -z "$SIG_PR" ] && [ -z "$SIG_SHA" ]; then
++    refuse "no_approval_signal bead=$BEAD"
++fi
++# A partially written signal is not a weaker approval, it is no approval.
++if [ -z "$SIG_VERDICT" ] || [ -z "$SIG_PR" ] || [ -z "$SIG_SHA" ] ||
++    [ -z "$SIG_REVIEWER" ] || [ -z "$SIG_AT" ]; then
++    refuse "incomplete_approval_signal bead=$BEAD verdict=${SIG_VERDICT:-<empty>} pr=${SIG_PR:-<empty>} sha=${SIG_SHA:-<empty>} reviewer=${SIG_REVIEWER:-<empty>} recorded_at=${SIG_AT:-<empty>}"
++fi
++
++if [ "$SIG_VERDICT" != "approved" ]; then
++    refuse "verdict_not_approved verdict=$SIG_VERDICT"
++fi
++if [[ ! "$SIG_PR" =~ ^[1-9][0-9]*$ ]]; then
++    refuse "malformed_pr_number pr=$SIG_PR"
++fi
++if [[ ! "$SIG_SHA" =~ ^[0-9a-f]{40}$ ]]; then
++    refuse "malformed_head_sha sha=$SIG_SHA"
++fi
++
++# The bead must name the branch, or there is nothing to bind the PR to.
++if [ -z "$BEAD_BRANCH" ]; then
++    refuse "bead_has_no_branch bead=$BEAD"
++fi
++# An approval for a different PR is not an approval for this one.
++if [ -n "$BEAD_PR" ] && [ "$BEAD_PR" != "$SIG_PR" ]; then
++    refuse "pr_number_mismatch signal_pr=$SIG_PR bead_pr=$BEAD_PR"
++fi
++
++if [ -n "$MERGE_SHA" ]; then
++    MERGE_SHA=$(printf '%s' "$MERGE_SHA" | tr '[:upper:]' '[:lower:]')
++    if [[ ! "$MERGE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
++        undecidable "malformed_merge_sha merge_sha=$MERGE_SHA"
++    fi
++    if [ "$MERGE_SHA" != "$SIG_SHA" ]; then
++        refuse "merge_sha_not_approved merge_sha=$MERGE_SHA approved_sha=$SIG_SHA"
++    fi
++fi
++
++resolve_github_token() {
++    local token="${GH_TOKEN:-${GITHUB_TOKEN:-${GIT_TOKEN:-}}}"
++    if [ -n "$token" ]; then
++        printf '%s\n' "$token"
++        return 0
++    fi
++    printf 'protocol=https\nhost=github.com\n\n' |
++        GIT_TERMINAL_PROMPT=0 git credential fill 2>/dev/null |
++        sed -n 's/^password=//p' | head -n 1
++}
++
++# Mirrors mol-refinery-patrol's own gh-or-REST split so the gate stays usable in
++# rigs without the gh CLI. Without the fallback those rigs would be permanently
++# refused — fail-closed, but permanently deadlocked, which is the bug this gate
++# exists to end.
++lookup_pr_rest() {
++    local number="$1" origin owner repo token raw
++    origin=$(git remote get-url origin 2>/dev/null) || return 1
++    case "$origin" in
++        git@github.com:*) origin=${origin#git@github.com:} ;;
++        https://github.com/*) origin=${origin#https://github.com/} ;;
++        *) return 1 ;;
++    esac
++    origin=${origin%.git}
++    case "$origin" in
++        */*) owner=${origin%%/*}; repo=${origin#*/} ;;
++        *) return 1 ;;
++    esac
++    token=$(resolve_github_token)
++    [ -n "$token" ] || return 1
++    raw=$(curl -fsS \
++        -H "Accept: application/vnd.github+json" \
++        -H "Authorization: Bearer $token" \
++        -H "X-GitHub-Api-Version: 2022-11-28" \
++        "https://api.github.com/repos/$owner/$repo/pulls/$number" 2>/dev/null) || return 1
++    printf '%s' "$raw" |
++        jq '{number, state: (.state | ascii_upcase), headRefName: .head.ref, headRefOid: .head.sha}' 2>/dev/null
++}
++
++lookup_pr() {
++    local number="$1"
++    if command -v gh >/dev/null 2>&1; then
++        gh pr view "$number" --json number,state,headRefName,headRefOid 2>/dev/null
++        return $?
++    fi
++    lookup_pr_rest "$number"
++}
++
++if ! PR_INFO=$(lookup_pr "$SIG_PR") || [ -z "$PR_INFO" ]; then
++    undecidable "pr_lookup_failed pr=$SIG_PR"
++fi
++
++LIVE_NUMBER=$(printf '%s' "$PR_INFO" | jq -r '.number // ""' 2>/dev/null)
++LIVE_STATE=$(printf '%s' "$PR_INFO" | jq -r '.state // ""' 2>/dev/null | tr '[:lower:]' '[:upper:]')
++LIVE_HEAD_REF=$(printf '%s' "$PR_INFO" | jq -r '.headRefName // ""' 2>/dev/null)
++LIVE_HEAD_SHA=$(printf '%s' "$PR_INFO" | jq -r '.headRefOid // ""' 2>/dev/null | tr '[:upper:]' '[:lower:]')
++
++if [ -z "$LIVE_NUMBER" ] || [ -z "$LIVE_STATE" ] || [ -z "$LIVE_HEAD_REF" ]; then
++    undecidable "pr_lookup_incomplete pr=$SIG_PR"
++fi
++if [ "$LIVE_NUMBER" != "$SIG_PR" ]; then
++    undecidable "pr_identity_mismatch asked=$SIG_PR got=$LIVE_NUMBER"
++fi
++if [[ ! "$LIVE_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
++    undecidable "unresolvable_live_head_sha pr=$SIG_PR head=${LIVE_HEAD_SHA:-<empty>}"
++fi
++if [ "$LIVE_STATE" != "OPEN" ]; then
++    refuse "pr_not_open pr=$SIG_PR state=$LIVE_STATE"
++fi
++if [ "$LIVE_HEAD_REF" != "$BEAD_BRANCH" ]; then
++    refuse "pr_branch_mismatch pr=$SIG_PR pr_head_ref=$LIVE_HEAD_REF bead_branch=$BEAD_BRANCH"
++fi
++if [ "$LIVE_HEAD_SHA" != "$SIG_SHA" ]; then
++    refuse "stale_head_sha pr=$SIG_PR approved_sha=$SIG_SHA live_head_sha=$LIVE_HEAD_SHA"
++fi
++
++echo "GATE: approved bead=$BEAD pr=$SIG_PR sha=$SIG_SHA reviewer=$SIG_REVIEWER recorded_at=$SIG_AT"
++exit 0
+diff --git a/gastown/assets/scripts/record-merge-approval.sh b/gastown/assets/scripts/record-merge-approval.sh
+new file mode 100755
+index 0000000..5d9d1ac
+--- /dev/null
++++ b/gastown/assets/scripts/record-merge-approval.sh
+@@ -0,0 +1,123 @@
++#!/usr/bin/env bash
++# Producer for the gc-native merge approval signal.
++#
++# gc has no way to emit a formal GitHub review event, so the refinery had no
++# reviewed-merge signal it could read: `merge_strategy=direct` merged unreviewed
++# and `mr` published a PR without ever merging. This script is the missing
++# producer. A reviewer agent records its verdict on the work bead itself — gc's
++# own durable store — keyed to the PR number AND the exact head SHA it reviewed.
++#
++# The head SHA is what makes the signal safe to consume: an approval names one
++# commit, so commits pushed after review do not inherit it. The consumer
++# (checks/merge-approval-gate.sh) refuses any signal whose SHA is not the live
++# PR head.
++#
++# Usage:
++#   record-merge-approval.sh --bead <id> --pr <number|#number|url> \
++#       --sha <40-hex-head-sha> --verdict approved|changes_requested \
++#       [--reviewer <identity>]
++#
++# The reviewer identity defaults to $GC_AGENT, then $BEADS_ACTOR.
++#
++# Exit codes:
++#   0  signal recorded
++#   1  bead store write failed (nothing was recorded)
++#   2  invalid usage or invalid argument (nothing was recorded)
++
++set -uo pipefail
++
++SELF=$(basename "$0")
++
++usage() {
++    cat >&2 <<EOF
++usage: $SELF --bead <id> --pr <number|#number|url> --sha <40-hex> \\
++           --verdict approved|changes_requested [--reviewer <identity>]
++EOF
++}
++
++die_usage() {
++    echo "ERROR: $*" >&2
++    usage
++    exit 2
++}
++
++BEAD=""
++PR_ARG=""
++SHA_ARG=""
++VERDICT=""
++REVIEWER=""
++
++need_value() {
++    # $1 = remaining arg count including the flag itself, $2 = flag name
++    [ "$1" -ge 2 ] || die_usage "$2 requires a value"
++}
++
++while [ "$#" -gt 0 ]; do
++    case "$1" in
++        --bead) need_value "$#" --bead; BEAD="$2"; shift 2 ;;
++        --bead=*) BEAD="${1#*=}"; shift ;;
++        --pr) need_value "$#" --pr; PR_ARG="$2"; shift 2 ;;
++        --pr=*) PR_ARG="${1#*=}"; shift ;;
++        --sha) need_value "$#" --sha; SHA_ARG="$2"; shift 2 ;;
++        --sha=*) SHA_ARG="${1#*=}"; shift ;;
++        --verdict) need_value "$#" --verdict; VERDICT="$2"; shift 2 ;;
++        --verdict=*) VERDICT="${1#*=}"; shift ;;
++        --reviewer) need_value "$#" --reviewer; REVIEWER="$2"; shift 2 ;;
++        --reviewer=*) REVIEWER="${1#*=}"; shift ;;
++        -h|--help) usage; exit 0 ;;
++        *) die_usage "unknown argument: $1" ;;
++    esac
++done
++
++[ -n "$BEAD" ] || die_usage "--bead is required"
++[ -n "$PR_ARG" ] || die_usage "--pr is required"
++[ -n "$SHA_ARG" ] || die_usage "--sha is required"
++[ -n "$VERDICT" ] || die_usage "--verdict is required"
++
++# Accept the three shapes a reviewer agent naturally has on hand: a bare
++# number, a `#123` reference, or the PR URL the refinery recorded in
++# metadata.pr_url. Everything downstream compares plain integers.
++PR_NUMBER=$(printf '%s\n' "$PR_ARG" |
++    sed -nE 's|^[Hh][Tt][Tt][Pp][Ss]?://[^/]+/[^/]+/[^/]+/pull/([0-9]+)/?$|\1|p; s|^#([0-9]+)$|\1|p; s|^([0-9]+)$|\1|p' |
++    head -n 1)
++if [[ ! "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
++    die_usage "could not read a pull request number from --pr $PR_ARG"
++fi
++
++# Require the full 40-hex object name. An abbreviated SHA cannot be compared for
++# equality against the live head the gate reads back from GitHub, and a prefix
++# comparison is exactly the kind of near-match that would let a stale approval
++# through.
++if [[ ! "$SHA_ARG" =~ ^[0-9a-fA-F]{40}$ ]]; then
++    die_usage "--sha must be a full 40-character hex commit SHA"
++fi
++HEAD_SHA=$(printf '%s' "$SHA_ARG" | tr '[:upper:]' '[:lower:]')
++
++case "$VERDICT" in
++    approved|changes_requested) ;;
++    *) die_usage "--verdict must be approved or changes_requested" ;;
++esac
++
++if [ -z "$REVIEWER" ]; then
++    REVIEWER="${GC_AGENT:-${BEADS_ACTOR:-}}"
++fi
++if [ -z "$REVIEWER" ]; then
++    die_usage "--reviewer is required when neither GC_AGENT nor BEADS_ACTOR is set"
++fi
++
++RECORDED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
++
++# One update, five keys. A half-written signal is the dangerous state — a
++# verdict without its SHA would read as "approved" to a naive consumer — so the
++# whole signal lands atomically or not at all.
++if ! gc bd update "$BEAD" \
++    --set-metadata merge_approval.verdict="$VERDICT" \
++    --set-metadata merge_approval.pr_number="$PR_NUMBER" \
++    --set-metadata merge_approval.head_sha="$HEAD_SHA" \
++    --set-metadata merge_approval.reviewer="$REVIEWER" \
++    --set-metadata merge_approval.recorded_at="$RECORDED_AT"; then
++    echo "ERROR: failed to record merge approval signal on $BEAD" >&2
++    exit 1
++fi
++
++echo "merge approval recorded: bead=$BEAD verdict=$VERDICT pr=$PR_NUMBER sha=$HEAD_SHA reviewer=$REVIEWER at=$RECORDED_AT"
+diff --git a/gastown/tests/test_merge_approval_gate.sh b/gastown/tests/test_merge_approval_gate.sh
+new file mode 100755
+index 0000000..78993a0
+--- /dev/null
++++ b/gastown/tests/test_merge_approval_gate.sh
+@@ -0,0 +1,616 @@
++#!/usr/bin/env bash
++# Contract tests for the gc-native merge approval signal.
++#
++# The producer must never leave a half-written signal behind, and the gate must
++# refuse every path that is not a current, matching approval — including the
++# paths where it cannot reach a verdict at all. Most of what follows is
++# fail-closed coverage; the happy paths are the two small tests at the end.
++set -euo pipefail
++
++ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
++PRODUCER="$ROOT/gastown/assets/scripts/record-merge-approval.sh"
++GATE="$ROOT/gastown/assets/scripts/checks/merge-approval-gate.sh"
++
++SHA_APPROVED=$(printf 'a%.0s' $(seq 1 40))
++SHA_OTHER=$(printf 'b%.0s' $(seq 1 40))
++
++fail() {
++    echo "FAIL: $*" >&2
++    exit 1
++}
++
++write_gc_stub() {
++    local bin="$1"
++    mkdir -p "$bin"
++    cat >"$bin/gc" <<'SH'
++#!/usr/bin/env bash
++# Only `gc bd show <id> --json` and `gc bd update <id> --set-metadata ...`
++# are exercised here.
++case "${1:-} ${2:-}" in
++    "bd show")
++        if [ -n "${STUB_BEAD_JSON:-}" ] && [ -f "$STUB_BEAD_JSON" ]; then
++            cat "$STUB_BEAD_JSON"
++            exit 0
++        fi
++        exit 1
++        ;;
++    "bd update")
++        printf '%s\n' "$*" >>"${STUB_UPDATE_LOG:-/dev/null}"
++        exit "${STUB_UPDATE_EXIT:-0}"
++        ;;
++esac
++exit 0
++SH
++    chmod +x "$bin/gc"
++}
++
++write_gh_stub() {
++    local bin="$1"
++    mkdir -p "$bin"
++    cat >"$bin/gh" <<'SH'
++#!/usr/bin/env bash
++# Only `gh pr view <number> --json ...` is exercised here.
++if [ "${STUB_GH_EXIT:-0}" != "0" ]; then
++    echo "gh: simulated failure" >&2
++    exit "${STUB_GH_EXIT}"
++fi
++if [ -n "${STUB_PR_JSON:-}" ] && [ -f "$STUB_PR_JSON" ]; then
++    cat "$STUB_PR_JSON"
++    exit 0
++fi
++exit 1
++SH
++    chmod +x "$bin/gh"
++}
++
++# bead_json writes a work bead payload in the shape `gc bd show --json` returns
++# (a single-element array). $1 = output path, remaining args = metadata k=v.
++bead_json() {
++    local out="$1"
++    shift
++    local jq_args=(-n)
++    local filter='{id: "wb-1", metadata: {}}'
++    local i=0
++    for pair in "$@"; do
++        i=$((i + 1))
++        jq_args+=(--arg "k$i" "${pair%%=*}" --arg "v$i" "${pair#*=}")
++        filter="$filter | .metadata[\$k$i] = \$v$i"
++    done
++    jq "${jq_args[@]}" "[$filter]" >"$out"
++}
++
++pr_json() {
++    local out="$1" number="$2" state="$3" head_ref="$4" head_sha="$5"
++    jq -n \
++        --argjson number "$number" \
++        --arg state "$state" \
++        --arg headRefName "$head_ref" \
++        --arg headRefOid "$head_sha" \
++        '{number: $number, state: $state, headRefName: $headRefName, headRefOid: $headRefOid}' \
++        >"$out"
++}
++
++# run_gate invokes the gate with the standard stub environment and captures its
++# exit status and stderr. Sets GATE_STATUS and GATE_OUTPUT.
++run_gate() {
++    local bin="$1" bead_file="$2" pr_file="$3"
++    shift 3
++    set +e
++    GATE_OUTPUT=$(PATH="$bin:$PATH" \
++        STUB_BEAD_JSON="$bead_file" \
++        STUB_PR_JSON="$pr_file" \
++        STUB_GH_EXIT="${STUB_GH_EXIT:-0}" \
++        bash "$GATE" --bead wb-1 --required true "$@" 2>&1)
++    GATE_STATUS=$?
++    set -e
++}
++
++expect_refusal() {
++    local want_reason="$1"
++    [ "$GATE_STATUS" -eq 1 ] ||
++        fail "expected refusal (exit 1) for $want_reason, got exit $GATE_STATUS: $GATE_OUTPUT"
++    grep -F "reason=$want_reason" <<<"$GATE_OUTPUT" >/dev/null ||
++        fail "expected refusal reason=$want_reason, got: $GATE_OUTPUT"
++}
++
++expect_undecidable() {
++    local want_reason="$1"
++    [ "$GATE_STATUS" -eq 2 ] ||
++        fail "expected undecidable (exit 2) for $want_reason, got exit $GATE_STATUS: $GATE_OUTPUT"
++    grep -F "reason=$want_reason" <<<"$GATE_OUTPUT" >/dev/null ||
++        fail "expected undecidable reason=$want_reason, got: $GATE_OUTPUT"
++}
++
++# ── Producer ────────────────────────────────────────────────────────────────
++
++test_producer_records_complete_signal() {
++    local tmp bin log
++    tmp=$(mktemp -d)
++    bin="$tmp/bin"
++    log="$tmp/update.log"
++    write_gc_stub "$bin"
++
++    PATH="$bin:$PATH" STUB_UPDATE_LOG="$log" GC_AGENT="rig/specialists.iris" \
++        bash "$PRODUCER" \
++        --bead wb-1 \
++        --pr "https://github.com/acme/widgets/pull/7" \
++        --sha "$(printf '%s' "$SHA_APPROVED" | tr '[:lower:]' '[:upper:]')" \
++        --verdict approved >/dev/null ||
++        fail "producer failed on a valid approval"
++
++    [[ "$(wc -l <"$log")" -eq 1 ]] ||
++        fail "producer must write the whole signal in a single bd update"
++    local line
++    line=$(cat "$log")
++    grep -F 'merge_approval.verdict=approved' <<<"$line" >/dev/null ||
++        fail "verdict not recorded: $line"
++    grep -F 'merge_approval.pr_number=7' <<<"$line" >/dev/null ||
++        fail "PR URL was not normalized to a number: $line"
++    grep -F "merge_approval.head_sha=$SHA_APPROVED" <<<"$line" >/dev/null ||
++        fail "head SHA not normalized to lowercase: $line"
++    grep -F 'merge_approval.reviewer=rig/specialists.iris' <<<"$line" >/dev/null ||
++        fail "reviewer identity not recorded from GC_AGENT: $line"
++    grep -E 'merge_approval\.recorded_at=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z' <<<"$line" >/dev/null ||
++        fail "timestamp not recorded: $line"
++}
++
++test_producer_rejects_invalid_input() {
++    local tmp bin log status
++    tmp=$(mktemp -d)
++    bin="$tmp/bin"
++    log="$tmp/update.log"
++    write_gc_stub "$bin"
++    : >"$log"
++
++    # An abbreviated SHA cannot be compared against the live head, so it must
++    # not be recordable at all.
++    set +e
++    PATH="$bin:$PATH" STUB_UPDATE_LOG="$log" GC_AGENT="iris" bash "$PRODUCER" \
++        --bead wb-1 --pr 7 --sha "aaaaaaa" --verdict approved >/dev/null 2>&1
++    status=$?
++    set -e
++    [ "$status" -eq 2 ] || fail "abbreviated SHA should be rejected with exit 2, got $status"
++
++    set +e
++    PATH="$bin:$PATH" STUB_UPDATE_LOG="$log" GC_AGENT="iris" bash "$PRODUCER" \
++        --bead wb-1 --pr 7 --sha "$SHA_APPROVED" --verdict lgtm >/dev/null 2>&1
++    status=$?
++    set -e
++    [ "$status" -eq 2 ] || fail "unknown verdict should be rejected with exit 2, got $status"
++
++    set +e
++    PATH="$bin:$PATH" STUB_UPDATE_LOG="$log" GC_AGENT="iris" bash "$PRODUCER" \
++        --bead wb-1 --pr "not-a-pr" --sha "$SHA_APPROVED" --verdict approved >/dev/null 2>&1
++    status=$?
++    set -e
++    [ "$status" -eq 2 ] || fail "unparseable PR reference should be rejected with exit 2, got $status"
++
++    # No reviewer identity anywhere: an anonymous approval is not a signal.
++    set +e
++    PATH="$bin:$PATH" STUB_UPDATE_LOG="$log" GC_AGENT="" BEADS_ACTOR="" bash "$PRODUCER" \
++        --bead wb-1 --pr 7 --sha "$SHA_APPROVED" --verdict approved >/dev/null 2>&1
++    status=$?
++    set -e
++    [ "$status" -eq 2 ] || fail "missing reviewer identity should be rejected with exit 2, got $status"
++
++    [[ ! -s "$log" ]] || fail "rejected input must not write anything to the bead: $(cat "$log")"
++}
++
++test_producer_surfaces_write_failure() {
++    local tmp bin status
++    tmp=$(mktemp -d)
++    bin="$tmp/bin"
++    write_gc_stub "$bin"
++
++    set +e
++    PATH="$bin:$PATH" STUB_UPDATE_EXIT=1 GC_AGENT="iris" bash "$PRODUCER" \
++        --bead wb-1 --pr 7 --sha "$SHA_APPROVED" --verdict approved >/dev/null 2>&1
++    status=$?
++    set -e
++    [ "$status" -eq 1 ] || fail "a failed bead write must exit 1, got $status"
++}
++
++# ── Gate: opt-in ────────────────────────────────────────────────────────────
++
++test_gate_is_opt_in() {
++    local tmp bin status output
++    tmp=$(mktemp -d)
++    bin="$tmp/bin"
++    write_gc_stub "$bin"
++    write_gh_stub "$bin"
++
++    # No bead payload is staged: a gate that reached the store would fail. The
++    # disabled gate must not look at all.
++    for value in "" false FALSE 0 no off; do
++        set +e
++        output=$(PATH="$bin:$PATH" bash "$GATE" --bead wb-1 --required "$value" 2>&1)
++        status=$?
++        set -e
++        [ "$status" -eq 0 ] ||
++            fail "--required '$value' should disable the gate, got exit $status: $output"
++        grep -F 'GATE: not-required' <<<"$output" >/dev/null ||
++            fail "--required '$value' should report not-required, got: $output"
++    done
++
++    # Unset falls back to the env var, which is also unset here.
++    set +e
++    output=$(PATH="$bin:$PATH" bash "$GATE" --bead wb-1 2>&1)
++    status=$?
++    set -e
++    [ "$status" -eq 0 ] || fail "an unset opt-in should disable the gate, got exit $status: $output"
++}
++
++test_gate_treats_unrecognized_opt_in_as_enabled() {
++    local tmp bin bead pr
++    tmp=$(mktemp -d)
++    bin="$tmp/bin"
++    bead="$tmp/bead.json"
++    pr="$tmp/pr.json"
++    write_gc_stub "$bin"
++    write_gh_stub "$bin"
++    bead_json "$bead" "branch=polecat/wb-1"
++    pr_json "$pr" 7 OPEN "polecat/wb-1" "$SHA_APPROVED"
++
++    # A typo in the rig config must not silently disable review.
++    set +e
++    GATE_OUTPUT=$(PATH="$bin:$PATH" STUB_BEAD_JSON="$bead" STUB_PR_JSON="$pr" \
++        bash "$GATE" --bead wb-1 --required "ture" 2>&1)
++    GATE_STATUS=$?
++    set -e
++    expect_refusal "no_approval_signal"
++}
++
++# ── Gate: fail-closed refusals ──────────────────────────────────────────────
++
++test_gate_refuses_missing_and_partial_signals() {
++    local tmp bin bead pr
++    tmp=$(mktemp -d)
++    bin="$tmp/bin"
++    bead="$tmp/bead.json"
++    pr="$tmp/pr.json"
++    write_gc_stub "$bin"
++    write_gh_stub "$bin"
++    pr_json "$pr" 7 OPEN "polecat/wb-1" "$SHA_APPROVED"
++
++    bead_json "$bead" "branch=polecat/wb-1"
++    run_gate "$bin" "$bead" "$pr"
++    expect_refusal "no_approval_signal"
++
++    # A verdict without the SHA that scopes it is the dangerous half-write.
++    bead_json "$bead" \
++        "branch=polecat/wb-1" \
++        "merge_approval.verdict=approved" \
++        "merge_approval.pr_number=7"
++    run_gate "$bin" "$bead" "$pr"
++    expect_refusal "incomplete_approval_signal"
++
++    # Reviewer identity and timestamp are part of the signal, not decoration.
++    bead_json "$bead" \
++        "branch=polecat/wb-1" \
++        "merge_approval.verdict=approved" \
++        "merge_approval.pr_number=7" \
++        "merge_approval.head_sha=$SHA_APPROVED"
++    run_gate "$bin" "$bead" "$pr"
++    expect_refusal "incomplete_approval_signal"
++}
++
++test_gate_refuses_non_approving_verdict() {
++    local tmp bin bead pr
++    tmp=$(mktemp -d)
++    bin="$tmp/bin"
++    bead="$tmp/bead.json"
++    pr="$tmp/pr.json"
++    write_gc_stub "$bin"
++    write_gh_stub "$bin"
++    pr_json "$pr" 7 OPEN "polecat/wb-1" "$SHA_APPROVED"
++    bead_json "$bead" \
++        "branch=polecat/wb-1" \
++        "merge_approval.verdict=changes_requested" \
++        "merge_approval.pr_number=7" \
++        "merge_approval.head_sha=$SHA_APPROVED" \
++        "merge_approval.reviewer=iris" \
++        "merge_approval.recorded_at=2026-07-31T18:00:00Z"
++
++    run_gate "$bin" "$bead" "$pr"
++    expect_refusal "verdict_not_approved"
++}
++
++test_gate_refuses_wrong_pr_number() {
++    local tmp bin bead pr
++    tmp=$(mktemp -d)
++    bin="$tmp/bin"
++    bead="$tmp/bead.json"
++    pr="$tmp/pr.json"
++    write_gc_stub "$bin"
++    write_gh_stub "$bin"
++    pr_json "$pr" 7 OPEN "polecat/wb-1" "$SHA_APPROVED"
++
++    # An approval recorded against a different PR cannot authorize this one.
++    bead_json "$bead" \
++        "branch=polecat/wb-1" \
++        "pr_number=7" \
++        "merge_approval.verdict=approved" \
++        "merge_approval.pr_number=9" \
++        "merge_approval.head_sha=$SHA_APPROVED" \
++        "merge_approval.reviewer=iris" \
++        "merge_approval.recorded_at=2026-07-31T18:00:00Z"
++    run_gate "$bin" "$bead" "$pr"
++    expect_refusal "pr_number_mismatch"
++
++    # Same check when the bead carries only the PR URL form.
++    bead_json "$bead" \
++        "branch=polecat/wb-1" \
++        "pr_url=https://github.com/acme/widgets/pull/7" \
++        "merge_approval.verdict=approved" \
++        "merge_approval.pr_number=9" \
++        "merge_approval.head_sha=$SHA_APPROVED" \
++        "merge_approval.reviewer=iris" \
++        "merge_approval.recorded_at=2026-07-31T18:00:00Z"
++    run_gate "$bin" "$bead" "$pr"
++    expect_refusal "pr_number_mismatch"
++}
++
++test_gate_refuses_stale_head_sha() {
++    local tmp bin bead pr
++    tmp=$(mktemp -d)
++    bin="$tmp/bin"
++    bead="$tmp/bead.json"
++    pr="$tmp/pr.json"
++    write_gc_stub "$bin"
++    write_gh_stub "$bin"
++
++    # Approval was recorded for SHA_APPROVED; the author has since pushed
++    # SHA_OTHER. The approval must not follow the branch forward.
++    pr_json "$pr" 7 OPEN "polecat/wb-1" "$SHA_OTHER"
++    bead_json "$bead" \
++        "branch=polecat/wb-1" \
++        "pr_number=7" \
++        "merge_approval.verdict=approved" \
++        "merge_approval.pr_number=7" \
++        "merge_approval.head_sha=$SHA_APPROVED" \
++        "merge_approval.reviewer=iris" \
++        "merge_approval.recorded_at=2026-07-31T18:00:00Z"
++
++    run_gate "$bin" "$bead" "$pr"
++    expect_refusal "stale_head_sha"
++}
++
++test_gate_refuses_merge_sha_that_was_not_approved() {
++    local tmp bin bead pr
++    tmp=$(mktemp -d)
++    bin="$tmp/bin"
++    bead="$tmp/bead.json"
++    pr="$tmp/pr.json"
++    write_gc_stub "$bin"
++    write_gh_stub "$bin"
++    pr_json "$pr" 7 OPEN "polecat/wb-1" "$SHA_APPROVED"
++    bead_json "$bead" \
++        "branch=polecat/wb-1" \
++        "pr_number=7" \
++        "merge_approval.verdict=approved" \
++        "merge_approval.pr_number=7" \
++        "merge_approval.head_sha=$SHA_APPROVED" \
++        "merge_approval.reviewer=iris" \
++        "merge_approval.recorded_at=2026-07-31T18:00:00Z"
++
++    # The refinery is about to merge a commit that is not the reviewed one:
++    # the local branch tip drifted from the PR head.
++    run_gate "$bin" "$bead" "$pr" --merge-sha "$SHA_OTHER"
++    expect_refusal "merge_sha_not_approved"
++}
++
++test_gate_refuses_unbindable_or_closed_pr() {
++    local tmp bin bead pr
++    tmp=$(mktemp -d)
++    bin="$tmp/bin"
++    bead="$tmp/bead.json"
++    pr="$tmp/pr.json"
++    write_gc_stub "$bin"
++    write_gh_stub "$bin"
++
++    # No branch on the bead: nothing ties the reviewed PR to this work.
++    pr_json "$pr" 7 OPEN "polecat/wb-1" "$SHA_APPROVED"
++    bead_json "$bead" \
++        "merge_approval.verdict=approved" \
++        "merge_approval.pr_number=7" \
++        "merge_approval.head_sha=$SHA_APPROVED" \
++        "merge_approval.reviewer=iris" \
++        "merge_approval.recorded_at=2026-07-31T18:00:00Z"
++    run_gate "$bin" "$bead" "$pr"
++    expect_refusal "bead_has_no_branch"
++
++    # The reviewed PR belongs to some other branch.
++    pr_json "$pr" 7 OPEN "polecat/other" "$SHA_APPROVED"
++    bead_json "$bead" \
++        "branch=polecat/wb-1" \
++        "merge_approval.verdict=approved" \
++        "merge_approval.pr_number=7" \
++        "merge_approval.head_sha=$SHA_APPROVED" \
++        "merge_approval.reviewer=iris" \
++        "merge_approval.recorded_at=2026-07-31T18:00:00Z"
++    run_gate "$bin" "$bead" "$pr"
++    expect_refusal "pr_branch_mismatch"
++
++    # A closed PR is not a live approval target.
++    pr_json "$pr" 7 CLOSED "polecat/wb-1" "$SHA_APPROVED"
++    bead_json "$bead" \
++        "branch=polecat/wb-1" \
++        "merge_approval.verdict=approved" \
++        "merge_approval.pr_number=7" \
++        "merge_approval.head_sha=$SHA_APPROVED" \
++        "merge_approval.reviewer=iris" \
++        "merge_approval.recorded_at=2026-07-31T18:00:00Z"
++    run_gate "$bin" "$bead" "$pr"
++    expect_refusal "pr_not_open"
++}
++
++test_gate_refuses_when_it_cannot_evaluate() {
++    local tmp bin bead pr
++    tmp=$(mktemp -d)
++    bin="$tmp/bin"
++    bead="$tmp/bead.json"
++    pr="$tmp/pr.json"
++    write_gc_stub "$bin"
++    write_gh_stub "$bin"
++    pr_json "$pr" 7 OPEN "polecat/wb-1" "$SHA_APPROVED"
++    bead_json "$bead" \
++        "branch=polecat/wb-1" \
++        "merge_approval.verdict=approved" \
++        "merge_approval.pr_number=7" \
++        "merge_approval.head_sha=$SHA_APPROVED" \
++        "merge_approval.reviewer=iris" \
++        "merge_approval.recorded_at=2026-07-31T18:00:00Z"
++
++    # The PR lookup fails: the gate cannot tell whether the approval is
++    # current, so it must not merge.
++    STUB_GH_EXIT=1 run_gate "$bin" "$bead" "$pr"
++    unset STUB_GH_EXIT
++    expect_undecidable "pr_lookup_failed"
++
++    # GitHub answered but without a usable head SHA.
++    jq -n '{number: 7, state: "OPEN", headRefName: "polecat/wb-1", headRefOid: ""}' >"$pr"
++    run_gate "$bin" "$bead" "$pr"
++    expect_undecidable "unresolvable_live_head_sha"
++
++    # The bead store is unreadable.
++    pr_json "$pr" 7 OPEN "polecat/wb-1" "$SHA_APPROVED"
++    run_gate "$bin" "$tmp/missing-bead.json" "$pr"
++    expect_undecidable "bead_unreadable"
++}
++
++# ── Gate: permitted merges ──────────────────────────────────────────────────
++
++test_gate_permits_current_approval() {
++    local tmp bin bead pr
++    tmp=$(mktemp -d)
++    bin="$tmp/bin"
++    bead="$tmp/bead.json"
++    pr="$tmp/pr.json"
++    write_gc_stub "$bin"
++    write_gh_stub "$bin"
++    pr_json "$pr" 7 OPEN "polecat/wb-1" "$SHA_APPROVED"
++    bead_json "$bead" \
++        "branch=polecat/wb-1" \
++        "pr_number=7" \
++        "merge_approval.verdict=approved" \
++        "merge_approval.pr_number=7" \
++        "merge_approval.head_sha=$SHA_APPROVED" \
++        "merge_approval.reviewer=rig/specialists.iris" \
++        "merge_approval.recorded_at=2026-07-31T18:00:00Z"
++
++    run_gate "$bin" "$bead" "$pr" --merge-sha "$SHA_APPROVED"
++    [ "$GATE_STATUS" -eq 0 ] ||
++        fail "a current approval matching the live head should permit the merge: $GATE_OUTPUT"
++    grep -F "GATE: approved" <<<"$GATE_OUTPUT" >/dev/null ||
++        fail "the permitted path should report the approval it acted on: $GATE_OUTPUT"
++    grep -F "reviewer=rig/specialists.iris" <<<"$GATE_OUTPUT" >/dev/null ||
++        fail "the permitted path should name the approving reviewer: $GATE_OUTPUT"
++}
++
++test_gate_resolves_pr_without_gh_cli() {
++    local tmp bin bead pr status output
++    tmp=$(mktemp -d)
++    bin="$tmp/bin"
++    bead="$tmp/bead.json"
++    pr="$tmp/pr.json"
++    mkdir -p "$bin"
++    write_gc_stub "$bin"
++
++    # Rigs without the gh CLI must still be able to reach a verdict, otherwise
++    # the fail-closed gate deadlocks them permanently — the very failure this
++    # gate exists to end. Build a hermetic PATH so the host's real gh cannot
++    # satisfy `command -v gh`.
++    local tool
++    for tool in bash basename cat tr sed head awk jq sleep; do
++        ln -sf "$(command -v "$tool")" "$bin/$tool"
++    done
++    cat >"$bin/git" <<'SH'
++#!/usr/bin/env bash
++if [ "${1:-}" = "remote" ] && [ "${2:-}" = "get-url" ]; then
++    echo "https://github.com/acme/widgets.git"
++    exit 0
++fi
++exit 1
++SH
++    chmod +x "$bin/git"
++    cat >"$bin/curl" <<'SH'
++#!/usr/bin/env bash
++# Answer only the pulls endpoint for the expected repo, in REST shape.
++for arg in "$@"; do
++    case "$arg" in
++        https://api.github.com/repos/acme/widgets/pulls/7)
++            cat "$STUB_REST_JSON"
++            exit 0
++            ;;
++    esac
++done
++exit 22
++SH
++    chmod +x "$bin/curl"
++
++    jq -n --arg sha "$SHA_APPROVED" \
++        '{number: 7, state: "open", head: {ref: "polecat/wb-1", sha: $sha}}' >"$pr"
++    bead_json "$bead" \
++        "branch=polecat/wb-1" \
++        "pr_number=7" \
++        "merge_approval.verdict=approved" \
++        "merge_approval.pr_number=7" \
++        "merge_approval.head_sha=$SHA_APPROVED" \
++        "merge_approval.reviewer=iris" \
++        "merge_approval.recorded_at=2026-07-31T18:00:00Z"
++
++    set +e
++    output=$(PATH="$bin" STUB_BEAD_JSON="$bead" STUB_REST_JSON="$pr" GH_TOKEN=stub-token \
++        "$bin/bash" "$GATE" --bead wb-1 --required true --merge-sha "$SHA_APPROVED" 2>&1)
++    status=$?
++    set -e
++    [ "$status" -eq 0 ] ||
++        fail "REST fallback should reach the same verdict without gh, got exit $status: $output"
++    grep -F "GATE: approved" <<<"$output" >/dev/null ||
++        fail "REST fallback should report the approval: $output"
++}
++
++# ── Formula wiring ──────────────────────────────────────────────────────────
++
++test_refinery_patrol_consumes_the_gate() {
++    local formula="$ROOT/gastown/formulas/mol-refinery-patrol.toml"
++
++    # Parse the TOML rather than grepping around the var block: the default
++    # sits after a multi-line description, and an off-by-default gate is the
++    # single most important property to assert.
++    python3 - "$formula" <<'PY' || fail "require_merge_approval must be declared and default to off"
++import sys, tomllib
++
++with open(sys.argv[1], "rb") as handle:
++    formula = tomllib.load(handle)
++var = formula.get("vars", {}).get("require_merge_approval")
++if var is None:
++    sys.exit("patrol formula does not declare require_merge_approval")
++if var.get("default") != "false":
++    sys.exit(f"require_merge_approval default is {var.get('default')!r}, want 'false'")
++PY
++    grep -F 'merge-approval-gate.sh' "$formula" >/dev/null ||
++        fail "patrol formula should invoke the merge approval gate"
++    grep -F 'APPROVAL_GATE_STATUS' "$formula" >/dev/null ||
++        fail "patrol formula should branch on the gate's exit status"
++    grep -F 'merge_approval_state=awaiting_review' "$formula" >/dev/null ||
++        fail "a refused merge should park the bead as awaiting_review, not close it"
++}
++
++test_producer_records_complete_signal
++test_producer_rejects_invalid_input
++test_producer_surfaces_write_failure
++test_gate_is_opt_in
++test_gate_treats_unrecognized_opt_in_as_enabled
++test_gate_refuses_missing_and_partial_signals
++test_gate_refuses_non_approving_verdict
++test_gate_refuses_wrong_pr_number
++test_gate_refuses_stale_head_sha
++test_gate_refuses_merge_sha_that_was_not_approved
++test_gate_refuses_unbindable_or_closed_pr
++test_gate_refuses_when_it_cannot_evaluate
++test_gate_permits_current_approval
++test_gate_resolves_pr_without_gh_cli
++test_refinery_patrol_consumes_the_gate
++
++echo "merge approval gate tests passed"
+-- 
+2.50.1 (Apple Git-155)
+
