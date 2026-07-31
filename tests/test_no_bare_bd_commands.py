@@ -142,6 +142,12 @@ BARE_BD_PATH_CHECK = re.compile(r"\bcommand[ \t]+-v[ \t]+bd\b")
 BARE_BD_SERIALIZED_ARGV = re.compile(
     rf'''(?:\[|\{{|=|:)\s*["']bd["']\s*,\s*["'](?:{BD_SUBCOMMAND_PATTERN})["']'''
 )
+# patches/ is the derived `git format-patch BASELINE..HEAD` export (see
+# docs/fork-patches.md). Its diff hunks quote the pre-image of every line a fork
+# commit changed, so a commit that REPLACES a bare `bd` call would ship a patch
+# file still containing it. Skipping it loses no coverage: the shipped
+# post-image of that same content is scanned directly.
+DERIVED_PREFIXES = ("patches/",)
 GC_BD_ARGV_TAIL_MARKER = "gc-bd-argv-tail"
 GC_BD_ARGV_TAIL_FIXTURE = Path("tests/test_gascity_pack_inference_gate.py")
 GC_BD_ARGV_TAIL_LINES = {
@@ -158,7 +164,11 @@ def tracked_files() -> list[Path]:
         check=True,
         capture_output=True,
     )
-    return [REPO_ROOT / path for path in result.stdout.decode().split("\0") if path]
+    return [
+        REPO_ROOT / path
+        for path in result.stdout.decode().split("\0")
+        if path and not path.startswith(DERIVED_PREFIXES)
+    ]
 
 
 def python_argv_violations(path: Path, text: str) -> list[str]:

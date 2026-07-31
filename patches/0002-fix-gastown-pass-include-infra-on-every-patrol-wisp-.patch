@@ -1,0 +1,430 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 31 Jul 2026 04:19:19 -0400
+Subject: [PATCH 2/2] fix(gastown): pass --include-infra on every patrol wisp
+ query (gcp-xbl)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Patrol wisp roots are ephemeral beads that live in the wisps table. bd's
+list command sets filter.SkipWisps whenever --include-infra is absent and
+the requested --type is not a configured infra type (cmd/bd/list.go:1097);
+`molecule` never is, so every `gc bd list --type=molecule` query the witness,
+refinery, and deacon prompts and patrol formulas ship returned zero rows —
+silently, with no error to notice. Probed live against the gascity-packs
+ledger: `--status=open --type=molecule` -> 0 results, the same query plus
+--include-infra -> 1 result.
+
+The consequences differ per agent but all leak. The witness reconcile-to-
+exactly-one blocks saw an empty list, so they never burned a surplus wisp and
+never resumed a queued one — each cycle poured a fresh wisp and stranded the
+prior one. Refinery and deacon use the same query to resolve CURRENT_WISP when
+GC_BEAD_ID is unset; it resolved empty, they took the "Could not resolve
+current wisp; not burning" path, and the just-poured successor left the old
+wisp behind. This commit adds --include-infra to all sixteen shipped molecule
+queries, including the prose one in the refinery patrol-summary step.
+
+The reconcile blocks carried a second defect: they queried --status=open only,
+so a successor a crashed session had already flipped to in_progress was
+invisible and leaked forever. Those now query --status=open,in_progress and
+filter out the wisp the agent is on by id, so a claimed-but-orphaned wisp is
+reconciled while the live one can never be burned out from under the agent.
+That exclusion is why the status widening is safe, and why the witness formula's
+next-iteration step now resolves CURRENT_WISP explicitly instead of burning a
+hand-substituted <this-wisp-id> placeholder. The deacon prompt's fallback gains
+the surplus burn the witness already had, so all three agents reconcile alike.
+
+Validation: tests/test_wisp_molecule_queries.py is a new static guard in the
+style of test_no_bare_bd_commands.py — it walks tracked files, joins shell line
+continuations, and fails any --type=molecule flag not paired with
+--include-infra, with detector self-tests for the space form, the continuation
+form, and the `issue_type=molecule` prose spelling it must not flag. Verified
+red against the pre-fix tree (17 sites reported) and green after. Full suite:
+103 passed / 7 skipped; golangci-lint 0 issues; validate_registry.py ok;
+go vet, go build, go test -race all clean.
+
+Follow-up: tests/test_gc_role_prompt_integration.py has one failure when run
+with GC_TEST_BIN set (claim route mismatch). It reproduces on a clean
+origin/integration checkout and is unrelated to this change; filed as gcp-7af.
+
+Both static guards also learned to skip patches/, the derived format-patch
+export. Its hunks quote the pre-image of every changed line, so this commit's
+own export re-introduced the broken query text and a removed bare-bd line, and
+the guards flagged their own fix — a structural gap in the fork patch system
+that only shows up once a fork commit deletes a guarded pattern. Skipping the
+derived artifact costs no coverage: the shipped post-image of that content is
+still scanned directly.
+---
+ gastown/agents/deacon/prompt.template.md   | 15 +++-
+ gastown/agents/refinery/prompt.template.md |  7 +-
+ gastown/agents/witness/prompt.template.md  | 28 ++++---
+ gastown/formulas/mol-deacon-patrol.toml    |  2 +-
+ gastown/formulas/mol-refinery-patrol.toml  | 18 ++--
+ gastown/formulas/mol-witness-patrol.toml   | 26 ++++--
+ tests/test_no_bare_bd_commands.py          | 12 ++-
+ tests/test_wisp_molecule_queries.py        | 98 ++++++++++++++++++++++
+ 8 files changed, 175 insertions(+), 31 deletions(-)
+ create mode 100644 tests/test_wisp_molecule_queries.py
+
+diff --git a/gastown/agents/deacon/prompt.template.md b/gastown/agents/deacon/prompt.template.md
+index 23323a1..83617f9 100644
+--- a/gastown/agents/deacon/prompt.template.md
++++ b/gastown/agents/deacon/prompt.template.md
+@@ -89,9 +89,20 @@ If `next-iteration` already ran, do not pour again; run `gc hook`.
+ ```bash
+ CURRENT_WISP=${GC_BEAD_ID:-}
+ if [ -z "$CURRENT_WISP" ]; then
+-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
++  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
+ fi
+-ASSIGNED_WISP=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
++# Reconcile your other patrol wisps to exactly one successor. `--include-infra`
++# is REQUIRED — wisp roots are ephemeral beads in the wisps table, which gc bd
++# list skips unless asked for, so without it this returns nothing, you pour a
++# duplicate, and the queued wisp leaks. Query open,in_progress (a successor a
++# crashed session already claimed is still yours to resume) and exclude the
++# wisp you are on so it is never burned here.
++SURPLUS_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json \
++  | jq -r --arg cur "$CURRENT_WISP" '.[] | select(.id != $cur) | .id')
++ASSIGNED_WISP=$(printf '%s\n' $SURPLUS_WISPS | sed -n '1p')
++for extra in $(printf '%s\n' $SURPLUS_WISPS | sed '1d'); do
++  gc bd mol burn "$extra" --force
++done
+ if [ -n "$CURRENT_WISP" ] && [ -z "$ASSIGNED_WISP" ]; then
+   NEXT=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id // empty')
+   if [ -z "$NEXT" ]; then
+diff --git a/gastown/agents/refinery/prompt.template.md b/gastown/agents/refinery/prompt.template.md
+index b2cd38b..bb048a4 100644
+--- a/gastown/agents/refinery/prompt.template.md
++++ b/gastown/agents/refinery/prompt.template.md
+@@ -69,7 +69,10 @@ external observers (witness, mayor) only catch on a slow patrol cycle.
+ ```bash
+ CURRENT_WISP=${GC_BEAD_ID:-}
+ if [ -z "$CURRENT_WISP" ]; then
+-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
++  # --include-infra is REQUIRED: wisp roots are ephemeral beads in the wisps
++  # table, which gc bd list skips unless asked for. Without it this resolves
++  # empty, the current wisp is never burned, and every cycle leaks one.
++  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
+ fi
+ NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id // empty')
+ if [ -z "$NEXT" ]; then
+@@ -114,7 +117,7 @@ assign the next wisp, burn the current wisp, THEN request restart**:
+ ```bash
+ CURRENT_WISP=${GC_BEAD_ID:-}
+ if [ -z "$CURRENT_WISP" ]; then
+-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
++  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
+ fi
+ NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id // empty')
+ if [ -z "$NEXT" ]; then
+diff --git a/gastown/agents/witness/prompt.template.md b/gastown/agents/witness/prompt.template.md
+index 3b96830..5a085e7 100644
+--- a/gastown/agents/witness/prompt.template.md
++++ b/gastown/agents/witness/prompt.template.md
+@@ -164,10 +164,12 @@ nothing).
+ # Step 1: Reconcile your patrol wisps to exactly one (town ledger, via gc bd).
+ # Collect every open/in_progress patrol wisp assigned to you, keep one, and
+ # burn the surplus so restarts never accumulate duplicates. Wisp roots are
+-# molecules — filter --type=molecule, never --type=wisp.
++# molecules — filter --type=molecule, never --type=wisp. `--include-infra` is
++# REQUIRED: wisp roots are ephemeral beads in the wisps table, which gc bd list
++# skips unless asked for, so a query without it silently returns nothing.
+ WISP_IDS=$(
+-  gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=0 --json | jq -r '.[].id'
+-  gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --limit=0 --json | jq -r '.[].id'
++  gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=0 --json | jq -r '.[].id'
++  gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r '.[].id'
+ )
+ WISP=$(printf '%s\n' $WISP_IDS | sed -n '1p')           # keep one (prefers in_progress)
+ for extra in $(printf '%s\n' $WISP_IDS | sed '1d'); do  # burn any surplus
+@@ -203,16 +205,20 @@ If `next-iteration` already ran, do not pour again; run `gc hook`.
+ ```bash
+ CURRENT_WISP=${GC_BEAD_ID:-}
+ if [ -z "$CURRENT_WISP" ]; then
+-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
++  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
+ fi
+-# Reconcile queued (open) patrol wisps to exactly one. A prior cycle may have
+-# poured a next wisp without burning, or a restart may have raced — keep the
+-# first and burn the surplus so wisps never accumulate. Wisp roots are
++# Reconcile your other patrol wisps to exactly one successor. A prior cycle may
++# have poured a next wisp without burning, or a restart may have raced — keep
++# the first and burn the surplus so wisps never accumulate. Wisp roots are
+ # molecules (never --type=wisp, which is not a valid gc bd type and matches
+-# nothing).
+-OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --limit=0 --json | jq -r '.[].id')
+-ASSIGNED_WISP=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
+-for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
++# nothing), and they live in the wisps table, so `--include-infra` is REQUIRED
++# or the query returns nothing and every cycle leaks a wisp. Query
++# open,in_progress — a successor a crashed session already claimed is still
++# yours to resume — and exclude the wisp you are on so it is never burned here.
++SURPLUS_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json \
++  | jq -r --arg cur "$CURRENT_WISP" '.[] | select(.id != $cur) | .id')
++ASSIGNED_WISP=$(printf '%s\n' $SURPLUS_WISPS | sed -n '1p')
++for extra in $(printf '%s\n' $SURPLUS_WISPS | sed '1d'); do
+   gc bd mol burn "$extra" --force
+ done
+ if [ -n "$CURRENT_WISP" ] && [ -z "$ASSIGNED_WISP" ]; then
+diff --git a/gastown/formulas/mol-deacon-patrol.toml b/gastown/formulas/mol-deacon-patrol.toml
+index 9568e6d..d158805 100644
+--- a/gastown/formulas/mol-deacon-patrol.toml
++++ b/gastown/formulas/mol-deacon-patrol.toml
+@@ -460,7 +460,7 @@ Handle any urgent messages that arrived during patrol. Archive the rest.
+ ```bash
+ CURRENT_WISP=${GC_BEAD_ID:-}
+ if [ -z "$CURRENT_WISP" ]; then
+-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
++  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
+ fi
+ 
+ NEXT=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix='{{binding_prefix}}' --json | jq -r '.new_epic_id // empty')
+diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
+index 63a46fb..a968839 100644
+--- a/gastown/formulas/mol-refinery-patrol.toml
++++ b/gastown/formulas/mol-refinery-patrol.toml
+@@ -119,7 +119,7 @@ wisp, burn the current wisp, then request a restart:
+ ```bash
+ CURRENT_WISP=${GC_BEAD_ID:-}
+ if [ -z "$CURRENT_WISP" ]; then
+-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
++  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
+ fi
+ NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
+ if [ -z "$NEXT" ]; then
+@@ -242,7 +242,7 @@ gc bd update $WORK \
+ ```bash
+ CURRENT_WISP=${GC_BEAD_ID:-}
+ if [ -z "$CURRENT_WISP" ]; then
+-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
++  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
+ fi
+ NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
+ if [ -z "$NEXT" ]; then
+@@ -343,7 +343,7 @@ TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_bran
+      ```bash
+      CURRENT_WISP=${GC_BEAD_ID:-}
+      if [ -z "$CURRENT_WISP" ]; then
+-       CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
++       CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
+      fi
+      NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
+      if [ -z "$NEXT" ]; then
+@@ -435,7 +435,7 @@ Branch: $BRANCH
+ Target: $TARGET"
+   CURRENT_WISP=${GC_BEAD_ID:-}
+   if [ -z "$CURRENT_WISP" ]; then
+-    CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
++    CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
+   fi
+   if [ -z "$CURRENT_WISP" ]; then
+     echo "Could not resolve current wisp; not burning."
+@@ -1105,9 +1105,11 @@ Include:
+ If the cycle ended early (conflict rejection, no work found), note
+ why and what state was left.
+ 
+-This summary is not stored separately — it lives in the wisp's
+-closing reason. The next session can find it via `gc bd list --type=molecule
+---status=closed --limit=5` if it needs predecessor context."""
++This summary is not stored separately — it lives in the wisp's closing
++reason. If the next session needs predecessor context, find it with
++`gc bd list --type=molecule --include-infra --status=closed --limit=5`
++(`--include-infra` is required — wisp roots live in the wisps table and
++are skipped without it)."""
+ 
+ [[steps]]
+ id = "next-iteration"
+@@ -1143,7 +1145,7 @@ If auto_land = "false": skip this entirely.
+ ```bash
+ CURRENT_WISP=${GC_BEAD_ID:-}
+ if [ -z "$CURRENT_WISP" ]; then
+-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
++  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
+ fi
+ NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
+ if [ -z "$NEXT" ]; then
+diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
+index 4703946..449fc94 100644
+--- a/gastown/formulas/mol-witness-patrol.toml
++++ b/gastown/formulas/mol-witness-patrol.toml
+@@ -527,13 +527,23 @@ is already assigned — the new session resumes from context.
+ 
+ Reuse an already-queued wisp instead of pouring a duplicate. A prior cycle
+ may have poured a next wisp without burning, or a restart may have raced —
+-keep one open patrol wisp and burn any surplus, so wisps never accumulate.
++keep one patrol wisp and burn any surplus, so wisps never accumulate.
+ Wisp roots are `issue_type=molecule` (never `--type=wisp`, which is not a
+-valid gc bd type and matches nothing).
++valid gc bd type and matches nothing), and they live in the wisps table, so
++`--include-infra` is REQUIRED — without it the query returns nothing, you
++pour a duplicate every cycle, and the prior wisp leaks. Query
++`open,in_progress`: a successor a crashed session already claimed is still
++yours to resume, and an open-only query leaves it stranded forever. Exclude
++the wisp you are on so this reconcile can never burn it out from under you.
+ ```bash
+-OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --limit=0 --json | jq -r '.[].id')
+-NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
+-for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
++CURRENT_WISP=${GC_BEAD_ID:-}
++if [ -z "$CURRENT_WISP" ]; then
++  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
++fi
++SURPLUS_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json \
++  | jq -r --arg cur "$CURRENT_WISP" '.[] | select(.id != $cur) | .id')
++NEXT=$(printf '%s\n' $SURPLUS_WISPS | sed -n '1p')
++for extra in $(printf '%s\n' $SURPLUS_WISPS | sed '1d'); do
+   gc bd mol burn "$extra" --force
+ done
+ if [ -z "$NEXT" ]; then
+@@ -544,7 +554,11 @@ fi
+ 
+ **3. Burn this wisp:**
+ ```bash
+-gc bd mol burn <this-wisp-id> --force
++if [ -n "$CURRENT_WISP" ]; then
++  gc bd mol burn "$CURRENT_WISP" --force
++else
++  echo "Could not resolve current witness wisp; not burning."
++fi
+ ```
+ 
+ **4. Exit this turn:**
+diff --git a/tests/test_no_bare_bd_commands.py b/tests/test_no_bare_bd_commands.py
+index 4d35385..d6d4783 100644
+--- a/tests/test_no_bare_bd_commands.py
++++ b/tests/test_no_bare_bd_commands.py
+@@ -142,6 +142,12 @@ BARE_BD_PATH_CHECK = re.compile(r"\bcommand[ \t]+-v[ \t]+bd\b")
+ BARE_BD_SERIALIZED_ARGV = re.compile(
+     rf'''(?:\[|\{{|=|:)\s*["']bd["']\s*,\s*["'](?:{BD_SUBCOMMAND_PATTERN})["']'''
+ )
++# patches/ is the derived `git format-patch BASELINE..HEAD` export (see
++# docs/fork-patches.md). Its diff hunks quote the pre-image of every line a fork
++# commit changed, so a commit that REPLACES a bare `bd` call would ship a patch
++# file still containing it. Skipping it loses no coverage: the shipped
++# post-image of that same content is scanned directly.
++DERIVED_PREFIXES = ("patches/",)
+ GC_BD_ARGV_TAIL_MARKER = "gc-bd-argv-tail"
+ GC_BD_ARGV_TAIL_FIXTURE = Path("tests/test_gascity_pack_inference_gate.py")
+ GC_BD_ARGV_TAIL_LINES = {
+@@ -158,7 +164,11 @@ def tracked_files() -> list[Path]:
+         check=True,
+         capture_output=True,
+     )
+-    return [REPO_ROOT / path for path in result.stdout.decode().split("\0") if path]
++    return [
++        REPO_ROOT / path
++        for path in result.stdout.decode().split("\0")
++        if path and not path.startswith(DERIVED_PREFIXES)
++    ]
+ 
+ 
+ def python_argv_violations(path: Path, text: str) -> list[str]:
+diff --git a/tests/test_wisp_molecule_queries.py b/tests/test_wisp_molecule_queries.py
+new file mode 100644
+index 0000000..23ee7f9
+--- /dev/null
++++ b/tests/test_wisp_molecule_queries.py
+@@ -0,0 +1,98 @@
++"""Guard: every shipped wisp query passes --include-infra.
++
++Patrol wisp roots (`gc bd mol wisp ... --root-only`) are ephemeral beads that
++live in the wisps table. `gc bd list` sets `SkipWisps` whenever `--include-infra`
++is absent and the requested `--type` is not a configured infra type; `molecule`
++never is, so a `--type=molecule` query without `--include-infra` silently
++returns zero rows instead of erroring.
++
++That silence is the whole bug class this guard exists for: the agent reads
++"no wisps" as "nothing to reconcile", pours a fresh wisp, and never burns the
++prior one — witness, refinery, and deacon each leak one wisp per patrol cycle,
++with no failure signal anywhere. The queries are prose in prompt templates and
++formula TOML, so nothing else type-checks them.
++"""
++
++from __future__ import annotations
++
++from pathlib import Path
++import re
++import subprocess
++
++
++REPO_ROOT = Path(__file__).resolve().parents[1]
++THIS_FILE = Path(__file__).resolve()
++
++# patches/ is the derived `git format-patch BASELINE..HEAD` export (see
++# docs/fork-patches.md). Its diff hunks quote the pre-image of every line a fork
++# commit changed, so a commit that FIXES a query here would ship a patch file
++# still containing the broken form. Skipping it loses no coverage: the shipped
++# post-image of that same content is scanned directly.
++DERIVED_PREFIXES = ("patches/",)
++
++# Match the flag form only (`--type=molecule` / `--type molecule`), never the
++# prose spelling `issue_type=molecule` that documents what a wisp root is.
++MOLECULE_TYPE_FLAG = re.compile(r"(?<!issue_type)(?<!\w)--type[= ]molecule\b")
++INCLUDE_INFRA_FLAG = "--include-infra"
++# Shell continuations split a single command over several source lines; join
++# them before checking so a flag on the continuation line still counts.
++LINE_CONTINUATION = re.compile(r"\\\r?\n[ \t]*")
++
++
++def tracked_files() -> list[Path]:
++    result = subprocess.run(
++        ["git", "ls-files", "-z"],
++        cwd=REPO_ROOT,
++        check=True,
++        capture_output=True,
++    )
++    return [
++        REPO_ROOT / path
++        for path in result.stdout.decode().split("\0")
++        if path and not path.startswith(DERIVED_PREFIXES)
++    ]
++
++
++def molecule_query_violations(path: Path, text: str) -> list[str]:
++    violations = []
++    relative = path.relative_to(REPO_ROOT) if path.is_absolute() else path
++    joined = LINE_CONTINUATION.sub(" ", text)
++    for line_number, line in enumerate(joined.splitlines(), start=1):
++        if MOLECULE_TYPE_FLAG.search(line) and INCLUDE_INFRA_FLAG not in line:
++            violations.append(f"{relative}:{line_number}: {line.strip()}")
++    return violations
++
++
++def test_shipped_molecule_queries_include_infra() -> None:
++    violations = []
++    for path in tracked_files():
++        if path.resolve() == THIS_FILE:
++            continue
++        try:
++            text = path.read_text(encoding="utf-8")
++        except UnicodeDecodeError:
++            continue
++        violations.extend(molecule_query_violations(path, text))
++
++    assert not violations, (
++        "wisp queries without --include-infra silently return zero rows:\n"
++        + "\n".join(violations)
++    )
++
++
++def test_detector_covers_flag_forms_and_prose() -> None:
++    fixture = Path("fixture.txt")
++
++    assert molecule_query_violations(fixture, "gc bd list --type=molecule --limit=0")
++    assert molecule_query_violations(fixture, "gc bd list --type molecule --limit=0")
++    assert molecule_query_violations(
++        fixture, "gc bd list --type=molecule \\\n  --status=open --json"
++    )
++    assert not molecule_query_violations(
++        fixture, "gc bd list --type=molecule --include-infra --limit=0"
++    )
++    assert not molecule_query_violations(
++        fixture, "gc bd list --type=molecule \\\n  --include-infra --json"
++    )
++    # Prose describing wisp roots is not a query.
++    assert not molecule_query_violations(fixture, "Wisp roots are `issue_type=molecule`.")
+-- 
+2.50.1 (Apple Git-155)
+
