@@ -33,6 +33,50 @@ gc formula show mol-shutdown-dance
 The recipe must read warrant metadata from the claimed bead via
 `$GC_BEAD_ID` and must not declare a required `warrant_id` var.
 
+## Merge Approval Gate
+
+`mol-refinery-patrol` can require a reviewed merge. The gate is **opt-in per
+rig** and off by default, so rigs that do not require review are unaffected:
+
+```toml
+[rigs.formula_vars]
+require_merge_approval = "true"
+review_agent = "specialists.iris"   # optional: nudged when a bead parks
+```
+
+gc cannot emit a formal GitHub review event, so the approval signal is
+gc-native: it lives in the work bead's own metadata, keyed to the PR number
+and the exact head SHA the reviewer read.
+
+| Metadata key | Meaning |
+|---|---|
+| `merge_approval.verdict` | `approved` or `changes_requested` |
+| `merge_approval.pr_number` | PR the verdict applies to |
+| `merge_approval.head_sha` | Full 40-hex commit the reviewer read |
+| `merge_approval.reviewer` | Approving reviewer identity |
+| `merge_approval.recorded_at` | UTC timestamp |
+
+A reviewer agent produces the signal:
+
+```bash
+assets/scripts/record-merge-approval.sh \
+    --bead <work-bead> --pr <number|url> --sha <live-head-sha> --verdict approved
+```
+
+The refinery consumes it through
+`assets/scripts/checks/merge-approval-gate.sh`, which re-reads the live PR head
+from GitHub and permits the merge only when the approved SHA is still the head.
+An approval therefore authorizes one commit, not a branch — pushing after review
+invalidates it. Every other outcome refuses, including the ones the gate cannot
+explain (unreadable bead, PR lookup failure, unresolvable head SHA): a tool
+error is a suspect, not a licence to merge.
+
+Turning the gate on implies the pull-request lane. `merge_strategy=direct` is
+promoted to `mr`, because a reviewed merge needs a PR to review; PR publication
+becomes the start of review instead of the terminal handoff, and a refused
+merge parks the bead (`merge_approval_state=awaiting_review`) for the next
+patrol iteration rather than closing or escalating it.
+
 ## Dog Pool
 
 Gastown owns `mol-shutdown-dance` and the dog agent that runs stuck-agent

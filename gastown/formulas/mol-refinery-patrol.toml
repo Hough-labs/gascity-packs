@@ -27,6 +27,13 @@ In `mr` mode, refinery treats PR publication as the terminal handoff for
 the direct-bead workflow: it records the PR URL on the work bead and
 closes the bead once the PR is verified.
 
+Rigs that require review set `require_merge_approval = "true"` in their
+`formula_vars`. That promotes `direct` to `mr` and turns PR publication into
+the start of review rather than the handoff: nothing lands until a reviewer
+records an approval signal on the work bead naming the PR and the exact head
+SHA. See the merge-push step for the full lane. Default is off, so rigs that
+do not require review behave exactly as before.
+
 Read each step's description before acting — Config values override defaults."""
 formula = "mol-refinery-patrol"
 
@@ -69,6 +76,24 @@ default = "main"
 [vars.delete_merged_branches]
 description = "Whether to delete source branches after merge"
 default = "true"
+
+[vars.require_merge_approval]
+description = """
+Opt-in review gate. When true, no branch lands without a gc-native approval
+signal on the work bead naming this PR and the exact head SHA the reviewer
+read (see the merge-push step). Default false, so rigs that do not require
+review are unaffected. Set it in the rig's `formula_vars`. Turning it on
+implies the pull-request lane: a reviewed merge needs a PR to review, so
+merge_strategy=direct is promoted to mr."""
+default = "false"
+
+[vars.review_agent]
+description = """
+Optional agent address to nudge when the approval gate parks a bead awaiting
+review, e.g. `specialists.iris` (the rig prefix is added automatically). Empty
+= no nudge, and the reviewer is expected to find the parked bead another way.
+From rig `formula_vars`."""
+default = ""
 
 [vars.integration_branch_auto_land]
 description = "Auto-create work beads to land completed integration branches"
@@ -421,6 +446,69 @@ if [ -n "$EXISTING_PR" ] && [ "$MERGE_STRATEGY" = "direct" ]; then
   MERGE_STRATEGY="mr"
 fi
 
+# Approval gate opt-in. Only the recognized off values disable it; anything
+# unrecognized (a typo in the rig's formula_vars) turns it ON, because the
+# failure mode of a mis-read switch must be "review required", never "review
+# silently skipped".
+case "$(printf '%s' "{{require_merge_approval}}" | tr '[:upper:]' '[:lower:]')" in
+  ''|false|0|no|off) APPROVAL_REQUIRED=0 ;;
+  *) APPROVAL_REQUIRED=1 ;;
+esac
+if [ "$APPROVAL_REQUIRED" -eq 1 ] && [ "$MERGE_STRATEGY" = "direct" ]; then
+  # A reviewed merge needs something to review. Without this promotion the
+  # gate would refuse every direct-mode bead forever (fail-closed, but
+  # permanently deadlocked) because no PR would ever exist to approve.
+  echo "require_merge_approval is on; a reviewed merge needs a pull request — using merge_strategy=mr."
+  MERGE_STRATEGY="mr"
+fi
+APPROVAL_GATE=""
+if [ "$APPROVAL_REQUIRED" -eq 1 ]; then
+  for cand in \
+    "${GC_PACK_DIR:-}/assets/scripts/checks/merge-approval-gate.sh" \
+    "${GC_CITY:-}/.gc/scripts/checks/merge-approval-gate.sh" \
+    "${GC_CITY_PATH:-}/.gc/scripts/checks/merge-approval-gate.sh" \
+    ".gc/scripts/checks/merge-approval-gate.sh"
+  do
+    if [ -f "$cand" ]; then
+      APPROVAL_GATE="$cand"
+      break
+    fi
+  done
+  if [ -z "$APPROVAL_GATE" ]; then
+    echo "require_merge_approval is on but merge-approval-gate.sh was not found. STOP. Do not mutate bead state."
+    echo "An unreadable gate is not an approval."
+    gc runtime drain-ack
+    exit 1
+  fi
+fi
+
+run_approval_gate() {
+  # $1 = the commit the refinery is about to land. Passing it closes the gap
+  # where the local rebased tip has drifted from the reviewed PR head.
+  ag_sha="${1:-}"
+  set -- --bead "$WORK" --required "{{require_merge_approval}}"
+  if [ -n "$ag_sha" ]; then
+    set -- "$@" --merge-sha "$ag_sha"
+  fi
+  bash "$APPROVAL_GATE" "$@"
+}
+
+park_awaiting_review() {
+  # A refused merge is not a failure and not an incident: the branch is fine,
+  # the reviewer simply has not approved THIS commit. Leave the bead open and
+  # assigned to the refinery with the refusal recorded, nudge the reviewer if
+  # the rig named one, and let the next patrol iteration re-check. Never
+  # close, never escalate, never retry the merge in this iteration.
+  gc bd update "$WORK" \
+    --set-metadata merge_approval_state=awaiting_review \
+    --set-metadata merge_approval_gate_reason="$1"
+  if [ -n "{{review_agent}}" ]; then
+    gc session nudge "${GC_RIG:+$GC_RIG/}{{review_agent}}" "REVIEW NEEDED: $WORK — ${PR_URL:-$BRANCH} awaiting merge approval. Record a verdict with record-merge-approval.sh (--pr + --sha of the live head)."
+  fi
+  echo "APPROVAL GATE REFUSED: $WORK — $1"
+  echo "Bead left open and assigned to the refinery; skip the merge and run patrol-summary + next-iteration."
+}
+
 block_existing_pr() {
   reason="$1"
   gc bd update $WORK \
@@ -674,6 +762,29 @@ if [ "$MERGE_STRATEGY" = "mr" ] && [ -z "$ORIGIN_REPO" ]; then
   exit 1
 fi
 ```
+
+**Approval-gated merge lane (`require_merge_approval = {{require_merge_approval}}`)**
+
+Off by default; when the rig turns it on, the refinery may not land anything
+without a gc-native approval signal recorded on the work bead. The signal lives
+in `merge_approval.*` metadata — verdict, PR number, head SHA, reviewer,
+timestamp — written by a reviewer agent via
+`assets/scripts/record-merge-approval.sh` and read here by
+`assets/scripts/checks/merge-approval-gate.sh`.
+
+The head SHA is the whole point. An approval authorizes one commit, not a
+branch: the gate re-reads the live PR head and refuses anything else, so
+commits pushed after review do not inherit the approval. It refuses just as
+hard when it cannot tell — unreadable bead, PR lookup failure, missing head
+SHA. A tool error is a suspect, not a licence to merge.
+
+Because the gate is keyed to a PR, `direct` was promoted to `mr` above. The
+lane runs: publish/verify the PR, record its metadata, then gate. Approved for
+the live head -> land it with the same ff-only merge script the direct path
+uses. Refused -> park the bead awaiting review and let the next patrol
+iteration re-check. A rebase that moves the branch changes the PR head and
+therefore invalidates a prior approval — that is intended, since what would be
+merged is no longer what was read.
 
 **If MERGE_STRATEGY = "direct" (default):**
 
@@ -1046,25 +1157,66 @@ fi
 ```
 If this command fails or prints empty output: STOP. Debug and retry. Do NOT continue.
 
-**4. Record PR metadata and close the work bead:**
+**4. Record PR metadata, then hand off or gate the merge:**
 
-Run as a single chained command so the metadata write cannot be skipped
-when the close-reason already names the PR. Both the `--set-metadata`
-write and the `gc bd close` are required — `pr_url` and `pr_number`
-are the only forensic breadcrumbs tying a closed bead to its pull
-request. `--unset-metadata rejection_reason` clears any stale rejection
-field from an earlier rejected/reworked attempt before the successful
-close.
+Record the PR breadcrumbs first, in one update. `pr_url` and `pr_number` are
+the only forensic breadcrumbs tying this bead to its pull request, and the
+approval gate reads `pr_number` back to check that the reviewer approved THIS
+PR — so the write must land before the gate runs, not alongside a close.
+`--unset-metadata rejection_reason` clears any stale rejection field from an
+earlier rejected/reworked attempt.
 
 ```bash
 gc bd update $WORK \
-  --set-metadata merge_result=pull_request \
   --set-metadata pr_url="$PR_URL" \
   --set-metadata pr_number="$PR_NUMBER" \
   --set-metadata merged_target="$TARGET" \
-  --unset-metadata rejection_reason && \
+  --unset-metadata rejection_reason
+```
+
+**4a. Approval gate off (`APPROVAL_REQUIRED` = 0) — PR publication is the
+terminal handoff, unchanged:**
+
+```bash
+gc bd update $WORK --set-metadata merge_result=pull_request && \
 gc bd close $WORK --reason "Pull request ready: $PR_URL"
 ```
+
+**4b. Approval gate on (`APPROVAL_REQUIRED` = 1) — the PR is the start of
+review, not the handoff:**
+
+```bash
+APPROVAL_GATE_OUTPUT=$(run_approval_gate "$(git rev-parse temp)" 2>&1)
+APPROVAL_GATE_STATUS=$?
+echo "$APPROVAL_GATE_OUTPUT"
+if [ "$APPROVAL_GATE_STATUS" -ne 0 ]; then
+  park_awaiting_review "$APPROVAL_GATE_OUTPUT"
+fi
+```
+
+If `APPROVAL_GATE_STATUS` is non-zero the bead is parked awaiting review: do
+NOT close it, do NOT merge, do NOT drain-ack, do NOT escalate. Run **5.
+Cleanup** and let this step complete so patrol-summary and next-iteration pour
+the next wisp — the bead stays open and assigned to the refinery, and the next
+iteration re-checks the gate. Waiting for a reviewer is the normal state of
+this lane, not an incident.
+
+If `APPROVAL_GATE_STATUS` is 0 the live PR head is the exact commit a reviewer
+approved. Land it:
+
+```bash
+gc bd update "$WORK" \
+  --set-metadata merge_approval_state=approved \
+  --unset-metadata merge_approval_gate_reason
+```
+
+Then run the direct path's **1. Merge, push, verify, and close work bead**
+script verbatim. It merges `temp` ff-only into `$TARGET`, verifies the remote
+ref moved, records `merged_sha`/`merged_target`, and closes the bead as
+merged. GitHub marks the pull request merged once its head commits are
+reachable from the base, so no separate PR-close call is needed. If that
+script exits non-zero: STOP, do not mutate bead state, and do not retry the
+gate — a later patrol iteration re-runs the whole path.
 
 **5. Cleanup:**
 ```bash
@@ -1085,7 +1237,7 @@ The Gastown example refinery supports direct and mr/pr merge strategies only."
 ```
 Do NOT close the bead, delete the branch, or burn the wisp until a human decides how to proceed.
 
-**GATE**: direct mode requires verified target push. mr mode requires verified PR URL. Bead closure only happens after the selected handoff is confirmed."""
+**GATE**: direct mode requires verified target push. mr mode requires verified PR URL. Bead closure only happens after the selected handoff is confirmed. When `require_merge_approval` is on, every merge additionally requires an approval signal matching the live PR head SHA; anything else — including a gate that cannot reach a verdict — parks the bead instead of landing it."""
 
 [[steps]]
 id = "patrol-summary"

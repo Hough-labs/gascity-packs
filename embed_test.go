@@ -12,6 +12,8 @@ func TestGastownEmbedsPackContent(t *testing.T) {
 		"agents/dog/agent.toml",
 		"agents/dog/prompt.template.md",
 		"formulas/mol-shutdown-dance.toml",
+		"assets/scripts/record-merge-approval.sh",
+		"assets/scripts/checks/merge-approval-gate.sh",
 		"template-fragments/propulsion.template.md",
 		"overlay/per-provider/codex/.codex/hooks.json",
 	} {
