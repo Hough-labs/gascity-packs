@@ -103,6 +103,36 @@ becomes the start of review instead of the terminal handoff, and a refused
 merge parks the bead (`merge_approval_state=awaiting_review`) for the next
 patrol iteration rather than closing or escalating it.
 
+## Role prompts point at formulas
+
+`agents/*/prompt.template.md` is injected into an agent's context at spawn and
+reads as authoritative operating instructions. A formula step in `formulas/`
+has to be opened deliberately. That asymmetry makes a restated command
+dangerous: when the formula gains a flag and the prompt's copy does not, the
+agent runs the lossy copy, it executes cleanly, and the dropped behaviour is
+simply gone. A partial command in injected context is worse than no command.
+
+**The rule: a prompt template names the formula step; it does not restate the
+step's command.** A pointer cannot drift; a copy can.
+
+Three narrow exceptions, each of which must be *complete*, not condensed:
+
+- **Cold-start bootstrap.** The first wisp pour has no formula step to read
+  yet. Marked as bootstrap-only in each template, with a pointer to the
+  `next-iteration` step that owns every later pour.
+- **A role with no formula.** `boot` runs a single-pass watchdog with no
+  formula, so its warrant command is authoritative there — and therefore
+  carries the dedup guard that the formula-owned copies carry.
+- **A flag whose omission fails silently.** The refinery's Rejection Flow
+  quotes the pool-return `gc bd update` verbatim, marked as a copy naming the
+  authoritative step, because a rejection that drops
+  `--set-metadata gc.routed_to=...` orphans the bead with no error, no stall
+  signal, and no wake.
+
+`tests/test_prompt_formula_command_drift.py` enforces the invariants whose loss
+was observed in practice: pool-returning updates declare their routing, warrant
+creation in injected context is deduped, and a prompt bail-out path drain-acks.
+
 ## Dog Pool
 
 Gastown owns `mol-shutdown-dance` and the dog agent that runs stuck-agent

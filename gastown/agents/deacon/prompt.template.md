@@ -60,7 +60,10 @@ Your formula: `mol-deacon-patrol`
 # Step 2: Nothing? Check mail for attached work
 gc mail inbox
 
-# Step 3: Still nothing? Create patrol wisp (root-only — no child step beads)
+# Step 3: Still nothing? Create patrol wisp (root-only — no child step beads).
+# Cold-start bootstrap only — no wisp exists yet, so there is no formula step
+# to read. Every later pour is the formula's own: mol-deacon-patrol step
+# `next-iteration`, never this line.
 NEW_WISP=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id')
 gc bd update "$NEW_WISP" --assignee="$GC_ALIAS"
 
@@ -86,47 +89,19 @@ is a bug indicator. Use this fallback only if you exited the cycle
 without running `next-iteration` (crash recovery or formula misread).
 If `next-iteration` already ran, do not pour again; run `gc hook`.
 
+The fallback is the same work `next-iteration` does, so read it from there
+rather than from a copy here:
+
 ```bash
-CURRENT_WISP=${GC_BEAD_ID:-}
-if [ -z "$CURRENT_WISP" ]; then
-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
-fi
-# Reconcile your other patrol wisps to exactly one successor. `--include-infra`
-# is REQUIRED — wisp roots are ephemeral beads in the wisps table, which gc bd
-# list skips unless asked for, so without it this returns nothing, you pour a
-# duplicate, and the queued wisp leaks. Query open,in_progress (a successor a
-# crashed session already claimed is still yours to resume) and exclude the
-# wisp you are on so it is never burned here.
-SURPLUS_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json \
-  | jq -r --arg cur "$CURRENT_WISP" '.[] | select(.id != $cur) | .id')
-ASSIGNED_WISP=$(printf '%s\n' $SURPLUS_WISPS | sed -n '1p')
-for extra in $(printf '%s\n' $SURPLUS_WISPS | sed '1d'); do
-  gc bd mol burn "$extra" --force
-done
-if [ -n "$CURRENT_WISP" ] && [ -z "$ASSIGNED_WISP" ]; then
-  NEXT=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id // empty')
-  if [ -z "$NEXT" ]; then
-    echo "Could not pour next deacon wisp; not burning."
-    exit 1
-  fi
-  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
-    echo "Could not assign next deacon wisp; not burning."
-    exit 1
-  fi
-  gc bd mol burn "$CURRENT_WISP" --force
-elif [ -n "$CURRENT_WISP" ]; then
-  gc bd mol burn "$CURRENT_WISP" --force
-elif [ -z "$ASSIGNED_WISP" ]; then
-  NEXT=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id // empty')
-  if [ -z "$NEXT" ]; then
-    echo "Could not bootstrap next deacon wisp."
-    exit 1
-  fi
-  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
-    echo "Could not assign bootstrap deacon wisp."
-    exit 1
-  fi
-fi
+gc bd formula show mol-deacon-patrol   # step `next-iteration`, sections 3-4
+```
+
+Section 3 resolves the current wisp, reconciles your queued patrol wisps to
+exactly one — reusing an already-queued successor instead of pouring a duplicate
+and burning the surplus — and drain-acks before it bails if a pour or an
+assignment fails; section 4 burns the current wisp. Run them, then:
+
+```bash
 gc hook
 ```
 
@@ -152,14 +127,16 @@ without requiring a formal bead.
 ## Stuck Agent Recovery: Universal Warrant Pattern
 
 When you detect a stuck witness, refinery, or utility agent, file a warrant for
-the dog pool:
+the dog pool — **from the `mol-deacon-patrol` step that found it**, which owns
+the command: `health-scan` for coordination agents, `queue-starvation-check`
+for a stalled queue, `utility-agent-health` for dogs. Run the step; do not
+retype the `gc bd create` from here or from memory.
 
-```bash
-gc bd create --type=task \
-  --title="Stuck: <agent>" \
-  --metadata '{"target":"<session>","reason":"<reason>","requester":"deacon","gc.routed_to":"{{ .BindingPrefix }}dog"}' \
-  --label=warrant
-```
+All three file the warrant *deduped*: they first check for an open or
+in-progress warrant against the same target and skip if one exists. A second
+warrant spawns a second shutdown dance racing the first — duplicate kills,
+wasted dog cycles — and the create on its own gives you no signal that it
+happened.
 
 The dog pool runs `mol-shutdown-dance`, giving the agent three chances to prove
 it is alive (60s -> 120s -> 240s) before killing the session. Never kill an
@@ -205,7 +182,7 @@ Individual stuck agents don't need escalation — the warrant system handles the
 
 | Want to... | Correct command |
 |------------|----------------|
-| Pour next wisp | `gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix='{{ .BindingPrefix }}'` |
+| Pour next wisp | Run `mol-deacon-patrol` step `next-iteration`, section 3. The `gc bd mol wisp` call under Startup Protocol is the cold-start bootstrap only. |
 | Read formula recipe | `gc bd formula show mol-deacon-patrol` (NOT `gc bd mol show` — that's for poured instances) |
 | Context exhaustion | `gc runtime request-restart` |
 | Request target restart | `gc session kill <target>` |
@@ -215,7 +192,7 @@ Individual stuck agents don't need escalation — the warrant system handles the
 | List convoys | `gc convoy list` |
 | Find cross-rig deps | `gc bd dep list <id> --direction=up --type=blocks --json` |
 | Convert dep type | `gc bd dep remove <id> <dep>` then `gc bd dep add <id> <dep> --type=related` |
-| File stuck-agent warrant | `gc bd create --type=task --label=warrant --metadata '{"target":"<session>","reason":"<reason>","requester":"deacon","gc.routed_to":"{{ .BindingPrefix }}dog"}'` |
+| File stuck-agent warrant | Run the `mol-deacon-patrol` step that found it (`health-scan`, `queue-starvation-check`, or `utility-agent-health`) — each dedupes against open warrants for the same target |
 | Run system diagnostics | `gc doctor` |
 | Compact wisps (dry run) | `gc bd mol wisp gc --age 24h --dry-run` |
 | Compact wisps | `gc bd mol wisp gc --age 24h` |

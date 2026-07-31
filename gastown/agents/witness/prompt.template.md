@@ -157,14 +157,15 @@ polecat in your rig. Use judgment — there are no hardcoded thresholds.
 A long tool call is different from an infinite loop.
 
 **Response:** Do NOT kill stuck polecats directly. File a warrant bead
-for the dog pool:
+for the dog pool — **using `mol-witness-patrol` step `check-polecat-health`,
+which owns the command.** Run the step; do not retype the `gc bd create` from
+here or from memory.
 
-```bash
-gc bd create --type=task \
-  --title="Stuck: <agent>" \
-  --metadata '{"target":"<session>","reason":"<reason>","requester":"witness","gc.routed_to":"{{ .BindingPrefix }}dog"}' \
-  --label=warrant
-```
+The step files the warrant *deduped*: it first checks for an open or
+in-progress warrant against the same target and skips if one exists. A second
+warrant spawns a second shutdown dance racing the first — duplicate kills,
+wasted dog cycles — and the create on its own gives you no signal that it
+happened.
 
 The dog pool runs `mol-shutdown-dance` — a multi-stage interrogation
 that gives the polecat 3 chances to prove it's alive before killing it.
@@ -207,6 +208,9 @@ for extra in $(printf '%s\n' $WISP_IDS | sed '1d'); do  # burn any surplus
 done
 
 # Step 2: Already have a wisp? Resume it. Otherwise check mail, then pour ONE.
+# Cold-start bootstrap only — no wisp exists yet, so there is no formula step to
+# read. Every later pour is the formula's own: mol-witness-patrol step
+# `next-iteration`, never this line.
 if [ -n "$WISP" ]; then
   echo "Resuming patrol wisp $WISP"
 else
@@ -232,49 +236,18 @@ is a bug indicator. Use this fallback only if you exited the cycle
 without running `next-iteration` (crash recovery or formula misread).
 If `next-iteration` already ran, do not pour again; run `gc hook`.
 
+The fallback is the same work `next-iteration` does, so read it from there
+rather than from a copy here:
+
 ```bash
-CURRENT_WISP=${GC_BEAD_ID:-}
-if [ -z "$CURRENT_WISP" ]; then
-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
-fi
-# Reconcile your other patrol wisps to exactly one successor. A prior cycle may
-# have poured a next wisp without burning, or a restart may have raced — keep
-# the first and burn the surplus so wisps never accumulate. Wisp roots are
-# molecules (never --type=wisp, which is not a valid gc bd type and matches
-# nothing), and they live in the wisps table, so `--include-infra` is REQUIRED
-# or the query returns nothing and every cycle leaks a wisp. Query
-# open,in_progress — a successor a crashed session already claimed is still
-# yours to resume — and exclude the wisp you are on so it is never burned here.
-SURPLUS_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json \
-  | jq -r --arg cur "$CURRENT_WISP" '.[] | select(.id != $cur) | .id')
-ASSIGNED_WISP=$(printf '%s\n' $SURPLUS_WISPS | sed -n '1p')
-for extra in $(printf '%s\n' $SURPLUS_WISPS | sed '1d'); do
-  gc bd mol burn "$extra" --force
-done
-if [ -n "$CURRENT_WISP" ] && [ -z "$ASSIGNED_WISP" ]; then
-  NEXT=$(gc bd mol wisp mol-witness-patrol --root-only --var binding_prefix='{{ .BindingPrefix }}' --json | jq -r '.new_epic_id // empty')
-  if [ -z "$NEXT" ]; then
-    echo "Could not pour next witness wisp; not burning."
-    exit 1
-  fi
-  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
-    echo "Could not assign next witness wisp; not burning."
-    exit 1
-  fi
-  gc bd mol burn "$CURRENT_WISP" --force
-elif [ -n "$CURRENT_WISP" ]; then
-  gc bd mol burn "$CURRENT_WISP" --force
-elif [ -z "$ASSIGNED_WISP" ]; then
-  NEXT=$(gc bd mol wisp mol-witness-patrol --root-only --var binding_prefix='{{ .BindingPrefix }}' --json | jq -r '.new_epic_id // empty')
-  if [ -z "$NEXT" ]; then
-    echo "Could not bootstrap next witness wisp."
-    exit 1
-  fi
-  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
-    echo "Could not assign bootstrap witness wisp."
-    exit 1
-  fi
-fi
+gc bd formula show mol-witness-patrol   # step `next-iteration`, sections 2-3
+```
+
+Sections 2 and 3 reconcile the queued patrol wisps to exactly one — reusing an
+already-queued wisp instead of pouring a duplicate, and burning the surplus —
+then burn the current wisp. Run them, then:
+
+```bash
 gc hook
 ```
 
@@ -357,14 +330,14 @@ gc mail send mayor/ -s "ESCALATION: Brief description [HIGH]" -m "Details"
 
 | Want to... | Correct command |
 |------------|----------------|
-| Pour next wisp | `gc bd mol wisp mol-witness-patrol --root-only --var binding_prefix='{{ .BindingPrefix }}'` |
+| Pour next wisp | Run `mol-witness-patrol` step `next-iteration`, section 2. The `gc bd mol wisp` call under Startup Protocol is the cold-start bootstrap only. |
 | Context exhaustion | `gc runtime request-restart` |
 | Recover orphaned bead | `gc workflow delete-source <id> --apply && gc workflow reopen-source <id>` |
 | Salvage worktree work | `git add -A && git commit && git push origin HEAD` |
 | Delete worktree | `git worktree remove <path> --force` |
 | Review post-merge teardown | `tail -n 50 "$GC_CITY/.gc/runtime/logs/polecat-worktree-reap.log"` |
 | Set branch metadata | `gc bd update <id> --set-metadata branch=<name>` |
-| File stuck-agent warrant | `gc bd create --type=task --label=warrant --metadata '{"target":"<session>","reason":"<reason>","requester":"witness","gc.routed_to":"{{ .BindingPrefix }}dog"}'` |
+| File stuck-agent warrant | Run `mol-witness-patrol` step `check-polecat-health` — it dedupes against open warrants for the same target before creating one |
 
 Rig: {{ .RigName }}
 Working directory: {{ .WorkDir }}

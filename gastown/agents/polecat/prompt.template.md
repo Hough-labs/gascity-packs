@@ -225,9 +225,15 @@ while [ "$SHOW_TRY" -lt 3 ]; do
 done
 if [ "$SHOW_OK" -ne 1 ]; then
   # Never leave a claimed bead stranded in_progress on an unreadable state:
-  # release it so it re-enters the pool instead of being lost.
+  # release it so it re-enters the pool instead of being lost. Restate the
+  # routing on the way out — an open, unassigned bead with no gc.routed_to is
+  # not pooled, it is orphaned: nothing spawns for it and it looks healthy.
+  # The claim falls through to assigned work too, so this can be a bead that
+  # never carried pool routing; routing it here is strictly better than
+  # dropping it.
   echo "CLAIM_RELEASED $WORK_ID unreadable after retries; returning it to the pool"
-  gc bd update "$WORK_ID" --status=open --assignee=""
+  gc bd update "$WORK_ID" --status=open --assignee="" \
+    --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat"
   gc runtime drain-ack
   exit 0
 fi

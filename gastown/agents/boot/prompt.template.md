@@ -77,11 +77,25 @@ Drain-ack and exit. Next Boot wake will re-evaluate.
 
 Clearly stuck: file a warrant for the dog pool.
 
+Boot has no formula, so unlike every other warrant producer this command is
+authoritative here rather than a copy of a formula step — which means it has to
+carry the dedup guard itself. Boot wakes on a timer against a single target, so
+two consecutive "clearly stuck" verdicts would otherwise file two warrants and
+race two shutdown dances against the same deacon.
+
 ```bash
-gc bd create --type=task \
-  --title="Stuck: {{ .BindingPrefix }}deacon" \
-  --metadata '{"target":"{{ .BindingPrefix }}deacon","reason":"Stale patrol wisp, no activity","requester":"boot","gc.routed_to":"{{ .BindingPrefix }}dog"}' \
-  --label=warrant
+TARGET_SESSION="{{ .BindingPrefix }}deacon"
+EXISTING_WARRANT=$(gc bd list --label=warrant --json --limit=0 \
+  | jq -r --arg t "$TARGET_SESSION" \
+      '[.[] | select((.status == "open" or .status == "in_progress") and (.metadata.target == $t))] | length')
+if [ "${EXISTING_WARRANT:-0}" -gt 0 ]; then
+  echo "Skipping warrant for $TARGET_SESSION — an open warrant already exists."
+else
+  gc bd create --type=task \
+    --title="Stuck: $TARGET_SESSION" \
+    --metadata '{"target":"{{ .BindingPrefix }}deacon","reason":"Stale patrol wisp, no activity","requester":"boot","gc.routed_to":"{{ .BindingPrefix }}dog"}' \
+    --label=warrant
+fi
 ```
 The dog pool picks up the warrant and runs the shutdown dance.
 
@@ -114,7 +128,7 @@ with a fresh provider context.
 | View deacon output | `{{ cmd }} session peek {{ .BindingPrefix }}deacon --lines 30` |
 | Check deacon work | `gc bd list --assignee={{ .BindingPrefix }}deacon --status=in_progress --json` |
 | Nudge deacon | `{{ cmd }} session nudge {{ .BindingPrefix }}deacon "message"` |
-| File stuck warrant | `gc bd create --type=task --label=warrant --metadata '{"target":"{{ .BindingPrefix }}deacon","reason":"...","requester":"boot","gc.routed_to":"{{ .BindingPrefix }}dog"}'` |
+| File stuck warrant | Use the guarded block in Triage Step 3 — the bare `gc bd create` skips the open-warrant check and races a second shutdown dance |
 | Check active sessions | `{{ cmd }} session list` |
 
 Working directory: {{ .WorkDir }}

@@ -66,30 +66,15 @@ external observers (witness, mayor) only catch on a slow patrol cycle.
 
 ### 1. ALWAYS pour the next wisp before burning the current one
 
-```bash
-CURRENT_WISP=${GC_BEAD_ID:-}
-if [ -z "$CURRENT_WISP" ]; then
-  # --include-infra is REQUIRED: wisp roots are ephemeral beads in the wisps
-  # table, which gc bd list skips unless asked for. Without it this resolves
-  # empty, the current wisp is never burned, and every cycle leaks one.
-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
-fi
-NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id // empty')
-if [ -z "$NEXT" ]; then
-  echo "Could not pour next refinery wisp; not burning."
-  exit 1
-fi
-if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
-  echo "Could not assign next refinery wisp; not burning."
-  exit 1
-fi
-if [ -n "$CURRENT_WISP" ]; then
-  gc bd mol burn "$CURRENT_WISP" --force
-else
-  echo "Could not resolve current wisp; not burning."
-  exit 1
-fi
-```
+**The pour-and-burn command lives in `mol-refinery-patrol` step
+`next-iteration`, section 2.** Run it from there. It resolves the current wisp,
+pours the next one, fails closed if the pour or the assignment fails
+(drain-acking before it exits, so the reconciler can recycle the session), and
+only then burns the current wisp. Retyping it from memory is how the ordering
+and the failure handling get lost.
+
+The same block appears in the rejection paths of steps `rebase` and
+`handle-failures` — those copies are the formula's own and stay in sync with it.
 
 **This rule applies UNCONDITIONALLY, including when:**
 
@@ -114,26 +99,12 @@ heavy: multi-hour session, large recent diffs, or noticing yourself taking
 shortcuts or summarizing prematurely. If context feels heavy, then **pour and
 assign the next wisp, burn the current wisp, THEN request restart**:
 
+Run the pour-and-burn from `mol-refinery-patrol` step `next-iteration`
+(section 2) exactly as in Rule 1 above — if it bails, it has already
+drain-acked and you stop there rather than requesting a restart. Only once the
+current wisp is burned:
+
 ```bash
-CURRENT_WISP=${GC_BEAD_ID:-}
-if [ -z "$CURRENT_WISP" ]; then
-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
-fi
-NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id // empty')
-if [ -z "$NEXT" ]; then
-  echo "Could not pour next refinery wisp; not requesting restart."
-  exit 1
-fi
-if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
-  echo "Could not assign next refinery wisp; not requesting restart."
-  exit 1
-fi
-if [ -n "$CURRENT_WISP" ]; then
-  gc bd mol burn "$CURRENT_WISP" --force
-else
-  echo "Could not resolve current wisp; not requesting restart."
-  exit 1
-fi
 gc runtime request-restart
 RESTART_STATUS=$?
 echo "Restart request returned with status $RESTART_STATUS; stop this session now."
@@ -179,7 +150,10 @@ done
 # Step 1: Check for an in-progress patrol wisp
 {{ .AssignedInProgressQuery }}
 
-# If none found, pour one (root-only — no child step beads) and assign it
+# If none found, pour one (root-only — no child step beads) and assign it.
+# This is the cold-start bootstrap only — there is no wisp yet, so there is no
+# formula step to read. Every LATER pour is the formula's own: use
+# mol-refinery-patrol step `next-iteration`, never this line.
 WISP=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id')
 gc bd update "$WISP" --assignee="$GC_AGENT"
 ```
@@ -231,13 +205,43 @@ Never infer a branch name. If `metadata.branch` is missing, reject the bead.
 
 ## Rejection Flow
 
-On rebase conflict or test failure:
-1. Put work bead back in pool:
-   `gc bd update $WORK --status=open --assignee="" --set-metadata rejection_reason="..."`
+**The commands live in the formula, not here.** Rebase conflicts are handled by
+`mol-refinery-patrol` step `rebase`; quality-gate and test failures by step
+`handle-failures`. Run the step. Do not reconstruct the rejection from this
+summary — it is a description of the shape, not a substitute for the step.
+
+What the shape is:
+
+1. Clean up the workflow and reopen the source bead, then put the work bead
+   back in the pool with **both** `rejection_reason` and `gc.routed_to`.
 2. Branch handling depends on failure type:
    - Conflict: leave branch intact (polecat needs it for rebase)
    - Test failure: delete branch (polecat redoes work)
-3. Pour next wisp, burn current one
+3. Pour next wisp, burn current one (Patrol Lifecycle Discipline Rule 1)
+
+**`gc.routed_to` is not optional, and dropping it fails silently.** An open,
+unassigned bead with a `rejection_reason` and no routing looks exactly like a
+healthy pooled bead — but nothing spawns for it, so no polecat ever picks it up.
+There is no error, no stall signal, and no wake; the rejection reports success
+and the work is stranded until a human notices. Witness patrols are correctly
+told not to flag unassigned pool beads, so the one observer positioned to catch
+it is instructed to ignore it.
+
+The routing flag both steps set, quoted here **verbatim as a copy** — the
+original lives in `mol-refinery-patrol` steps `rebase` and `handle-failures`,
+which are authoritative if these ever disagree:
+
+```bash
+gc bd update $WORK \
+  --status=open \
+  --assignee="" \
+  --set-metadata rejection_reason="<why>" \
+  --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat"
+```
+
+The full step also runs `gc workflow delete-source $WORK --apply && gc workflow
+reopen-source $WORK` before this update, and cleans up the `temp` branch after.
+That is why you run the step rather than this fragment.
 
 A new polecat picks up the bead, sees `metadata.branch` and
 `metadata.rejection_reason`, rebases or redoes work, reassigns to refinery.
@@ -311,8 +315,9 @@ alert the witness, not `gc mail send`.
 
 | Want to... | Correct command |
 |------------|----------------|
-| Pour next wisp | `gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }}` |
+| Pour next wisp | Run `mol-refinery-patrol` step `next-iteration`, section 2. The bare `gc bd mol wisp` call under Startup is the cold-start bootstrap only — it skips the validate/assign/burn ordering. |
 | Burn current wisp | Follow Patrol Lifecycle Discipline Rule 1: pour next wisp, validate `NEXT`, assign it to `$GC_AGENT`, then burn `$CURRENT_WISP`. Never run a standalone burn. |
+| Reject a bead to the pool | Run `mol-refinery-patrol` step `rebase` (conflict) or `handle-failures` (test failure). The update must set `gc.routed_to` or the bead is silently orphaned. |
 | Find assigned work | `gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee="$GC_AGENT" --status=open` |
 | Snapshot event position | `gc events --seq` |
 | Wait for assignment | `gc events --watch --type=bead.updated --after=$SEQ` |
