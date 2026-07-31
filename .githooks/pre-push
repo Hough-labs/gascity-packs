@@ -1,12 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ── Fork: refuse to push a stale patches/ to the integration branch ──────────
+# ── Fork: refuse to push a stale patches/ ────────────────────────────────────
+# patches/ is a DERIVED artifact (git format-patch BASELINE..HEAD), so every
+# commit that diverges from BASELINE has to be re-exported. That obligation
+# lands on whoever authors the commit — but this check used to fire only on
+# pushes to refs/heads/integration, and the author of a fork commit pushes a
+# topic branch. The integration push is performed later, by someone else. So
+# the one push the author never performs was the only one guarded: a stale
+# export sailed through the author's green local run, and surfaced a full
+# review cycle later at the merge gate, on a branch already approved. Validate
+# every pushed branch instead — the obligation and the enforcement now land on
+# the same push.
+#
 # Keyed off the refs actually being pushed — git feeds
 # "<local ref> <local sha> <remote ref> <remote sha>" per ref on stdin — rather
 # than off HEAD. A push from a detached worktree, or one using an explicit
-# `HEAD:integration` refspec, updates integration without ever having it as its
-# symbolic HEAD, and a HEAD-keyed check would wave both through.
+# `HEAD:integration` refspec, updates a branch without ever having it as its
+# symbolic HEAD, and a HEAD-keyed check would wave both through. The pushed
+# local SHA goes to check-patches as REV, so what is validated is exactly what
+# lands, not whatever the working tree happens to hold.
+#
+# Branches that do not descend from BASELINE carry no fork divergence to
+# export; check-patches passes those itself rather than failing on a history
+# the patch stack does not describe.
 #
 # Validation only — it never amends. (An amend after git has already captured
 # the push range causes perpetual local/origin SHA drift.) Bypass with
@@ -17,12 +34,14 @@ set -euo pipefail
 zero="0000000000000000000000000000000000000000"
 
 while read -r _local_ref local_sha remote_ref _remote_sha; do
-  if [ "$remote_ref" != "refs/heads/integration" ]; then
-    continue
-  fi
   # Branch deletion — no tree to validate.
   if [ "$local_sha" = "$zero" ]; then
     continue
   fi
-  make -s check-patches
+  # Tags and other non-branch refs carry no patch-export obligation.
+  case "$remote_ref" in
+    refs/heads/*) ;;
+    *) continue ;;
+  esac
+  make -s check-patches REV="$local_sha"
 done

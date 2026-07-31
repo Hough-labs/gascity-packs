@@ -7,6 +7,11 @@
 # Full workflow: docs/fork-patches.md
 BASELINE ?= f69ec02b39e04b1febc3ced4c47fd4972f706e91
 
+# The commit `make check-patches` validates. Defaults to HEAD for the everyday
+# "did I remember `make patches`" run; the pre-push hook overrides it with the
+# exact SHA git is about to send, so the commit checked is the commit that lands.
+REV ?= HEAD
+
 # git does not honour in-repo hooks on clone, so the pre-push staleness guard
 # below would sit inert in a fresh checkout until somebody remembered a setup
 # step — and the one thing it guards (a stale patches/ export) is exactly what
@@ -45,8 +50,9 @@ registry-help:
 	@printf '%s\n' ''
 	@printf '%s\n' 'Fork patch targets (integration branch):'
 	@printf '%s\n' '  make patches'
-	@printf '%s\n' '  make check-patches'
+	@printf '%s\n' '  make check-patches [REV=<commit-ish>]'
 	@printf '%s\n' '  make upgrade'
+	@printf '%s\n' '  make test-patch-guard'
 	@printf '%s\n' '  make hooks            (auto-armed by any make run)'
 
 registry-format-validate:
@@ -91,7 +97,7 @@ registry-withdraw:
 # of the fork's divergence, EXCLUDING patches/ itself (so it can't recursively
 # include its own exports). Regenerate with `make patches` after adding or
 # editing a fork commit. See docs/fork-patches.md.
-.PHONY: patches upgrade check-patches hooks
+.PHONY: patches upgrade check-patches test-patch-guard hooks
 
 hooks:
 	@git config core.hooksPath .githooks
@@ -108,29 +114,7 @@ upgrade:
 	@BASELINE=$(BASELINE) bash scripts/upgrade-integration.sh
 
 check-patches:
-	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
-		git format-patch --zero-commit $(BASELINE)..HEAD --output-directory "$$tmp" -- . ':!patches/' >/dev/null 2>&1; \
-		expected=$$(ls "$$tmp"/*.patch 2>/dev/null | wc -l | tr -d ' '); \
-		actual=$$(ls patches/*.patch 2>/dev/null | wc -l | tr -d ' '); \
-		if [ "$$expected" != "$$actual" ]; then \
-			echo "patches/ is stale: $$actual present, $$expected expected."; \
-			echo "  Run: make patches && git add patches && git commit"; \
-			exit 1; \
-		fi; \
-		for f in "$$tmp"/*.patch; do \
-			[ -e "$$f" ] || continue; \
-			b=$$(basename "$$f"); \
-			if [ ! -f "patches/$$b" ]; then \
-				echo "patches/ is stale: missing $$b."; \
-				echo "  Run: make patches && git add patches && git commit"; \
-				exit 1; \
-			fi; \
-			tail -n +2 "patches/$$b" > "$$tmp/.committed"; \
-			tail -n +2 "$$f"          > "$$tmp/.regen"; \
-			if ! cmp -s "$$tmp/.committed" "$$tmp/.regen"; then \
-				echo "patches/ is stale: content drift in $$b."; \
-				echo "  Run: make patches && git add patches && git commit"; \
-				exit 1; \
-			fi; \
-		done; \
-		echo "patches/ up to date ($$actual patches)"
+	@BASELINE=$(BASELINE) REV=$(REV) bash scripts/check-patches.sh
+
+test-patch-guard:
+	@bash tests/test_fork_patch_guard.sh

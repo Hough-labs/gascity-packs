@@ -1,0 +1,535 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 31 Jul 2026 16:26:45 -0400
+Subject: [PATCH 2/2] fix(hooks): enforce the patches/ export on every branch
+ push (gcp-2qk)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+patches/ is a derived artifact — the `git format-patch BASELINE..HEAD` export of
+the fork's divergence — so every fork commit has to be re-exported. The
+obligation lands on whoever authors the commit, but .githooks/pre-push only
+validated pushes whose remote ref was refs/heads/integration:
+
+    if [ "$remote_ref" != "refs/heads/integration" ]; then continue; fi
+
+The author of a fork commit pushes a topic branch. The integration push is
+performed later, by the refinery. So the only guarded push was the one the
+author never performs: a stale export went out on a green local run and
+surfaced a full agent cycle later at the merge gate, on a branch that had
+already been reviewed. The refinery measured 3 of 4 open polecat branches
+unlandable for exactly this reason, with the fourth proving the step is
+discoverable — a missing enforcement point, not a forgetful author.
+
+The hook now validates every pushed branch ref and passes the SHA git is about
+to send to check-patches as REV, so what gets validated is what lands. Tag
+pushes and deletions are skipped (no tree to validate), as are branches that do
+not descend from BASELINE — an upstream-only branch carries no fork divergence,
+and BASELINE..HEAD there would describe an unrelated stack the author cannot
+act on.
+
+check-patches moves out of the Makefile into scripts/check-patches.sh, matching
+how `make upgrade` already delegates to scripts/upgrade-integration.sh. Beyond
+readability that buys the REV parameter, and one behavioural change: patches/ is
+now read out of REV's tree via git cat-file rather than off disk. A push sends
+commits, not the working tree, so an export regenerated but left uncommitted is
+not what lands — counting it would admit exactly the drift being guarded
+against. `make check-patches` still defaults to REV=HEAD.
+
+Validation: tests/test_fork_patch_guard.sh drives the real hook end-to-end
+through a scratch repo with a bare remote — the guard only ever runs inside
+`git push`, so no existing test sweep touches it. Verified red against the
+previous ref-filtered hook (both stale-topic-branch cases accepted the push,
+"hook did not fire") and green against this one, 7/7. gofumpt/go vet/go build/
+go test -race, golangci-lint (0 issues), validate_registry.py, pytest tests
+(101 passed) and shellcheck over the three shell files are all clean; the 12
+gofumpt findings are pre-existing on integration and unchanged by this diff,
+which touches no Go.
+
+Not done here: the bead's alternative of running check-patches in CI on
+pull_request. ci.yml triggers only on main and is upstream-tracked, so
+fork-specific jobs there would grow the patch stack's conflict surface at every
+baseline upgrade without adding enforcement the hook does not already provide
+earlier. Worth revisiting if the fork ever gains its own workflow file.
+---
+ .githooks/pre-push             |  33 ++++--
+ Makefile                       |  40 ++-----
+ docs/fork-patches.md           |  40 ++++++-
+ scripts/check-patches.sh       |  72 ++++++++++++
+ tests/test_fork_patch_guard.sh | 198 +++++++++++++++++++++++++++++++++
+ 5 files changed, 346 insertions(+), 37 deletions(-)
+ create mode 100755 scripts/check-patches.sh
+ create mode 100755 tests/test_fork_patch_guard.sh
+
+diff --git a/.githooks/pre-push b/.githooks/pre-push
+index 5ec2ee3..6ce8b28 100755
+--- a/.githooks/pre-push
++++ b/.githooks/pre-push
+@@ -1,12 +1,29 @@
+ #!/usr/bin/env bash
+ set -euo pipefail
+ 
+-# ── Fork: refuse to push a stale patches/ to the integration branch ──────────
++# ── Fork: refuse to push a stale patches/ ────────────────────────────────────
++# patches/ is a DERIVED artifact (git format-patch BASELINE..HEAD), so every
++# commit that diverges from BASELINE has to be re-exported. That obligation
++# lands on whoever authors the commit — but this check used to fire only on
++# pushes to refs/heads/integration, and the author of a fork commit pushes a
++# topic branch. The integration push is performed later, by someone else. So
++# the one push the author never performs was the only one guarded: a stale
++# export sailed through the author's green local run, and surfaced a full
++# review cycle later at the merge gate, on a branch already approved. Validate
++# every pushed branch instead — the obligation and the enforcement now land on
++# the same push.
++#
+ # Keyed off the refs actually being pushed — git feeds
+ # "<local ref> <local sha> <remote ref> <remote sha>" per ref on stdin — rather
+ # than off HEAD. A push from a detached worktree, or one using an explicit
+-# `HEAD:integration` refspec, updates integration without ever having it as its
+-# symbolic HEAD, and a HEAD-keyed check would wave both through.
++# `HEAD:integration` refspec, updates a branch without ever having it as its
++# symbolic HEAD, and a HEAD-keyed check would wave both through. The pushed
++# local SHA goes to check-patches as REV, so what is validated is exactly what
++# lands, not whatever the working tree happens to hold.
++#
++# Branches that do not descend from BASELINE carry no fork divergence to
++# export; check-patches passes those itself rather than failing on a history
++# the patch stack does not describe.
+ #
+ # Validation only — it never amends. (An amend after git has already captured
+ # the push range causes perpetual local/origin SHA drift.) Bypass with
+@@ -17,12 +34,14 @@ set -euo pipefail
+ zero="0000000000000000000000000000000000000000"
+ 
+ while read -r _local_ref local_sha remote_ref _remote_sha; do
+-  if [ "$remote_ref" != "refs/heads/integration" ]; then
+-    continue
+-  fi
+   # Branch deletion — no tree to validate.
+   if [ "$local_sha" = "$zero" ]; then
+     continue
+   fi
+-  make -s check-patches
++  # Tags and other non-branch refs carry no patch-export obligation.
++  case "$remote_ref" in
++    refs/heads/*) ;;
++    *) continue ;;
++  esac
++  make -s check-patches REV="$local_sha"
+ done
+diff --git a/Makefile b/Makefile
+index 8d1c9a2..9e50ca6 100644
+--- a/Makefile
++++ b/Makefile
+@@ -7,6 +7,11 @@
+ # Full workflow: docs/fork-patches.md
+ BASELINE ?= f69ec02b39e04b1febc3ced4c47fd4972f706e91
+ 
++# The commit `make check-patches` validates. Defaults to HEAD for the everyday
++# "did I remember `make patches`" run; the pre-push hook overrides it with the
++# exact SHA git is about to send, so the commit checked is the commit that lands.
++REV ?= HEAD
++
+ # git does not honour in-repo hooks on clone, so the pre-push staleness guard
+ # below would sit inert in a fresh checkout until somebody remembered a setup
+ # step — and the one thing it guards (a stale patches/ export) is exactly what
+@@ -45,8 +50,9 @@ registry-help:
+ 	@printf '%s\n' ''
+ 	@printf '%s\n' 'Fork patch targets (integration branch):'
+ 	@printf '%s\n' '  make patches'
+-	@printf '%s\n' '  make check-patches'
++	@printf '%s\n' '  make check-patches [REV=<commit-ish>]'
+ 	@printf '%s\n' '  make upgrade'
++	@printf '%s\n' '  make test-patch-guard'
+ 	@printf '%s\n' '  make hooks            (auto-armed by any make run)'
+ 
+ registry-format-validate:
+@@ -91,7 +97,7 @@ registry-withdraw:
+ # of the fork's divergence, EXCLUDING patches/ itself (so it can't recursively
+ # include its own exports). Regenerate with `make patches` after adding or
+ # editing a fork commit. See docs/fork-patches.md.
+-.PHONY: patches upgrade check-patches hooks
++.PHONY: patches upgrade check-patches test-patch-guard hooks
+ 
+ hooks:
+ 	@git config core.hooksPath .githooks
+@@ -108,29 +114,7 @@ upgrade:
+ 	@BASELINE=$(BASELINE) bash scripts/upgrade-integration.sh
+ 
+ check-patches:
+-	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+-		git format-patch --zero-commit $(BASELINE)..HEAD --output-directory "$$tmp" -- . ':!patches/' >/dev/null 2>&1; \
+-		expected=$$(ls "$$tmp"/*.patch 2>/dev/null | wc -l | tr -d ' '); \
+-		actual=$$(ls patches/*.patch 2>/dev/null | wc -l | tr -d ' '); \
+-		if [ "$$expected" != "$$actual" ]; then \
+-			echo "patches/ is stale: $$actual present, $$expected expected."; \
+-			echo "  Run: make patches && git add patches && git commit"; \
+-			exit 1; \
+-		fi; \
+-		for f in "$$tmp"/*.patch; do \
+-			[ -e "$$f" ] || continue; \
+-			b=$$(basename "$$f"); \
+-			if [ ! -f "patches/$$b" ]; then \
+-				echo "patches/ is stale: missing $$b."; \
+-				echo "  Run: make patches && git add patches && git commit"; \
+-				exit 1; \
+-			fi; \
+-			tail -n +2 "patches/$$b" > "$$tmp/.committed"; \
+-			tail -n +2 "$$f"          > "$$tmp/.regen"; \
+-			if ! cmp -s "$$tmp/.committed" "$$tmp/.regen"; then \
+-				echo "patches/ is stale: content drift in $$b."; \
+-				echo "  Run: make patches && git add patches && git commit"; \
+-				exit 1; \
+-			fi; \
+-		done; \
+-		echo "patches/ up to date ($$actual patches)"
++	@BASELINE=$(BASELINE) REV=$(REV) bash scripts/check-patches.sh
++
++test-patch-guard:
++	@bash tests/test_fork_patch_guard.sh
+diff --git a/docs/fork-patches.md b/docs/fork-patches.md
+index fcf4745..66c3e5e 100644
+--- a/docs/fork-patches.md
++++ b/docs/fork-patches.md
+@@ -52,6 +52,28 @@ The guard is advisory either way — `git push --no-verify` bypasses it, and a c
+ that never runs `make` is never armed. `make check-patches` is the authoritative
+ check; run it in CI if the fork ever grows one.
+ 
++### What the guard covers
++
++Every pushed **branch**, not just `integration`. The obligation to re-export
++`patches/` belongs to whoever authors a fork commit, so the check has to fire on
++the push that author actually performs — their topic branch. Guarding only
++`integration` put the check on a push the author never makes: a stale export
++went out green, and surfaced a full review cycle later when someone else pushed
++the merge, on a branch that had already been approved.
++
++Tag pushes and branch deletions are skipped (no tree to validate), as are
++branches that do not descend from `BASELINE` — an upstream-only topic branch
++carries no fork divergence to export, and `BASELINE..HEAD` there would describe
++an unrelated stack.
++
++The commit validated is the SHA git is about to send, read out of that commit's
++tree — never the working tree. A `patches/` regenerated on disk but not
++committed is not what the push delivers, so it does not satisfy the guard. This
++is why the everyday flow below ends in a commit.
++
++`make test-patch-guard` exercises the hook end-to-end against a scratch repo
++with a real remote.
++
+ Remotes follow the same convention as the `gascity` fork — `origin` is the fork,
+ `upstream` is the source repo:
+ 
+@@ -73,10 +95,24 @@ git add patches/
+ git commit --amend --no-edit       # fold the export into the same commit
+ ```
+ 
+-`make check-patches` (run automatically by the pre-push hook on this branch)
+-fails the push if `patches/` does not match the current `BASELINE..HEAD`
++`make check-patches` (run automatically by the pre-push hook on every branch
++push) fails the push if `patches/` does not match the `BASELINE..<pushed SHA>`
+ divergence, so the export can never silently drift from the commits.
+ 
++The same applies to a fork commit authored on a topic branch — `polecat/<bead>`,
++a feature branch, anything that will eventually reach `integration`. Regenerate
++and commit the export there too, or the push is refused:
++
++```bash
++make patches && git add patches/ && git commit --amend --no-edit
++```
++
++To check a commit other than `HEAD` by hand:
++
++```bash
++make check-patches REV=<commit-ish>
++```
++
+ ## Upgrading the baseline (moving to a newer upstream commit)
+ 
+ 1. Pick the new upstream commit (`git fetch upstream`, then resolve it with
+diff --git a/scripts/check-patches.sh b/scripts/check-patches.sh
+new file mode 100755
+index 0000000..febdb35
+--- /dev/null
++++ b/scripts/check-patches.sh
+@@ -0,0 +1,72 @@
++#!/usr/bin/env bash
++# scripts/check-patches.sh — verify patches/ matches the BASELINE..REV divergence.
++#
++# Usage: make check-patches [REV=<commit-ish>]
++#        (the Makefile passes BASELINE and REV in via the environment)
++#
++# patches/ is a DERIVED artifact — the `git format-patch BASELINE..REV` export
++# of the fork's divergence, excluding patches/ itself. This is the authoritative
++# check that the export has not drifted from the commits it claims to describe.
++#
++# REV is validated as a COMMIT, not as the working tree: `patches/` is read out
++# of REV's tree, never off disk. A regenerated-but-uncommitted export is not
++# what a push sends, so counting it would let exactly the drift this guards
++# against through. REV defaults to HEAD; the pre-push hook passes the SHA git is
++# about to send, so the commit validated is the commit that lands.
++#
++# Exits 0 when the export is in sync, or when REV does not descend from BASELINE
++# (a branch off pure upstream carries no fork divergence to export). Exits 1 on
++# drift, with the regeneration command to run.
++
++set -euo pipefail
++
++# BASELINE is normally injected by `make check-patches`; keep a default so the
++# script is runnable standalone. Must match the Makefile's BASELINE.
++BASELINE="${BASELINE:-f69ec02b39e04b1febc3ced4c47fd4972f706e91}"
++REV="${REV:-HEAD}"
++
++stale() {
++    echo "patches/ is stale: $*"
++    echo "  Run: make patches && git add patches && git commit"
++    exit 1
++}
++
++SHA=$(git rev-parse --quiet --verify "$REV^{commit}") ||
++    { echo "check-patches: $REV is not a commit" >&2; exit 1; }
++
++git rev-parse --quiet --verify "$BASELINE^{commit}" >/dev/null 2>&1 ||
++    { echo "check-patches: BASELINE $BASELINE not found locally" >&2; exit 1; }
++
++# A ref that does not descend from BASELINE is not carrying the fork's patch
++# stack — an upstream-only topic branch, say. `BASELINE..REV` there would export
++# an unrelated history and fail for a reason the author cannot act on.
++if ! git merge-base --is-ancestor "$BASELINE" "$SHA"; then
++    echo "patches/ not checked: $REV does not descend from BASELINE $(git rev-parse --short "$BASELINE")"
++    exit 0
++fi
++
++tmp=$(mktemp -d)
++trap 'rm -rf "$tmp"' EXIT
++
++git format-patch --zero-commit "$BASELINE..$SHA" --output-directory "$tmp" -- . ':!patches/' >/dev/null 2>&1
++
++expected=$(find "$tmp" -maxdepth 1 -name '*.patch' | wc -l | tr -d ' ')
++actual=$(git ls-tree -r --name-only "$SHA" -- patches/ | grep -c '\.patch$' || true)
++
++if [ "$expected" != "$actual" ]; then
++    stale "$actual present, $expected expected."
++fi
++
++for f in "$tmp"/*.patch; do
++    [ -e "$f" ] || continue
++    b=$(basename "$f")
++    git cat-file -e "$SHA:patches/$b" 2>/dev/null || stale "missing $b."
++    # Skip the `From <sha> ...` header line on both sides before comparing: it
++    # is the one line format-patch derives from the commit rather than from its
++    # content, and the committed export was generated on a different invocation.
++    git cat-file blob "$SHA:patches/$b" | tail -n +2 > "$tmp/.committed"
++    tail -n +2 "$f"                                > "$tmp/.regen"
++    cmp -s "$tmp/.committed" "$tmp/.regen" || stale "content drift in $b."
++done
++
++echo "patches/ up to date ($actual patches)"
+diff --git a/tests/test_fork_patch_guard.sh b/tests/test_fork_patch_guard.sh
+new file mode 100755
+index 0000000..d30208f
+--- /dev/null
++++ b/tests/test_fork_patch_guard.sh
+@@ -0,0 +1,198 @@
++#!/usr/bin/env bash
++# tests/test_fork_patch_guard.sh — regression tests for the fork's stale-patches
++# guard (.githooks/pre-push + scripts/check-patches.sh).
++#
++# Usage: make test-patch-guard
++#
++# The guard only ever runs inside `git push`, so nothing in the normal test
++# sweep touches it — it can rot silently, and the failure mode is invisible
++# until a branch reaches the merge gate. These tests drive the real hook
++# end-to-end: a scratch repo with a real bare remote, real `git push`, and the
++# repo's actual Makefile and hook copied in.
++#
++# The regression this pins down: the hook once validated only pushes whose
++# remote ref was refs/heads/integration, so a topic branch carrying an
++# un-exported fork commit pushed clean and failed one review cycle later, at
++# the integration push its author never performs.
++
++set -euo pipefail
++
++ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
++
++PASS=0
++FAIL=0
++
++fail() {
++    echo "FAIL: $*" >&2
++    FAIL=$((FAIL + 1))
++}
++
++pass() {
++    echo "  ok: $*"
++    PASS=$((PASS + 1))
++}
++
++SCRATCH=$(mktemp -d)
++trap 'rm -rf "$SCRATCH"' EXIT
++
++# ── Scratch fork ─────────────────────────────────────────────────────────────
++# An upstream commit (the BASELINE), then the fork's patch-management commit on
++# top of it, exported into patches/ exactly as the real integration branch is.
++
++git init --quiet --bare "$SCRATCH/remote.git"
++git init --quiet -b integration "$SCRATCH/work"
++cd "$SCRATCH/work"
++
++git config user.email "test@example.com"
++git config user.name "Patch Guard Test"
++git config commit.gpgsign false
++git config tag.gpgSign false
++git remote add origin "$SCRATCH/remote.git"
++
++echo "upstream content" > upstream.txt
++git add upstream.txt
++git commit --quiet -m "upstream: baseline commit"
++
++# Everything downstream keys off this SHA, including the hook's `make` run —
++# export it so the Makefile's `BASELINE ?=` default is overridden there too.
++export BASELINE
++BASELINE=$(git rev-parse HEAD)
++
++mkdir -p .githooks scripts tests
++cp -f "$ROOT/Makefile" Makefile
++cp -f "$ROOT/.githooks/pre-push" .githooks/pre-push
++cp -f "$ROOT/scripts/check-patches.sh" scripts/check-patches.sh
++chmod +x .githooks/pre-push scripts/check-patches.sh
++git config core.hooksPath .githooks
++
++git add Makefile .githooks scripts
++git commit --quiet -m "chore(fork): add patch management system"
++make -s patches >/dev/null
++git add patches/
++git commit --quiet --amend --no-edit
++
++git push --quiet origin integration >/dev/null 2>&1 ||
++    fail "baseline integration push should be accepted (fork tooling in sync)"
++
++# ── A fork commit on a topic branch, not yet exported ────────────────────────
++
++git switch --quiet -c polecat/scratch-1
++echo "fork change" > fork.txt
++git add fork.txt
++git commit --quiet -m "feat: a fork commit whose export was forgotten"
++
++test_stale_topic_branch_push_is_refused() {
++    local out
++    if out=$(git push origin polecat/scratch-1 2>&1); then
++        fail "stale patches/ on a topic branch was accepted; hook did not fire"
++        return
++    fi
++    case "$out" in
++        *"patches/ is stale"*) pass "stale topic-branch push refused" ;;
++        *) fail "topic-branch push failed for the wrong reason: $out" ;;
++    esac
++}
++
++test_regenerated_but_uncommitted_export_is_still_refused() {
++    # The push sends commits, not the working tree. An export regenerated on
++    # disk but never committed is not what lands, so it must not satisfy the
++    # guard — this is the difference between checking REV's tree and checking
++    # whatever happens to be sitting in patches/.
++    local out
++    make -s patches >/dev/null
++    if out=$(git push origin polecat/scratch-1 2>&1); then
++        fail "uncommitted patches/ regeneration was accepted as in sync"
++    else
++        case "$out" in
++            *"patches/ is stale"*) pass "uncommitted export still refused" ;;
++            *) fail "push failed for the wrong reason: $out" ;;
++        esac
++    fi
++    git checkout --quiet -- patches/ 2>/dev/null || true
++    git clean --quiet -fd patches/ 2>/dev/null || true
++}
++
++test_exported_topic_branch_push_is_accepted() {
++    local out
++    make -s patches >/dev/null
++    git add patches/
++    git commit --quiet --amend --no-edit
++    # A branch of its own: amending rewrote polecat/scratch-1, so reusing it
++    # here would report non-fast-forward — an echo of an earlier test's push
++    # rather than this one's verdict.
++    git switch --quiet -c polecat/scratch-2
++    if out=$(git push origin polecat/scratch-2 2>&1); then
++        pass "topic-branch push accepted once the export is committed"
++    else
++        fail "in-sync topic-branch push was refused: $out"
++    fi
++}
++
++test_branch_off_baseline_is_still_guarded() {
++    # The original behaviour must survive: integration itself stays guarded.
++    local out
++    git switch --quiet integration
++    echo "another fork change" > fork2.txt
++    git add fork2.txt
++    git commit --quiet -m "feat: unexported commit on integration"
++    if out=$(git push origin integration 2>&1); then
++        fail "stale patches/ on integration was accepted"
++    else
++        case "$out" in
++            *"patches/ is stale"*) pass "integration push still refused when stale" ;;
++            *) fail "integration push failed for the wrong reason: $out" ;;
++        esac
++    fi
++    git reset --quiet --hard HEAD~1
++}
++
++test_branch_not_descending_from_baseline_is_skipped() {
++    # An orphan branch shares no history with BASELINE, so BASELINE..HEAD would
++    # export an unrelated stack. Nothing to enforce there — let it through.
++    local out
++    git checkout --quiet --orphan unrelated
++    git rm --quiet -rf . >/dev/null 2>&1 || true
++    echo "unrelated" > unrelated.txt
++    git add unrelated.txt
++    git commit --quiet -m "docs: unrelated history"
++    if out=$(git push origin unrelated 2>&1); then
++        pass "branch not descending from BASELINE pushed without enforcement"
++    else
++        fail "orphan branch push was refused: $out"
++    fi
++    git switch --quiet integration
++}
++
++test_tag_push_is_skipped() {
++    local out
++    git tag scratch-tag integration
++    if out=$(git push origin scratch-tag 2>&1); then
++        pass "tag push skipped by the guard"
++    else
++        fail "tag push was refused: $out"
++    fi
++}
++
++test_branch_deletion_is_skipped() {
++    local out
++    if out=$(git push origin --delete unrelated 2>&1); then
++        pass "branch deletion skipped by the guard"
++    else
++        fail "branch deletion was refused: $out"
++    fi
++}
++
++test_stale_topic_branch_push_is_refused
++test_regenerated_but_uncommitted_export_is_still_refused
++test_exported_topic_branch_push_is_accepted
++test_branch_off_baseline_is_still_guarded
++test_branch_not_descending_from_baseline_is_skipped
++test_tag_push_is_skipped
++test_branch_deletion_is_skipped
++
++echo ""
++if [ "$FAIL" -ne 0 ]; then
++    echo "test_fork_patch_guard: $PASS passed, $FAIL failed"
++    exit 1
++fi
++echo "test_fork_patch_guard: $PASS passed"
+-- 
+2.50.1 (Apple Git-155)
+

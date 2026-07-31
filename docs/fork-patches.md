@@ -52,6 +52,28 @@ The guard is advisory either way — `git push --no-verify` bypasses it, and a c
 that never runs `make` is never armed. `make check-patches` is the authoritative
 check; run it in CI if the fork ever grows one.
 
+### What the guard covers
+
+Every pushed **branch**, not just `integration`. The obligation to re-export
+`patches/` belongs to whoever authors a fork commit, so the check has to fire on
+the push that author actually performs — their topic branch. Guarding only
+`integration` put the check on a push the author never makes: a stale export
+went out green, and surfaced a full review cycle later when someone else pushed
+the merge, on a branch that had already been approved.
+
+Tag pushes and branch deletions are skipped (no tree to validate), as are
+branches that do not descend from `BASELINE` — an upstream-only topic branch
+carries no fork divergence to export, and `BASELINE..HEAD` there would describe
+an unrelated stack.
+
+The commit validated is the SHA git is about to send, read out of that commit's
+tree — never the working tree. A `patches/` regenerated on disk but not
+committed is not what the push delivers, so it does not satisfy the guard. This
+is why the everyday flow below ends in a commit.
+
+`make test-patch-guard` exercises the hook end-to-end against a scratch repo
+with a real remote.
+
 Remotes follow the same convention as the `gascity` fork — `origin` is the fork,
 `upstream` is the source repo:
 
@@ -73,9 +95,23 @@ git add patches/
 git commit --amend --no-edit       # fold the export into the same commit
 ```
 
-`make check-patches` (run automatically by the pre-push hook on this branch)
-fails the push if `patches/` does not match the current `BASELINE..HEAD`
+`make check-patches` (run automatically by the pre-push hook on every branch
+push) fails the push if `patches/` does not match the `BASELINE..<pushed SHA>`
 divergence, so the export can never silently drift from the commits.
+
+The same applies to a fork commit authored on a topic branch — `polecat/<bead>`,
+a feature branch, anything that will eventually reach `integration`. Regenerate
+and commit the export there too, or the push is refused:
+
+```bash
+make patches && git add patches/ && git commit --amend --no-edit
+```
+
+To check a commit other than `HEAD` by hand:
+
+```bash
+make check-patches REV=<commit-ish>
+```
 
 ## Upgrading the baseline (moving to a newer upstream commit)
 
