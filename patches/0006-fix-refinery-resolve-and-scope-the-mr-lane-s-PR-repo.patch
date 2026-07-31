@@ -1,0 +1,415 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 31 Jul 2026 17:36:14 -0400
+Subject: [PATCH 6/6] fix(refinery): resolve and scope the mr lane's PR repo to
+ origin (gcp-6qp)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+On a fork-based rig the refinery's `mr` lane published and looked up pull
+requests in the wrong repository. Two defects compounded, both in
+mol-refinery-patrol's merge-push step:
+
+`ORIGIN_REPO` came from `gh repo view`, which answers with gh's own base-repo
+heuristic. In a fork clone that also carries an `upstream` remote — the shape
+of gascity-packs, where branches are pushed to Hough-labs and upstream points
+at gastownhall — gh resolves to the PARENT. And having computed `ORIGIN_REPO`,
+the lane never used it: `gh pr create`, `gh pr view <branch>` and the
+`lookup_pr_info` gh path all ran unscoped, so even a correct default could
+diverge from where the calls actually landed.
+
+The result was latent only because `require_merge_approval` is off. Turning it
+on promotes every merge-ready bead from direct to mr, and each one either hard
+stops ("Pull request ... was not found", because the create targeted a repo the
+head branch does not exist in and the fallback lookup read the same wrong repo)
+or trips the PR_REPO/PR_HEAD_REPO guards into a per-bead escalation. That is a
+hard failure or an escalation storm, not the intended "parked awaiting review".
+
+The fix derives `ORIGIN_REPO` from `git remote get-url origin` — the repo the
+branch is actually pushed to — in both the gh and REST paths, so the two can no
+longer disagree, and keeps `gh repo view` only as a fallback for remotes the
+parser cannot read (GitHub Enterprise, ssh config aliases). Every `gh pr` call
+is now `--repo "$ORIGIN_REPO"`-scoped. `lookup_pr_info` refuses outright when
+origin is unresolvable rather than falling back to gh's guess — an unscoped
+lookup is the bug, so there is no safe degraded mode. `gh` treats a PR URL
+argument as authoritative over `--repo`, so scoping the lookup does not weaken
+the existing cross-repo validation of `metadata.existing_pr`; those guards
+still fire.
+
+`gh repo set-default` was rejected as the fix: it is untracked local git
+config, lost on re-clone, and leaves the formula wrong for every other
+fork-based rig.
+
+Validation: new gastown/tests/test_refinery_origin_repo.sh extracts the
+resolution block from the shipped formula between sentinels (so the test cannot
+drift from what the refinery runs) and exercises it against fixture repos on a
+hermetic PATH — fork-with-upstream, single-remote, the no-gh REST path, ssh://
+origins, non-github fallback, and both unresolvable-origin diagnostics — plus a
+static check that no `gh pr` call in the formula is unscoped. Both halves were
+cycled red against the pre-fix logic (fork case resolved gastownhall/…, and all
+three gh pr calls reported unscoped) and green after. All five gastown shell
+tests pass. Eight pytest failures in tests/, gascity/, discord/ and github/
+reproduce identically on the parent commit and are unrelated to this change.
+---
+ gastown/formulas/mol-refinery-patrol.toml  |  57 +++--
+ gastown/tests/test_refinery_origin_repo.sh | 255 +++++++++++++++++++++
+ 2 files changed, 295 insertions(+), 17 deletions(-)
+ create mode 100755 gastown/tests/test_refinery_origin_repo.sh
+
+diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
+index 46941d7..a475414 100644
+--- a/gastown/formulas/mol-refinery-patrol.toml
++++ b/gastown/formulas/mol-refinery-patrol.toml
+@@ -420,24 +420,36 @@ BRANCH=$(gc bd show $WORK --json | jq -r '.[0].metadata.branch')
+ TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_branch}}"')
+ MERGE_STRATEGY=$(gc bd show $WORK --json | jq -r '.[0].metadata.merge_strategy // "direct"')
+ EXISTING_PR=$(gc bd show $WORK --json | jq -r '.[0].metadata.existing_pr // empty')
++# --- origin-repo-resolution:begin ---
++# The repository that matters here is the one this worktree PUSHES to: origin.
++# `gh repo view` answers with gh's own base-repo heuristic, which on a fork that
++# also carries an `upstream` remote resolves to the PARENT — so a fork-based rig
++# would create and look up its pull requests in a repo its branches were never
++# pushed to (gastownhall/gascity-packs#... — the mr lane could not see PR #1 on
++# the fork). Parse origin directly; gh is a fallback only for remotes this
++# parser cannot read (GitHub Enterprise hosts, ssh config aliases).
++ORIGIN_REPO=""
+ ORIGIN_REPO_ERROR=""
+-if command -v gh >/dev/null 2>&1; then
+-  if ! ORIGIN_REPO=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>&1); then
+-    ORIGIN_REPO_ERROR="gh repo view failed while resolving origin repository: $ORIGIN_REPO"
+-    ORIGIN_REPO=""
++ORIGIN_URL=$(git remote get-url origin 2>/dev/null || true)
++case "$ORIGIN_URL" in
++  git@github.com:*|https://github.com/*|ssh://git@github.com/*)
++    ORIGIN_REPO=$(printf '%s\n' "$ORIGIN_URL" \
++      | sed -E 's#^ssh://git@github.com/##; s#^git@github.com:##; s#^https://github.com/##; s#\\.git$##')
++    ;;
++esac
++if [ -z "$ORIGIN_REPO" ]; then
++  if command -v gh >/dev/null 2>&1; then
++    if ! ORIGIN_REPO=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>&1); then
++      ORIGIN_REPO_ERROR="gh repo view failed while resolving origin repository: $ORIGIN_REPO"
++      ORIGIN_REPO=""
++    fi
++  elif [ -z "$ORIGIN_URL" ]; then
++    ORIGIN_REPO_ERROR="Could not read the origin remote (git remote get-url origin failed); cannot resolve the repository for pull-request handoff."
++  else
++    ORIGIN_REPO_ERROR="GitHub REST fallback supports only github.com origin remotes; install gh for $ORIGIN_URL."
+   fi
+-else
+-  ORIGIN_URL=$(git remote get-url origin)
+-  case "$ORIGIN_URL" in
+-    git@github.com:*|https://github.com/*)
+-      ORIGIN_REPO=$(printf '%s\n' "$ORIGIN_URL" \
+-        | sed -E 's#^git@github.com:##; s#^https://github.com/##; s#\\.git$##')
+-      ;;
+-    *)
+-      ORIGIN_REPO_ERROR="GitHub REST fallback supports only github.com origin remotes; install gh for $ORIGIN_URL."
+-      ;;
+-  esac
+ fi
++# --- origin-repo-resolution:end ---
+ if [ "$MERGE_STRATEGY" = "pr" ]; then
+   MERGE_STRATEGY="mr"
+ fi
+@@ -724,8 +736,18 @@ curl_gh_api() {
+ lookup_pr_info() {
+   ref="$1"
+   err_file="$2"
++  # An unscoped lookup is what let this lane read the wrong repository in the
++  # first place. Without a resolved origin there is nothing safe to scope to,
++  # so refuse rather than fall back to gh's base-repo guess.
++  if [ -z "$ORIGIN_REPO" ]; then
++    {
++      [ -n "$ORIGIN_REPO_ERROR" ] && echo "$ORIGIN_REPO_ERROR"
++      echo "Could not resolve the origin repository; refusing an unscoped pull request lookup for $ref."
++    } >"$err_file"
++    return 1
++  fi
+   if command -v gh >/dev/null 2>&1; then
+-    gh pr view --json url,number,state,headRefName,baseRefName,headRepositoryOwner,headRepository -- "$ref" 2>"$err_file"
++    gh pr view --repo "$ORIGIN_REPO" --json url,number,state,headRefName,baseRefName,headRepositoryOwner,headRepository -- "$ref" 2>"$err_file"
+     return $?
+   fi
+   if ! init_github_rest 2>"$err_file"; then
+@@ -1068,13 +1090,14 @@ if [ -n "$EXISTING_PR" ]; then
+ else
+   if command -v gh >/dev/null 2>&1; then
+     PR_URL=$(gh pr create \
++      --repo "$ORIGIN_REPO" \
+       --base "$TARGET" \
+       --head "$BRANCH" \
+       --title "$ISSUE_TITLE ($WORK)" \
+       --body-file "$PR_BODY_FILE" 2>/dev/null || true)
+ 
+     if [ -z "$PR_URL" ]; then
+-      PR_URL=$(gh pr view "$BRANCH" --json url -q '.url')
++      PR_URL=$(gh pr view "$BRANCH" --repo "$ORIGIN_REPO" --json url -q '.url')
+     fi
+   else
+     PR_ERR=$(mktemp)
+diff --git a/gastown/tests/test_refinery_origin_repo.sh b/gastown/tests/test_refinery_origin_repo.sh
+new file mode 100755
+index 0000000..e639073
+--- /dev/null
++++ b/gastown/tests/test_refinery_origin_repo.sh
+@@ -0,0 +1,255 @@
++#!/usr/bin/env bash
++# Contract tests for the refinery mr lane's origin-repository resolution.
++#
++# A fork-based rig pushes its branches to `origin` while an `upstream` remote
++# points at the parent. `gh repo view` answers with gh's base-repo heuristic,
++# which picks the parent — so a lane that trusted it created and looked up pull
++# requests in a repository its branches never reached. These tests pin both
++# halves of the fix: resolution reads the origin remote, and every `gh pr` call
++# is scoped to what resolution produced.
++set -euo pipefail
++
++ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
++FORMULA="$ROOT/gastown/formulas/mol-refinery-patrol.toml"
++
++fail() {
++    echo "FAIL: $*" >&2
++    exit 1
++}
++
++# The block under test is the shipped formula text, extracted between its
++# sentinels — not a transcription that could drift from what the refinery runs.
++extract_resolution() {
++    python3 - "$FORMULA" "$1" <<'PY'
++import sys
++import tomllib
++
++formula, out = sys.argv[1], sys.argv[2]
++begin = "# --- origin-repo-resolution:begin ---"
++end = "# --- origin-repo-resolution:end ---"
++
++with open(formula, "rb") as handle:
++    doc = tomllib.load(handle)
++
++blocks = [
++    text.split(begin, 1)[1].split(end, 1)[0]
++    for text in (step.get("description", "") for step in doc["steps"])
++    if begin in text and end in text
++]
++if len(blocks) != 1:
++    sys.exit(f"expected exactly one origin-repo-resolution block, found {len(blocks)}")
++
++with open(out, "w") as handle:
++    handle.write(blocks[0])
++PY
++}
++
++# A hermetic PATH. The "no gh installed" cases are only meaningful if the real
++# gh on the developer's machine cannot leak in, so the resolution runs against
++# exactly the tools named here.
++make_bin() {
++    local bin="$1" gh_repo="${2-}"
++    mkdir -p "$bin"
++    local tool
++    for tool in git sed; do
++        ln -sf "$(command -v "$tool")" "$bin/$tool"
++    done
++    if [ -n "$gh_repo" ]; then
++        # Absolute interpreter: $bin is the whole PATH the stub runs under, so
++        # a `/usr/bin/env` shebang would have nothing to look bash up in.
++        cat >"$bin/gh" <<SH
++#!/bin/sh
++# Only \`gh repo view --json nameWithOwner\` is exercised here. It answers with
++# the parent, exactly as real gh does in a fork clone carrying an upstream.
++if [ "\${1:-}" = "repo" ] && [ "\${2:-}" = "view" ]; then
++    printf '%s\n' "$gh_repo"
++    exit 0
++fi
++echo "gh: unexpected invocation: \$*" >&2
++exit 1
++SH
++        chmod +x "$bin/gh"
++    fi
++}
++
++make_repo() {
++    local repo="$1"
++    shift
++    mkdir -p "$repo"
++    git -C "$repo" init -q
++    while [ "$#" -gt 0 ]; do
++        git -C "$repo" remote add "$1" "$2"
++        shift 2
++    done
++}
++
++# Echoes "<ORIGIN_REPO>|<ORIGIN_REPO_ERROR>" after running the extracted block.
++resolve() {
++    local repo="$1" bin="$2"
++    (
++        cd "$repo"
++        # Absolute bash: $bin deliberately has no shell in it, and the PATH
++        # assignment below is what the interpreter lookup would otherwise use.
++        # The body stays single-quoted on purpose — $ORIGIN_REPO must expand in
++        # the inner shell, after the block runs, not in this one.
++        # shellcheck disable=SC2016
++        PATH="$bin" HOME="$repo" "$BASH" -c '
++            . "$1"
++            printf "%s|%s\n" "$ORIGIN_REPO" "$ORIGIN_REPO_ERROR"
++        ' _ "$BLOCK"
++    )
++}
++
++test_fork_with_upstream_resolves_origin_not_parent() {
++    local tmp repo bin got
++    tmp=$(mktemp -d)
++    repo="$tmp/rig"
++    bin="$tmp/bin"
++    make_repo "$repo" \
++        origin git@github.com:Hough-labs/gascity-packs.git \
++        upstream git@github.com:gastownhall/gascity-packs.git
++    make_bin "$bin" "gastownhall/gascity-packs"
++
++    got=$(resolve "$repo" "$bin")
++    [ "$got" = "Hough-labs/gascity-packs|" ] ||
++        fail "fork rig resolved '$got', want 'Hough-labs/gascity-packs|' (gh's parent answer must not win)"
++    rm -rf "$tmp"
++}
++
++test_single_remote_rig_is_unchanged() {
++    local tmp repo bin got
++    tmp=$(mktemp -d)
++    repo="$tmp/rig"
++    bin="$tmp/bin"
++    make_repo "$repo" origin https://github.com/gastownhall/gascity.git
++    make_bin "$bin" "gastownhall/gascity"
++
++    got=$(resolve "$repo" "$bin")
++    [ "$got" = "gastownhall/gascity|" ] ||
++        fail "single-remote rig resolved '$got', want 'gastownhall/gascity|'"
++    rm -rf "$tmp"
++}
++
++test_rest_path_matches_gh_path() {
++    # No gh on PATH: the REST fallback must reach the same answer from the same
++    # remote, so the two paths cannot disagree about which repo owns the PR.
++    local tmp repo bin got
++    tmp=$(mktemp -d)
++    repo="$tmp/rig"
++    bin="$tmp/bin"
++    make_repo "$repo" \
++        origin git@github.com:Hough-labs/gascity-packs.git \
++        upstream git@github.com:gastownhall/gascity-packs.git
++    make_bin "$bin"
++
++    got=$(resolve "$repo" "$bin")
++    [ "$got" = "Hough-labs/gascity-packs|" ] ||
++        fail "REST path resolved '$got', want 'Hough-labs/gascity-packs|' (must match the gh path)"
++    rm -rf "$tmp"
++}
++
++test_ssh_scheme_origin_is_parsed() {
++    local tmp repo bin got
++    tmp=$(mktemp -d)
++    repo="$tmp/rig"
++    bin="$tmp/bin"
++    make_repo "$repo" origin ssh://git@github.com/Hough-labs/gascity-packs.git
++    make_bin "$bin" "gastownhall/gascity-packs"
++
++    got=$(resolve "$repo" "$bin")
++    [ "$got" = "Hough-labs/gascity-packs|" ] ||
++        fail "ssh:// origin resolved '$got', want 'Hough-labs/gascity-packs|'"
++    rm -rf "$tmp"
++}
++
++test_non_github_origin_falls_back_to_gh() {
++    local tmp repo bin got
++    tmp=$(mktemp -d)
++    repo="$tmp/rig"
++    bin="$tmp/bin"
++    make_repo "$repo" origin git@git.example.com:team/rig.git
++    make_bin "$bin" "team/rig"
++
++    got=$(resolve "$repo" "$bin")
++    [ "$got" = "team/rig|" ] ||
++        fail "non-github origin resolved '$got', want gh's answer 'team/rig|'"
++    rm -rf "$tmp"
++}
++
++test_non_github_origin_without_gh_reports_an_error() {
++    local tmp repo bin got
++    tmp=$(mktemp -d)
++    repo="$tmp/rig"
++    bin="$tmp/bin"
++    make_repo "$repo" origin git@git.example.com:team/rig.git
++    make_bin "$bin"
++
++    got=$(resolve "$repo" "$bin")
++    [ "${got%%|*}" = "" ] ||
++        fail "non-github origin without gh resolved '${got%%|*}', want empty"
++    case "${got#*|}" in
++        *"supports only github.com origin remotes"*) : ;;
++        *) fail "non-github origin without gh reported '${got#*|}', want a github.com-only diagnostic" ;;
++    esac
++    rm -rf "$tmp"
++}
++
++test_missing_origin_remote_reports_an_error() {
++    local tmp repo bin got
++    tmp=$(mktemp -d)
++    repo="$tmp/rig"
++    bin="$tmp/bin"
++    make_repo "$repo"
++    make_bin "$bin"
++
++    got=$(resolve "$repo" "$bin")
++    [ "${got%%|*}" = "" ] ||
++        fail "missing origin resolved '${got%%|*}', want empty"
++    case "${got#*|}" in
++        *"Could not read the origin remote"*) : ;;
++        *) fail "missing origin reported '${got#*|}', want a missing-remote diagnostic" ;;
++    esac
++    rm -rf "$tmp"
++}
++
++test_every_gh_pr_call_is_repo_scoped() {
++    python3 - "$FORMULA" <<'PY' || fail "mol-refinery-patrol has an unscoped gh pr call"
++import sys
++import tomllib
++
++with open(sys.argv[1], "rb") as handle:
++    doc = tomllib.load(handle)
++
++unscoped = []
++for step in doc["steps"]:
++    in_code = False
++    for line in step.get("description", "").splitlines():
++        if line.lstrip().startswith("```"):
++            in_code = not in_code
++            continue
++        if not in_code or line.lstrip().startswith("#"):
++            continue
++        if "gh pr " in line and '--repo "$ORIGIN_REPO"' not in line:
++            unscoped.append((step["id"], line.strip()))
++
++for step_id, line in unscoped:
++    print(f"unscoped gh pr call in step {step_id}: {line}")
++sys.exit(1 if unscoped else 0)
++PY
++}
++
++BLOCK=$(mktemp)
++trap 'rm -f "$BLOCK"' EXIT
++extract_resolution "$BLOCK"
++export BLOCK
++
++test_fork_with_upstream_resolves_origin_not_parent
++test_single_remote_rig_is_unchanged
++test_rest_path_matches_gh_path
++test_ssh_scheme_origin_is_parsed
++test_non_github_origin_falls_back_to_gh
++test_non_github_origin_without_gh_reports_an_error
++test_missing_origin_remote_reports_an_error
++test_every_gh_pr_call_is_repo_scoped
++
++echo "refinery origin repo resolution tests passed"
+-- 
+2.50.1 (Apple Git-155)
+
