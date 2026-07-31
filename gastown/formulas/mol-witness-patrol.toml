@@ -144,7 +144,17 @@ This happens when:
 
 **Step 1: Find orphaned beads via session-ID liveness.**
 
-List beads assigned to agents in YOUR rig:
+**Ordering is mandatory: capture the candidate bead list FIRST, build the
+liveness map SECOND.** Both reads are snapshots of a city that keeps moving,
+and only this order is safe. Sessions can appear between the two reads, but a
+session that a bead already names cannot retroactively vanish from a *later*
+roster read — so a map built after the bead list is a superset of every
+assignee that list can name. Build the map first and the window inverts: a
+polecat that spawns and gets assigned work in between is missing from the map,
+resolves to `absent`, and has its live worktree force-removed by Step 2. Do not
+reorder these two reads.
+
+List beads assigned to agents in YOUR rig (FIRST read):
 ```bash
 gc bd list --status=in_progress --json --limit=0
 gc bd list --status=open --json --limit=0
@@ -156,7 +166,8 @@ open/unassigned before witness observes it; that requires a separate
 worktree-salvage scan keyed by `metadata.work_dir`. Bound Gastown polecat
 assignees use the shape `<rig>/{{binding_prefix}}<polecat-suffix>`.
 
-Get the full session roster for liveness checks:
+Get the full session roster for liveness checks (SECOND read — only after the
+bead list above has been captured):
 ```bash
 gc session list --state=all --json
 gc bd list --type=session --label=gc:session --include-infra --include-gates --all --json --limit=0
@@ -171,8 +182,12 @@ a NEW session with a different ID — the old one never comes back.
 
 **Liveness check procedure:**
 
-1. Build the assignee→state liveness map ONCE per cycle (before the
-   per-bead loop), then resolve each bead's assignee against it. Resolve by
+1. Build the assignee→state liveness map ONCE per cycle (after the bead list
+   is captured, before the per-bead loop), then resolve each bead's assignee
+   against it. The map MUST be built after the bead-list snapshot so it stays a
+   superset of every assignee that list can name — that is the ordering mandate
+   in Step 1, and it is what keeps a session spawned mid-cycle from resolving to
+   `absent`. Do not re-invert it. Resolve by
    exact identifier lookup — do NOT extract a session ID with a regex or
    fixed prefix list: rig prefixes are configuration-derived, and assignees
    may be a session bead ID, session name, alias, concrete agent name, or
@@ -237,15 +252,53 @@ a NEW session with a different ID — the old one never comes back.
    pool/ephemeral work identities. If the assignee is a refinery, witness, or
    other configured infrastructure identity, skip it instead of recovering it.
 
-3. Classify:
+3. **Confirm every `absent` with a targeted live re-query before acting on
+   it.** Recovery is destructive — it force-removes a worktree and reopens the
+   source bead — so one stale map lookup must never be enough to trigger it.
+   The `MAP_COUNT==0` fail-safe above only catches an EMPTY map; a map that is
+   merely STALE is fully populated, passes that check, and fails silently on
+   exactly the beads whose sessions are newest. Re-read that ONE identity and
+   only keep `absent` if the second read agrees:
+   ```bash
+   if [ "$STATE" = "absent" ]; then
+     CONFIRM_SESSIONS=$(mktemp); CONFIRM_BEADS=$(mktemp)
+     if gc session list --state=all --json > "$CONFIRM_SESSIONS" \
+       && gc bd list --type=session --label=gc:session --include-infra --include-gates --all --json --limit=0 > "$CONFIRM_BEADS"; then
+       STATE=$(jq -r -n --arg a "$ASSIGNEE" \
+         --slurpfile sessions "$CONFIRM_SESSIONS" --slurpfile session_beads "$CONFIRM_BEADS" '
+         ([ ($sessions[0].sessions // [])[]
+            | select((.id == $a) or (.name == $a) or (.session_name == $a)
+                     or (.alias == $a) or (.agent_name == $a))
+            | (if (.closed // false) then "closed" else (.state // "") end) ]
+          + [ ($session_beads[0] // [])[]
+            | select(.metadata.configured_named_identity == $a)
+            | (if (.status == "closed") then "closed" else (.metadata.state // "") end) ])
+         | first // "absent"')
+     else
+       STATE="unconfirmed"
+     fi
+     rm -f "$CONFIRM_SESSIONS" "$CONFIRM_BEADS"
+   fi
+   ```
+   A confirmation read that FAILS (non-zero exit, empty file, unparseable JSON)
+   is NOT proof of absence — that is what `unconfirmed` means, and an
+   `unconfirmed` bead is skipped this cycle, not recovered. The re-read costs
+   one roster pair per absent candidate — rare in a healthy city — and it turns
+   an ordering race into a confirmed orphan. This is the guard that keeps
+   Step 2 safe even if the Step 1 ordering regresses.
+
+4. Classify:
    - `active` or `awake` → **not orphaned** (may be stuck —
      `check-polecat-health` handles that separately)
    - `creating`, `asleep`, `drained`, `suspended`, `draining`, or
      `quarantined` → **not orphaned** (controller or operator state still owns
      the session)
-   - `archived`, `closed`, or `absent` after the exact lookup → **orphaned
-     bead** for pool/ephemeral work — the owning session is gone and will never
-     come back, regardless of whether the pool template still exists
+   - `unconfirmed` (the item-3 re-query itself failed) → **not orphaned** —
+     skip the bead and let the next cycle re-evaluate it
+   - `archived`, `closed`, or an `absent` **confirmed by the item-3 re-query**
+     → **orphaned bead** for pool/ephemeral work — the owning session is gone
+     and will never come back, regardless of whether the pool template still
+     exists
 
 **Important**: Beads assigned to the refinery, witness, or other
 infrastructure agents (not pool instances) should be skipped — those
