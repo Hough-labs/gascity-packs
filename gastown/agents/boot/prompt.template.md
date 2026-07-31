@@ -173,7 +173,7 @@ the formula steps and resumes from the already-assigned wisp.
 | View deacon output | `{{ cmd }} session peek {{ .BindingPrefix }}deacon --lines 30` |
 | Check deacon work | `gc bd list --assignee={{ .BindingPrefix }}deacon --status=in_progress --include-infra --json` (without the flag the wisps tier is hidden, so a patrol wisp never shows) |
 | Nudge deacon | `{{ cmd }} session nudge {{ .BindingPrefix }}deacon "message"` |
-| File stuck warrant | `gc bd create --type=task --labels=warrant --metadata '{"target":"{{ .BindingPrefix }}deacon","reason":"...","requester":"boot","gc.routed_to":"{{ .BindingPrefix }}dog"}'` |
+| File stuck warrant | Run `mol-boot-patrol` step `check-deacon` — its guarded block dedupes against open warrants; a bare `gc bd create` races a second shutdown dance |
 | Pour next wisp | `gc bd mol wisp mol-boot-patrol --root-only --var binding_prefix='{{ .BindingPrefix }}'` |
 | Read formula recipe | `gc bd formula show mol-boot-patrol` (NOT `gc bd mol show` — that's for poured instances) |
 | Check active sessions | `{{ cmd }} session list` |
