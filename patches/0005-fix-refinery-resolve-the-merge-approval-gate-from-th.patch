@@ -1,0 +1,472 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 31 Jul 2026 17:37:54 -0400
+Subject: [PATCH 5/5] fix(refinery): resolve the merge approval gate from the
+ formula's own pack tree (gcp-amo)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Turning require_merge_approval on did not gate merges — it hard-stopped the
+refinery on every patrol iteration. The four-candidate lookup the gate shipped
+with could not resolve merge-approval-gate.sh from the context the formula
+actually runs in, so patrol printed "An unreadable gate is not an approval",
+drain-acked, and exited 1 before touching any bead. Fail-closed became
+fail-forever.
+
+Every candidate was unreachable by construction, not by accident. GC_PACK_DIR
+is exported only when gc invokes a *pack command*; a formula's inline bash is
+the agent's own shell, and the var is unset in every running agent process in
+the city. Nothing materializes pack check scripts into $GC_CITY/.gc/scripts/
+checks/, so candidates 2-4 pointed at a directory that has never existed. This
+was the only formula-invoked check using that lookup pattern — the sibling
+check scripts are reached as pack commands, where GC_PACK_DIR *is* set — so the
+strategy had no working precedent anywhere and was never exercised end to end.
+
+The gate now resolves primarily from this formula's own source path, reported
+by `gc formula list --json`: the gate ships beside the formula in the same pack
+tree, so that anchor is present whenever the formula is, needs no environment
+beyond the city, and is version-coherent by construction — a formula from one
+pin can never reach a gate from another. It works identically for a rig pinned
+to a SHA, because gc checks the pin out into the content-addressed pack cache
+and reports that path. GC_PACK_DIR and the city scripts dir stay as fallbacks
+for cities that stage checks themselves; an unresolvable gate still refuses to
+merge, unchanged.
+
+Chose formula-side resolution over the two alternatives deliberately. Having gc
+materialize pack checks into the city scripts dir, or export GC_PACK_DIR into
+agent sessions, would both need gc-binary changes plus new deploy machinery,
+and neither gives the version coherence that anchoring on the formula's own
+tree does for free.
+
+Validation: the wiring block is delimited by markers and the tests execute it
+verbatim rather than a transcription, so the resolution strategy cannot regress
+silently. New coverage asserts resolution with GC_PACK_DIR unset (the real
+runtime condition), resolution from a SHA-pinned pack cache path, the city
+scripts fallback, the fail-closed stop when nothing resolves, and — the
+behaviour the bug denied — that a resolvable gate parks an unapproved bead as
+merge_approval_state=awaiting_review instead of drain-acking. Verified red
+against the pre-fix lookup in the same scenario, and confirmed live from the
+refinery worktree with the real gc and GC_PACK_DIR unset that resolution lands
+on the pinned pack cache tree.
+
+Follow-up: tests/test_no_bare_bd_commands.py is already red on integration from
+the gcp-dc8 stack — filed as gcp-1q4, discovered-from this bead. This change
+adds no new violations to it.
+---
+ gastown/README.md                         |  11 +
+ gastown/formulas/mol-refinery-patrol.toml |  65 +++++-
+ gastown/tests/test_merge_approval_gate.sh | 273 ++++++++++++++++++++++
+ 3 files changed, 341 insertions(+), 8 deletions(-)
+
+diff --git a/gastown/README.md b/gastown/README.md
+index c32517a..5a98bc3 100644
+--- a/gastown/README.md
++++ b/gastown/README.md
+@@ -71,6 +71,17 @@ invalidates it. Every other outcome refuses, including the ones the gate cannot
+ explain (unreadable bead, PR lookup failure, unresolvable head SHA): a tool
+ error is a suspect, not a licence to merge.
+ 
++The patrol formula locates that script through its own resolved source path —
++`gc formula list --json` reports where gc loaded `mol-refinery-patrol.toml`
++from, and the gate sits beside it in the same pack tree. That anchor is the
++only one that holds in the context the formula actually runs in (the agent's
++own shell, where `GC_PACK_DIR` is unset — gc exports it for pack *commands*
++only) and it is version-coherent by construction: a formula from one pin can
++never reach a gate from another. `$GC_CITY/.gc/scripts/checks/` and
++`GC_PACK_DIR` remain fallbacks for cities that stage checks themselves. If none
++resolve, patrol stops without touching bead state — an unreadable gate is not
++an approval.
++
+ Turning the gate on implies the pull-request lane. `merge_strategy=direct` is
+ promoted to `mr`, because a reviewed merge needs a PR to review; PR publication
+ becomes the start of review instead of the terminal handoff, and a refused
+diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
+index 18a0b17..46941d7 100644
+--- a/gastown/formulas/mol-refinery-patrol.toml
++++ b/gastown/formulas/mol-refinery-patrol.toml
+@@ -461,19 +461,66 @@ if [ "$APPROVAL_REQUIRED" -eq 1 ] && [ "$MERGE_STRATEGY" = "direct" ]; then
+   echo "require_merge_approval is on; a reviewed merge needs a pull request — using merge_strategy=mr."
+   MERGE_STRATEGY="mr"
+ fi
+-APPROVAL_GATE=""
+-if [ "$APPROVAL_REQUIRED" -eq 1 ]; then
+-  for cand in \
+-    "${GC_PACK_DIR:-}/assets/scripts/checks/merge-approval-gate.sh" \
++# >>> merge-approval-gate-wiring >>>
++# Everything between these markers is executed verbatim by
++# gastown/tests/test_merge_approval_gate.sh, so the resolution and refusal
++# behaviour asserted there is the behaviour the refinery actually runs. Keep
++# the block self-contained: its only inputs are APPROVAL_REQUIRED, WORK, and
++# the formula vars.
++#
++# Locate merge-approval-gate.sh from the context this formula actually runs in:
++# the agent's own shell, not a `gc` pack-command invocation.
++#
++# The primary anchor is this formula's own resolved source path. The gate ships
++# beside the formula in the same pack tree, so that path is the one candidate
++# guaranteed to be (a) present whenever the formula itself is and (b) version-
++# coherent with it — a formula from pin X can never reach a gate from pin Y.
++# `gc formula list --json` reports it for every formula gc can see, including
++# packs pinned to a SHA (gc checks the pin out into the pack cache and reports
++# the cache path), and it needs no environment beyond the city.
++#
++# The env-var and city-scripts candidates stay as fallbacks for cities that do
++# materialize checks into `.gc/scripts/checks/`, but none of them can be the
++# primary: GC_PACK_DIR is exported only when gc invokes a *pack command* and is
++# unset in every agent process, and nothing materializes pack check scripts
++# into the city scripts dir today. Depending on them alone made the gate
++# permanently unresolvable, which turned fail-closed into fail-forever
++# (gcp-amo).
++resolve_approval_gate() {
++  rag_rel="assets/scripts/checks/merge-approval-gate.sh"
++  rag_city="${GC_CITY:-${GC_CITY_PATH:-}}"
++  if [ -n "$rag_city" ]; then
++    rag_json=$(gc formula list --city "$rag_city" --json 2>/dev/null)
++  else
++    rag_json=$(gc formula list --json 2>/dev/null)
++  fi
++  rag_src=$(printf '%s' "$rag_json" \
++    | jq -r '.formulas[]? | select(.name == "mol-refinery-patrol") | .source // empty' 2>/dev/null \
++    | head -1)
++  if [ -n "$rag_src" ]; then
++    # <pack>/formulas/mol-refinery-patrol.toml -> <pack>
++    rag_pack=$(dirname "$(dirname "$rag_src")")
++    if [ -f "$rag_pack/$rag_rel" ]; then
++      printf '%s\n' "$rag_pack/$rag_rel"
++      return 0
++    fi
++  fi
++  for rag_cand in \
++    "${GC_PACK_DIR:-}/$rag_rel" \
+     "${GC_CITY:-}/.gc/scripts/checks/merge-approval-gate.sh" \
+     "${GC_CITY_PATH:-}/.gc/scripts/checks/merge-approval-gate.sh" \
+     ".gc/scripts/checks/merge-approval-gate.sh"
+   do
+-    if [ -f "$cand" ]; then
+-      APPROVAL_GATE="$cand"
+-      break
++    if [ -f "$rag_cand" ]; then
++      printf '%s\n' "$rag_cand"
++      return 0
+     fi
+   done
++  return 1
++}
++APPROVAL_GATE=""
++if [ "$APPROVAL_REQUIRED" -eq 1 ]; then
++  APPROVAL_GATE=$(resolve_approval_gate)
+   if [ -z "$APPROVAL_GATE" ]; then
+     echo "require_merge_approval is on but merge-approval-gate.sh was not found. STOP. Do not mutate bead state."
+     echo "An unreadable gate is not an approval."
+@@ -513,6 +560,7 @@ park_awaiting_review() {
+   echo "APPROVAL GATE REFUSED: $WORK — $1"
+   echo "Bead left open and assigned to the refinery; skip the merge and run patrol-summary + next-iteration."
+ }
++# <<< merge-approval-gate-wiring <<<
+ 
+ block_existing_pr() {
+   reason="$1"
+@@ -775,7 +823,8 @@ without a gc-native approval signal recorded on the work bead. The signal lives
+ in `merge_approval.*` metadata — verdict, PR number, head SHA, reviewer,
+ timestamp — written by a reviewer agent via
+ `assets/scripts/record-merge-approval.sh` and read here by
+-`assets/scripts/checks/merge-approval-gate.sh`.
++`assets/scripts/checks/merge-approval-gate.sh`, resolved from this formula's
++own pack tree (see `resolve_approval_gate` above).
+ 
+ The head SHA is the whole point. An approval authorizes one commit, not a
+ branch: the gate re-reads the live PR head and refuses anything else, so
+diff --git a/gastown/tests/test_merge_approval_gate.sh b/gastown/tests/test_merge_approval_gate.sh
+index 78993a0..5a3a5ee 100755
+--- a/gastown/tests/test_merge_approval_gate.sh
++++ b/gastown/tests/test_merge_approval_gate.sh
+@@ -595,6 +595,274 @@ PY
+         fail "patrol formula should branch on the gate's exit status"
+     grep -F 'merge_approval_state=awaiting_review' "$formula" >/dev/null ||
+         fail "a refused merge should park the bead as awaiting_review, not close it"
++    # The gate must not be reachable only through GC_PACK_DIR / the city
++    # scripts dir again — neither exists in the refinery's shell (gcp-amo).
++    grep -F 'gc formula list' "$formula" >/dev/null ||
++        fail "the gate must be resolved from the formula's own pack tree, not env vars alone"
++}
++
++# ── Gate resolution (gcp-amo) ───────────────────────────────────────────────
++#
++# The four-candidate lookup this formula shipped with could not resolve the
++# gate from the context the refinery actually runs in: GC_PACK_DIR is exported
++# only for gc *pack commands* and is unset in every agent process, and nothing
++# materializes pack check scripts into `$GC_CITY/.gc/scripts/checks/`. The gate
++# was therefore permanently unresolvable, so turning require_merge_approval on
++# hard-stopped patrol instead of gating it.
++#
++# These tests execute the formula's own wiring block rather than a transcription
++# of it, so they fail if the resolution strategy regresses. GC_PACK_DIR is unset
++# throughout — that is the real runtime condition, not a hypothetical.
++
++# extract_gate_wiring writes the formula's marked wiring block to $1, with the
++# formula vars substituted. $2 = require_merge_approval, $3 = review_agent.
++extract_gate_wiring() {
++    local out="$1" required="${2:-true}" review_agent="${3:-}"
++    python3 - "$ROOT/gastown/formulas/mol-refinery-patrol.toml" \
++        "$out" "$required" "$review_agent" <<'PY' ||
++import sys, tomllib
++
++formula_path, out_path, required, review_agent = sys.argv[1:5]
++START = "# >>> merge-approval-gate-wiring >>>"
++END = "# <<< merge-approval-gate-wiring <<<"
++
++with open(formula_path, "rb") as handle:
++    formula = tomllib.load(handle)
++
++blocks = [
++    step.get("description", "")
++    for step in formula.get("steps", [])
++    if START in step.get("description", "")
++]
++if len(blocks) != 1:
++    sys.exit(f"expected exactly one wiring block, found {len(blocks)}")
++body = blocks[0]
++block = body[body.index(START) : body.index(END) + len(END)]
++if "{{" in block.replace("{{require_merge_approval}}", "").replace(
++    "{{review_agent}}", ""
++):
++    sys.exit("wiring block references a formula var the tests do not substitute")
++block = block.replace("{{require_merge_approval}}", required)
++block = block.replace("{{review_agent}}", review_agent)
++with open(out_path, "w") as handle:
++    handle.write(block + "\n")
++PY
++        fail "could not extract the gate wiring block from the patrol formula"
++}
++
++# write_formula_gc_stub writes a `gc` that answers `formula list --json` with
++# $2 as mol-refinery-patrol's source path (empty = formula not found), logs
++# every bead-write and nudge invocation, and records a `runtime drain-ack`.
++write_formula_gc_stub() {
++    local bin="$1" source_path="$2"
++    mkdir -p "$bin"
++    cat >"$bin/gc" <<'SH'
++#!/usr/bin/env bash
++# Subcommands are matched one word at a time so this stub never spells a
++# bare beads invocation that tests/test_no_bare_bd_commands.py would flag.
++case "${1:-}" in
++    formula)
++        [ "${2:-}" = "list" ] || exit 0
++        if [ -n "${STUB_FORMULA_SOURCE:-}" ]; then
++            jq -n --arg source "$STUB_FORMULA_SOURCE" \
++                '{formulas: [{name: "mol-other", source: "/nope/formulas/mol-other.toml"},
++                             {name: "mol-refinery-patrol", source: $source}]}'
++        else
++            jq -n '{formulas: []}'
++        fi
++        exit 0
++        ;;
++    bd|session)
++        printf '%s\n' "$*" >>"${STUB_UPDATE_LOG:-/dev/null}"
++        exit 0
++        ;;
++    runtime)
++        [ "${2:-}" = "drain-ack" ] &&
++            printf 'drain-ack\n' >>"${STUB_UPDATE_LOG:-/dev/null}"
++        exit 0
++        ;;
++esac
++exit 0
++SH
++    chmod +x "$bin/gc"
++    STUB_FORMULA_SOURCE="$source_path"
++    export STUB_FORMULA_SOURCE
++}
++
++# plant_pack_tree materializes a pack tree at $1 holding the real gate script,
++# and echoes the formula source path inside it.
++plant_pack_tree() {
++    local pack="$1"
++    mkdir -p "$pack/formulas" "$pack/assets/scripts/checks"
++    cp "$GATE" "$pack/assets/scripts/checks/merge-approval-gate.sh"
++    : >"$pack/formulas/mol-refinery-patrol.toml"
++    printf '%s\n' "$pack/formulas/mol-refinery-patrol.toml"
++}
++
++# run_wiring sources the extracted block in an isolated shell. $1 = wiring
++# file, $2 = bin dir, remaining env comes from the caller. Sets WIRING_STATUS
++# and WIRING_OUTPUT; the resolved gate path is echoed as the last line.
++run_wiring() {
++    local wiring="$1" bin="$2"
++    set +e
++    WIRING_OUTPUT=$(PATH="$bin:$PATH" \
++        GC_CITY="${GC_CITY:-}" GC_CITY_PATH="${GC_CITY_PATH:-}" \
++        bash -c '
++            unset GC_PACK_DIR
++            APPROVAL_REQUIRED=1
++            WORK=wb-1
++            . "$1"
++            printf "RESOLVED=%s\n" "$APPROVAL_GATE"
++        ' _ "$wiring" 2>&1)
++    WIRING_STATUS=$?
++    set -e
++}
++
++test_gate_resolver_finds_the_pack_tree_without_gc_pack_dir() {
++    local tmp bin wiring pack source
++    tmp=$(mktemp -d)
++    bin="$tmp/bin"
++    wiring="$tmp/wiring.sh"
++    pack="$tmp/pack/gastown"
++    source=$(plant_pack_tree "$pack")
++    extract_gate_wiring "$wiring"
++    write_formula_gc_stub "$bin" "$source"
++
++    # No city scripts dir anywhere: the pack tree is the only thing that can
++    # answer, which is exactly the production shape.
++    GC_CITY="$tmp/city" GC_CITY_PATH="$tmp/city" run_wiring "$wiring" "$bin"
++
++    [ "$WIRING_STATUS" -eq 0 ] ||
++        fail "wiring should resolve the gate with GC_PACK_DIR unset, got exit $WIRING_STATUS: $WIRING_OUTPUT"
++    grep -Fx "RESOLVED=$pack/assets/scripts/checks/merge-approval-gate.sh" <<<"$WIRING_OUTPUT" >/dev/null ||
++        fail "expected the gate resolved from the formula's own pack tree, got: $WIRING_OUTPUT"
++    rm -rf "$tmp"
++}
++
++test_gate_resolver_works_for_a_sha_pinned_pack() {
++    local tmp bin wiring pack source
++    tmp=$(mktemp -d)
++    bin="$tmp/bin"
++    wiring="$tmp/wiring.sh"
++    # gc checks a SHA pin out into the content-addressed pack cache and reports
++    # that path, so a pinned rig must resolve the same way a branch-tracking one
++    # does. Mirror the cache layout rather than a checkout-shaped path.
++    pack="$tmp/.gc/cache/repos/$(printf 'c%.0s' $(seq 1 64))/gastown"
++    source=$(plant_pack_tree "$pack")
++    extract_gate_wiring "$wiring"
++    write_formula_gc_stub "$bin" "$source"
++
++    GC_CITY="$tmp/city" GC_CITY_PATH="$tmp/city" run_wiring "$wiring" "$bin"
++
++    [ "$WIRING_STATUS" -eq 0 ] ||
++        fail "a SHA-pinned pack should resolve, got exit $WIRING_STATUS: $WIRING_OUTPUT"
++    grep -Fx "RESOLVED=$pack/assets/scripts/checks/merge-approval-gate.sh" <<<"$WIRING_OUTPUT" >/dev/null ||
++        fail "expected the gate resolved from the pinned pack cache, got: $WIRING_OUTPUT"
++    rm -rf "$tmp"
++}
++
++test_gate_resolver_falls_back_to_the_city_scripts_dir() {
++    local tmp bin wiring city
++    tmp=$(mktemp -d)
++    bin="$tmp/bin"
++    wiring="$tmp/wiring.sh"
++    city="$tmp/city"
++    mkdir -p "$city/.gc/scripts/checks"
++    cp "$GATE" "$city/.gc/scripts/checks/merge-approval-gate.sh"
++    extract_gate_wiring "$wiring"
++    # gc cannot name the formula's source; the materialized city copy must
++    # still be honoured so cities that do stage checks keep working.
++    write_formula_gc_stub "$bin" ""
++
++    GC_CITY="$city" GC_CITY_PATH="$city" run_wiring "$wiring" "$bin"
++
++    [ "$WIRING_STATUS" -eq 0 ] ||
++        fail "the city scripts dir should still resolve, got exit $WIRING_STATUS: $WIRING_OUTPUT"
++    grep -Fx "RESOLVED=$city/.gc/scripts/checks/merge-approval-gate.sh" <<<"$WIRING_OUTPUT" >/dev/null ||
++        fail "expected the city-materialized gate, got: $WIRING_OUTPUT"
++    rm -rf "$tmp"
++}
++
++test_gate_wiring_still_fails_closed_when_nothing_resolves() {
++    local tmp bin wiring log output status
++    tmp=$(mktemp -d)
++    bin="$tmp/bin"
++    wiring="$tmp/wiring.sh"
++    log="$tmp/update.log"
++    extract_gate_wiring "$wiring"
++    write_formula_gc_stub "$bin" ""
++
++    set +e
++    output=$(PATH="$bin:$PATH" STUB_UPDATE_LOG="$log" \
++        GC_CITY="$tmp/city" GC_CITY_PATH="$tmp/city" \
++        bash -c '
++            unset GC_PACK_DIR
++            cd "$2"
++            APPROVAL_REQUIRED=1
++            WORK=wb-1
++            . "$1"
++            echo "REACHED_MERGE"
++        ' _ "$wiring" "$tmp" 2>&1)
++    status=$?
++    set -e
++
++    [ "$status" -eq 1 ] ||
++        fail "an unresolvable gate must stop with exit 1, got exit $status: $output"
++    grep -F "REACHED_MERGE" <<<"$output" >/dev/null &&
++        fail "an unresolvable gate must not fall through to the merge: $output"
++    grep -F "An unreadable gate is not an approval." <<<"$output" >/dev/null ||
++        fail "expected the fail-closed refusal message, got: $output"
++    grep -F "set-metadata" "$log" >/dev/null &&
++        fail "the fail-closed path must not mutate bead state: $(cat "$log")"
++    rm -rf "$tmp"
++}
++
++test_resolved_gate_parks_an_unapproved_bead_instead_of_stopping() {
++    local tmp bin wiring pack source log bead output status
++    tmp=$(mktemp -d)
++    bin="$tmp/bin"
++    wiring="$tmp/wiring.sh"
++    pack="$tmp/pack/gastown"
++    log="$tmp/update.log"
++    bead="$tmp/bead.json"
++    source=$(plant_pack_tree "$pack")
++    extract_gate_wiring "$wiring"
++    write_formula_gc_stub "$bin" "$source"
++    # A work bead with a PR but no approval signal at all — the ordinary state
++    # of every bead the moment it reaches the refinery.
++    bead_json "$bead" "pr_url=https://github.com/acme/widgets/pull/7"
++
++    set +e
++    output=$(PATH="$bin:$PATH" STUB_UPDATE_LOG="$log" STUB_BEAD_JSON="$bead" \
++        GC_CITY="$tmp/city" GC_CITY_PATH="$tmp/city" \
++        bash -c '
++            unset GC_PACK_DIR
++            APPROVAL_REQUIRED=1
++            WORK=wb-1
++            BRANCH=polecat/wb-1
++            . "$1"
++            gate_output=$(run_approval_gate "$2" 2>&1)
++            gate_status=$?
++            if [ "$gate_status" -ne 0 ]; then
++              park_awaiting_review "$gate_output"
++            else
++              echo "MERGED"
++            fi
++        ' _ "$wiring" "$SHA_APPROVED" 2>&1)
++    status=$?
++    set -e
++
++    [ "$status" -eq 0 ] ||
++        fail "an unapproved bead should park, not abort the iteration, got exit $status: $output"
++    grep -F "MERGED" <<<"$output" >/dev/null &&
++        fail "an unapproved bead must not merge: $output"
++    grep -F "APPROVAL GATE REFUSED" <<<"$output" >/dev/null ||
++        fail "expected the parked-refusal report, got: $output"
++    grep -F "merge_approval_state=awaiting_review" "$log" >/dev/null ||
++        fail "expected the bead parked as awaiting_review, log: $(cat "$log")"
++    grep -F "drain-ack" "$log" >/dev/null &&
++        fail "parking must not drain-ack the patrol: $(cat "$log")"
++    rm -rf "$tmp"
+ }
+ 
+ test_producer_records_complete_signal
+@@ -612,5 +880,10 @@ test_gate_refuses_when_it_cannot_evaluate
+ test_gate_permits_current_approval
+ test_gate_resolves_pr_without_gh_cli
+ test_refinery_patrol_consumes_the_gate
++test_gate_resolver_finds_the_pack_tree_without_gc_pack_dir
++test_gate_resolver_works_for_a_sha_pinned_pack
++test_gate_resolver_falls_back_to_the_city_scripts_dir
++test_gate_wiring_still_fails_closed_when_nothing_resolves
++test_resolved_gate_parks_an_unapproved_bead_instead_of_stopping
+ 
+ echo "merge approval gate tests passed"
+-- 
+2.50.1 (Apple Git-155)
+
