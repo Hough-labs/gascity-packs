@@ -248,6 +248,22 @@ test_post_merge_worktree_teardown_has_an_owner() {
     grep -F 'Do NOT delete this worktree yourself' "$polecat" >/dev/null ||
         fail "polecat formula should point worktree teardown at the witness"
 
+    # The live-owner gate reads metadata.polecat_session off the WORK bead. The
+    # startup claim block only stamps the step bead, so without this write the
+    # gate is decorative and PR rework can lose its worktree.
+    grep -F -e '--set-metadata polecat_session="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"' \
+        "$polecat" >/dev/null ||
+        fail "workspace-setup must stamp polecat_session on the work bead for the teardown liveness gate"
+    python3 - "$polecat" <<'PY' || fail "polecat_session must be stamped alongside work_dir, not somewhere unrelated"
+import sys
+text = open(sys.argv[1], encoding="utf-8").read()
+start = text.index('**If no worktree** — create one scoped to the bead')
+end = text.index('**3. Ensure branch exists.**')
+block = text[start:end]
+if 'work_dir="$WORKTREE_PATH"' not in block or 'polecat_session=' not in block:
+    raise SystemExit(1)
+PY
+
     # The gates are the safety contract; losing any one of them silently turns
     # housekeeping into data loss.
     grep -F '*/polecats/*/worktrees/*' "$reaper" >/dev/null ||

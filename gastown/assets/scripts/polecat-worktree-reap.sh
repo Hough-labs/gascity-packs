@@ -213,9 +213,15 @@ while IFS= read -r WT; do
     # Gate 3: never discard uncommitted work. Ignored files are artifacts and
     # are excluded by `git status --porcelain`; untracked non-ignored files are
     # reported and block the reap so the witness can salvage them.
-    DIRTY=$(git -C "$WT" status --porcelain 2>/dev/null || printf 'UNREADABLE')
+    if ! DIRTY=$(git -C "$WT" status --porcelain 2>/dev/null); then
+        # A worktree git cannot even read is not one to delete on a guess.
+        record worktree_status_unreadable "$BEAD" "$WT" "git status failed in the worktree"
+        SKIPPED=$((SKIPPED + 1))
+        continue
+    fi
     if [ -n "$DIRTY" ]; then
-        record worktree_dirty_kept "$BEAD" "$WT" "uncommitted changes present"
+        record worktree_dirty_kept "$BEAD" "$WT" \
+            "$(printf '%s\n' "$DIRTY" | wc -l | tr -d ' ') uncommitted path(s)"
         SKIPPED=$((SKIPPED + 1))
         continue
     fi
@@ -245,4 +251,8 @@ done <<EOF
 $CANDIDATES
 EOF
 
-echo "polecat-worktree-reap: reaped=$REAPED skipped=$SKIPPED (log: $LOG_FILE)"
+if [ "$DRY_RUN" -eq 1 ]; then
+    echo "polecat-worktree-reap: would reap=$REAPED skipped=$SKIPPED (dry run; log: $LOG_FILE)"
+else
+    echo "polecat-worktree-reap: reaped=$REAPED skipped=$SKIPPED (log: $LOG_FILE)"
+fi

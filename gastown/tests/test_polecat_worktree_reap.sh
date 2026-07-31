@@ -14,8 +14,9 @@ write_gc_stub() {
     mkdir -p "$bin"
     cat >"$bin/gc" <<'SH'
 #!/usr/bin/env sh
-# Serves the two reads polecat-worktree-reap.sh performs:
-#   gc [bd --rig <rig>] show <bead> --json
+# Serves the two reads polecat-worktree-reap.sh performs, in both their
+# rig-scoped and unscoped forms:
+#   gc bd --rig <rig> show <bead> --json
 #   gc session list --state=all --json
 case "$1" in
     session)

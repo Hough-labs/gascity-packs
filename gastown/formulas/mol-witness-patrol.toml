@@ -530,6 +530,7 @@ tail -n 50 "${LOG_DIR:-$GC_CITY/.gc/runtime/logs}/polecat-worktree-reap.log"
 | `worktree_dirty_kept` | Closed bead, uncommitted changes on disk | Salvage per Case C/D, then re-run |
 | `worktree_owner_live` | Closed bead, polecat still alive (PR rework) | None — expected; next cycle retries |
 | `worktree_bead_unreadable` | `gc bd show` returned nothing | If it persists, check Dolt health |
+| `worktree_status_unreadable` | `git status` failed inside the worktree | Inspect by hand; likely a broken or moved checkout |
 | `worktree_reap_failed` | Directory survived removal | Investigate permissions/mounts, mail mayor |
 
 A `worktree_dirty_kept` that repeats across cycles means real work is

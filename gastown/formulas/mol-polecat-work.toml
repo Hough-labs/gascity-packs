@@ -107,8 +107,18 @@ cd "$WORKTREE_PATH"
 ```
 Record immediately so restarts and witness recovery can find it:
 ```bash
-gc bd update "$WORK_BEAD_ID" --set-metadata work_dir="$WORKTREE_PATH"
+gc bd update "$WORK_BEAD_ID" \
+  --set-metadata work_dir="$WORKTREE_PATH" \
+  --set-metadata polecat_session="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
 ```
+
+`polecat_session` must land on the WORK bead, not just on the step bead the
+startup claim block stamps. It is what tells the witness's
+`reap-merged-worktrees` teardown that you are still alive: on a PR-review rig
+the refinery closes this bead when the PR opens, while you stay available for
+FIX_NEEDED rework and still need this worktree. Without the stamp the witness
+sees no owner and may reclaim the directory out from under you — recoverable
+(workspace-setup rebuilds it from `metadata.branch`) but wasteful.
 
 Worktrees are scoped to the work bead (not the agent name) so that:
 - An agent can pick up new work even if an old worktree is being recovered
