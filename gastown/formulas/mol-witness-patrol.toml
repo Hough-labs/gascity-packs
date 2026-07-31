@@ -262,9 +262,14 @@ a NEW session with a different ID — the old one never comes back.
    ```bash
    if [ "$STATE" = "absent" ]; then
      CONFIRM_SESSIONS=$(mktemp); CONFIRM_BEADS=$(mktemp)
+     # Default to unconfirmed and overwrite ONLY on a read that fully
+     # succeeded and parsed. Every failure path then falls through to
+     # "skip this bead", with no way to reach a destructive `absent`.
+     STATE="unconfirmed"
      if gc session list --state=all --json > "$CONFIRM_SESSIONS" \
-       && gc bd list --type=session --label=gc:session --include-infra --include-gates --all --json --limit=0 > "$CONFIRM_BEADS"; then
-       STATE=$(jq -r -n --arg a "$ASSIGNEE" \
+       && gc bd list --type=session --label=gc:session --include-infra --include-gates --all --json --limit=0 > "$CONFIRM_BEADS" \
+       && [ -s "$CONFIRM_SESSIONS" ] && [ -s "$CONFIRM_BEADS" ]; then
+       CONFIRMED=$(jq -r -n --arg a "$ASSIGNEE" \
          --slurpfile sessions "$CONFIRM_SESSIONS" --slurpfile session_beads "$CONFIRM_BEADS" '
          ([ ($sessions[0].sessions // [])[]
             | select((.id == $a) or (.name == $a) or (.session_name == $a)
@@ -273,9 +278,7 @@ a NEW session with a different ID — the old one never comes back.
           + [ ($session_beads[0] // [])[]
             | select(.metadata.configured_named_identity == $a)
             | (if (.status == "closed") then "closed" else (.metadata.state // "") end) ])
-         | first // "absent"')
-     else
-       STATE="unconfirmed"
+         | first // "absent"') && STATE="$CONFIRMED"
      fi
      rm -f "$CONFIRM_SESSIONS" "$CONFIRM_BEADS"
    fi
