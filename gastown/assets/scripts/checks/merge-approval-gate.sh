@@ -28,7 +28,8 @@
 # Exit codes:
 #   0  merge permitted (approved and current), or gate not enabled
 #   1  REFUSE — missing, incomplete, non-approving, mismatched, or stale signal
-#   2  REFUSE — cannot evaluate (unreadable bead, PR lookup failure, no token)
+#   2  REFUSE — cannot evaluate (unreadable bead, unresolvable origin repo, PR
+#      lookup failure, no token)
 
 set -uo pipefail
 
@@ -188,23 +189,55 @@ resolve_github_token() {
         sed -n 's/^password=//p' | head -n 1
 }
 
+# --- origin-repo-resolution:begin ---
+# Both lookup paths must ask the SAME repository, and it must be the one this
+# rig's branches were actually pushed to. `gh` resolves its base repo with its
+# own heuristic, which on a fork that also carries an `upstream` remote answers
+# the PARENT — so an unscoped `gh pr view 2` read a stranger's pull request and
+# judged the approval against it, refusing every valid approval (gcp-3ty).
+# Parse `git remote get-url origin` directly and treat gh's guess as something
+# to override, never to trust; same call mol-refinery-patrol's mr lane made in
+# gcp-6qp. Resolution lives here once so the gh and REST paths cannot disagree.
+ORIGIN_URL=""
+ORIGIN_REPO=""
+ORIGIN_REPO_ERROR=""
+
+resolve_origin_repo() {
+    local origin
+    ORIGIN_URL=$(git remote get-url origin 2>/dev/null)
+    if [ -z "$ORIGIN_URL" ]; then
+        ORIGIN_REPO_ERROR="origin_remote_unreadable"
+        return 1
+    fi
+    origin="$ORIGIN_URL"
+    case "$origin" in
+        git@github.com:*) origin=${origin#git@github.com:} ;;
+        https://github.com/*) origin=${origin#https://github.com/} ;;
+        ssh://git@github.com/*) origin=${origin#ssh://git@github.com/} ;;
+        *)
+            ORIGIN_REPO_ERROR="unsupported_origin_remote"
+            return 1
+            ;;
+    esac
+    origin=${origin%.git}
+    if [[ ! "$origin" =~ ^[^/]+/[^/]+$ ]]; then
+        ORIGIN_REPO_ERROR="unparseable_origin_remote"
+        return 1
+    fi
+    ORIGIN_REPO="$origin"
+    return 0
+}
+# --- origin-repo-resolution:end ---
+
 # Mirrors mol-refinery-patrol's own gh-or-REST split so the gate stays usable in
 # rigs without the gh CLI. Without the fallback those rigs would be permanently
 # refused — fail-closed, but permanently deadlocked, which is the bug this gate
 # exists to end.
 lookup_pr_rest() {
-    local number="$1" origin owner repo token raw
-    origin=$(git remote get-url origin 2>/dev/null) || return 1
-    case "$origin" in
-        git@github.com:*) origin=${origin#git@github.com:} ;;
-        https://github.com/*) origin=${origin#https://github.com/} ;;
-        *) return 1 ;;
-    esac
-    origin=${origin%.git}
-    case "$origin" in
-        */*) owner=${origin%%/*}; repo=${origin#*/} ;;
-        *) return 1 ;;
-    esac
+    local number="$1" owner repo token raw
+    [ -n "$ORIGIN_REPO" ] || return 1
+    owner=${ORIGIN_REPO%%/*}
+    repo=${ORIGIN_REPO#*/}
     token=$(resolve_github_token)
     [ -n "$token" ] || return 1
     raw=$(curl -fsS \
@@ -219,11 +252,19 @@ lookup_pr_rest() {
 lookup_pr() {
     local number="$1"
     if command -v gh >/dev/null 2>&1; then
-        gh pr view "$number" --json number,state,headRefName,headRefOid 2>/dev/null
+        gh pr view "$number" --repo "$ORIGIN_REPO" \
+            --json number,state,headRefName,headRefOid 2>/dev/null
         return $?
     fi
     lookup_pr_rest "$number"
 }
+
+# An unscoped lookup is the defect itself, so there is no degraded mode: without
+# a resolved origin the gate has no repository it may safely ask about, and a
+# gate that cannot ask does not merge.
+if ! resolve_origin_repo; then
+    undecidable "origin_repo_unresolved cause=$ORIGIN_REPO_ERROR origin=${ORIGIN_URL:-<empty>}"
+fi
 
 if ! PR_INFO=$(lookup_pr "$SIG_PR") || [ -z "$PR_INFO" ]; then
     undecidable "pr_lookup_failed pr=$SIG_PR"

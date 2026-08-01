@@ -63,6 +63,24 @@ SH
     chmod +x "$bin/gh"
 }
 
+# The gate resolves the repository to query from the origin remote, so every
+# gate test needs one it controls. Reading the ambient checkout's remote would
+# make these tests depend on where they happen to be cloned.
+write_git_stub() {
+    local bin="$1"
+    mkdir -p "$bin"
+    cat >"$bin/git" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = "remote" ] && [ "${2:-}" = "get-url" ]; then
+    [ "${STUB_ORIGIN_EXIT:-0}" = "0" ] || exit "$STUB_ORIGIN_EXIT"
+    printf '%s\n' "${STUB_ORIGIN_URL:-https://github.com/acme/widgets.git}"
+    exit 0
+fi
+exit 1
+SH
+    chmod +x "$bin/git"
+}
+
 # bead_json writes a work bead payload in the shape `gc bd show --json` returns
 # (a single-element array). $1 = output path, remaining args = metadata k=v.
 bead_json() {
@@ -100,6 +118,9 @@ run_gate() {
         STUB_BEAD_JSON="$bead_file" \
         STUB_PR_JSON="$pr_file" \
         STUB_GH_EXIT="${STUB_GH_EXIT:-0}" \
+        STUB_ORIGIN_URL="${STUB_ORIGIN_URL:-https://github.com/acme/widgets.git}" \
+        STUB_ORIGIN_EXIT="${STUB_ORIGIN_EXIT:-0}" \
+        STUB_GH_REPO_LOG="${STUB_GH_REPO_LOG:-}" \
         bash "$GATE" --bead wb-1 --required true "$@" 2>&1)
     GATE_STATUS=$?
     set -e
@@ -218,6 +239,7 @@ test_gate_is_opt_in() {
     bin="$tmp/bin"
     write_gc_stub "$bin"
     write_gh_stub "$bin"
+    write_git_stub "$bin"
 
     # No bead payload is staged: a gate that reached the store would fail. The
     # disabled gate must not look at all.
@@ -248,6 +270,7 @@ test_gate_treats_unrecognized_opt_in_as_enabled() {
     pr="$tmp/pr.json"
     write_gc_stub "$bin"
     write_gh_stub "$bin"
+    write_git_stub "$bin"
     bead_json "$bead" "branch=polecat/wb-1"
     pr_json "$pr" 7 OPEN "polecat/wb-1" "$SHA_APPROVED"
 
@@ -270,6 +293,7 @@ test_gate_refuses_missing_and_partial_signals() {
     pr="$tmp/pr.json"
     write_gc_stub "$bin"
     write_gh_stub "$bin"
+    write_git_stub "$bin"
     pr_json "$pr" 7 OPEN "polecat/wb-1" "$SHA_APPROVED"
 
     bead_json "$bead" "branch=polecat/wb-1"
@@ -302,6 +326,7 @@ test_gate_refuses_non_approving_verdict() {
     pr="$tmp/pr.json"
     write_gc_stub "$bin"
     write_gh_stub "$bin"
+    write_git_stub "$bin"
     pr_json "$pr" 7 OPEN "polecat/wb-1" "$SHA_APPROVED"
     bead_json "$bead" \
         "branch=polecat/wb-1" \
@@ -323,6 +348,7 @@ test_gate_refuses_wrong_pr_number() {
     pr="$tmp/pr.json"
     write_gc_stub "$bin"
     write_gh_stub "$bin"
+    write_git_stub "$bin"
     pr_json "$pr" 7 OPEN "polecat/wb-1" "$SHA_APPROVED"
 
     # An approval recorded against a different PR cannot authorize this one.
@@ -358,6 +384,7 @@ test_gate_refuses_stale_head_sha() {
     pr="$tmp/pr.json"
     write_gc_stub "$bin"
     write_gh_stub "$bin"
+    write_git_stub "$bin"
 
     # Approval was recorded for SHA_APPROVED; the author has since pushed
     # SHA_OTHER. The approval must not follow the branch forward.
@@ -383,6 +410,7 @@ test_gate_refuses_merge_sha_that_was_not_approved() {
     pr="$tmp/pr.json"
     write_gc_stub "$bin"
     write_gh_stub "$bin"
+    write_git_stub "$bin"
     pr_json "$pr" 7 OPEN "polecat/wb-1" "$SHA_APPROVED"
     bead_json "$bead" \
         "branch=polecat/wb-1" \
@@ -407,6 +435,7 @@ test_gate_refuses_unbindable_or_closed_pr() {
     pr="$tmp/pr.json"
     write_gc_stub "$bin"
     write_gh_stub "$bin"
+    write_git_stub "$bin"
 
     # No branch on the bead: nothing ties the reviewed PR to this work.
     pr_json "$pr" 7 OPEN "polecat/wb-1" "$SHA_APPROVED"
@@ -452,6 +481,7 @@ test_gate_refuses_when_it_cannot_evaluate() {
     pr="$tmp/pr.json"
     write_gc_stub "$bin"
     write_gh_stub "$bin"
+    write_git_stub "$bin"
     pr_json "$pr" 7 OPEN "polecat/wb-1" "$SHA_APPROVED"
     bead_json "$bead" \
         "branch=polecat/wb-1" \
@@ -478,6 +508,151 @@ test_gate_refuses_when_it_cannot_evaluate() {
     expect_undecidable "bead_unreadable"
 }
 
+# ── Gate: origin-repo scoping (gcp-3ty) ─────────────────────────────────────
+#
+# On a fork carrying an `upstream` remote, `gh pr view <n>` with no `--repo`
+# resolves the PARENT. The gate read PR n of a repository the branch was never
+# pushed to and compared the approval against it, so every approval was refused
+# — a permanent merge deadlock dressed up as reviewer inaction.
+#
+# The stub below answers DIFFERENTLY depending on whether `--repo` was passed:
+# the unscoped answer is the upstream's unrelated PR n, the scoped answer is the
+# origin's. A stub that ignored `--repo` could not tell the two apart and so
+# could not catch this bug at all.
+
+write_fork_aware_gh_stub() {
+    local bin="$1"
+    mkdir -p "$bin"
+    cat >"$bin/gh" <<'SH'
+#!/usr/bin/env bash
+repo=""
+prev=""
+for arg in "$@"; do
+    case "$arg" in
+        --repo=*) repo="${arg#*=}" ;;
+        *) [ "$prev" = "--repo" ] && repo="$arg" ;;
+    esac
+    prev="$arg"
+done
+printf '%s\n' "repo=${repo:-<unscoped>}" >>"${STUB_GH_REPO_LOG:-/dev/null}"
+if [ "$repo" = "${STUB_ORIGIN_REPO:-}" ]; then
+    cat "$STUB_PR_JSON"
+else
+    # What gh's base-repo heuristic hands back on a fork: same number,
+    # different repository, entirely unrelated pull request.
+    cat "$STUB_UPSTREAM_PR_JSON"
+fi
+exit 0
+SH
+    chmod +x "$bin/gh"
+}
+
+test_gate_scopes_the_pr_lookup_to_the_origin_repo() {
+    local tmp bin bead pr upstream log
+    tmp=$(mktemp -d)
+    bin="$tmp/bin"
+    bead="$tmp/bead.json"
+    pr="$tmp/pr.json"
+    upstream="$tmp/upstream-pr.json"
+    log="$tmp/gh-repo.log"
+    write_gc_stub "$bin"
+    write_fork_aware_gh_stub "$bin"
+    write_git_stub "$bin"
+
+    # The origin fork's PR 7: open, on our branch, at the approved SHA.
+    pr_json "$pr" 7 OPEN "polecat/wb-1" "$SHA_APPROVED"
+    # The upstream parent's PR 7: a stranger's change, long since merged. This
+    # is what the pre-fix gate reported as `pr_not_open state=MERGED`.
+    pr_json "$upstream" 7 MERGED "someone/unrelated" "$SHA_OTHER"
+    bead_json "$bead" \
+        "branch=polecat/wb-1" \
+        "pr_number=7" \
+        "merge_approval.verdict=approved" \
+        "merge_approval.pr_number=7" \
+        "merge_approval.head_sha=$SHA_APPROVED" \
+        "merge_approval.reviewer=rig/specialists.iris" \
+        "merge_approval.recorded_at=2026-07-31T18:00:00Z"
+
+    # bash 3.2 leaks assignments that prefix a function call, so every stub var
+    # is unset again before the next case reads a stale one.
+    STUB_ORIGIN_URL="https://github.com/hough-labs/gascity-packs.git" \
+        STUB_ORIGIN_REPO="hough-labs/gascity-packs" \
+        STUB_UPSTREAM_PR_JSON="$upstream" \
+        STUB_GH_REPO_LOG="$log" \
+        run_gate "$bin" "$bead" "$pr" --merge-sha "$SHA_APPROVED"
+    unset STUB_ORIGIN_URL STUB_ORIGIN_REPO STUB_UPSTREAM_PR_JSON STUB_GH_REPO_LOG
+
+    [ "$GATE_STATUS" -eq 0 ] ||
+        fail "the gate must read the origin fork's PR, not the upstream parent's: $GATE_OUTPUT"
+    grep -Fx "repo=hough-labs/gascity-packs" "$log" >/dev/null ||
+        fail "expected the lookup scoped to the origin repo, gh saw: $(cat "$log")"
+    grep -F "repo=<unscoped>" "$log" >/dev/null &&
+        fail "the gate must never issue an unscoped gh lookup: $(cat "$log")"
+
+    # Same signal, ssh remote: resolution must not depend on the URL form.
+    : >"$log"
+    STUB_ORIGIN_URL="git@github.com:hough-labs/gascity-packs.git" \
+        STUB_ORIGIN_REPO="hough-labs/gascity-packs" \
+        STUB_UPSTREAM_PR_JSON="$upstream" \
+        STUB_GH_REPO_LOG="$log" \
+        run_gate "$bin" "$bead" "$pr" --merge-sha "$SHA_APPROVED"
+    unset STUB_ORIGIN_URL STUB_ORIGIN_REPO STUB_UPSTREAM_PR_JSON STUB_GH_REPO_LOG
+    [ "$GATE_STATUS" -eq 0 ] ||
+        fail "an ssh origin remote should resolve the same way: $GATE_OUTPUT"
+    grep -Fx "repo=hough-labs/gascity-packs" "$log" >/dev/null ||
+        fail "ssh remote did not scope the lookup, gh saw: $(cat "$log")"
+
+    rm -rf "$tmp"
+}
+
+test_gate_refuses_rather_than_querying_an_unscoped_repo() {
+    local tmp bin bead pr upstream log
+    tmp=$(mktemp -d)
+    bin="$tmp/bin"
+    bead="$tmp/bead.json"
+    pr="$tmp/pr.json"
+    upstream="$tmp/upstream-pr.json"
+    log="$tmp/gh-repo.log"
+    write_gc_stub "$bin"
+    write_fork_aware_gh_stub "$bin"
+    write_git_stub "$bin"
+    pr_json "$pr" 7 OPEN "polecat/wb-1" "$SHA_APPROVED"
+    pr_json "$upstream" 7 MERGED "someone/unrelated" "$SHA_OTHER"
+    bead_json "$bead" \
+        "branch=polecat/wb-1" \
+        "pr_number=7" \
+        "merge_approval.verdict=approved" \
+        "merge_approval.pr_number=7" \
+        "merge_approval.head_sha=$SHA_APPROVED" \
+        "merge_approval.reviewer=iris" \
+        "merge_approval.recorded_at=2026-07-31T18:00:00Z"
+
+    # No origin remote at all: there is nothing safe to scope to, and falling
+    # back to gh's own guess is precisely the defect.
+    : >"$log"
+    STUB_ORIGIN_EXIT=1 STUB_UPSTREAM_PR_JSON="$upstream" STUB_GH_REPO_LOG="$log" \
+        run_gate "$bin" "$bead" "$pr"
+    unset STUB_ORIGIN_EXIT STUB_UPSTREAM_PR_JSON STUB_GH_REPO_LOG
+    expect_undecidable "origin_repo_unresolved"
+    [ ! -s "$log" ] ||
+        fail "an unresolvable origin must not reach gh at all, gh saw: $(cat "$log")"
+
+    # A remote this parser cannot read is the same situation: undecidable, not
+    # a licence to ask gh where it thinks it is.
+    : >"$log"
+    STUB_ORIGIN_URL="https://git.example.com/acme/widgets.git" \
+        STUB_UPSTREAM_PR_JSON="$upstream" STUB_GH_REPO_LOG="$log" \
+        run_gate "$bin" "$bead" "$pr"
+    unset STUB_ORIGIN_URL STUB_UPSTREAM_PR_JSON STUB_GH_REPO_LOG
+    expect_undecidable "origin_repo_unresolved"
+    grep -F "cause=unsupported_origin_remote" <<<"$GATE_OUTPUT" >/dev/null ||
+        fail "expected the unsupported-remote cause to be reported: $GATE_OUTPUT"
+    [ ! -s "$log" ] ||
+        fail "an unsupported origin must not reach gh at all, gh saw: $(cat "$log")"
+
+    rm -rf "$tmp"
+}
+
 # ── Gate: permitted merges ──────────────────────────────────────────────────
 
 test_gate_permits_current_approval() {
@@ -488,6 +663,7 @@ test_gate_permits_current_approval() {
     pr="$tmp/pr.json"
     write_gc_stub "$bin"
     write_gh_stub "$bin"
+    write_git_stub "$bin"
     pr_json "$pr" 7 OPEN "polecat/wb-1" "$SHA_APPROVED"
     bead_json "$bead" \
         "branch=polecat/wb-1" \
@@ -877,6 +1053,8 @@ test_gate_refuses_stale_head_sha
 test_gate_refuses_merge_sha_that_was_not_approved
 test_gate_refuses_unbindable_or_closed_pr
 test_gate_refuses_when_it_cannot_evaluate
+test_gate_scopes_the_pr_lookup_to_the_origin_repo
+test_gate_refuses_rather_than_querying_an_unscoped_repo
 test_gate_permits_current_approval
 test_gate_resolves_pr_without_gh_cli
 test_refinery_patrol_consumes_the_gate
