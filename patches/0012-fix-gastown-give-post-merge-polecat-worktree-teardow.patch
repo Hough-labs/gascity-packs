@@ -1,0 +1,822 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 31 Jul 2026 04:22:36 -0400
+Subject: [PATCH 12/13] fix(gastown): give post-merge polecat worktree teardown
+ an owner (gcp-z2z)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+mol-polecat-work's workspace-setup creates one git worktree per work bead at
+<polecat-home>/worktrees/<bead-id>. mol-witness-patrol removed those worktrees
+only on the crash path, for beads still in_progress under a dead agent. The
+happy path — refinery merges, closes the bead, polecat drains — had no teardown
+owner at all, so every completed bead left its worktree and full checkout on
+disk permanently: one leak per merged bead, forever.
+
+Ownership goes to the witness, because it is the only agent still around at the
+right moment for both merge strategies. In `direct` mode the refinery merges,
+closes, and exits while the polecat drained long before, so neither can do it.
+In `mr`/`pr` mode the refinery closes the bead when the PR is created, but the
+polecat stays available for FIX_NEEDED rework and still needs its worktree —
+teardown has to wait for it to actually drain. The witness patrols after both.
+
+The new assets/scripts/polecat-worktree-reap.sh enumerates real worktrees via
+`git worktree list` rather than scanning closed beads, so the work set is
+exactly the leak set and shrinks to nothing as it runs. It removes a worktree
+only when all four gates hold: the path is a per-bead polecat worktree
+(.../polecats/<agent>/worktrees/<bead-id>, which excludes agent-home worktrees,
+the rig root, and the refinery's temp merge worktree), the bead is closed,
+`git status --porcelain` is empty, and no live session owns the bead. It
+deliberately does NOT require every commit to be on a remote: a rebase-merging
+refinery rewrites hashes and then deletes the merged branch, so a genuinely
+merged worktree always looks like it holds unpublished commits, and gating on
+that would reap nothing in the exact case this fixes. Bead closure is the
+refinery's own proof the work landed.
+
+Wired as the witness `pre_start` rather than as a command inside the patrol
+step: pack assets install into a content-hashed cache directory that a formula
+step cannot name, and {{.ConfigDir}} is the only stable handle on the script.
+The patrol step is therefore a review step — it reads the JSONL decision log
+and acts on non-routine events, notably a repeating `worktree_dirty_kept`,
+which means real work is stranded under an already-closed bead. Every failure
+in the script degrades to a clean exit 0 so housekeeping can never block the
+witness from starting, and its log never defaults inside the rig repo.
+
+Validation: test_polecat_worktree_reap.sh drives the script against real git
+worktrees with a stubbed gc, covering reap / in_progress / dirty / live-owner /
+unreadable-bead / non-polecat-worktree / agent-home / dry-run / idempotent
+re-run. Each of the four gates was mutation-checked — removing any one makes a
+specific assertion fail. test_gastown_pack_assets.sh adds the wiring contract
+(pre_start present, patrol step wired into the chain rather than orphaned, both
+role docs naming the owner), also mutation-checked. A --dry-run against the live
+city correctly found both in-flight per-bead worktrees and skipped both.
+
+Follow-up filed as gcp-qg7: mol-witness-patrol's orphan salvage reads
+metadata.worktree where polecats record metadata.work_dir, so crash-path salvage
+always resolves an empty path. Left out of this branch to keep the diff scoped
+to the happy path.
+---
+ gastown/agents/witness/agent.toml             |   9 +
+ gastown/agents/witness/prompt.template.md     |  25 ++
+ .../assets/scripts/polecat-worktree-reap.sh   | 248 ++++++++++++++++++
+ gastown/formulas/mol-polecat-work.toml        |   6 +
+ gastown/formulas/mol-witness-patrol.toml      | 108 +++++++-
+ gastown/tests/test_gastown_pack_assets.sh     |  50 ++++
+ gastown/tests/test_polecat_worktree_reap.sh   | 197 ++++++++++++++
+ 7 files changed, 636 insertions(+), 7 deletions(-)
+ create mode 100755 gastown/assets/scripts/polecat-worktree-reap.sh
+ create mode 100644 gastown/tests/test_polecat_worktree_reap.sh
+
+diff --git a/gastown/agents/witness/agent.toml b/gastown/agents/witness/agent.toml
+index 424fbae..ca75206 100644
+--- a/gastown/agents/witness/agent.toml
++++ b/gastown/agents/witness/agent.toml
+@@ -1,6 +1,15 @@
+ scope = "rig"
+ wake_mode = "fresh"
+ work_dir = ".gc/agents/{{.Rig}}/witness"
++# Post-merge teardown of per-bead polecat worktrees. The witness owns both ends
++# of the worktree lifecycle — the crash path via mol-witness-patrol's
++# recover-orphaned-beads step, and the happy path here. Wired as pre_start
++# because pack assets live in a content-hashed cache directory that a formula
++# step cannot name; {{.ConfigDir}} is the only stable handle on the script.
++# The reaper is read-mostly, idempotent, and refuses to touch a worktree that
++# is dirty, not closed, or still owned by a live session — see the script
++# header for all four gates.
++pre_start = ["{{.ConfigDir}}/assets/scripts/polecat-worktree-reap.sh {{.RigRoot}} --rig {{.Rig}}"]
+ nudge = "Run 'gc prime' to check worker status and begin patrol cycle."
+ idle_timeout = "1h"
+ # Preemptively cycle the witness before the typical provider cred-cache
+diff --git a/gastown/agents/witness/prompt.template.md b/gastown/agents/witness/prompt.template.md
+index 5a085e7..a80d86e 100644
+--- a/gastown/agents/witness/prompt.template.md
++++ b/gastown/agents/witness/prompt.template.md
+@@ -16,6 +16,7 @@
+ 
+ Your job:
+ - Recover orphaned beads (agents that won't spawn anymore)
++- Reap per-bead polecat worktrees once their bead closes
+ - Monitor refinery queue health
+ - Detect stuck polecats (alive but not progressing)
+ - Triage help requests from polecats
+@@ -115,6 +116,29 @@ draining, and quarantined sessions are not orphaned. Only recover pool work
+ whose resolved owner is archived, closed, or absent after exact identity
+ lookup.
+ 
++## Post-Merge Worktree Teardown
++
++Orphan recovery above is the crash path. The happy path is the same chain
++run to completion: once a bead is CLOSED, the refinery has already verified
++the merge or the PR handoff, so the per-bead polecat worktree is disposable
++too. You own that teardown — nobody else is still around for it. In
++`direct` mode the refinery and the polecat are both gone by the time the
++bead closes; in `mr`/`pr` mode the bead closes at PR creation while the
++polecat is still available for FIX_NEEDED rework.
++
++`assets/scripts/polecat-worktree-reap.sh` does the work and runs
++automatically as your `pre_start`, so it has already run for this session.
++It removes a worktree only when the path is a per-bead polecat worktree,
++the bead is closed, `git status --porcelain` is empty, and no live session
++owns the bead. Everything else it leaves alone and logs.
++
++Your patrol job is to read
++`$GC_CITY/.gc/runtime/logs/polecat-worktree-reap.log` and act on what is
++not routine — a `worktree_dirty_kept` that repeats across cycles means real
++work is stranded under an already-closed bead. Salvage it with the recipes
++above, then re-run the reaper. Full detail lives in the `mol-witness-patrol`
++`reap-merged-worktrees` step.
++
+ ---
+ 
+ ## Stuck Polecat Detection
+@@ -332,6 +356,7 @@ gc mail send mayor/ -s "ESCALATION: Brief description [HIGH]" -m "Details"
+ | Recover orphaned bead | `gc workflow delete-source <id> --apply && gc workflow reopen-source <id>` |
+ | Salvage worktree work | `git add -A && git commit && git push origin HEAD` |
+ | Delete worktree | `git worktree remove <path> --force` |
++| Review post-merge teardown | `tail -n 50 "$GC_CITY/.gc/runtime/logs/polecat-worktree-reap.log"` |
+ | Set branch metadata | `gc bd update <id> --set-metadata branch=<name>` |
+ | File stuck-agent warrant | `gc bd create --type=task --label=warrant --metadata '{"target":"<session>","reason":"<reason>","requester":"witness","gc.routed_to":"{{ .BindingPrefix }}dog"}'` |
+ 
+diff --git a/gastown/assets/scripts/polecat-worktree-reap.sh b/gastown/assets/scripts/polecat-worktree-reap.sh
+new file mode 100755
+index 0000000..5900cbf
+--- /dev/null
++++ b/gastown/assets/scripts/polecat-worktree-reap.sh
+@@ -0,0 +1,248 @@
++#!/usr/bin/env bash
++# polecat-worktree-reap.sh — reap per-bead polecat worktrees once their bead closes.
++#
++# The leak this closes:
++#   mol-polecat-work's workspace-setup creates ONE worktree per work bead at
++#   <polecat-home>/worktrees/<bead-id> and records it in metadata.work_dir.
++#   mol-witness-patrol's orphan recovery removes those worktrees only for
++#   ORPHANED (still in_progress) beads. The happy path — refinery merges,
++#   closes the bead, polecat drains — had no teardown owner, so every
++#   completed bead left its worktree on disk forever.
++#
++# Ownership: the witness. It is the only agent alive at the right moment for
++# both merge strategies:
++#   - direct: the refinery merges, closes the bead, and exits; the polecat is
++#             already gone, so neither can do the teardown.
++#   - mr/pr:  the refinery closes the bead when the PR is created, but the
++#             polecat stays available for FIX_NEEDED rework. The session
++#             liveness gate below defers the reap until that polecat drains.
++#
++# Safety gates — ALL must hold before a worktree is removed:
++#   1. Path shape is a per-bead polecat worktree: .../polecats/<agent>/worktrees/<bead-id>.
++#      A polecat's persistent agent-home worktree has no `worktrees/` parent
++#      segment, so it is never a candidate.
++#   2. The bead is `closed`. The refinery closes only after a verified merge or
++#      a verified PR handoff, so the committed work is canonical elsewhere.
++#   3. `git status --porcelain` is empty — nothing uncommitted would be lost.
++#      Ignored files are build artifacts and do not block; untracked
++#      non-ignored files do.
++#   4. No live session owns the bead (metadata.polecat_session).
++#
++# Deliberately NOT gated on "every commit is on a remote": a rebase-merging
++# refinery rewrites commit hashes and then deletes the merged branch, so a
++# genuinely merged worktree always looks like it holds unpublished commits.
++# Bead closure is the refinery's own proof that the work landed.
++#
++# Output: one JSON line per decision appended to LOG_FILE, plus a human
++# summary on stdout. Idempotent and safe to re-run: a reaped worktree stops
++# being a candidate, so the work set shrinks to nothing.
++#
++# Env / args:
++#   $1 | GC_RIG_ROOT   rig repo root (default: `git rev-parse --show-toplevel`)
++#   --rig <name>       rig name — scopes `gc bd`. Defaults to $GC_RIG. Needed
++#                      because pre_start runs before the session environment
++#                      exists, so $GC_RIG cannot be assumed there.
++#   LOG_DIR            where to write the log. Defaults to the city runtime log
++#                      directory; NEVER defaults inside the rig repo, which
++#                      would litter the canonical checkout with untracked files.
++#   --dry-run          report what would be reaped, remove nothing
++#
++# Usage:
++#   GC_RIG=helm polecat-worktree-reap.sh
++#   polecat-worktree-reap.sh /path/to/rig --rig helm --dry-run
++
++set -euo pipefail
++
++DRY_RUN=0
++RIG_ROOT=""
++RIG_NAME="${GC_RIG:-}"
++
++while [ "$#" -gt 0 ]; do
++    case "$1" in
++        --dry-run) DRY_RUN=1 ;;
++        --rig)
++            shift
++            [ "$#" -gt 0 ] || { echo "polecat-worktree-reap: --rig needs a value" >&2; exit 2; }
++            RIG_NAME="$1"
++            ;;
++        -*) echo "polecat-worktree-reap: unknown flag $1" >&2; exit 2 ;;
++        *) RIG_ROOT="$1" ;;
++    esac
++    shift
++done
++
++if [ -z "$RIG_ROOT" ]; then
++    RIG_ROOT="${GC_RIG_ROOT:-}"
++fi
++if [ -z "$RIG_ROOT" ]; then
++    RIG_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
++fi
++if [ -z "$RIG_ROOT" ] || [ ! -d "$RIG_ROOT" ]; then
++    echo "polecat-worktree-reap: rig root not found (pass it as \$1 or set GC_RIG_ROOT)" >&2
++    exit 2
++fi
++
++# Log destination, in descending order of confidence. The rig repo is
++# deliberately absent from this list: the reaper must never leave untracked
++# files in the canonical checkout it is cleaning up around.
++if [ -n "${LOG_DIR:-}" ]; then
++    :
++elif [ -n "${GC_CITY_RUNTIME_DIR:-}" ]; then
++    LOG_DIR="$GC_CITY_RUNTIME_DIR/logs"
++elif [ -n "${GC_CITY:-}" ]; then
++    LOG_DIR="$GC_CITY/.gc/runtime/logs"
++else
++    LOG_DIR="${TMPDIR:-/tmp}/gc-polecat-worktree-reap"
++fi
++LOG_FILE="$LOG_DIR/polecat-worktree-reap.log"
++# Housekeeping must never block the witness from starting: this script runs as
++# the witness pre_start, so every failure below degrades to a clean exit 0.
++if ! mkdir -p "$LOG_DIR" 2>/dev/null || ! touch "$LOG_FILE" 2>/dev/null; then
++    echo "polecat-worktree-reap: cannot write $LOG_FILE; skipping this run" >&2
++    exit 0
++fi
++
++TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
++
++# `gc bd` is rig-scoped when a rig name is known; keep the unscoped form working
++# so the script is still runnable by hand from inside a rig repo.
++gc_bd() {
++    if [ -n "$RIG_NAME" ]; then
++        gc bd --rig "$RIG_NAME" "$@"
++    else
++        gc bd "$@"
++    fi
++}
++
++record() {
++    # record <event> <bead> <worktree> <detail>
++    jq -cn \
++        --arg ts "$TS" \
++        --arg event "$1" \
++        --arg rig "$RIG_NAME" \
++        --arg bead "$2" \
++        --arg worktree "$3" \
++        --arg detail "$4" \
++        --argjson dry_run "$DRY_RUN" \
++        '{ts:$ts, event:$event, rig:$rig, bead:$bead, worktree:$worktree, detail:$detail, dry_run:($dry_run == 1)}' \
++        >>"$LOG_FILE"
++    echo "$1 $2 $3${4:+ ($4)}"
++}
++
++# Clear metadata for worktrees already removed from disk so the candidate list
++# reflects reality rather than stale administrative entries.
++git -C "$RIG_ROOT" worktree prune >/dev/null 2>&1 || true
++
++CANDIDATES=$(git -C "$RIG_ROOT" worktree list --porcelain 2>/dev/null \
++    | sed -n 's/^worktree //p' \
++    | while IFS= read -r wt; do
++        # Gate 1: per-bead polecat worktree shape. The parent directory must be
++        # literally `worktrees` and the path must sit under a `polecats` tree —
++        # that excludes the polecat's own persistent agent-home worktree, the
++        # rig root, and the refinery's temporary merge worktree.
++        case "$wt" in
++            */polecats/*/worktrees/*) ;;
++            *) continue ;;
++        esac
++        [ "$(basename "$(dirname "$wt")")" = "worktrees" ] || continue
++        # The leaf is the bead id. Anything else is not ours to remove.
++        case "$(basename "$wt")" in
++            *[!a-zA-Z0-9-]* | '' | -* | *-) continue ;;
++        esac
++        printf '%s\n' "$wt"
++    done || true)
++
++if [ -z "$CANDIDATES" ]; then
++    echo "polecat-worktree-reap: no per-bead polecat worktrees under $RIG_ROOT"
++    exit 0
++fi
++
++# Session roster, fetched once. `gc session list --json` returns an OBJECT
++# ({sessions:[...]}), not a top-level array, and its fields are lowercase
++# snake_case — same schema facts mol-witness-patrol's liveness map depends on.
++SESSIONS_FILE=$(mktemp)
++trap 'rm -f "$SESSIONS_FILE"' EXIT
++gc session list --state=all --json >"$SESSIONS_FILE" 2>/dev/null || printf '{"sessions":[]}' >"$SESSIONS_FILE"
++
++session_is_live() {
++    [ -n "$1" ] || return 1
++    jq -e --arg id "$1" '
++        (.sessions // [])
++        | map(select(
++            (.id // "") == $id or (.name // "") == $id or
++            (.session_name // "") == $id or (.alias // "") == $id or
++            (.agent_name // "") == $id))
++        | any(.closed != true)
++    ' "$SESSIONS_FILE" >/dev/null 2>&1
++}
++
++REAPED=0
++SKIPPED=0
++
++while IFS= read -r WT; do
++    [ -n "$WT" ] || continue
++    BEAD=$(basename "$WT")
++
++    BEAD_JSON=$(gc_bd show "$BEAD" --json 2>/dev/null || true)
++    STATUS=$(printf '%s' "$BEAD_JSON" | jq -r '.[0].status // empty' 2>/dev/null || true)
++
++    if [ -z "$STATUS" ]; then
++        # An unreadable bead is not proof the work is done. Leave the worktree
++        # alone; a later cycle retries once bd is readable again.
++        record worktree_bead_unreadable "$BEAD" "$WT" "gc bd show returned no status"
++        SKIPPED=$((SKIPPED + 1))
++        continue
++    fi
++
++    # Gate 2: only closed beads. in_progress/open worktrees belong to a live
++    # polecat, or to the orphan-recovery path in mol-witness-patrol.
++    if [ "$STATUS" != "closed" ]; then
++        SKIPPED=$((SKIPPED + 1))
++        continue
++    fi
++
++    # Gate 4: a polecat still reworking a FIX_NEEDED PR keeps its worktree even
++    # though the bead is already closed by the PR handoff.
++    OWNER=$(printf '%s' "$BEAD_JSON" | jq -r '.[0].metadata.polecat_session // empty' 2>/dev/null || true)
++    if session_is_live "$OWNER"; then
++        record worktree_owner_live "$BEAD" "$WT" "session $OWNER still live"
++        SKIPPED=$((SKIPPED + 1))
++        continue
++    fi
++
++    # Gate 3: never discard uncommitted work. Ignored files are artifacts and
++    # are excluded by `git status --porcelain`; untracked non-ignored files are
++    # reported and block the reap so the witness can salvage them.
++    DIRTY=$(git -C "$WT" status --porcelain 2>/dev/null || printf 'UNREADABLE')
++    if [ -n "$DIRTY" ]; then
++        record worktree_dirty_kept "$BEAD" "$WT" "uncommitted changes present"
++        SKIPPED=$((SKIPPED + 1))
++        continue
++    fi
++
++    if [ "$DRY_RUN" -eq 1 ]; then
++        record worktree_reap_pending "$BEAD" "$WT" "dry run"
++        REAPED=$((REAPED + 1))
++        continue
++    fi
++
++    if ! git -C "$RIG_ROOT" worktree remove --force "$WT" >/dev/null 2>&1; then
++        # Fallback for a worktree git refuses to administer (moved, partially
++        # deleted). Removing the directory then pruning restores consistency.
++        rm -rf "$WT"
++    fi
++    git -C "$RIG_ROOT" worktree prune >/dev/null 2>&1 || true
++
++    if [ -e "$WT" ]; then
++        record worktree_reap_failed "$BEAD" "$WT" "directory still present after removal"
++        SKIPPED=$((SKIPPED + 1))
++        continue
++    fi
++
++    record worktree_reaped "$BEAD" "$WT" "bead closed"
++    REAPED=$((REAPED + 1))
++done <<EOF
++$CANDIDATES
++EOF
++
++echo "polecat-worktree-reap: reaped=$REAPED skipped=$SKIPPED (log: $LOG_FILE)"
+diff --git a/gastown/formulas/mol-polecat-work.toml b/gastown/formulas/mol-polecat-work.toml
+index 411b476..189a1ab 100644
+--- a/gastown/formulas/mol-polecat-work.toml
++++ b/gastown/formulas/mol-polecat-work.toml
+@@ -115,6 +115,12 @@ Worktrees are scoped to the work bead (not the agent name) so that:
+ - Multiple orphaned worktrees can coexist without collision
+ - The witness cleans them independently per-bead
+ 
++Do NOT delete this worktree yourself, not even after `submit-and-exit`. You
++are standing in it, and on a PR-review rig you may still need it for
++FIX_NEEDED rework. Teardown is the witness's job at both ends of the
++lifecycle: `mol-witness-patrol` `recover-orphaned-beads` if you crash, and
++`reap-merged-worktrees` once the refinery closes the bead.
++
+ **3. Ensure branch exists.**
+ 
+ Check if `metadata.branch` already records a branch:
+diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
+index ba999c9..d3af93a 100644
+--- a/gastown/formulas/mol-witness-patrol.toml
++++ b/gastown/formulas/mol-witness-patrol.toml
+@@ -25,9 +25,12 @@ monitors the WORK layer:
+ 
+ 1. **Orphaned bead recovery** — beads assigned to agents that won't spawn
+    (pool max changed, agent removed from config). This is the core job.
+-2. **Refinery queue health** — work beads assigned to refinery, staleness.
+-3. **Polecat health** — detect stuck polecats, file warrants for dog pool.
+-4. **Help mail** — triage HELP/escalation requests from polecats.
++2. **Per-bead worktree teardown** — reap polecat worktrees whose bead has
++   closed. The witness owns BOTH ends of the worktree lifecycle: the crash
++   path (orphan recovery) and the happy path (post-merge teardown).
++3. **Refinery queue health** — work beads assigned to refinery, staleness.
++4. **Polecat health** — detect stuck polecats, file warrants for dog pool.
++5. **Help mail** — triage HELP/escalation requests from polecats.
+ 
+ Gate checks and convoy/swarm completion are town-wide concerns handled by
+ the deacon, not the per-rig witness.
+@@ -47,6 +50,14 @@ The witness's core recovery job: when a bead is orphaned (agent won't
+ come back), ensure the work reaches the branch (push), then clean up
+ the worktree. This makes the work schedulable again.
+ 
++The same rule applies when nothing went wrong. A CLOSED bead means the
++refinery already verified the merge or the PR handoff, so its per-bead
++polecat worktree is disposable too. Nobody else is positioned to remove
++it — in `direct` mode the refinery and the polecat are both gone by the
++time the bead closes, and in `mr`/`pr` mode the bead closes at PR
++creation while the polecat is still available for FIX_NEEDED rework.
++That teardown is the witness's job: `reap-merged-worktrees`.
++
+ ## What the witness does NOT do
+ 
+ - Zombie detection (controller reconcile loop handles this)
+@@ -443,14 +454,97 @@ gc bd update <bead> --set-metadata recovered=true
+ ```
+ 
+ **Exit criteria:** All orphaned beads recovered, worktrees cleaned.
+-Or no orphans found. Continue to `check-refinery` — do NOT exit the
+-wisp here. The `next-iteration` step is the only place that pours the
+-next wisp and burns this one."""
++Or no orphans found. Continue to `reap-merged-worktrees` — do NOT exit
++the wisp here. The `next-iteration` step is the only place that pours
++the next wisp and burns this one."""
++
++[[steps]]
++id = "reap-merged-worktrees"
++title = "Review post-merge worktree teardown"
++needs = ["recover-orphaned-beads"]
++description = """
++The previous step cleans up worktrees on the CRASH path. This step covers
++the HAPPY path — and the witness owns both ends.
++
++`mol-polecat-work` workspace-setup creates one worktree per work bead at
++`<polecat-home>/worktrees/<bead-id>` and records it in `metadata.work_dir`.
++Until this teardown existed, nothing removed it once the bead closed, so a
++rig accumulated exactly one abandoned worktree — and its full checkout —
++per completed bead.
++
++**Why the witness and not the refinery or the polecat:**
++
++| Merge strategy | State when the bead closes | Who could reap |
++|---|---|---|
++| `direct` | Refinery merged and exited; polecat drained long before | Neither — only a later patrol |
++| `mr` / `pr` | Refinery closed the bead at PR creation; the polecat is still available for FIX_NEEDED rework and still needs its worktree | Only an agent that can wait for the polecat to drain |
++
++The witness is the one agent that patrols after both have gone.
++
++**You do not run the reaper by hand.** `assets/scripts/polecat-worktree-reap.sh`
++is wired as the witness `pre_start` in `agents/witness/agent.toml`, so it
++has already run for this session:
++
++```
++<pack-config-dir>/assets/scripts/polecat-worktree-reap.sh <rig-root> --rig <rig>
++```
++
++It lives in `pre_start` rather than in a command here because pack assets
++are installed into a content-hashed cache directory that a formula step
++cannot name; the agent config's config-dir template is the only stable
++handle on the script. Your job in this step is to read what it decided and
++act on anything that is not routine. Re-run it by hand (adding `--dry-run`
++to preview) only when clearing an incident.
++
++**What it will and will not remove.** All four gates must hold:
++
++1. The path is a per-bead polecat worktree
++   (`.../polecats/<agent>/worktrees/<bead-id>`). A polecat's persistent
++   agent-home worktree has no `worktrees/` parent segment and is never a
++   candidate, nor is the rig root or the refinery's temporary merge worktree.
++2. The bead is `closed`. `open`/`in_progress` worktrees belong to a live
++   polecat or to the orphan-recovery step above.
++3. `git status --porcelain` in the worktree is empty. Uncommitted work is
++   never discarded — a dirty worktree is logged as `worktree_dirty_kept`
++   and left for you to salvage using the Case C/D recipes above.
++4. No live session owns the bead (`metadata.polecat_session`). This is what
++   defers the reap in `mr`/`pr` mode until the polecat actually drains.
++
++It deliberately does NOT require every commit to be on a remote: a
++rebase-merging refinery rewrites hashes and then deletes the merged branch,
++so a genuinely merged worktree always looks like it holds unpublished
++commits. Bead closure is the refinery's own proof that the work landed.
++
++**Review the log.** Every decision lands in
++`$GC_CITY/.gc/runtime/logs/polecat-worktree-reap.log` as one JSON line
++(`$LOG_DIR` overrides the location; the reaper never writes inside the rig
++repo). Read this cycle's lines:
++
++```bash
++tail -n 50 "${LOG_DIR:-$GC_CITY/.gc/runtime/logs}/polecat-worktree-reap.log"
++```
++
++| Event | Meaning | Action |
++|---|---|---|
++| `worktree_reaped` | Removed. Routine. | Log only |
++| `worktree_dirty_kept` | Closed bead, uncommitted changes on disk | Salvage per Case C/D, then re-run |
++| `worktree_owner_live` | Closed bead, polecat still alive (PR rework) | None — expected; next cycle retries |
++| `worktree_bead_unreadable` | `gc bd show` returned nothing | If it persists, check Dolt health |
++| `worktree_reap_failed` | Directory survived removal | Investigate permissions/mounts, mail mayor |
++
++A `worktree_dirty_kept` that repeats across cycles means real work is
++stranded on disk under a bead that is already closed. Mail the mayor —
++that is a lost-work signal, not routine housekeeping.
++
++**Exit criteria:** Reaper log reviewed and any non-routine event acted on.
++Continue to `check-refinery` — do NOT exit the wisp here. The
++`next-iteration` step is the only place that pours the next wisp and burns
++this one."""
+ 
+ [[steps]]
+ id = "check-refinery"
+ title = "Check refinery queue health"
+-needs = ["recover-orphaned-beads"]
++needs = ["reap-merged-worktrees"]
+ description = """
+ Ensure the refinery is processing work and the queue is healthy.
+ 
+diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
+index 56e1205..58089e8 100755
+--- a/gastown/tests/test_gastown_pack_assets.sh
++++ b/gastown/tests/test_gastown_pack_assets.sh
+@@ -1,4 +1,7 @@
+ #!/usr/bin/env bash
++# These are contract tests over pack files: nearly every assertion greps for a
++# literal shell snippet, so single-quoted `$VAR` is the point, not an error.
++# shellcheck disable=SC2016
+ set -euo pipefail
+ 
+ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+@@ -216,8 +219,55 @@ if verify >= metadata:
+ PY
+ }
+ 
++test_post_merge_worktree_teardown_has_an_owner() {
++    local reaper="$GASTOWN/assets/scripts/polecat-worktree-reap.sh"
++    local witness_cfg="$GASTOWN/agents/witness/agent.toml"
++    local witness_prompt="$GASTOWN/agents/witness/prompt.template.md"
++    local patrol="$GASTOWN/formulas/mol-witness-patrol.toml"
++    local polecat="$GASTOWN/formulas/mol-polecat-work.toml"
++
++    [[ -f "$reaper" ]] || fail "missing post-merge worktree reaper script"
++    [[ -x "$reaper" ]] || fail "worktree reaper must be executable"
++    parse_toml "$witness_cfg" "$patrol" "$polecat"
++
++    # The reaper needs a wiring that actually fires. A formula step cannot name
++    # it (pack assets install into a content-hashed cache), so pre_start with
++    # the config-dir template is the only stable handle.
++    grep -F 'pre_start = ["{{.ConfigDir}}/assets/scripts/polecat-worktree-reap.sh {{.RigRoot}} --rig {{.Rig}}"]' \
++        "$witness_cfg" >/dev/null ||
++        fail "witness must run the worktree reaper from pre_start with rig root and rig name"
++
++    # Ownership must be stated where each role reads it, or teardown drifts
++    # back to nobody.
++    grep -F 'id = "reap-merged-worktrees"' "$patrol" >/dev/null ||
++        fail "witness patrol should own a post-merge worktree teardown step"
++    grep -F 'needs = ["reap-merged-worktrees"]' "$patrol" >/dev/null ||
++        fail "the teardown step must be wired into the patrol chain, not orphaned"
++    grep -F 'Reap per-bead polecat worktrees once their bead closes' "$witness_prompt" >/dev/null ||
++        fail "witness prompt should list post-merge worktree teardown as a duty"
++    grep -F 'Do NOT delete this worktree yourself' "$polecat" >/dev/null ||
++        fail "polecat formula should point worktree teardown at the witness"
++
++    # The gates are the safety contract; losing any one of them silently turns
++    # housekeeping into data loss.
++    grep -F '*/polecats/*/worktrees/*' "$reaper" >/dev/null ||
++        fail "reaper must restrict candidates to per-bead polecat worktrees"
++    grep -F '[ "$STATUS" != "closed" ]' "$reaper" >/dev/null ||
++        fail "reaper must reap only closed beads"
++    grep -F 'git -C "$WT" status --porcelain' "$reaper" >/dev/null ||
++        fail "reaper must refuse to remove a worktree with uncommitted work"
++    grep -F 'session_is_live "$OWNER"' "$reaper" >/dev/null ||
++        fail "reaper must defer while a live session still owns the bead"
++
++    # The reaper cleans up around the canonical checkout; it must never write
++    # into it.
++    ! grep -F 'LOG_DIR="$RIG_ROOT' "$reaper" >/dev/null ||
++        fail "reaper must not default its log inside the rig repo"
++}
++
+ test_dog_assets_are_pack_local
+ test_retired_dog_formulas_are_not_reintroduced
++test_post_merge_worktree_teardown_has_an_owner
+ test_shutdown_dance_contracts_are_executable
+ test_shutdown_dance_lifecycle_and_audit_contracts
+ test_composition_is_documented
+diff --git a/gastown/tests/test_polecat_worktree_reap.sh b/gastown/tests/test_polecat_worktree_reap.sh
+new file mode 100644
+index 0000000..86b871c
+--- /dev/null
++++ b/gastown/tests/test_polecat_worktree_reap.sh
+@@ -0,0 +1,197 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
++SCRIPT="$ROOT/gastown/assets/scripts/polecat-worktree-reap.sh"
++
++fail() {
++    echo "FAIL: $*" >&2
++    exit 1
++}
++
++write_gc_stub() {
++    local bin="$1"
++    mkdir -p "$bin"
++    cat >"$bin/gc" <<'SH'
++#!/usr/bin/env sh
++# Serves the two reads polecat-worktree-reap.sh performs:
++#   gc [bd --rig <rig>] show <bead> --json
++#   gc session list --state=all --json
++case "$1" in
++    session)
++        cat "$GC_SESSIONS_JSON"
++        ;;
++    bd)
++        shift
++        if [ "$1" = "--rig" ]; then shift 2; fi
++        if [ "$1" = "show" ]; then
++            jq -c --arg id "$2" '[.[] | select(.id == $id)]' "$GC_BEADS_JSON"
++        else
++            printf '[]'
++        fi
++        ;;
++    *)
++        printf '[]'
++        ;;
++esac
++SH
++    chmod +x "$bin/gc"
++}
++
++setup_rig() {
++    local rig="$1"
++    mkdir -p "$rig"
++    git -C "$rig" init -q
++    git -C "$rig" config user.email reap@test
++    git -C "$rig" config user.name reap
++    echo seed >"$rig/seed.txt"
++    git -C "$rig" add seed.txt
++    git -C "$rig" commit -qm seed
++}
++
++add_bead_worktree() {
++    # add_bead_worktree <rig> <polecat-home> <bead-id>
++    git -C "$1" worktree add -q "$2/worktrees/$3" --detach HEAD
++}
++
++test_reaps_only_closed_clean_unowned_bead_worktrees() {
++    local tmp rig bin home beads sessions logdir
++    tmp=$(mktemp -d)
++    rig="$tmp/rig"
++    bin="$tmp/bin"
++    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
++    beads="$tmp/beads.json"
++    sessions="$tmp/sessions.json"
++    logdir="$tmp/logs"
++    mkdir -p "$logdir"
++
++    setup_rig "$rig"
++    write_gc_stub "$bin"
++
++    # The polecat's persistent agent-home worktree: no `worktrees/` parent
++    # segment, so it must never be considered a candidate.
++    git -C "$rig" worktree add -q "$home" --detach HEAD
++
++    add_bead_worktree "$rig" "$home" wt-closed
++    add_bead_worktree "$rig" "$home" wt-inprogress
++    add_bead_worktree "$rig" "$home" wt-dirty
++    add_bead_worktree "$rig" "$home" wt-live
++    add_bead_worktree "$rig" "$home" wt-unknown
++
++    # Another agent's per-bead worktree for the SAME closed bead. It is clean,
++    # unowned, and named after a closed bead — every gate but the path shape
++    # would pass. The witness reaps polecat worktrees only.
++    local refinery="$tmp/city/.gc/worktrees/rig/refinery"
++    add_bead_worktree "$rig" "$refinery" wt-closed
++
++    echo scratch >"$home/worktrees/wt-dirty/seed.txt"
++
++    cat >"$beads" <<'JSON'
++[
++  {"id":"wt-closed","status":"closed","metadata":{"polecat_session":"deadsess"}},
++  {"id":"wt-inprogress","status":"in_progress","metadata":{"polecat_session":"deadsess"}},
++  {"id":"wt-dirty","status":"closed","metadata":{"polecat_session":"deadsess"}},
++  {"id":"wt-live","status":"closed","metadata":{"polecat_session":"livesess"}}
++]
++JSON
++
++    cat >"$sessions" <<'JSON'
++{"sessions":[
++  {"id":"livesess","name":"livesess","state":"running","closed":false},
++  {"id":"deadsess","name":"deadsess","state":"closed","closed":true}
++]}
++JSON
++
++    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
++        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" >"$tmp/out.txt" 2>&1 ||
++        fail "reaper exited non-zero: $(cat "$tmp/out.txt")"
++
++    [[ ! -e "$home/worktrees/wt-closed" ]] ||
++        fail "a closed, clean, unowned bead worktree was not reaped"
++    [[ -e "$home/worktrees/wt-inprogress" ]] ||
++        fail "an in_progress bead worktree was reaped; only closed beads are disposable"
++    [[ -e "$home/worktrees/wt-dirty" ]] ||
++        fail "a worktree with uncommitted changes was reaped; work would be lost"
++    [[ -e "$home/worktrees/wt-live" ]] ||
++        fail "a worktree still owned by a live polecat session was reaped"
++    [[ -e "$home/worktrees/wt-unknown" ]] ||
++        fail "a worktree whose bead could not be read was reaped"
++    [[ -e "$home/seed.txt" ]] ||
++        fail "the polecat agent-home worktree was reaped; only per-bead worktrees are candidates"
++    [[ -e "$tmp/city/.gc/worktrees/rig/refinery/worktrees/wt-closed" ]] ||
++        fail "a non-polecat agent's per-bead worktree was reaped; the witness owns polecat worktrees only"
++    [[ -e "$rig/seed.txt" ]] ||
++        fail "the rig root worktree was touched"
++
++    local log="$logdir/polecat-worktree-reap.log"
++    [[ -f "$log" ]] || fail "reaper wrote no log"
++    grep -F '"event":"worktree_reaped"' "$log" >/dev/null ||
++        fail "the reap was not recorded in the log"
++    grep -F '"bead":"wt-closed"' "$log" >/dev/null ||
++        fail "the reaped bead was not named in the log"
++    grep -F '"event":"worktree_dirty_kept"' "$log" >/dev/null ||
++        fail "a dirty worktree kept was not reported for salvage"
++    grep -F '"event":"worktree_owner_live"' "$log" >/dev/null ||
++        fail "a live-owner deferral was not reported"
++    grep -F '"event":"worktree_bead_unreadable"' "$log" >/dev/null ||
++        fail "an unreadable bead was not reported"
++    ! grep -F 'wt-inprogress' "$log" >/dev/null ||
++        fail "an in_progress bead should be skipped silently, not logged as an incident"
++
++    # Git's administrative view must agree with the filesystem.
++    ! git -C "$rig" worktree list --porcelain | grep -F "$home/worktrees/wt-closed" >/dev/null ||
++        fail "the reaped worktree is still registered with git"
++
++    rm -rf "$tmp"
++}
++
++test_dry_run_removes_nothing_and_rerun_is_idempotent() {
++    local tmp rig bin home beads sessions logdir
++    tmp=$(mktemp -d)
++    rig="$tmp/rig"
++    bin="$tmp/bin"
++    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
++    beads="$tmp/beads.json"
++    sessions="$tmp/sessions.json"
++    logdir="$tmp/logs"
++    mkdir -p "$logdir"
++
++    setup_rig "$rig"
++    write_gc_stub "$bin"
++    add_bead_worktree "$rig" "$home" wt-closed
++
++    cat >"$beads" <<'JSON'
++[{"id":"wt-closed","status":"closed","metadata":{"polecat_session":"deadsess"}}]
++JSON
++    printf '{"sessions":[]}' >"$sessions"
++
++    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
++        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --dry-run >"$tmp/dry.txt" 2>&1 ||
++        fail "dry run exited non-zero: $(cat "$tmp/dry.txt")"
++
++    [[ -e "$home/worktrees/wt-closed" ]] ||
++        fail "--dry-run removed a worktree"
++    grep -F '"event":"worktree_reap_pending"' "$logdir/polecat-worktree-reap.log" >/dev/null ||
++        fail "--dry-run did not report the pending reap"
++
++    # A missing polecat_session must not read as "owned by a live session".
++    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
++        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" >/dev/null 2>&1 ||
++        fail "reaper exited non-zero on the real run"
++    [[ ! -e "$home/worktrees/wt-closed" ]] ||
++        fail "the closed worktree survived the real run"
++
++    # Second real run: nothing left to do, still exits clean.
++    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
++        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" >"$tmp/again.txt" 2>&1 ||
++        fail "re-running the reaper on a clean tree failed: $(cat "$tmp/again.txt")"
++    grep -F 'no per-bead polecat worktrees' "$tmp/again.txt" >/dev/null ||
++        fail "a second run should find no candidates"
++
++    rm -rf "$tmp"
++}
++
++test_reaps_only_closed_clean_unowned_bead_worktrees
++test_dry_run_removes_nothing_and_rerun_is_idempotent
++
++echo "polecat worktree reap tests passed"
+-- 
+2.50.1 (Apple Git-155)
+

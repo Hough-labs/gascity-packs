@@ -1,0 +1,167 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 31 Jul 2026 04:31:42 -0400
+Subject: [PATCH 13/13] fix(gastown): stamp polecat_session on the work bead so
+ the teardown liveness gate works (gcp-z2z)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Self-review of the previous commit found the live-owner gate was decorative.
+polecat-worktree-reap.sh defers reaping while metadata.polecat_session names a
+live session — the protection that keeps a PR-review polecat's worktree alive
+through FIX_NEEDED rework, since the refinery closes the bead at PR creation.
+But the startup claim block stamps polecat_session on the bead it claimed,
+which under a formula-driven pool workflow is the STEP bead, not the work bead.
+Checked live: work beads gcp-z2z and gcp-xbl carried work_dir, branch and
+fork_sha but no polecat_session, so the gate would never have fired and rework
+worktrees could be reclaimed mid-flight.
+
+workspace-setup now writes polecat_session next to work_dir in the same
+`gc bd update`, which is where the rest of the ownership metadata already
+lands. Beads predating this stamp degrade safely rather than dangerously: with
+no owner recorded the gate passes, the worktree is reaped only if it is also
+closed and clean, and workspace-setup rebuilds it from metadata.branch on the
+next run — wasteful, not lossy.
+
+Also from self-review, both on the operator-facing signal, since the JSONL log
+is the witness's only review surface for this teardown:
+- A worktree whose `git status` fails was reported as `worktree_dirty_kept`
+  ("uncommitted changes present"), conflating an unreadable checkout with a
+  dirty one. It now reports `worktree_status_unreadable`, and the dirty case
+  carries the actual count of uncommitted paths.
+- `--dry-run` printed "reaped=N" for worktrees it had not touched; it now says
+  "would reap=N (dry run)".
+
+Test comment reworded to drop a `[bd ...]` bracket form that
+tests/test_no_bare_bd_commands.py reads as an unrouted bare bd invocation.
+
+Validation: shellcheck clean; go vet / golangci-lint / validate_registry /
+go build / go test green; all four gastown shell suites pass. Both new
+assertions mutation-checked — removing the polecat_session stamp fails the
+contract test. The 7 failures in the CI pytest set (gascity claim-command,
+discord/github intake service) reproduce identically on a pristine
+origin/integration worktree and are filed as gcp-ks5.
+---
+ gastown/assets/scripts/polecat-worktree-reap.sh | 16 +++++++++++++---
+ gastown/formulas/mol-polecat-work.toml          | 12 +++++++++++-
+ gastown/formulas/mol-witness-patrol.toml        |  1 +
+ gastown/tests/test_gastown_pack_assets.sh       | 16 ++++++++++++++++
+ gastown/tests/test_polecat_worktree_reap.sh     |  5 +++--
+ 5 files changed, 44 insertions(+), 6 deletions(-)
+
+diff --git a/gastown/assets/scripts/polecat-worktree-reap.sh b/gastown/assets/scripts/polecat-worktree-reap.sh
+index 5900cbf..340fd5d 100755
+--- a/gastown/assets/scripts/polecat-worktree-reap.sh
++++ b/gastown/assets/scripts/polecat-worktree-reap.sh
+@@ -213,9 +213,15 @@ while IFS= read -r WT; do
+     # Gate 3: never discard uncommitted work. Ignored files are artifacts and
+     # are excluded by `git status --porcelain`; untracked non-ignored files are
+     # reported and block the reap so the witness can salvage them.
+-    DIRTY=$(git -C "$WT" status --porcelain 2>/dev/null || printf 'UNREADABLE')
++    if ! DIRTY=$(git -C "$WT" status --porcelain 2>/dev/null); then
++        # A worktree git cannot even read is not one to delete on a guess.
++        record worktree_status_unreadable "$BEAD" "$WT" "git status failed in the worktree"
++        SKIPPED=$((SKIPPED + 1))
++        continue
++    fi
+     if [ -n "$DIRTY" ]; then
+-        record worktree_dirty_kept "$BEAD" "$WT" "uncommitted changes present"
++        record worktree_dirty_kept "$BEAD" "$WT" \
++            "$(printf '%s\n' "$DIRTY" | wc -l | tr -d ' ') uncommitted path(s)"
+         SKIPPED=$((SKIPPED + 1))
+         continue
+     fi
+@@ -245,4 +251,8 @@ done <<EOF
+ $CANDIDATES
+ EOF
+ 
+-echo "polecat-worktree-reap: reaped=$REAPED skipped=$SKIPPED (log: $LOG_FILE)"
++if [ "$DRY_RUN" -eq 1 ]; then
++    echo "polecat-worktree-reap: would reap=$REAPED skipped=$SKIPPED (dry run; log: $LOG_FILE)"
++else
++    echo "polecat-worktree-reap: reaped=$REAPED skipped=$SKIPPED (log: $LOG_FILE)"
++fi
+diff --git a/gastown/formulas/mol-polecat-work.toml b/gastown/formulas/mol-polecat-work.toml
+index 189a1ab..52b4d0d 100644
+--- a/gastown/formulas/mol-polecat-work.toml
++++ b/gastown/formulas/mol-polecat-work.toml
+@@ -107,9 +107,19 @@ cd "$WORKTREE_PATH"
+ ```
+ Record immediately so restarts and witness recovery can find it:
+ ```bash
+-gc bd update "$WORK_BEAD_ID" --set-metadata work_dir="$WORKTREE_PATH"
++gc bd update "$WORK_BEAD_ID" \
++  --set-metadata work_dir="$WORKTREE_PATH" \
++  --set-metadata polecat_session="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
+ ```
+ 
++`polecat_session` must land on the WORK bead, not just on the step bead the
++startup claim block stamps. It is what tells the witness's
++`reap-merged-worktrees` teardown that you are still alive: on a PR-review rig
++the refinery closes this bead when the PR opens, while you stay available for
++FIX_NEEDED rework and still need this worktree. Without the stamp the witness
++sees no owner and may reclaim the directory out from under you — recoverable
++(workspace-setup rebuilds it from `metadata.branch`) but wasteful.
++
+ Worktrees are scoped to the work bead (not the agent name) so that:
+ - An agent can pick up new work even if an old worktree is being recovered
+ - Multiple orphaned worktrees can coexist without collision
+diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
+index d3af93a..4098612 100644
+--- a/gastown/formulas/mol-witness-patrol.toml
++++ b/gastown/formulas/mol-witness-patrol.toml
+@@ -530,6 +530,7 @@ tail -n 50 "${LOG_DIR:-$GC_CITY/.gc/runtime/logs}/polecat-worktree-reap.log"
+ | `worktree_dirty_kept` | Closed bead, uncommitted changes on disk | Salvage per Case C/D, then re-run |
+ | `worktree_owner_live` | Closed bead, polecat still alive (PR rework) | None — expected; next cycle retries |
+ | `worktree_bead_unreadable` | `gc bd show` returned nothing | If it persists, check Dolt health |
++| `worktree_status_unreadable` | `git status` failed inside the worktree | Inspect by hand; likely a broken or moved checkout |
+ | `worktree_reap_failed` | Directory survived removal | Investigate permissions/mounts, mail mayor |
+ 
+ A `worktree_dirty_kept` that repeats across cycles means real work is
+diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
+index 58089e8..973236e 100755
+--- a/gastown/tests/test_gastown_pack_assets.sh
++++ b/gastown/tests/test_gastown_pack_assets.sh
+@@ -248,6 +248,22 @@ test_post_merge_worktree_teardown_has_an_owner() {
+     grep -F 'Do NOT delete this worktree yourself' "$polecat" >/dev/null ||
+         fail "polecat formula should point worktree teardown at the witness"
+ 
++    # The live-owner gate reads metadata.polecat_session off the WORK bead. The
++    # startup claim block only stamps the step bead, so without this write the
++    # gate is decorative and PR rework can lose its worktree.
++    grep -F -e '--set-metadata polecat_session="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"' \
++        "$polecat" >/dev/null ||
++        fail "workspace-setup must stamp polecat_session on the work bead for the teardown liveness gate"
++    python3 - "$polecat" <<'PY' || fail "polecat_session must be stamped alongside work_dir, not somewhere unrelated"
++import sys
++text = open(sys.argv[1], encoding="utf-8").read()
++start = text.index('**If no worktree** — create one scoped to the bead')
++end = text.index('**3. Ensure branch exists.**')
++block = text[start:end]
++if 'work_dir="$WORKTREE_PATH"' not in block or 'polecat_session=' not in block:
++    raise SystemExit(1)
++PY
++
+     # The gates are the safety contract; losing any one of them silently turns
+     # housekeeping into data loss.
+     grep -F '*/polecats/*/worktrees/*' "$reaper" >/dev/null ||
+diff --git a/gastown/tests/test_polecat_worktree_reap.sh b/gastown/tests/test_polecat_worktree_reap.sh
+index 86b871c..7b72c70 100644
+--- a/gastown/tests/test_polecat_worktree_reap.sh
++++ b/gastown/tests/test_polecat_worktree_reap.sh
+@@ -14,8 +14,9 @@ write_gc_stub() {
+     mkdir -p "$bin"
+     cat >"$bin/gc" <<'SH'
+ #!/usr/bin/env sh
+-# Serves the two reads polecat-worktree-reap.sh performs:
+-#   gc [bd --rig <rig>] show <bead> --json
++# Serves the two reads polecat-worktree-reap.sh performs, in both their
++# rig-scoped and unscoped forms:
++#   gc bd --rig <rig> show <bead> --json
+ #   gc session list --state=all --json
+ case "$1" in
+     session)
+-- 
+2.50.1 (Apple Git-155)
+
