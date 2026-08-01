@@ -222,16 +222,28 @@ def test_detectors_catch_the_drift_they_are_named_for() -> None:
         fixture, 'gc bd update $WORK --status=open --assignee="$REFINERY_TARGET"'
     )
 
-    unguarded_warrant = (
-        "```bash\ngc bd create --type=task --label=warrant "
-        "--metadata '{\"target\":\"x\"}'\n```"
+    # Built line-by-line rather than with embedded "\n" escapes: a literal
+    # backslash-n immediately before `gc` reads as a bare `bd` invocation to
+    # tests/test_no_bare_bd_commands.py, whose gc-prefix check is line-based.
+    unguarded_warrant = "\n".join(
+        [
+            "```bash",
+            "gc bd create --type=task --label=warrant --metadata '{\"target\":\"x\"}'",
+            "```",
+        ]
     )
     assert warrant_dedup_violations(fixture, unguarded_warrant)
-    guarded_warrant = (
-        "```bash\nEXISTING_WARRANT=$(gc bd list --label=warrant --json)\n"
-        "if [ \"$EXISTING_WARRANT\" -gt 0 ]; then\n  echo skip\nelse\n"
-        "  gc bd create --type=task --label=warrant --metadata '{\"target\":\"x\"}'\n"
-        "fi\n```"
+    guarded_warrant = "\n".join(
+        [
+            "```bash",
+            "EXISTING_WARRANT=$(gc bd list --label=warrant --json)",
+            'if [ "$EXISTING_WARRANT" -gt 0 ]; then',
+            "  echo skip",
+            "else",
+            "  gc bd create --type=task --label=warrant --metadata '{\"target\":\"x\"}'",
+            "fi",
+            "```",
+        ]
     )
     assert not warrant_dedup_violations(fixture, guarded_warrant)
     # A quick-reference table row is outside any fenced block, so it can never
