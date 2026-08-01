@@ -1,0 +1,486 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 31 Jul 2026 22:58:06 -0400
+Subject: [PATCH 14/14] fix(gastown): fail closed on an unreadable session
+ roster and stage the reaper rollout (gcp-z2z)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Mayor review of PR #5 @ 54a8b7b: CHANGES_REQUESTED on two defects. The design
+and gates 1-3 stand; these are the two fixes, nothing wider.
+
+1. session_is_live failed OPEN. A `gc session list` that errored fell back to
+   {"sessions":[]}, and malformed JSON drove jq -e non-zero — both resolved to
+   NOT LIVE, so gate 4 silently vanished on exactly the reads that failed and
+   the reap proceeded against a live polecat. That is the inverted form of the
+   rule gcp-g98 just landed in the witness one step away in the same formula:
+   a confirmation read that fails is not proof of absence.
+
+   Replaced with a tri-state `session_state` printing live | absent |
+   unconfirmed. The roster is seeded `unconfirmed` and promoted only by a read
+   that exited 0, wrote a non-empty file, and parsed with `.sessions` an array;
+   a per-session jq failure or an unrecognized verdict degrades the same way.
+   `unconfirmed` skips the worktree and logs worktree_owner_unconfirmed, so no
+   failed read has a route to a removal. The empty-owner path is unchanged
+   (`absent`) — the review recorded that as a known limit, not a fix.
+
+2. No staged rollout. pre_start passed no --dry-run, so real removal began the
+   moment the city moved off its pin, while city.toml deliberately holds the
+   native gascity reaper in dry-run until gc-zxxy is answered. Real removal is
+   now opt-in behind --no-dry-run, DRY_RUN defaults to 1, and the witness
+   pre_start does not pass it — so the reaper reports its would-reap set and
+   removes nothing until an operator flips it. --dry-run still works.
+
+Docs follow the behavior: agent.toml, the witness prompt, and the patrol step
+all state that the reaper is in dry-run and how the flip is made, and the event
+table gains worktree_reap_pending and worktree_owner_unconfirmed rows.
+
+Tests: real removal is opt-in (bare invocation removes nothing, pre_start
+carries no opt-in), and an unreadable roster — command failure AND unparseable
+output — skips a worktree whose owner is live, with a third case proving a
+clean roster still reaps so the guard is not just inertness. Verified red
+against 54a8b7b: the pre-fix script reaps a live-owned worktree when the roster
+read fails.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ gastown/agents/witness/agent.toml             |  11 +-
+ gastown/agents/witness/prompt.template.md     |  12 +-
+ .../assets/scripts/polecat-worktree-reap.sh   |  93 +++++++++++++---
+ gastown/formulas/mol-witness-patrol.toml      |  28 ++++-
+ gastown/tests/test_gastown_pack_assets.sh     |  22 +++-
+ gastown/tests/test_polecat_worktree_reap.sh   | 103 +++++++++++++++++-
+ 6 files changed, 237 insertions(+), 32 deletions(-)
+
+diff --git a/gastown/agents/witness/agent.toml b/gastown/agents/witness/agent.toml
+index ca75206..938dc73 100644
+--- a/gastown/agents/witness/agent.toml
++++ b/gastown/agents/witness/agent.toml
+@@ -7,8 +7,15 @@ work_dir = ".gc/agents/{{.Rig}}/witness"
+ # because pack assets live in a content-hashed cache directory that a formula
+ # step cannot name; {{.ConfigDir}} is the only stable handle on the script.
+ # The reaper is read-mostly, idempotent, and refuses to touch a worktree that
+-# is dirty, not closed, or still owned by a live session — see the script
+-# header for all four gates.
++# is dirty, not closed, or owned by a session it cannot confirm is gone — see
++# the script header for all four gates.
++#
++# STAGED ROLLOUT: no --no-dry-run here, so this reports what it WOULD reap and
++# removes nothing. That matches the city's posture for the native gascity
++# reaper, which city.toml holds in dry-run until gc-zxxy is answered; two
++# reapers must not disagree about whether removal is live. Review the logged
++# would-reap set across several patrol cycles, confirm no live worktree ever
++# appears in it, then append --no-dry-run to flip on real removal.
+ pre_start = ["{{.ConfigDir}}/assets/scripts/polecat-worktree-reap.sh {{.RigRoot}} --rig {{.Rig}}"]
+ nudge = "Run 'gc prime' to check worker status and begin patrol cycle."
+ idle_timeout = "1h"
+diff --git a/gastown/agents/witness/prompt.template.md b/gastown/agents/witness/prompt.template.md
+index a80d86e..641135e 100644
+--- a/gastown/agents/witness/prompt.template.md
++++ b/gastown/agents/witness/prompt.template.md
+@@ -128,9 +128,15 @@ polecat is still available for FIX_NEEDED rework.
+ 
+ `assets/scripts/polecat-worktree-reap.sh` does the work and runs
+ automatically as your `pre_start`, so it has already run for this session.
+-It removes a worktree only when the path is a per-bead polecat worktree,
+-the bead is closed, `git status --porcelain` is empty, and no live session
+-owns the bead. Everything else it leaves alone and logs.
++It reaps a worktree only when the path is a per-bead polecat worktree, the
++bead is closed, `git status --porcelain` is empty, and the session roster
++confirms no live session owns the bead. Everything else it leaves alone and
++logs.
++
++**It is in dry-run today** — the `pre_start` wiring passes no
++`--no-dry-run`, so it reports `worktree_reap_pending` and removes nothing,
++matching the staged rollout city.toml applies to the native gascity reaper.
++Read the would-reap set as a report, not as a completed cleanup.
+ 
+ Your patrol job is to read
+ `$GC_CITY/.gc/runtime/logs/polecat-worktree-reap.log` and act on what is
+diff --git a/gastown/assets/scripts/polecat-worktree-reap.sh b/gastown/assets/scripts/polecat-worktree-reap.sh
+index 340fd5d..b45b00c 100755
+--- a/gastown/assets/scripts/polecat-worktree-reap.sh
++++ b/gastown/assets/scripts/polecat-worktree-reap.sh
+@@ -26,7 +26,17 @@
+ #   3. `git status --porcelain` is empty — nothing uncommitted would be lost.
+ #      Ignored files are build artifacts and do not block; untracked
+ #      non-ignored files do.
+-#   4. No live session owns the bead (metadata.polecat_session).
++#   4. The session roster confirms no live session owns the bead
++#      (metadata.polecat_session). A roster read that fails or does not parse
++#      is `unconfirmed`, not `absent`, and skips the reap.
++#
++# Staged rollout: REAL REMOVAL IS OPT-IN. The script dry-runs unless it is
++# given --no-dry-run, and the witness pre_start wiring deliberately does not
++# pass it. The city holds the native gascity reaper to the same staged rollout
++# (city.toml, auto_reap_closed_bead_worktrees_dry_run) until gc-zxxy is
++# answered; a second reaper must not go live while the first is held inert.
++# Flip it by adding --no-dry-run to the pre_start in agents/witness/agent.toml
++# once the logged would-reap set has been reviewed across several cycles.
+ #
+ # Deliberately NOT gated on "every commit is on a remote": a rebase-merging
+ # refinery rewrites commit hashes and then deletes the merged branch, so a
+@@ -45,21 +55,25 @@
+ #   LOG_DIR            where to write the log. Defaults to the city runtime log
+ #                      directory; NEVER defaults inside the rig repo, which
+ #                      would litter the canonical checkout with untracked files.
+-#   --dry-run          report what would be reaped, remove nothing
++#   --dry-run          report what would be reaped, remove nothing (the default)
++#   --no-dry-run       opt in to real removal
+ #
+ # Usage:
+-#   GC_RIG=helm polecat-worktree-reap.sh
+-#   polecat-worktree-reap.sh /path/to/rig --rig helm --dry-run
++#   GC_RIG=helm polecat-worktree-reap.sh                    # dry run
++#   polecat-worktree-reap.sh /path/to/rig --rig helm --no-dry-run
+ 
+ set -euo pipefail
+ 
+-DRY_RUN=0
++# Dry run is the default; real removal must be asked for. See the staged
++# rollout note in the header.
++DRY_RUN=1
+ RIG_ROOT=""
+ RIG_NAME="${GC_RIG:-}"
+ 
+ while [ "$#" -gt 0 ]; do
+     case "$1" in
+         --dry-run) DRY_RUN=1 ;;
++        --no-dry-run) DRY_RUN=0 ;;
+         --rig)
+             shift
+             [ "$#" -gt 0 ] || { echo "polecat-worktree-reap: --rig needs a value" >&2; exit 2; }
+@@ -160,20 +174,54 @@ fi
+ # Session roster, fetched once. `gc session list --json` returns an OBJECT
+ # ({sessions:[...]}), not a top-level array, and its fields are lowercase
+ # snake_case — same schema facts mol-witness-patrol's liveness map depends on.
++#
++# A roster read that FAILS is not proof the owning session is gone. Seed the
++# roster state to `unconfirmed` and promote it only on a read that exited 0,
++# wrote a non-empty file, AND parsed as the expected shape; every failure path
++# then falls through to skip-this-worktree with no route to a removal. This is
++# mol-witness-patrol's absent-confirm discipline (gcp-g98) applied to the same
++# subsystem: a confirmation read that fails is not proof of absence.
+ SESSIONS_FILE=$(mktemp)
+ trap 'rm -f "$SESSIONS_FILE"' EXIT
+-gc session list --state=all --json >"$SESSIONS_FILE" 2>/dev/null || printf '{"sessions":[]}' >"$SESSIONS_FILE"
++ROSTER_STATE="unconfirmed"
++if gc session list --state=all --json >"$SESSIONS_FILE" 2>/dev/null &&
++    [ -s "$SESSIONS_FILE" ] &&
++    jq -e '(.sessions | type) == "array"' "$SESSIONS_FILE" >/dev/null 2>&1; then
++    ROSTER_STATE="readable"
++fi
+ 
+-session_is_live() {
+-    [ -n "$1" ] || return 1
+-    jq -e --arg id "$1" '
++# Prints the liveness verdict for a bead's owning session:
++#   live        — a matching session exists and is not closed
++#   absent      — the roster was read and holds no live match
++#   unconfirmed — the roster could not be read or parsed; NOT proof of absence
++session_state() {
++    local owner="$1" verdict
++    if [ "$ROSTER_STATE" != "readable" ]; then
++        printf 'unconfirmed\n'
++        return
++    fi
++    if [ -z "$owner" ]; then
++        # No owner stamped on the bead, so there is no session to confirm and
++        # the gate does not apply. Beads predating the polecat_session stamp
++        # take this path; the other three gates still bind.
++        printf 'absent\n'
++        return
++    fi
++    if ! verdict=$(jq -r --arg id "$owner" '
+         (.sessions // [])
+         | map(select(
+             (.id // "") == $id or (.name // "") == $id or
+             (.session_name // "") == $id or (.alias // "") == $id or
+             (.agent_name // "") == $id))
+-        | any(.closed != true)
+-    ' "$SESSIONS_FILE" >/dev/null 2>&1
++        | if any(.closed != true) then "live" else "absent" end
++    ' "$SESSIONS_FILE" 2>/dev/null); then
++        printf 'unconfirmed\n'
++        return
++    fi
++    case "$verdict" in
++        live | absent) printf '%s\n' "$verdict" ;;
++        *) printf 'unconfirmed\n' ;;
++    esac
+ }
+ 
+ REAPED=0
+@@ -202,13 +250,22 @@ while IFS= read -r WT; do
+     fi
+ 
+     # Gate 4: a polecat still reworking a FIX_NEEDED PR keeps its worktree even
+-    # though the bead is already closed by the PR handoff.
++    # though the bead is already closed by the PR handoff. A roster we could not
++    # read tells us nothing about that polecat, so it skips too.
+     OWNER=$(printf '%s' "$BEAD_JSON" | jq -r '.[0].metadata.polecat_session // empty' 2>/dev/null || true)
+-    if session_is_live "$OWNER"; then
+-        record worktree_owner_live "$BEAD" "$WT" "session $OWNER still live"
+-        SKIPPED=$((SKIPPED + 1))
+-        continue
+-    fi
++    case "$(session_state "$OWNER")" in
++        live)
++            record worktree_owner_live "$BEAD" "$WT" "session $OWNER still live"
++            SKIPPED=$((SKIPPED + 1))
++            continue
++            ;;
++        unconfirmed)
++            record worktree_owner_unconfirmed "$BEAD" "$WT" \
++                "session roster unreadable; a failed read is not proof of absence"
++            SKIPPED=$((SKIPPED + 1))
++            continue
++            ;;
++    esac
+ 
+     # Gate 3: never discard uncommitted work. Ignored files are artifacts and
+     # are excluded by `git status --porcelain`; untracked non-ignored files are
+@@ -252,7 +309,7 @@ $CANDIDATES
+ EOF
+ 
+ if [ "$DRY_RUN" -eq 1 ]; then
+-    echo "polecat-worktree-reap: would reap=$REAPED skipped=$SKIPPED (dry run; log: $LOG_FILE)"
++    echo "polecat-worktree-reap: would reap=$REAPED skipped=$SKIPPED (dry run — nothing removed; pass --no-dry-run to reap; log: $LOG_FILE)"
+ else
+     echo "polecat-worktree-reap: reaped=$REAPED skipped=$SKIPPED (log: $LOG_FILE)"
+ fi
+diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
+index 4098612..50552ed 100644
+--- a/gastown/formulas/mol-witness-patrol.toml
++++ b/gastown/formulas/mol-witness-patrol.toml
+@@ -493,8 +493,20 @@ It lives in `pre_start` rather than in a command here because pack assets
+ are installed into a content-hashed cache directory that a formula step
+ cannot name; the agent config's config-dir template is the only stable
+ handle on the script. Your job in this step is to read what it decided and
+-act on anything that is not routine. Re-run it by hand (adding `--dry-run`
+-to preview) only when clearing an incident.
++act on anything that is not routine. Re-run it by hand only when clearing
++an incident.
++
++**STAGED ROLLOUT — it is in dry-run today.** Real removal is opt-in
++(`--no-dry-run`) and the `pre_start` above does not pass it, so every
++would-be reap logs as `worktree_reap_pending` and nothing is removed. That
++is deliberate: `city.toml` holds the *native* gascity reaper
++(`auto_reap_closed_bead_worktrees_dry_run`) to the same staged rollout
++until `gc-zxxy` is answered, and a second reaper must not do live removals
++while the operator's own equivalent is held inert. Do NOT flip it from a
++patrol; the flip is an operator decision — append `--no-dry-run` to the
++`pre_start` in `agents/witness/agent.toml` once the logged would-reap set
++has been reviewed across several cycles and no live worktree ever appeared
++in it. Treat the log as a report, not as a completed cleanup.
+ 
+ **What it will and will not remove.** All four gates must hold:
+ 
+@@ -507,8 +519,12 @@ to preview) only when clearing an incident.
+ 3. `git status --porcelain` in the worktree is empty. Uncommitted work is
+    never discarded — a dirty worktree is logged as `worktree_dirty_kept`
+    and left for you to salvage using the Case C/D recipes above.
+-4. No live session owns the bead (`metadata.polecat_session`). This is what
+-   defers the reap in `mr`/`pr` mode until the polecat actually drains.
++4. The session roster confirms no live session owns the bead
++   (`metadata.polecat_session`). This is what defers the reap in `mr`/`pr`
++   mode until the polecat actually drains. A roster read that fails or does
++   not parse is `unconfirmed`, never `absent` — a confirmation read that
++   fails is not proof of absence, the same rule the orphan-recovery step
++   above applies before it touches a bead.
+ 
+ It deliberately does NOT require every commit to be on a remote: a
+ rebase-merging refinery rewrites hashes and then deletes the merged branch,
+@@ -526,9 +542,11 @@ tail -n 50 "${LOG_DIR:-$GC_CITY/.gc/runtime/logs}/polecat-worktree-reap.log"
+ 
+ | Event | Meaning | Action |
+ |---|---|---|
+-| `worktree_reaped` | Removed. Routine. | Log only |
++| `worktree_reap_pending` | Passed every gate; dry-run, so NOT removed | Routine while the rollout is staged — this is the would-reap set to review |
++| `worktree_reaped` | Removed. Routine, and only once `--no-dry-run` is wired. | Log only |
+ | `worktree_dirty_kept` | Closed bead, uncommitted changes on disk | Salvage per Case C/D, then re-run |
+ | `worktree_owner_live` | Closed bead, polecat still alive (PR rework) | None — expected; next cycle retries |
++| `worktree_owner_unconfirmed` | `gc session list` failed or did not parse, so liveness is unknown | If it persists, the session roster is broken — check `gc doctor`; nothing was removed |
+ | `worktree_bead_unreadable` | `gc bd show` returned nothing | If it persists, check Dolt health |
+ | `worktree_status_unreadable` | `git status` failed inside the worktree | Inspect by hand; likely a broken or moved checkout |
+ | `worktree_reap_failed` | Directory survived removal | Investigate permissions/mounts, mail mayor |
+diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
+index 973236e..32d4809 100755
+--- a/gastown/tests/test_gastown_pack_assets.sh
++++ b/gastown/tests/test_gastown_pack_assets.sh
+@@ -272,9 +272,29 @@ PY
+         fail "reaper must reap only closed beads"
+     grep -F 'git -C "$WT" status --porcelain' "$reaper" >/dev/null ||
+         fail "reaper must refuse to remove a worktree with uncommitted work"
+-    grep -F 'session_is_live "$OWNER"' "$reaper" >/dev/null ||
++    grep -F 'session_state "$OWNER"' "$reaper" >/dev/null ||
+         fail "reaper must defer while a live session still owns the bead"
+ 
++    # Gate 4 must FAIL CLOSED. A roster read that errors or does not parse is
++    # `unconfirmed`, never `absent` — the same rule the witness's absent-confirm
++    # block enforces. The old fallback to an empty roster made the gate vanish
++    # on exactly the reads that failed.
++    ! grep -F '{"sessions":[]}' "$reaper" >/dev/null ||
++        fail "reaper must not fall back to an empty session roster; that makes the liveness gate fail open"
++    grep -F 'ROSTER_STATE="unconfirmed"' "$reaper" >/dev/null ||
++        fail "reaper must seed the roster state to unconfirmed and promote it only on a clean read"
++    grep -F 'worktree_owner_unconfirmed' "$reaper" >/dev/null ||
++        fail "reaper must skip and log when session liveness cannot be confirmed"
++
++    # Staged rollout: dry run is the default and the witness wiring must not
++    # opt in, so real removal cannot begin on a pin bump alone.
++    grep -x -F 'DRY_RUN=1' "$reaper" >/dev/null ||
++        fail "reaper must default to dry run"
++    grep -F -- '--no-dry-run) DRY_RUN=0 ;;' "$reaper" >/dev/null ||
++        fail "reaper must make real removal opt-in behind --no-dry-run"
++    ! grep -E '^pre_start = .*--no-dry-run' "$witness_cfg" >/dev/null ||
++        fail "witness pre_start must not enable live removal while the rollout is staged"
++
+     # The reaper cleans up around the canonical checkout; it must never write
+     # into it.
+     ! grep -F 'LOG_DIR="$RIG_ROOT' "$reaper" >/dev/null ||
+diff --git a/gastown/tests/test_polecat_worktree_reap.sh b/gastown/tests/test_polecat_worktree_reap.sh
+index 7b72c70..91abb5f 100644
+--- a/gastown/tests/test_polecat_worktree_reap.sh
++++ b/gastown/tests/test_polecat_worktree_reap.sh
+@@ -104,7 +104,7 @@ JSON
+ JSON
+ 
+     GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+-        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" >"$tmp/out.txt" 2>&1 ||
++        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out.txt" 2>&1 ||
+         fail "reaper exited non-zero: $(cat "$tmp/out.txt")"
+ 
+     [[ ! -e "$home/worktrees/wt-closed" ]] ||
+@@ -146,6 +146,101 @@ JSON
+     rm -rf "$tmp"
+ }
+ 
++test_real_removal_is_opt_in() {
++    # Staged rollout: the witness pre_start passes no --no-dry-run, so the
++    # bare invocation must behave exactly like --dry-run. If this ever
++    # regresses, real removal goes live on the first pin bump with no
++    # observation window.
++    local tmp rig bin home beads sessions logdir
++    tmp=$(mktemp -d)
++    rig="$tmp/rig"
++    bin="$tmp/bin"
++    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
++    beads="$tmp/beads.json"
++    sessions="$tmp/sessions.json"
++    logdir="$tmp/logs"
++    mkdir -p "$logdir"
++
++    setup_rig "$rig"
++    write_gc_stub "$bin"
++    add_bead_worktree "$rig" "$home" wt-closed
++
++    cat >"$beads" <<'JSON'
++[{"id":"wt-closed","status":"closed","metadata":{"polecat_session":"deadsess"}}]
++JSON
++    printf '{"sessions":[]}' >"$sessions"
++
++    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
++        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" >"$tmp/out.txt" 2>&1 ||
++        fail "default run exited non-zero: $(cat "$tmp/out.txt")"
++
++    [[ -e "$home/worktrees/wt-closed" ]] ||
++        fail "the default run removed a worktree; real removal must be opt-in"
++    grep -F '"event":"worktree_reap_pending"' "$logdir/polecat-worktree-reap.log" >/dev/null ||
++        fail "the default run did not report the pending reap"
++    grep -F '"dry_run":true' "$logdir/polecat-worktree-reap.log" >/dev/null ||
++        fail "the default run did not record itself as a dry run"
++
++    # And the wiring the witness actually ships must not carry the opt-in.
++    ! grep -E '^pre_start = .*--no-dry-run' "$ROOT/gastown/agents/witness/agent.toml" >/dev/null ||
++        fail "witness pre_start enables live removal; the rollout must stay staged"
++
++    rm -rf "$tmp"
++}
++
++test_unreadable_session_roster_skips_the_reap() {
++    # A confirmation read that FAILS is not proof of absence. Both a roster
++    # command that errors and one that returns unparseable output must land in
++    # `unconfirmed` and skip, never fall through to a removal.
++    local tmp rig bin home beads logdir
++    tmp=$(mktemp -d)
++    rig="$tmp/rig"
++    bin="$tmp/bin"
++    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
++    beads="$tmp/beads.json"
++    logdir="$tmp/logs"
++    mkdir -p "$logdir"
++
++    setup_rig "$rig"
++    write_gc_stub "$bin"
++    add_bead_worktree "$rig" "$home" wt-closed
++
++    cat >"$beads" <<'JSON'
++[{"id":"wt-closed","status":"closed","metadata":{"polecat_session":"deadsess"}}]
++JSON
++
++    # Case 1: the roster command fails outright (missing file -> cat exits 1).
++    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" \
++        GC_SESSIONS_JSON="$tmp/no-such-roster.json" \
++        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/fail.txt" 2>&1 ||
++        fail "reaper exited non-zero on an unreadable roster: $(cat "$tmp/fail.txt")"
++
++    [[ -e "$home/worktrees/wt-closed" ]] ||
++        fail "a failed session-roster read let the reap proceed; gate 4 failed open"
++    grep -F '"event":"worktree_owner_unconfirmed"' "$logdir/polecat-worktree-reap.log" >/dev/null ||
++        fail "an unconfirmed liveness verdict was not reported"
++
++    # Case 2: the roster is present but not JSON.
++    printf 'not json at all' >"$tmp/bad.json"
++    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$tmp/bad.json" \
++        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/bad.txt" 2>&1 ||
++        fail "reaper exited non-zero on a malformed roster: $(cat "$tmp/bad.txt")"
++
++    [[ -e "$home/worktrees/wt-closed" ]] ||
++        fail "a malformed session roster let the reap proceed; gate 4 failed open"
++
++    # Case 3: the same worktree IS reaped once the roster reads cleanly, so the
++    # skip above is the guard working and not the reaper being inert.
++    printf '{"sessions":[]}' >"$tmp/good.json"
++    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$tmp/good.json" \
++        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/good.txt" 2>&1 ||
++        fail "reaper exited non-zero on a readable roster: $(cat "$tmp/good.txt")"
++    [[ ! -e "$home/worktrees/wt-closed" ]] ||
++        fail "a readable roster with no live owner should have reaped the worktree"
++
++    rm -rf "$tmp"
++}
++
+ test_dry_run_removes_nothing_and_rerun_is_idempotent() {
+     local tmp rig bin home beads sessions logdir
+     tmp=$(mktemp -d)
+@@ -177,14 +272,14 @@ JSON
+ 
+     # A missing polecat_session must not read as "owned by a live session".
+     GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+-        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" >/dev/null 2>&1 ||
++        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run >/dev/null 2>&1 ||
+         fail "reaper exited non-zero on the real run"
+     [[ ! -e "$home/worktrees/wt-closed" ]] ||
+         fail "the closed worktree survived the real run"
+ 
+     # Second real run: nothing left to do, still exits clean.
+     GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+-        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" >"$tmp/again.txt" 2>&1 ||
++        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/again.txt" 2>&1 ||
+         fail "re-running the reaper on a clean tree failed: $(cat "$tmp/again.txt")"
+     grep -F 'no per-bead polecat worktrees' "$tmp/again.txt" >/dev/null ||
+         fail "a second run should find no candidates"
+@@ -193,6 +288,8 @@ JSON
+ }
+ 
+ test_reaps_only_closed_clean_unowned_bead_worktrees
++test_real_removal_is_opt_in
++test_unreadable_session_roster_skips_the_reap
+ test_dry_run_removes_nothing_and_rerun_is_idempotent
+ 
+ echo "polecat worktree reap tests passed"
+-- 
+2.50.1 (Apple Git-155)
+
