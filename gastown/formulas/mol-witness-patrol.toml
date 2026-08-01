@@ -493,8 +493,20 @@ It lives in `pre_start` rather than in a command here because pack assets
 are installed into a content-hashed cache directory that a formula step
 cannot name; the agent config's config-dir template is the only stable
 handle on the script. Your job in this step is to read what it decided and
-act on anything that is not routine. Re-run it by hand (adding `--dry-run`
-to preview) only when clearing an incident.
+act on anything that is not routine. Re-run it by hand only when clearing
+an incident.
+
+**STAGED ROLLOUT — it is in dry-run today.** Real removal is opt-in
+(`--no-dry-run`) and the `pre_start` above does not pass it, so every
+would-be reap logs as `worktree_reap_pending` and nothing is removed. That
+is deliberate: `city.toml` holds the *native* gascity reaper
+(`auto_reap_closed_bead_worktrees_dry_run`) to the same staged rollout
+until `gc-zxxy` is answered, and a second reaper must not do live removals
+while the operator's own equivalent is held inert. Do NOT flip it from a
+patrol; the flip is an operator decision — append `--no-dry-run` to the
+`pre_start` in `agents/witness/agent.toml` once the logged would-reap set
+has been reviewed across several cycles and no live worktree ever appeared
+in it. Treat the log as a report, not as a completed cleanup.
 
 **What it will and will not remove.** All four gates must hold:
 
@@ -507,8 +519,12 @@ to preview) only when clearing an incident.
 3. `git status --porcelain` in the worktree is empty. Uncommitted work is
    never discarded — a dirty worktree is logged as `worktree_dirty_kept`
    and left for you to salvage using the Case C/D recipes above.
-4. No live session owns the bead (`metadata.polecat_session`). This is what
-   defers the reap in `mr`/`pr` mode until the polecat actually drains.
+4. The session roster confirms no live session owns the bead
+   (`metadata.polecat_session`). This is what defers the reap in `mr`/`pr`
+   mode until the polecat actually drains. A roster read that fails or does
+   not parse is `unconfirmed`, never `absent` — a confirmation read that
+   fails is not proof of absence, the same rule the orphan-recovery step
+   above applies before it touches a bead.
 
 It deliberately does NOT require every commit to be on a remote: a
 rebase-merging refinery rewrites hashes and then deletes the merged branch,
@@ -526,9 +542,11 @@ tail -n 50 "${LOG_DIR:-$GC_CITY/.gc/runtime/logs}/polecat-worktree-reap.log"
 
 | Event | Meaning | Action |
 |---|---|---|
-| `worktree_reaped` | Removed. Routine. | Log only |
+| `worktree_reap_pending` | Passed every gate; dry-run, so NOT removed | Routine while the rollout is staged — this is the would-reap set to review |
+| `worktree_reaped` | Removed. Routine, and only once `--no-dry-run` is wired. | Log only |
 | `worktree_dirty_kept` | Closed bead, uncommitted changes on disk | Salvage per Case C/D, then re-run |
 | `worktree_owner_live` | Closed bead, polecat still alive (PR rework) | None — expected; next cycle retries |
+| `worktree_owner_unconfirmed` | `gc session list` failed or did not parse, so liveness is unknown | If it persists, the session roster is broken — check `gc doctor`; nothing was removed |
 | `worktree_bead_unreadable` | `gc bd show` returned nothing | If it persists, check Dolt health |
 | `worktree_status_unreadable` | `git status` failed inside the worktree | Inspect by hand; likely a broken or moved checkout |
 | `worktree_reap_failed` | Directory survived removal | Investigate permissions/mounts, mail mayor |

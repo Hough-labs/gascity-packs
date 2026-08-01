@@ -26,7 +26,17 @@
 #   3. `git status --porcelain` is empty — nothing uncommitted would be lost.
 #      Ignored files are build artifacts and do not block; untracked
 #      non-ignored files do.
-#   4. No live session owns the bead (metadata.polecat_session).
+#   4. The session roster confirms no live session owns the bead
+#      (metadata.polecat_session). A roster read that fails or does not parse
+#      is `unconfirmed`, not `absent`, and skips the reap.
+#
+# Staged rollout: REAL REMOVAL IS OPT-IN. The script dry-runs unless it is
+# given --no-dry-run, and the witness pre_start wiring deliberately does not
+# pass it. The city holds the native gascity reaper to the same staged rollout
+# (city.toml, auto_reap_closed_bead_worktrees_dry_run) until gc-zxxy is
+# answered; a second reaper must not go live while the first is held inert.
+# Flip it by adding --no-dry-run to the pre_start in agents/witness/agent.toml
+# once the logged would-reap set has been reviewed across several cycles.
 #
 # Deliberately NOT gated on "every commit is on a remote": a rebase-merging
 # refinery rewrites commit hashes and then deletes the merged branch, so a
@@ -45,21 +55,25 @@
 #   LOG_DIR            where to write the log. Defaults to the city runtime log
 #                      directory; NEVER defaults inside the rig repo, which
 #                      would litter the canonical checkout with untracked files.
-#   --dry-run          report what would be reaped, remove nothing
+#   --dry-run          report what would be reaped, remove nothing (the default)
+#   --no-dry-run       opt in to real removal
 #
 # Usage:
-#   GC_RIG=helm polecat-worktree-reap.sh
-#   polecat-worktree-reap.sh /path/to/rig --rig helm --dry-run
+#   GC_RIG=helm polecat-worktree-reap.sh                    # dry run
+#   polecat-worktree-reap.sh /path/to/rig --rig helm --no-dry-run
 
 set -euo pipefail
 
-DRY_RUN=0
+# Dry run is the default; real removal must be asked for. See the staged
+# rollout note in the header.
+DRY_RUN=1
 RIG_ROOT=""
 RIG_NAME="${GC_RIG:-}"
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --dry-run) DRY_RUN=1 ;;
+        --no-dry-run) DRY_RUN=0 ;;
         --rig)
             shift
             [ "$#" -gt 0 ] || { echo "polecat-worktree-reap: --rig needs a value" >&2; exit 2; }
@@ -160,20 +174,54 @@ fi
 # Session roster, fetched once. `gc session list --json` returns an OBJECT
 # ({sessions:[...]}), not a top-level array, and its fields are lowercase
 # snake_case — same schema facts mol-witness-patrol's liveness map depends on.
+#
+# A roster read that FAILS is not proof the owning session is gone. Seed the
+# roster state to `unconfirmed` and promote it only on a read that exited 0,
+# wrote a non-empty file, AND parsed as the expected shape; every failure path
+# then falls through to skip-this-worktree with no route to a removal. This is
+# mol-witness-patrol's absent-confirm discipline (gcp-g98) applied to the same
+# subsystem: a confirmation read that fails is not proof of absence.
 SESSIONS_FILE=$(mktemp)
 trap 'rm -f "$SESSIONS_FILE"' EXIT
-gc session list --state=all --json >"$SESSIONS_FILE" 2>/dev/null || printf '{"sessions":[]}' >"$SESSIONS_FILE"
+ROSTER_STATE="unconfirmed"
+if gc session list --state=all --json >"$SESSIONS_FILE" 2>/dev/null &&
+    [ -s "$SESSIONS_FILE" ] &&
+    jq -e '(.sessions | type) == "array"' "$SESSIONS_FILE" >/dev/null 2>&1; then
+    ROSTER_STATE="readable"
+fi
 
-session_is_live() {
-    [ -n "$1" ] || return 1
-    jq -e --arg id "$1" '
+# Prints the liveness verdict for a bead's owning session:
+#   live        — a matching session exists and is not closed
+#   absent      — the roster was read and holds no live match
+#   unconfirmed — the roster could not be read or parsed; NOT proof of absence
+session_state() {
+    local owner="$1" verdict
+    if [ "$ROSTER_STATE" != "readable" ]; then
+        printf 'unconfirmed\n'
+        return
+    fi
+    if [ -z "$owner" ]; then
+        # No owner stamped on the bead, so there is no session to confirm and
+        # the gate does not apply. Beads predating the polecat_session stamp
+        # take this path; the other three gates still bind.
+        printf 'absent\n'
+        return
+    fi
+    if ! verdict=$(jq -r --arg id "$owner" '
         (.sessions // [])
         | map(select(
             (.id // "") == $id or (.name // "") == $id or
             (.session_name // "") == $id or (.alias // "") == $id or
             (.agent_name // "") == $id))
-        | any(.closed != true)
-    ' "$SESSIONS_FILE" >/dev/null 2>&1
+        | if any(.closed != true) then "live" else "absent" end
+    ' "$SESSIONS_FILE" 2>/dev/null); then
+        printf 'unconfirmed\n'
+        return
+    fi
+    case "$verdict" in
+        live | absent) printf '%s\n' "$verdict" ;;
+        *) printf 'unconfirmed\n' ;;
+    esac
 }
 
 REAPED=0
@@ -202,13 +250,22 @@ while IFS= read -r WT; do
     fi
 
     # Gate 4: a polecat still reworking a FIX_NEEDED PR keeps its worktree even
-    # though the bead is already closed by the PR handoff.
+    # though the bead is already closed by the PR handoff. A roster we could not
+    # read tells us nothing about that polecat, so it skips too.
     OWNER=$(printf '%s' "$BEAD_JSON" | jq -r '.[0].metadata.polecat_session // empty' 2>/dev/null || true)
-    if session_is_live "$OWNER"; then
-        record worktree_owner_live "$BEAD" "$WT" "session $OWNER still live"
-        SKIPPED=$((SKIPPED + 1))
-        continue
-    fi
+    case "$(session_state "$OWNER")" in
+        live)
+            record worktree_owner_live "$BEAD" "$WT" "session $OWNER still live"
+            SKIPPED=$((SKIPPED + 1))
+            continue
+            ;;
+        unconfirmed)
+            record worktree_owner_unconfirmed "$BEAD" "$WT" \
+                "session roster unreadable; a failed read is not proof of absence"
+            SKIPPED=$((SKIPPED + 1))
+            continue
+            ;;
+    esac
 
     # Gate 3: never discard uncommitted work. Ignored files are artifacts and
     # are excluded by `git status --porcelain`; untracked non-ignored files are
@@ -252,7 +309,7 @@ $CANDIDATES
 EOF
 
 if [ "$DRY_RUN" -eq 1 ]; then
-    echo "polecat-worktree-reap: would reap=$REAPED skipped=$SKIPPED (dry run; log: $LOG_FILE)"
+    echo "polecat-worktree-reap: would reap=$REAPED skipped=$SKIPPED (dry run — nothing removed; pass --no-dry-run to reap; log: $LOG_FILE)"
 else
     echo "polecat-worktree-reap: reaped=$REAPED skipped=$SKIPPED (log: $LOG_FILE)"
 fi

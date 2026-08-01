@@ -128,9 +128,15 @@ polecat is still available for FIX_NEEDED rework.
 
 `assets/scripts/polecat-worktree-reap.sh` does the work and runs
 automatically as your `pre_start`, so it has already run for this session.
-It removes a worktree only when the path is a per-bead polecat worktree,
-the bead is closed, `git status --porcelain` is empty, and no live session
-owns the bead. Everything else it leaves alone and logs.
+It reaps a worktree only when the path is a per-bead polecat worktree, the
+bead is closed, `git status --porcelain` is empty, and the session roster
+confirms no live session owns the bead. Everything else it leaves alone and
+logs.
+
+**It is in dry-run today** — the `pre_start` wiring passes no
+`--no-dry-run`, so it reports `worktree_reap_pending` and removes nothing,
+matching the staged rollout city.toml applies to the native gascity reaper.
+Read the would-reap set as a report, not as a completed cleanup.
 
 Your patrol job is to read
 `$GC_CITY/.gc/runtime/logs/polecat-worktree-reap.log` and act on what is

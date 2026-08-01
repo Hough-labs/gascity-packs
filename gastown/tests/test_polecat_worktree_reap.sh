@@ -104,7 +104,7 @@ JSON
 JSON
 
     GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
-        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" >"$tmp/out.txt" 2>&1 ||
+        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out.txt" 2>&1 ||
         fail "reaper exited non-zero: $(cat "$tmp/out.txt")"
 
     [[ ! -e "$home/worktrees/wt-closed" ]] ||
@@ -146,6 +146,101 @@ JSON
     rm -rf "$tmp"
 }
 
+test_real_removal_is_opt_in() {
+    # Staged rollout: the witness pre_start passes no --no-dry-run, so the
+    # bare invocation must behave exactly like --dry-run. If this ever
+    # regresses, real removal goes live on the first pin bump with no
+    # observation window.
+    local tmp rig bin home beads sessions logdir
+    tmp=$(mktemp -d)
+    rig="$tmp/rig"
+    bin="$tmp/bin"
+    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
+    beads="$tmp/beads.json"
+    sessions="$tmp/sessions.json"
+    logdir="$tmp/logs"
+    mkdir -p "$logdir"
+
+    setup_rig "$rig"
+    write_gc_stub "$bin"
+    add_bead_worktree "$rig" "$home" wt-closed
+
+    cat >"$beads" <<'JSON'
+[{"id":"wt-closed","status":"closed","metadata":{"polecat_session":"deadsess"}}]
+JSON
+    printf '{"sessions":[]}' >"$sessions"
+
+    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" >"$tmp/out.txt" 2>&1 ||
+        fail "default run exited non-zero: $(cat "$tmp/out.txt")"
+
+    [[ -e "$home/worktrees/wt-closed" ]] ||
+        fail "the default run removed a worktree; real removal must be opt-in"
+    grep -F '"event":"worktree_reap_pending"' "$logdir/polecat-worktree-reap.log" >/dev/null ||
+        fail "the default run did not report the pending reap"
+    grep -F '"dry_run":true' "$logdir/polecat-worktree-reap.log" >/dev/null ||
+        fail "the default run did not record itself as a dry run"
+
+    # And the wiring the witness actually ships must not carry the opt-in.
+    ! grep -E '^pre_start = .*--no-dry-run' "$ROOT/gastown/agents/witness/agent.toml" >/dev/null ||
+        fail "witness pre_start enables live removal; the rollout must stay staged"
+
+    rm -rf "$tmp"
+}
+
+test_unreadable_session_roster_skips_the_reap() {
+    # A confirmation read that FAILS is not proof of absence. Both a roster
+    # command that errors and one that returns unparseable output must land in
+    # `unconfirmed` and skip, never fall through to a removal.
+    local tmp rig bin home beads logdir
+    tmp=$(mktemp -d)
+    rig="$tmp/rig"
+    bin="$tmp/bin"
+    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
+    beads="$tmp/beads.json"
+    logdir="$tmp/logs"
+    mkdir -p "$logdir"
+
+    setup_rig "$rig"
+    write_gc_stub "$bin"
+    add_bead_worktree "$rig" "$home" wt-closed
+
+    cat >"$beads" <<'JSON'
+[{"id":"wt-closed","status":"closed","metadata":{"polecat_session":"deadsess"}}]
+JSON
+
+    # Case 1: the roster command fails outright (missing file -> cat exits 1).
+    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" \
+        GC_SESSIONS_JSON="$tmp/no-such-roster.json" \
+        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/fail.txt" 2>&1 ||
+        fail "reaper exited non-zero on an unreadable roster: $(cat "$tmp/fail.txt")"
+
+    [[ -e "$home/worktrees/wt-closed" ]] ||
+        fail "a failed session-roster read let the reap proceed; gate 4 failed open"
+    grep -F '"event":"worktree_owner_unconfirmed"' "$logdir/polecat-worktree-reap.log" >/dev/null ||
+        fail "an unconfirmed liveness verdict was not reported"
+
+    # Case 2: the roster is present but not JSON.
+    printf 'not json at all' >"$tmp/bad.json"
+    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$tmp/bad.json" \
+        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/bad.txt" 2>&1 ||
+        fail "reaper exited non-zero on a malformed roster: $(cat "$tmp/bad.txt")"
+
+    [[ -e "$home/worktrees/wt-closed" ]] ||
+        fail "a malformed session roster let the reap proceed; gate 4 failed open"
+
+    # Case 3: the same worktree IS reaped once the roster reads cleanly, so the
+    # skip above is the guard working and not the reaper being inert.
+    printf '{"sessions":[]}' >"$tmp/good.json"
+    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$tmp/good.json" \
+        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/good.txt" 2>&1 ||
+        fail "reaper exited non-zero on a readable roster: $(cat "$tmp/good.txt")"
+    [[ ! -e "$home/worktrees/wt-closed" ]] ||
+        fail "a readable roster with no live owner should have reaped the worktree"
+
+    rm -rf "$tmp"
+}
+
 test_dry_run_removes_nothing_and_rerun_is_idempotent() {
     local tmp rig bin home beads sessions logdir
     tmp=$(mktemp -d)
@@ -177,14 +272,14 @@ JSON
 
     # A missing polecat_session must not read as "owned by a live session".
     GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
-        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" >/dev/null 2>&1 ||
+        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run >/dev/null 2>&1 ||
         fail "reaper exited non-zero on the real run"
     [[ ! -e "$home/worktrees/wt-closed" ]] ||
         fail "the closed worktree survived the real run"
 
     # Second real run: nothing left to do, still exits clean.
     GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
-        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" >"$tmp/again.txt" 2>&1 ||
+        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/again.txt" 2>&1 ||
         fail "re-running the reaper on a clean tree failed: $(cat "$tmp/again.txt")"
     grep -F 'no per-bead polecat worktrees' "$tmp/again.txt" >/dev/null ||
         fail "a second run should find no candidates"
@@ -193,6 +288,8 @@ JSON
 }
 
 test_reaps_only_closed_clean_unowned_bead_worktrees
+test_real_removal_is_opt_in
+test_unreadable_session_roster_skips_the_reap
 test_dry_run_removes_nothing_and_rerun_is_idempotent
 
 echo "polecat worktree reap tests passed"

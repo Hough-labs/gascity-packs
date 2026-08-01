@@ -272,8 +272,28 @@ PY
         fail "reaper must reap only closed beads"
     grep -F 'git -C "$WT" status --porcelain' "$reaper" >/dev/null ||
         fail "reaper must refuse to remove a worktree with uncommitted work"
-    grep -F 'session_is_live "$OWNER"' "$reaper" >/dev/null ||
+    grep -F 'session_state "$OWNER"' "$reaper" >/dev/null ||
         fail "reaper must defer while a live session still owns the bead"
+
+    # Gate 4 must FAIL CLOSED. A roster read that errors or does not parse is
+    # `unconfirmed`, never `absent` — the same rule the witness's absent-confirm
+    # block enforces. The old fallback to an empty roster made the gate vanish
+    # on exactly the reads that failed.
+    ! grep -F '{"sessions":[]}' "$reaper" >/dev/null ||
+        fail "reaper must not fall back to an empty session roster; that makes the liveness gate fail open"
+    grep -F 'ROSTER_STATE="unconfirmed"' "$reaper" >/dev/null ||
+        fail "reaper must seed the roster state to unconfirmed and promote it only on a clean read"
+    grep -F 'worktree_owner_unconfirmed' "$reaper" >/dev/null ||
+        fail "reaper must skip and log when session liveness cannot be confirmed"
+
+    # Staged rollout: dry run is the default and the witness wiring must not
+    # opt in, so real removal cannot begin on a pin bump alone.
+    grep -x -F 'DRY_RUN=1' "$reaper" >/dev/null ||
+        fail "reaper must default to dry run"
+    grep -F -- '--no-dry-run) DRY_RUN=0 ;;' "$reaper" >/dev/null ||
+        fail "reaper must make real removal opt-in behind --no-dry-run"
+    ! grep -E '^pre_start = .*--no-dry-run' "$witness_cfg" >/dev/null ||
+        fail "witness pre_start must not enable live removal while the rollout is staged"
 
     # The reaper cleans up around the canonical checkout; it must never write
     # into it.

@@ -7,8 +7,15 @@ work_dir = ".gc/agents/{{.Rig}}/witness"
 # because pack assets live in a content-hashed cache directory that a formula
 # step cannot name; {{.ConfigDir}} is the only stable handle on the script.
 # The reaper is read-mostly, idempotent, and refuses to touch a worktree that
-# is dirty, not closed, or still owned by a live session — see the script
-# header for all four gates.
+# is dirty, not closed, or owned by a session it cannot confirm is gone — see
+# the script header for all four gates.
+#
+# STAGED ROLLOUT: no --no-dry-run here, so this reports what it WOULD reap and
+# removes nothing. That matches the city's posture for the native gascity
+# reaper, which city.toml holds in dry-run until gc-zxxy is answered; two
+# reapers must not disagree about whether removal is live. Review the logged
+# would-reap set across several patrol cycles, confirm no live worktree ever
+# appears in it, then append --no-dry-run to flip on real removal.
 pre_start = ["{{.ConfigDir}}/assets/scripts/polecat-worktree-reap.sh {{.RigRoot}} --rig {{.Rig}}"]
 nudge = "Run 'gc prime' to check worker status and begin patrol cycle."
 idle_timeout = "1h"
