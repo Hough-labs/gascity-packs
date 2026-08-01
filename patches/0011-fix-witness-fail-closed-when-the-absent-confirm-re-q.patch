@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 31 Jul 2026 11:12:42 -0400
+Subject: [PATCH 11/11] fix(witness): fail closed when the absent-confirm
+ re-query cannot be parsed (gcp-g98)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Self-review touch-up on the item-3 confirmation block.
+
+The committed version only reached STATE="unconfirmed" when the two
+roster commands exited non-zero. A command that exited 0 but wrote an
+empty or unparseable file left jq to emit its `first // "absent"`
+default, so an unreadable roster resolved to `absent` — the exact
+destructive verdict the guard exists to prevent, and a contradiction of
+the prose directly beneath it ("empty file, unparseable JSON is NOT
+proof of absence").
+
+Now STATE is seeded to "unconfirmed" up front and overwritten only by a
+read that both succeeded and produced non-empty files that jq parsed
+(`CONFIRMED=$(jq ...) && STATE="$CONFIRMED"`). Every failure path falls
+through to skip-this-bead with no route to `absent`.
+---
+ gastown/formulas/mol-witness-patrol.toml | 13 ++++++++-----
+ 1 file changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
+index 81fada9..ba999c9 100644
+--- a/gastown/formulas/mol-witness-patrol.toml
++++ b/gastown/formulas/mol-witness-patrol.toml
+@@ -262,9 +262,14 @@ a NEW session with a different ID — the old one never comes back.
+    ```bash
+    if [ "$STATE" = "absent" ]; then
+      CONFIRM_SESSIONS=$(mktemp); CONFIRM_BEADS=$(mktemp)
++     # Default to unconfirmed and overwrite ONLY on a read that fully
++     # succeeded and parsed. Every failure path then falls through to
++     # "skip this bead", with no way to reach a destructive `absent`.
++     STATE="unconfirmed"
+      if gc session list --state=all --json > "$CONFIRM_SESSIONS" \
+-       && gc bd list --type=session --label=gc:session --include-infra --include-gates --all --json --limit=0 > "$CONFIRM_BEADS"; then
+-       STATE=$(jq -r -n --arg a "$ASSIGNEE" \
++       && gc bd list --type=session --label=gc:session --include-infra --include-gates --all --json --limit=0 > "$CONFIRM_BEADS" \
++       && [ -s "$CONFIRM_SESSIONS" ] && [ -s "$CONFIRM_BEADS" ]; then
++       CONFIRMED=$(jq -r -n --arg a "$ASSIGNEE" \
+          --slurpfile sessions "$CONFIRM_SESSIONS" --slurpfile session_beads "$CONFIRM_BEADS" '
+          ([ ($sessions[0].sessions // [])[]
+             | select((.id == $a) or (.name == $a) or (.session_name == $a)
+@@ -273,9 +278,7 @@ a NEW session with a different ID — the old one never comes back.
+           + [ ($session_beads[0] // [])[]
+             | select(.metadata.configured_named_identity == $a)
+             | (if (.status == "closed") then "closed" else (.metadata.state // "") end) ])
+-         | first // "absent"')
+-     else
+-       STATE="unconfirmed"
++         | first // "absent"') && STATE="$CONFIRMED"
+      fi
+      rm -f "$CONFIRM_SESSIONS" "$CONFIRM_BEADS"
+    fi
+-- 
+2.50.1 (Apple Git-155)
+
