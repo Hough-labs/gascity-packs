@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 31 Jul 2026 23:23:19 -0400
+Subject: [PATCH 17/17] test: build drift-suite fixtures line-by-line, not with
+ embedded escapes (gcp-co9)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Carried over from 857ba86 on the pre-rebase branch, whose other half is now
+redundant. That commit fixed two regressions from the prompt-drift change; only
+one of them is still live on integration.
+
+The dropped half excluded patches/ from tests/test_no_bare_bd_commands.py.
+dabcb2c (gcp-xbl) landed the same exclusion independently as DERIVED_PREFIXES
+while this branch was held, so replaying ours would only re-implement it in a
+second style. Integration's version is kept.
+
+The half that survives is this one: the new drift suite built its detector
+self-test fixtures with embedded "\n" escapes, and a literal backslash-n
+immediately before `gc` reads as a bare `bd` invocation to
+test_no_bare_bd_commands.py, whose gc-prefix check is line-based. Nothing on
+integration fixes that — the fixtures only exist on this branch — so without
+this the bare-bd guard fails against our own new test file. Rebuilt with
+"\n".join(...) so each command starts a line.
+---
+ tests/test_prompt_formula_command_drift.py | 28 +++++++++++++++-------
+ 1 file changed, 20 insertions(+), 8 deletions(-)
+
+diff --git a/tests/test_prompt_formula_command_drift.py b/tests/test_prompt_formula_command_drift.py
+index f798183..133fbb3 100644
+--- a/tests/test_prompt_formula_command_drift.py
++++ b/tests/test_prompt_formula_command_drift.py
+@@ -222,16 +222,28 @@ def test_detectors_catch_the_drift_they_are_named_for() -> None:
+         fixture, 'gc bd update $WORK --status=open --assignee="$REFINERY_TARGET"'
+     )
+ 
+-    unguarded_warrant = (
+-        "```bash\ngc bd create --type=task --label=warrant "
+-        "--metadata '{\"target\":\"x\"}'\n```"
++    # Built line-by-line rather than with embedded "\n" escapes: a literal
++    # backslash-n immediately before `gc` reads as a bare `bd` invocation to
++    # tests/test_no_bare_bd_commands.py, whose gc-prefix check is line-based.
++    unguarded_warrant = "\n".join(
++        [
++            "```bash",
++            "gc bd create --type=task --label=warrant --metadata '{\"target\":\"x\"}'",
++            "```",
++        ]
+     )
+     assert warrant_dedup_violations(fixture, unguarded_warrant)
+-    guarded_warrant = (
+-        "```bash\nEXISTING_WARRANT=$(gc bd list --label=warrant --json)\n"
+-        "if [ \"$EXISTING_WARRANT\" -gt 0 ]; then\n  echo skip\nelse\n"
+-        "  gc bd create --type=task --label=warrant --metadata '{\"target\":\"x\"}'\n"
+-        "fi\n```"
++    guarded_warrant = "\n".join(
++        [
++            "```bash",
++            "EXISTING_WARRANT=$(gc bd list --label=warrant --json)",
++            'if [ "$EXISTING_WARRANT" -gt 0 ]; then',
++            "  echo skip",
++            "else",
++            "  gc bd create --type=task --label=warrant --metadata '{\"target\":\"x\"}'",
++            "fi",
++            "```",
++        ]
+     )
+     assert not warrant_dedup_violations(fixture, guarded_warrant)
+     # A quick-reference table row is outside any fenced block, so it can never
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,895 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 31 Jul 2026 16:39:16 -0400
+Subject: [PATCH 16/17] fix(prompts): stop role templates restating formula
+ commands lossily (gcp-co9)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A refinery rejection orphaned a bead: the refinery role prompt's condensed
+"Rejection Flow" restated mol-refinery-patrol's pool-return `gc bd update`
+without `--set-metadata gc.routed_to=...`, and the prompt is what is injected at
+spawn while the formula must be opened deliberately. Nothing spawns for a bead
+with no routing, so it sat open and unassigned indefinitely while the refinery
+reported a successful rejection. The state is indistinguishable from a healthy
+pooled bead, and witness patrols are correctly told not to flag unassigned pool
+beads — so the one observer positioned to catch it is instructed to ignore it.
+
+Patching that one flag would have left the drift class intact: two sources of
+truth for the same command, where the lossy copy is the injected one. This
+audits every restated formula command across gastown/agents/*/ and resolves each
+by pointing at the owning formula step instead of copying it — a pointer cannot
+drift, a copy can. Six lossy restatements were found and fixed:
+
+- refinery Rejection Flow dropped `gc.routed_to` and the `gc workflow
+  delete-source/reopen-source` cleanup. This one keeps a verbatim copy of the
+  routing update, explicitly marked as a copy naming the authoritative steps
+  (`rebase`, `handle-failures`), because the acceptance bar is that the injected
+  prompt alone yields a routed bead.
+- refinery Patrol Lifecycle Rules 1 and 2 each restated next-iteration's
+  pour/burn without the `gc runtime drain-ack` that precedes every formula
+  bail-out; a session that exits 1 without acking is never recycled.
+- deacon and witness "No Idle State" fallbacks had the same missing ack.
+- witness and deacon warrant blocks (and their quick-reference rows) dropped the
+  open-warrant dedup guard every formula copy carries; a duplicate warrant races
+  a second shutdown dance against the same target.
+
+Two inline commands are kept because there is nothing to point at, and both are
+now complete rather than condensed: boot has no formula, so its warrant command
+gains the dedup guard; the polecat claim block's CLAIM_RELEASED path now sets
+`gc.routed_to` when it returns an unreadable bead to the pool — it can release
+directly-assigned work that never carried pool routing, which is the same
+silent-orphan shape. Cold-start wisp pours are marked bootstrap-only with a
+pointer to the step that owns every later pour.
+
+tests/test_prompt_formula_command_drift.py locks in the three invariants whose
+loss was observed, so the next formula edit cannot silently re-diverge:
+pool-returning updates declare routing, warrant creation in injected context is
+deduped, prompt bail-out paths drain-ack. Written red first — it reported
+exactly the 12 sites found by hand — then green. gastown/README.md documents the
+convention and its three exceptions.
+
+Rebased onto integration 41ccd40 after the original branch was held. Five
+conflicted hunks, each resolved by verifying that the pointer target really
+carries what the inline copy gained since the fork at e82ecfb — a pointer that
+lands on a staler command silently reverts the fix that was made inline:
+
+- refinery Rules 1 and 2, and the witness fallback, gained `--include-infra`
+  from dabcb2c (gcp-xbl). mol-refinery-patrol.toml and mol-witness-patrol.toml
+  both already carry it, so those pointers are safe as written.
+- The witness warrant pointer lands on mol-witness-patrol `check-polecat-health`
+  step 3, which files the warrant deduped and with `gc.routed_to`. Safe.
+- The deacon fallback was NOT safe. dabcb2c gave the deacon prompt the
+  surplus-wisp reconcile the witness already had, but landed it only in the
+  prompt; mol-deacon-patrol's `next-iteration` still poured unconditionally.
+  Pointing at it as-shipped would have dropped the reconcile. So the claim above
+  no longer holds for one formula: mol-deacon-patrol.toml section 3 now carries
+  the reconcile, modelled on mol-witness-patrol's, keeping the formula's own
+  fail-closed drain-ack on each bail-out. Effective behaviour is unchanged — the
+  deacon runs whichever copy it reads, and both now reconcile.
+- gastown/README.md conflicted only because the new section landed where the
+  approval-gate section (gcp-a22/amo/dc8) had since been inserted. Both are kept.
+
+The other formulas are unchanged; they were already correct.
+
+Validation: go vet/build/test clean; validate_registry.py ok; the three gastown
+shell suites pass; the full CI pytest set passes in a clean environment. Seven
+failures appear when the suite is run from inside a gastown agent session — they
+reproduce identically on the clean base and are env leakage (GC_BIN, GC_TEMPLATE)
+filed as gcp-9ur, discovered-from this bead.
+
+Downstream: these templates reach running agents via pack pin + redeploy, so no
+live agent picks up the fix until the pack is redeployed.
+---
+ gastown/README.md                          |  30 +++
+ gastown/agents/boot/prompt.template.md     |  24 +-
+ gastown/agents/deacon/prompt.template.md   |  77 +++----
+ gastown/agents/polecat/prompt.template.md  |  10 +-
+ gastown/agents/refinery/prompt.template.md | 103 +++++----
+ gastown/agents/witness/prompt.template.md  |  75 ++-----
+ gastown/formulas/mol-deacon-patrol.toml    |  41 +++-
+ tests/test_prompt_formula_command_drift.py | 246 +++++++++++++++++++++
+ 8 files changed, 439 insertions(+), 167 deletions(-)
+ create mode 100644 tests/test_prompt_formula_command_drift.py
+
+diff --git a/gastown/README.md b/gastown/README.md
+index 9b7ca8b..ab1a59a 100644
+--- a/gastown/README.md
++++ b/gastown/README.md
+@@ -103,6 +103,36 @@ becomes the start of review instead of the terminal handoff, and a refused
+ merge parks the bead (`merge_approval_state=awaiting_review`) for the next
+ patrol iteration rather than closing or escalating it.
+ 
++## Role prompts point at formulas
++
++`agents/*/prompt.template.md` is injected into an agent's context at spawn and
++reads as authoritative operating instructions. A formula step in `formulas/`
++has to be opened deliberately. That asymmetry makes a restated command
++dangerous: when the formula gains a flag and the prompt's copy does not, the
++agent runs the lossy copy, it executes cleanly, and the dropped behaviour is
++simply gone. A partial command in injected context is worse than no command.
++
++**The rule: a prompt template names the formula step; it does not restate the
++step's command.** A pointer cannot drift; a copy can.
++
++Three narrow exceptions, each of which must be *complete*, not condensed:
++
++- **Cold-start bootstrap.** The first wisp pour has no formula step to read
++  yet. Marked as bootstrap-only in each template, with a pointer to the
++  `next-iteration` step that owns every later pour.
++- **A role with no formula.** `boot` runs a single-pass watchdog with no
++  formula, so its warrant command is authoritative there — and therefore
++  carries the dedup guard that the formula-owned copies carry.
++- **A flag whose omission fails silently.** The refinery's Rejection Flow
++  quotes the pool-return `gc bd update` verbatim, marked as a copy naming the
++  authoritative step, because a rejection that drops
++  `--set-metadata gc.routed_to=...` orphans the bead with no error, no stall
++  signal, and no wake.
++
++`tests/test_prompt_formula_command_drift.py` enforces the invariants whose loss
++was observed in practice: pool-returning updates declare their routing, warrant
++creation in injected context is deduped, and a prompt bail-out path drain-acks.
++
+ ## Dog Pool
+ 
+ Gastown owns `mol-shutdown-dance` and the dog agent that runs stuck-agent
+diff --git a/gastown/agents/boot/prompt.template.md b/gastown/agents/boot/prompt.template.md
+index eb1ddc7..e10f95c 100644
+--- a/gastown/agents/boot/prompt.template.md
++++ b/gastown/agents/boot/prompt.template.md
+@@ -77,11 +77,25 @@ Drain-ack and exit. Next Boot wake will re-evaluate.
+ 
+ Clearly stuck: file a warrant for the dog pool.
+ 
++Boot has no formula, so unlike every other warrant producer this command is
++authoritative here rather than a copy of a formula step — which means it has to
++carry the dedup guard itself. Boot wakes on a timer against a single target, so
++two consecutive "clearly stuck" verdicts would otherwise file two warrants and
++race two shutdown dances against the same deacon.
++
+ ```bash
+-gc bd create --type=task \
+-  --title="Stuck: {{ .BindingPrefix }}deacon" \
+-  --metadata '{"target":"{{ .BindingPrefix }}deacon","reason":"Stale patrol wisp, no activity","requester":"boot","gc.routed_to":"{{ .BindingPrefix }}dog"}' \
+-  --label=warrant
++TARGET_SESSION="{{ .BindingPrefix }}deacon"
++EXISTING_WARRANT=$(gc bd list --label=warrant --json --limit=0 \
++  | jq -r --arg t "$TARGET_SESSION" \
++      '[.[] | select((.status == "open" or .status == "in_progress") and (.metadata.target == $t))] | length')
++if [ "${EXISTING_WARRANT:-0}" -gt 0 ]; then
++  echo "Skipping warrant for $TARGET_SESSION — an open warrant already exists."
++else
++  gc bd create --type=task \
++    --title="Stuck: $TARGET_SESSION" \
++    --metadata '{"target":"{{ .BindingPrefix }}deacon","reason":"Stale patrol wisp, no activity","requester":"boot","gc.routed_to":"{{ .BindingPrefix }}dog"}' \
++    --label=warrant
++fi
+ ```
+ The dog pool picks up the warrant and runs the shutdown dance.
+ 
+@@ -114,7 +128,7 @@ with a fresh provider context.
+ | View deacon output | `{{ cmd }} session peek {{ .BindingPrefix }}deacon --lines 30` |
+ | Check deacon work | `gc bd list --assignee={{ .BindingPrefix }}deacon --status=in_progress --json` |
+ | Nudge deacon | `{{ cmd }} session nudge {{ .BindingPrefix }}deacon "message"` |
+-| File stuck warrant | `gc bd create --type=task --label=warrant --metadata '{"target":"{{ .BindingPrefix }}deacon","reason":"...","requester":"boot","gc.routed_to":"{{ .BindingPrefix }}dog"}'` |
++| File stuck warrant | Use the guarded block in Triage Step 3 — the bare `gc bd create` skips the open-warrant check and races a second shutdown dance |
+ | Check active sessions | `{{ cmd }} session list` |
+ 
+ Working directory: {{ .WorkDir }}
+diff --git a/gastown/agents/deacon/prompt.template.md b/gastown/agents/deacon/prompt.template.md
+index 83617f9..d2622cc 100644
+--- a/gastown/agents/deacon/prompt.template.md
++++ b/gastown/agents/deacon/prompt.template.md
+@@ -60,7 +60,10 @@ Your formula: `mol-deacon-patrol`
+ # Step 2: Nothing? Check mail for attached work
+ gc mail inbox
+ 
+-# Step 3: Still nothing? Create patrol wisp (root-only — no child step beads)
++# Step 3: Still nothing? Create patrol wisp (root-only — no child step beads).
++# Cold-start bootstrap only — no wisp exists yet, so there is no formula step
++# to read. Every later pour is the formula's own: mol-deacon-patrol step
++# `next-iteration`, never this line.
+ NEW_WISP=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id')
+ gc bd update "$NEW_WISP" --assignee="$GC_ALIAS"
+ 
+@@ -86,47 +89,19 @@ is a bug indicator. Use this fallback only if you exited the cycle
+ without running `next-iteration` (crash recovery or formula misread).
+ If `next-iteration` already ran, do not pour again; run `gc hook`.
+ 
++The fallback is the same work `next-iteration` does, so read it from there
++rather than from a copy here:
++
++```bash
++gc bd formula show mol-deacon-patrol   # step `next-iteration`, sections 3-4
++```
++
++Section 3 resolves the current wisp, reconciles your queued patrol wisps to
++exactly one — reusing an already-queued successor instead of pouring a duplicate
++and burning the surplus — and drain-acks before it bails if a pour or an
++assignment fails; section 4 burns the current wisp. Run them, then:
++
+ ```bash
+-CURRENT_WISP=${GC_BEAD_ID:-}
+-if [ -z "$CURRENT_WISP" ]; then
+-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
+-fi
+-# Reconcile your other patrol wisps to exactly one successor. `--include-infra`
+-# is REQUIRED — wisp roots are ephemeral beads in the wisps table, which gc bd
+-# list skips unless asked for, so without it this returns nothing, you pour a
+-# duplicate, and the queued wisp leaks. Query open,in_progress (a successor a
+-# crashed session already claimed is still yours to resume) and exclude the
+-# wisp you are on so it is never burned here.
+-SURPLUS_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json \
+-  | jq -r --arg cur "$CURRENT_WISP" '.[] | select(.id != $cur) | .id')
+-ASSIGNED_WISP=$(printf '%s\n' $SURPLUS_WISPS | sed -n '1p')
+-for extra in $(printf '%s\n' $SURPLUS_WISPS | sed '1d'); do
+-  gc bd mol burn "$extra" --force
+-done
+-if [ -n "$CURRENT_WISP" ] && [ -z "$ASSIGNED_WISP" ]; then
+-  NEXT=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id // empty')
+-  if [ -z "$NEXT" ]; then
+-    echo "Could not pour next deacon wisp; not burning."
+-    exit 1
+-  fi
+-  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+-    echo "Could not assign next deacon wisp; not burning."
+-    exit 1
+-  fi
+-  gc bd mol burn "$CURRENT_WISP" --force
+-elif [ -n "$CURRENT_WISP" ]; then
+-  gc bd mol burn "$CURRENT_WISP" --force
+-elif [ -z "$ASSIGNED_WISP" ]; then
+-  NEXT=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id // empty')
+-  if [ -z "$NEXT" ]; then
+-    echo "Could not bootstrap next deacon wisp."
+-    exit 1
+-  fi
+-  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+-    echo "Could not assign bootstrap deacon wisp."
+-    exit 1
+-  fi
+-fi
+ gc hook
+ ```
+ 
+@@ -152,14 +127,16 @@ without requiring a formal bead.
+ ## Stuck Agent Recovery: Universal Warrant Pattern
+ 
+ When you detect a stuck witness, refinery, or utility agent, file a warrant for
+-the dog pool:
++the dog pool — **from the `mol-deacon-patrol` step that found it**, which owns
++the command: `health-scan` for coordination agents, `queue-starvation-check`
++for a stalled queue, `utility-agent-health` for dogs. Run the step; do not
++retype the `gc bd create` from here or from memory.
+ 
+-```bash
+-gc bd create --type=task \
+-  --title="Stuck: <agent>" \
+-  --metadata '{"target":"<session>","reason":"<reason>","requester":"deacon","gc.routed_to":"{{ .BindingPrefix }}dog"}' \
+-  --label=warrant
+-```
++All three file the warrant *deduped*: they first check for an open or
++in-progress warrant against the same target and skip if one exists. A second
++warrant spawns a second shutdown dance racing the first — duplicate kills,
++wasted dog cycles — and the create on its own gives you no signal that it
++happened.
+ 
+ The dog pool runs `mol-shutdown-dance`, giving the agent three chances to prove
+ it is alive (60s -> 120s -> 240s) before killing the session. Never kill an
+@@ -205,7 +182,7 @@ Individual stuck agents don't need escalation — the warrant system handles the
+ 
+ | Want to... | Correct command |
+ |------------|----------------|
+-| Pour next wisp | `gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix='{{ .BindingPrefix }}'` |
++| Pour next wisp | Run `mol-deacon-patrol` step `next-iteration`, section 3. The `gc bd mol wisp` call under Startup Protocol is the cold-start bootstrap only. |
+ | Read formula recipe | `gc bd formula show mol-deacon-patrol` (NOT `gc bd mol show` — that's for poured instances) |
+ | Context exhaustion | `gc runtime request-restart` |
+ | Request target restart | `gc session kill <target>` |
+@@ -215,7 +192,7 @@ Individual stuck agents don't need escalation — the warrant system handles the
+ | List convoys | `gc convoy list` |
+ | Find cross-rig deps | `gc bd dep list <id> --direction=up --type=blocks --json` |
+ | Convert dep type | `gc bd dep remove <id> <dep>` then `gc bd dep add <id> <dep> --type=related` |
+-| File stuck-agent warrant | `gc bd create --type=task --label=warrant --metadata '{"target":"<session>","reason":"<reason>","requester":"deacon","gc.routed_to":"{{ .BindingPrefix }}dog"}'` |
++| File stuck-agent warrant | Run the `mol-deacon-patrol` step that found it (`health-scan`, `queue-starvation-check`, or `utility-agent-health`) — each dedupes against open warrants for the same target |
+ | Run system diagnostics | `gc doctor` |
+ | Compact wisps (dry run) | `gc bd mol wisp gc --age 24h --dry-run` |
+ | Compact wisps | `gc bd mol wisp gc --age 24h` |
+diff --git a/gastown/agents/polecat/prompt.template.md b/gastown/agents/polecat/prompt.template.md
+index 3661c0e..5bf6c00 100644
+--- a/gastown/agents/polecat/prompt.template.md
++++ b/gastown/agents/polecat/prompt.template.md
+@@ -225,9 +225,15 @@ while [ "$SHOW_TRY" -lt 3 ]; do
+ done
+ if [ "$SHOW_OK" -ne 1 ]; then
+   # Never leave a claimed bead stranded in_progress on an unreadable state:
+-  # release it so it re-enters the pool instead of being lost.
++  # release it so it re-enters the pool instead of being lost. Restate the
++  # routing on the way out — an open, unassigned bead with no gc.routed_to is
++  # not pooled, it is orphaned: nothing spawns for it and it looks healthy.
++  # The claim falls through to assigned work too, so this can be a bead that
++  # never carried pool routing; routing it here is strictly better than
++  # dropping it.
+   echo "CLAIM_RELEASED $WORK_ID unreadable after retries; returning it to the pool"
+-  gc bd update "$WORK_ID" --status=open --assignee=""
++  gc bd update "$WORK_ID" --status=open --assignee="" \
++    --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat"
+   gc runtime drain-ack
+   exit 0
+ fi
+diff --git a/gastown/agents/refinery/prompt.template.md b/gastown/agents/refinery/prompt.template.md
+index bb048a4..2a3534f 100644
+--- a/gastown/agents/refinery/prompt.template.md
++++ b/gastown/agents/refinery/prompt.template.md
+@@ -66,30 +66,15 @@ external observers (witness, mayor) only catch on a slow patrol cycle.
+ 
+ ### 1. ALWAYS pour the next wisp before burning the current one
+ 
+-```bash
+-CURRENT_WISP=${GC_BEAD_ID:-}
+-if [ -z "$CURRENT_WISP" ]; then
+-  # --include-infra is REQUIRED: wisp roots are ephemeral beads in the wisps
+-  # table, which gc bd list skips unless asked for. Without it this resolves
+-  # empty, the current wisp is never burned, and every cycle leaks one.
+-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
+-fi
+-NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id // empty')
+-if [ -z "$NEXT" ]; then
+-  echo "Could not pour next refinery wisp; not burning."
+-  exit 1
+-fi
+-if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+-  echo "Could not assign next refinery wisp; not burning."
+-  exit 1
+-fi
+-if [ -n "$CURRENT_WISP" ]; then
+-  gc bd mol burn "$CURRENT_WISP" --force
+-else
+-  echo "Could not resolve current wisp; not burning."
+-  exit 1
+-fi
+-```
++**The pour-and-burn command lives in `mol-refinery-patrol` step
++`next-iteration`, section 2.** Run it from there. It resolves the current wisp,
++pours the next one, fails closed if the pour or the assignment fails
++(drain-acking before it exits, so the reconciler can recycle the session), and
++only then burns the current wisp. Retyping it from memory is how the ordering
++and the failure handling get lost.
++
++The same block appears in the rejection paths of steps `rebase` and
++`handle-failures` — those copies are the formula's own and stay in sync with it.
+ 
+ **This rule applies UNCONDITIONALLY, including when:**
+ 
+@@ -114,26 +99,12 @@ heavy: multi-hour session, large recent diffs, or noticing yourself taking
+ shortcuts or summarizing prematurely. If context feels heavy, then **pour and
+ assign the next wisp, burn the current wisp, THEN request restart**:
+ 
++Run the pour-and-burn from `mol-refinery-patrol` step `next-iteration`
++(section 2) exactly as in Rule 1 above — if it bails, it has already
++drain-acked and you stop there rather than requesting a restart. Only once the
++current wisp is burned:
++
+ ```bash
+-CURRENT_WISP=${GC_BEAD_ID:-}
+-if [ -z "$CURRENT_WISP" ]; then
+-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
+-fi
+-NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id // empty')
+-if [ -z "$NEXT" ]; then
+-  echo "Could not pour next refinery wisp; not requesting restart."
+-  exit 1
+-fi
+-if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+-  echo "Could not assign next refinery wisp; not requesting restart."
+-  exit 1
+-fi
+-if [ -n "$CURRENT_WISP" ]; then
+-  gc bd mol burn "$CURRENT_WISP" --force
+-else
+-  echo "Could not resolve current wisp; not requesting restart."
+-  exit 1
+-fi
+ gc runtime request-restart
+ RESTART_STATUS=$?
+ echo "Restart request returned with status $RESTART_STATUS; stop this session now."
+@@ -179,7 +150,10 @@ done
+ # Step 1: Check for an in-progress patrol wisp
+ {{ .AssignedInProgressQuery }}
+ 
+-# If none found, pour one (root-only — no child step beads) and assign it
++# If none found, pour one (root-only — no child step beads) and assign it.
++# This is the cold-start bootstrap only — there is no wisp yet, so there is no
++# formula step to read. Every LATER pour is the formula's own: use
++# mol-refinery-patrol step `next-iteration`, never this line.
+ WISP=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id')
+ gc bd update "$WISP" --assignee="$GC_AGENT"
+ ```
+@@ -231,13 +205,43 @@ Never infer a branch name. If `metadata.branch` is missing, reject the bead.
+ 
+ ## Rejection Flow
+ 
+-On rebase conflict or test failure:
+-1. Put work bead back in pool:
+-   `gc bd update $WORK --status=open --assignee="" --set-metadata rejection_reason="..."`
++**The commands live in the formula, not here.** Rebase conflicts are handled by
++`mol-refinery-patrol` step `rebase`; quality-gate and test failures by step
++`handle-failures`. Run the step. Do not reconstruct the rejection from this
++summary — it is a description of the shape, not a substitute for the step.
++
++What the shape is:
++
++1. Clean up the workflow and reopen the source bead, then put the work bead
++   back in the pool with **both** `rejection_reason` and `gc.routed_to`.
+ 2. Branch handling depends on failure type:
+    - Conflict: leave branch intact (polecat needs it for rebase)
+    - Test failure: delete branch (polecat redoes work)
+-3. Pour next wisp, burn current one
++3. Pour next wisp, burn current one (Patrol Lifecycle Discipline Rule 1)
++
++**`gc.routed_to` is not optional, and dropping it fails silently.** An open,
++unassigned bead with a `rejection_reason` and no routing looks exactly like a
++healthy pooled bead — but nothing spawns for it, so no polecat ever picks it up.
++There is no error, no stall signal, and no wake; the rejection reports success
++and the work is stranded until a human notices. Witness patrols are correctly
++told not to flag unassigned pool beads, so the one observer positioned to catch
++it is instructed to ignore it.
++
++The routing flag both steps set, quoted here **verbatim as a copy** — the
++original lives in `mol-refinery-patrol` steps `rebase` and `handle-failures`,
++which are authoritative if these ever disagree:
++
++```bash
++gc bd update $WORK \
++  --status=open \
++  --assignee="" \
++  --set-metadata rejection_reason="<why>" \
++  --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat"
++```
++
++The full step also runs `gc workflow delete-source $WORK --apply && gc workflow
++reopen-source $WORK` before this update, and cleans up the `temp` branch after.
++That is why you run the step rather than this fragment.
+ 
+ A new polecat picks up the bead, sees `metadata.branch` and
+ `metadata.rejection_reason`, rebases or redoes work, reassigns to refinery.
+@@ -311,8 +315,9 @@ alert the witness, not `gc mail send`.
+ 
+ | Want to... | Correct command |
+ |------------|----------------|
+-| Pour next wisp | `gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }}` |
++| Pour next wisp | Run `mol-refinery-patrol` step `next-iteration`, section 2. The bare `gc bd mol wisp` call under Startup is the cold-start bootstrap only — it skips the validate/assign/burn ordering. |
+ | Burn current wisp | Follow Patrol Lifecycle Discipline Rule 1: pour next wisp, validate `NEXT`, assign it to `$GC_AGENT`, then burn `$CURRENT_WISP`. Never run a standalone burn. |
++| Reject a bead to the pool | Run `mol-refinery-patrol` step `rebase` (conflict) or `handle-failures` (test failure). The update must set `gc.routed_to` or the bead is silently orphaned. |
+ | Find assigned work | `gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee="$GC_AGENT" --status=open` |
+ | Snapshot event position | `gc events --seq` |
+ | Wait for assignment | `gc events --watch --type=bead.updated --after=$SEQ` |
+diff --git a/gastown/agents/witness/prompt.template.md b/gastown/agents/witness/prompt.template.md
+index 641135e..3a61292 100644
+--- a/gastown/agents/witness/prompt.template.md
++++ b/gastown/agents/witness/prompt.template.md
+@@ -157,14 +157,15 @@ polecat in your rig. Use judgment — there are no hardcoded thresholds.
+ A long tool call is different from an infinite loop.
+ 
+ **Response:** Do NOT kill stuck polecats directly. File a warrant bead
+-for the dog pool:
++for the dog pool — **using `mol-witness-patrol` step `check-polecat-health`,
++which owns the command.** Run the step; do not retype the `gc bd create` from
++here or from memory.
+ 
+-```bash
+-gc bd create --type=task \
+-  --title="Stuck: <agent>" \
+-  --metadata '{"target":"<session>","reason":"<reason>","requester":"witness","gc.routed_to":"{{ .BindingPrefix }}dog"}' \
+-  --label=warrant
+-```
++The step files the warrant *deduped*: it first checks for an open or
++in-progress warrant against the same target and skips if one exists. A second
++warrant spawns a second shutdown dance racing the first — duplicate kills,
++wasted dog cycles — and the create on its own gives you no signal that it
++happened.
+ 
+ The dog pool runs `mol-shutdown-dance` — a multi-stage interrogation
+ that gives the polecat 3 chances to prove it's alive before killing it.
+@@ -207,6 +208,9 @@ for extra in $(printf '%s\n' $WISP_IDS | sed '1d'); do  # burn any surplus
+ done
+ 
+ # Step 2: Already have a wisp? Resume it. Otherwise check mail, then pour ONE.
++# Cold-start bootstrap only — no wisp exists yet, so there is no formula step to
++# read. Every later pour is the formula's own: mol-witness-patrol step
++# `next-iteration`, never this line.
+ if [ -n "$WISP" ]; then
+   echo "Resuming patrol wisp $WISP"
+ else
+@@ -232,49 +236,18 @@ is a bug indicator. Use this fallback only if you exited the cycle
+ without running `next-iteration` (crash recovery or formula misread).
+ If `next-iteration` already ran, do not pour again; run `gc hook`.
+ 
++The fallback is the same work `next-iteration` does, so read it from there
++rather than from a copy here:
++
++```bash
++gc bd formula show mol-witness-patrol   # step `next-iteration`, sections 2-3
++```
++
++Sections 2 and 3 reconcile the queued patrol wisps to exactly one — reusing an
++already-queued wisp instead of pouring a duplicate, and burning the surplus —
++then burn the current wisp. Run them, then:
++
+ ```bash
+-CURRENT_WISP=${GC_BEAD_ID:-}
+-if [ -z "$CURRENT_WISP" ]; then
+-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
+-fi
+-# Reconcile your other patrol wisps to exactly one successor. A prior cycle may
+-# have poured a next wisp without burning, or a restart may have raced — keep
+-# the first and burn the surplus so wisps never accumulate. Wisp roots are
+-# molecules (never --type=wisp, which is not a valid gc bd type and matches
+-# nothing), and they live in the wisps table, so `--include-infra` is REQUIRED
+-# or the query returns nothing and every cycle leaks a wisp. Query
+-# open,in_progress — a successor a crashed session already claimed is still
+-# yours to resume — and exclude the wisp you are on so it is never burned here.
+-SURPLUS_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json \
+-  | jq -r --arg cur "$CURRENT_WISP" '.[] | select(.id != $cur) | .id')
+-ASSIGNED_WISP=$(printf '%s\n' $SURPLUS_WISPS | sed -n '1p')
+-for extra in $(printf '%s\n' $SURPLUS_WISPS | sed '1d'); do
+-  gc bd mol burn "$extra" --force
+-done
+-if [ -n "$CURRENT_WISP" ] && [ -z "$ASSIGNED_WISP" ]; then
+-  NEXT=$(gc bd mol wisp mol-witness-patrol --root-only --var binding_prefix='{{ .BindingPrefix }}' --json | jq -r '.new_epic_id // empty')
+-  if [ -z "$NEXT" ]; then
+-    echo "Could not pour next witness wisp; not burning."
+-    exit 1
+-  fi
+-  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+-    echo "Could not assign next witness wisp; not burning."
+-    exit 1
+-  fi
+-  gc bd mol burn "$CURRENT_WISP" --force
+-elif [ -n "$CURRENT_WISP" ]; then
+-  gc bd mol burn "$CURRENT_WISP" --force
+-elif [ -z "$ASSIGNED_WISP" ]; then
+-  NEXT=$(gc bd mol wisp mol-witness-patrol --root-only --var binding_prefix='{{ .BindingPrefix }}' --json | jq -r '.new_epic_id // empty')
+-  if [ -z "$NEXT" ]; then
+-    echo "Could not bootstrap next witness wisp."
+-    exit 1
+-  fi
+-  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+-    echo "Could not assign bootstrap witness wisp."
+-    exit 1
+-  fi
+-fi
+ gc hook
+ ```
+ 
+@@ -357,14 +330,14 @@ gc mail send mayor/ -s "ESCALATION: Brief description [HIGH]" -m "Details"
+ 
+ | Want to... | Correct command |
+ |------------|----------------|
+-| Pour next wisp | `gc bd mol wisp mol-witness-patrol --root-only --var binding_prefix='{{ .BindingPrefix }}'` |
++| Pour next wisp | Run `mol-witness-patrol` step `next-iteration`, section 2. The `gc bd mol wisp` call under Startup Protocol is the cold-start bootstrap only. |
+ | Context exhaustion | `gc runtime request-restart` |
+ | Recover orphaned bead | `gc workflow delete-source <id> --apply && gc workflow reopen-source <id>` |
+ | Salvage worktree work | `git add -A && git commit && git push origin HEAD` |
+ | Delete worktree | `git worktree remove <path> --force` |
+ | Review post-merge teardown | `tail -n 50 "$GC_CITY/.gc/runtime/logs/polecat-worktree-reap.log"` |
+ | Set branch metadata | `gc bd update <id> --set-metadata branch=<name>` |
+-| File stuck-agent warrant | `gc bd create --type=task --label=warrant --metadata '{"target":"<session>","reason":"<reason>","requester":"witness","gc.routed_to":"{{ .BindingPrefix }}dog"}'` |
++| File stuck-agent warrant | Run `mol-witness-patrol` step `check-polecat-health` — it dedupes against open warrants for the same target before creating one |
+ 
+ Rig: {{ .RigName }}
+ Working directory: {{ .WorkDir }}
+diff --git a/gastown/formulas/mol-deacon-patrol.toml b/gastown/formulas/mol-deacon-patrol.toml
+index d158805..cae6ef2 100644
+--- a/gastown/formulas/mol-deacon-patrol.toml
++++ b/gastown/formulas/mol-deacon-patrol.toml
+@@ -456,23 +456,44 @@ gc mail inbox
+ ```
+ Handle any urgent messages that arrived during patrol. Archive the rest.
+ 
+-**3. Resolve current wisp and pour next iteration BEFORE burning:**
++**3. Resolve current wisp and pour next iteration BEFORE burning (reconcile to
++exactly one):**
++
++Reuse an already-queued wisp instead of pouring a duplicate. A prior cycle may
++have poured a next wisp without burning, or a restart may have raced — keep one
++patrol wisp and burn any surplus, so wisps never accumulate. Wisp roots are
++`issue_type=molecule` (never `--type=wisp`, which is not a valid gc bd type and
++matches nothing), and they live in the wisps table, so `--include-infra` is
++REQUIRED — without it the query returns nothing, you pour a duplicate every
++cycle, and the prior wisp leaks. Query `open,in_progress`: a successor a crashed
++session already claimed is still yours to resume, and an open-only query leaves
++it stranded forever. Exclude the wisp you are on so this reconcile can never
++burn it out from under you.
++
+ ```bash
+ CURRENT_WISP=${GC_BEAD_ID:-}
+ if [ -z "$CURRENT_WISP" ]; then
+   CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
+ fi
++SURPLUS_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json \
++  | jq -r --arg cur "$CURRENT_WISP" '.[] | select(.id != $cur) | .id')
++NEXT=$(printf '%s\n' $SURPLUS_WISPS | sed -n '1p')
++for extra in $(printf '%s\n' $SURPLUS_WISPS | sed '1d'); do
++  gc bd mol burn "$extra" --force
++done
+ 
+-NEXT=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix='{{binding_prefix}}' --json | jq -r '.new_epic_id // empty')
+ if [ -z "$NEXT" ]; then
+-  echo "Could not pour next deacon wisp; not burning."
+-  gc runtime drain-ack
+-  exit 1
+-fi
+-if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+-  echo "Could not assign next deacon wisp; not burning."
+-  gc runtime drain-ack
+-  exit 1
++  NEXT=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix='{{binding_prefix}}' --json | jq -r '.new_epic_id // empty')
++  if [ -z "$NEXT" ]; then
++    echo "Could not pour next deacon wisp; not burning."
++    gc runtime drain-ack
++    exit 1
++  fi
++  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
++    echo "Could not assign next deacon wisp; not burning."
++    gc runtime drain-ack
++    exit 1
++  fi
+ fi
+ ```
+ 
+diff --git a/tests/test_prompt_formula_command_drift.py b/tests/test_prompt_formula_command_drift.py
+new file mode 100644
+index 0000000..f798183
+--- /dev/null
++++ b/tests/test_prompt_formula_command_drift.py
+@@ -0,0 +1,246 @@
++"""Guards against role-prompt / formula command drift.
++
++A role prompt template is injected into an agent's context at spawn and reads as
++authoritative operating instructions. A formula step has to be opened
++deliberately. When a template restates a formula-owned command and silently
++drops a flag, the agent runs the lossy copy: it executes cleanly, reports
++success, and the dropped behaviour is simply gone.
++
++That is not hypothetical. A refinery rejection followed the role prompt's
++condensed "Rejection Flow", which restated the formula's pool-return
++`gc bd update` without `--set-metadata gc.routed_to=...`. Nothing spawns for a
++bead with no routing, so the rejected bead sat open and unassigned forever while
++every status surface stayed green — and an unassigned pool bead is
++indistinguishable by inspection from a healthy one.
++
++These checks encode the invariants that were lost, so the drift cannot silently
++reappear the next time a formula is edited. The convention the templates follow
++is documented in ``gastown/README.md`` ("Role prompts point at formulas").
++"""
++
++from __future__ import annotations
++
++from pathlib import Path
++import re
++import subprocess
++
++
++REPO_ROOT = Path(__file__).resolve().parents[1]
++AGENT_PROMPT_GLOB = "gastown/agents/*/prompt.template.md"
++
++FENCE_OPEN = re.compile(r"^\s*```(\w*)\s*$")
++FENCE_CLOSE = re.compile(r"^\s*```\s*$")
++
++POOL_RETURN_ASSIGNEE = re.compile(r"""--assignee=(?:""|'')""")
++
++
++def gastown_assets() -> list[Path]:
++    """Every tracked pack asset that can carry an agent-facing command."""
++    result = subprocess.run(
++        ["git", "ls-files", "-z", "gastown"],
++        cwd=REPO_ROOT,
++        check=True,
++        capture_output=True,
++    )
++    paths = [REPO_ROOT / part for part in result.stdout.decode().split("\0") if part]
++    return [path for path in paths if path.suffix in {".md", ".toml", ".sh"}]
++
++
++def agent_prompts() -> list[Path]:
++    prompts = sorted(REPO_ROOT.glob(AGENT_PROMPT_GLOB))
++    assert prompts, "no role prompt templates found — glob is wrong"
++    return prompts
++
++
++def logical_commands(text: str) -> list[tuple[int, str]]:
++    """Yield (start line number, command) with backslash continuations joined.
++
++    Formula and prompt commands are routinely spread over several lines with
++    trailing backslashes; a per-line scan would see `--status=open` and the
++    `gc.routed_to` flag as unrelated lines and miss the pairing entirely.
++    """
++    commands: list[tuple[int, str]] = []
++    pending: list[str] = []
++    start = 0
++    for number, raw in enumerate(text.split("\n"), start=1):
++        if not pending:
++            start = number
++        stripped = raw.rstrip()
++        if stripped.endswith("\\"):
++            pending.append(stripped[:-1].strip())
++            continue
++        pending.append(stripped.strip())
++        commands.append((start, " ".join(part for part in pending if part)))
++        pending = []
++    if pending:
++        commands.append((start, " ".join(part for part in pending if part)))
++    return commands
++
++
++def fenced_blocks(text: str) -> list[tuple[str, int, str]]:
++    """Return (language, first body line number, body) for each fenced block."""
++    lines = text.split("\n")
++    blocks: list[tuple[str, int, str]] = []
++    index = 0
++    while index < len(lines):
++        opener = FENCE_OPEN.match(lines[index])
++        if not opener:
++            index += 1
++            continue
++        start = index + 1
++        end = start
++        while end < len(lines) and not FENCE_CLOSE.match(lines[end]):
++            end += 1
++        blocks.append((opener.group(1), start + 1, "\n".join(lines[start:end])))
++        index = end + 1
++    return blocks
++
++
++def pool_return_violations(path: Path, text: str) -> list[str]:
++    """Pool-returning updates must state where the bead is routed next."""
++    violations = []
++    for number, command in logical_commands(text):
++        if "gc bd update" not in command:
++            continue
++        if "--status=open" not in command:
++            continue
++        if not POOL_RETURN_ASSIGNEE.search(command):
++            continue
++        if "gc.routed_to" in command:
++            continue
++        violations.append(
++            f"{path.relative_to(REPO_ROOT)}:{number}: returns a bead to the pool without gc.routed_to"
++        )
++    return violations
++
++
++def warrant_dedup_violations(path: Path, text: str) -> list[str]:
++    """Warrant creation in injected context must carry the dedup guard.
++
++    Every formula that files a warrant first checks for an open warrant against
++    the same target — a duplicate spawns a second shutdown dance racing the
++    first. A prompt template that restates the create without the guard hands
++    the agent a command that looks complete and is not. Templates should point
++    at the owning formula step instead; where a role has no formula to point at
++    (boot), the inline command has to carry the guard itself.
++    """
++    violations = []
++    guarded = {
++        number
++        for _lang, start, body in fenced_blocks(text)
++        if "EXISTING_WARRANT" in body
++        for number in range(start, start + body.count("\n") + 1)
++    }
++    for number, command in logical_commands(text):
++        if "gc bd create" not in command or "--label=warrant" not in command:
++            continue
++        if number in guarded:
++            continue
++        violations.append(
++            f"{path.relative_to(REPO_ROOT)}:{number}: warrant creation restated without the dedup guard"
++        )
++    return violations
++
++
++def bail_without_drain_violations(path: Path, text: str) -> list[str]:
++    """A prompt block that gives up must drain-ack, as the formula does.
++
++    `exit 1` without `gc runtime drain-ack` leaves the reconciler believing the
++    session is still live, so it is never recycled. Every formula bail-out path
++    acks first; a prompt copy that drops the ack is the same lossy-restatement
++    class as the missing routing flag.
++    """
++    violations = []
++    for lang, start, body in fenced_blocks(text):
++        if lang not in {"bash", "sh", ""}:
++            continue
++        if "exit 1" not in body:
++            continue
++        if "gc runtime drain-ack" in body:
++            continue
++        violations.append(
++            f"{path.relative_to(REPO_ROOT)}:{start}: bash block exits 1 without gc runtime drain-ack"
++        )
++    return violations
++
++
++def test_pool_returning_updates_declare_routing() -> None:
++    violations = []
++    for path in gastown_assets():
++        violations.extend(pool_return_violations(path, path.read_text(encoding="utf-8")))
++
++    assert not violations, (
++        "a bead returned to the pool without gc.routed_to is silently orphaned "
++        "— nothing spawns for it and every status surface stays green:\n"
++        + "\n".join(violations)
++    )
++
++
++def test_prompt_templates_do_not_restate_warrant_creation_unguarded() -> None:
++    violations = []
++    for path in agent_prompts():
++        violations.extend(
++            warrant_dedup_violations(path, path.read_text(encoding="utf-8"))
++        )
++
++    assert not violations, (
++        "point at the owning formula step instead of restating the warrant "
++        "command, or carry the dedup guard inline:\n" + "\n".join(violations)
++    )
++
++
++def test_prompt_template_bail_paths_drain_ack() -> None:
++    violations = []
++    for path in agent_prompts():
++        violations.extend(
++            bail_without_drain_violations(path, path.read_text(encoding="utf-8"))
++        )
++
++    assert not violations, (
++        "a session that exits without drain-ack is never recycled:\n"
++        + "\n".join(violations)
++    )
++
++
++def test_detectors_catch_the_drift_they_are_named_for() -> None:
++    fixture = REPO_ROOT / "fixture.md"
++
++    lossy_reject = 'gc bd update $WORK --status=open --assignee="" --set-metadata rejection_reason="..."'
++    assert pool_return_violations(fixture, lossy_reject)
++    assert pool_return_violations(
++        fixture,
++        'gc bd update $WORK \\\n  --status=open \\\n  --assignee="" \\\n'
++        '  --set-metadata rejection_reason="..."',
++    )
++    assert not pool_return_violations(
++        fixture,
++        'gc bd update $WORK \\\n  --status=open \\\n  --assignee="" \\\n'
++        '  --set-metadata gc.routed_to="$RIG/gastown.polecat"',
++    )
++    # Handing a bead to a named assignee is not a pool return.
++    assert not pool_return_violations(
++        fixture, 'gc bd update $WORK --status=open --assignee="$REFINERY_TARGET"'
++    )
++
++    unguarded_warrant = (
++        "```bash\ngc bd create --type=task --label=warrant "
++        "--metadata '{\"target\":\"x\"}'\n```"
++    )
++    assert warrant_dedup_violations(fixture, unguarded_warrant)
++    guarded_warrant = (
++        "```bash\nEXISTING_WARRANT=$(gc bd list --label=warrant --json)\n"
++        "if [ \"$EXISTING_WARRANT\" -gt 0 ]; then\n  echo skip\nelse\n"
++        "  gc bd create --type=task --label=warrant --metadata '{\"target\":\"x\"}'\n"
++        "fi\n```"
++    )
++    assert not warrant_dedup_violations(fixture, guarded_warrant)
++    # A quick-reference table row is outside any fenced block, so it can never
++    # carry the guard — it has to point at the formula instead.
++    assert warrant_dedup_violations(
++        fixture, "| File warrant | `gc bd create --type=task --label=warrant ...` |"
++    )
++
++    assert bail_without_drain_violations(fixture, "```bash\necho no\nexit 1\n```")
++    assert not bail_without_drain_violations(
++        fixture, "```bash\necho no\ngc runtime drain-ack\nexit 1\n```"
++    )
+-- 
+2.50.1 (Apple Git-155)
+
