@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 31 Jul 2026 04:19:19 -0400
-Subject: [PATCH 2/2] fix(gastown): pass --include-infra on every patrol wisp
+Subject: [PATCH 9/9] fix(gastown): pass --include-infra on every patrol wisp
  query (gcp-xbl)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -182,10 +182,10 @@ index 9568e6d..d158805 100644
  
  NEXT=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix='{{binding_prefix}}' --json | jq -r '.new_epic_id // empty')
 diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
-index 63a46fb..a968839 100644
+index 0bfaec1..fb310b8 100644
 --- a/gastown/formulas/mol-refinery-patrol.toml
 +++ b/gastown/formulas/mol-refinery-patrol.toml
-@@ -119,7 +119,7 @@ wisp, burn the current wisp, then request a restart:
+@@ -148,7 +148,7 @@ wisp, burn the current wisp, then request a restart:
  ```bash
  CURRENT_WISP=${GC_BEAD_ID:-}
  if [ -z "$CURRENT_WISP" ]; then
@@ -194,7 +194,7 @@ index 63a46fb..a968839 100644
  fi
  NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
  if [ -z "$NEXT" ]; then
-@@ -242,7 +242,7 @@ gc bd update $WORK \
+@@ -271,7 +271,7 @@ gc bd update $WORK \
  ```bash
  CURRENT_WISP=${GC_BEAD_ID:-}
  if [ -z "$CURRENT_WISP" ]; then
@@ -203,7 +203,7 @@ index 63a46fb..a968839 100644
  fi
  NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
  if [ -z "$NEXT" ]; then
-@@ -343,7 +343,7 @@ TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_bran
+@@ -372,7 +372,7 @@ TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_bran
       ```bash
       CURRENT_WISP=${GC_BEAD_ID:-}
       if [ -z "$CURRENT_WISP" ]; then
@@ -212,7 +212,7 @@ index 63a46fb..a968839 100644
       fi
       NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
       if [ -z "$NEXT" ]; then
-@@ -435,7 +435,7 @@ Branch: $BRANCH
+@@ -647,7 +647,7 @@ Branch: $BRANCH
  Target: $TARGET"
    CURRENT_WISP=${GC_BEAD_ID:-}
    if [ -z "$CURRENT_WISP" ]; then
@@ -221,7 +221,7 @@ index 63a46fb..a968839 100644
    fi
    if [ -z "$CURRENT_WISP" ]; then
      echo "Could not resolve current wisp; not burning."
-@@ -1105,9 +1105,11 @@ Include:
+@@ -1393,9 +1393,11 @@ Include:
  If the cycle ended early (conflict rejection, no work found), note
  why and what state was left.
  
@@ -236,7 +236,7 @@ index 63a46fb..a968839 100644
  
  [[steps]]
  id = "next-iteration"
-@@ -1143,7 +1145,7 @@ If auto_land = "false": skip this entirely.
+@@ -1431,7 +1433,7 @@ If auto_land = "false": skip this entirely.
  ```bash
  CURRENT_WISP=${GC_BEAD_ID:-}
  if [ -z "$CURRENT_WISP" ]; then
