@@ -1503,7 +1503,8 @@ def test_gastown_build_workflow_contract_covers_orchestration_roles() -> None:
     )
     assert "''|*[!0-9]*) HALT_REASON=content_gate_error ;;" in contracts["mol-polecat-work"]
     assert "0) HALT_REASON=no_commits ;;" in contracts["mol-polecat-work"]
-    assert 'git worktree add --detach "$MERGE_WT" "origin/$TARGET"' in contracts["mol-refinery-patrol"]
+    assert 'git worktree add --detach "$mfp_wt" "$BEFORE_SHA"' in contracts["mol-refinery-patrol"]
+    assert 'git merge-base --is-ancestor "$TEMP_SHA" "$AFTER_SHA"' in contracts["mol-refinery-patrol"]
     assert 'gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT"' in contracts["mol-refinery-patrol"]
     assert "gc gastown pr-merge-reconcile record" in contracts["mol-refinery-patrol"]
     assert "closure happens only in" in contracts["mol-refinery-patrol"]
