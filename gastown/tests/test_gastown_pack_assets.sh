@@ -193,14 +193,38 @@ print(text[start:end])
 PY
 )
 
-    [[ "$direct_block" == *'git worktree add --detach "$MERGE_WT" "origin/$TARGET"'* ]] ||
-        fail "direct refinery merge must use a detached target worktree"
+    # The worktree base is a resolved SHA, not `origin/$TARGET`. Same detached
+    # worktree as before — the target branch may be checked out in the rig's
+    # main worktree — but pinning the base closes the ref-vs-SHA gap between
+    # the tip the merge is performed on and the tip the advance check compares
+    # against.
+    [[ "$direct_block" == *'git worktree add --detach "$mfp_wt" "$BEFORE_SHA"'* ]] ||
+        fail "direct refinery merge must use a detached target worktree pinned to the resolved BEFORE_SHA"
     [[ "$direct_block" == *'+refs/heads/${TARGET}:refs/remotes/origin/${TARGET}'* ]] ||
         fail "direct refinery merge refspecs must brace TARGET for zsh-safe expansion"
-    [[ "$direct_block" == *'git -C "$MERGE_WT" push origin "HEAD:$TARGET"'* ]] ||
+    [[ "$direct_block" == *'git -C "$mfp_wt" push origin "HEAD:$TARGET"'* ]] ||
         fail "direct refinery merge must push the verified merge worktree HEAD"
-    [[ "$direct_block" == *'[ "$MERGED_SHA" != "$REMOTE" ]'* ]] ||
-        fail "direct refinery merge must compare merged SHA to origin target"
+
+    # gcp-p87: the abort must not depend on `set -e` propagating through the
+    # refinery's execution harness — it did not, and the lane ran on into the
+    # metadata write and the close after a failed ff-merge.
+    [[ "$direct_block" == *'mfp_merge_status=$?'* ]] ||
+        fail "direct refinery merge must check the ff-merge exit status explicitly"
+    ! printf '%s\n' "$direct_block" | grep -E '^[[:space:]]*set[[:space:]]+-[a-z]*e' >/dev/null ||
+        fail "direct refinery merge must not rely on set -e for its abort path"
+
+    # gcp-p87: `[ "$MERGED_SHA" != "$REMOTE" ]` was tautological on exactly the
+    # failure path it guarded — after a failed ff-merge the worktree HEAD is
+    # still the target tip, pushing an unchanged HEAD is a successful no-op, and
+    # the comparison was the old tip against itself. Verification must instead
+    # read the target back after the push and require that it ADVANCED, and that
+    # it advanced BY THIS BRANCH.
+    ! [[ "$direct_block" == *'[ "$MERGED_SHA" != "$REMOTE" ]'* ]] ||
+        fail "direct refinery merge still carries the tautological pre-push SHA comparison"
+    [[ "$direct_block" == *'[ "$AFTER_SHA" = "$BEFORE_SHA" ]'* ]] ||
+        fail "direct refinery merge must require the target to have advanced"
+    [[ "$direct_block" == *'git merge-base --is-ancestor "$TEMP_SHA" "$AFTER_SHA"'* ]] ||
+        fail "direct refinery merge must require the target to have advanced by this branch"
     [[ "$direct_block" == *'STOP. Do not mutate bead state.'* ]] ||
         fail "direct refinery merge must fail closed before metadata writes"
     ! printf '%s\n' "$direct_block" | grep -E '^[[:space:]]*git checkout \$TARGET([[:space:]]|$)' >/dev/null ||
@@ -212,7 +236,7 @@ text = open(sys.argv[1], encoding="utf-8").read()
 start = text.index('**If MERGE_STRATEGY = "direct"')
 end = text.index('**If MERGE_STRATEGY = "mr"')
 block = text[start:end]
-verify = block.index('[ "$MERGED_SHA" != "$REMOTE" ]')
+verify = block.index('git merge-base --is-ancestor "$TEMP_SHA" "$AFTER_SHA"')
 metadata = block.index('--set-metadata merge_result=merged')
 if verify >= metadata:
     raise SystemExit(1)

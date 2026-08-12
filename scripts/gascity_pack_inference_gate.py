@@ -124,8 +124,13 @@ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
         "{{build_command}}",
         "{{test_command}}",
         "branch_has_real_change",
-        'git worktree add --detach "$MERGE_WT" "origin/$TARGET"',
-        'git -C "$MERGE_WT" merge --ff-only "$TEMP_SHA"',
+        'git worktree add --detach "$mfp_wt" "$BEFORE_SHA"',
+        'git -C "$mfp_wt" merge --ff-only "$TEMP_SHA"',
+        # The merge must be proven, not asserted: the target has to have
+        # ADVANCED, and to have advanced BY THIS BRANCH, both read back after
+        # the push. Comparing the pre-push snapshot to itself passed on the one
+        # path that mattered and reported a merge that never happened (gcp-p87).
+        'git merge-base --is-ancestor "$TEMP_SHA" "$AFTER_SHA"',
         "--set-metadata merge_result=merged",
         '--set-metadata merged_sha="$MERGED_SHA"',
         'gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT"',
