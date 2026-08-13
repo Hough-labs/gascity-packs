@@ -151,7 +151,19 @@ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
     "mol-deacon-patrol": (
         "Work-layer health",
         "queue-starvation-check",
-        "gc agents list --json --active",
+        # The starvation check's own query is the thing most able to fail
+        # silently: each of these three anchors replaces a defect that made the
+        # step report a flat zero queue for every session (gcp-wzhy). Session
+        # enumeration must come from `gc session list`, which carries every
+        # identity form an assignee can take — `gc agents list` yields only the
+        # alias. The city/hq store answers to a bare `gc bd list` and NOT to
+        # `--rig=<name>`, which fails while exiting 0. And `--include-infra` is
+        # what makes wisps, molecules, sessions and messages visible at all.
+        "gc session list --state active --json",
+        "gc bd list --status=open --include-infra --json --limit=0",
+        # Exact match, not jq's `inside`/`contains` substring semantics, which
+        # matched `gc-t` against session id `gc-ttk`.
+        "$ids | index($a)",
         "gc bd create --type=task --label=warrant",
         "\"gc.routed_to\":\"{{binding_prefix}}dog\"",
     ),
