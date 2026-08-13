@@ -444,6 +444,19 @@ the PR is open and matches the branch, base, and origin repository.
 ```bash
 REFINERY_TARGET="${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery"
 gc bd update "$WORK_BEAD_ID" --status=open --assignee="$REFINERY_TARGET" --set-metadata gc.routed_to=""
+# The handoff is the assignee write; `--status=open` is bookkeeping that has
+# been observed not to stick (gcp-s14g). Read it back and correct it once, so
+# the bead does not sit in_progress with nobody working it. This is best-effort
+# on purpose: the refinery's find-work scans open,in_progress precisely so a
+# status that refuses to settle cannot hide the bead again. Never abort the
+# handoff over it — the branch is already pushed.
+HANDOFF_STATUS=$(gc bd show "$WORK_BEAD_ID" --json 2>/dev/null | jq -r '.[0].status // empty')
+if [ "$HANDOFF_STATUS" != "open" ]; then
+    gc bd update "$WORK_BEAD_ID" --status=open >/dev/null 2>&1
+    HANDOFF_STATUS=$(gc bd show "$WORK_BEAD_ID" --json 2>/dev/null | jq -r '.[0].status // empty')
+    [ "$HANDOFF_STATUS" = "open" ] ||
+        echo "WARN $WORK_BEAD_ID handed off to $REFINERY_TARGET with status=${HANDOFF_STATUS:-unreadable}, not open; the refinery still sees it (find-work scans open,in_progress)."
+fi
 ```
 
 `${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery` resolves to

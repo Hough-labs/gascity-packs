@@ -200,8 +200,10 @@ description = """
 
 Search for work beads assigned to you with branch metadata:
 ```bash
-WORK=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee=$GC_AGENT --status=open \
+# --- find-work-query:begin ---
+WORK=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee=$GC_AGENT --status=open,in_progress \
   --exclude-type=epic --has-metadata-key=branch --limit=1 --json | jq -r '.[0].id // empty')
+# --- find-work-query:end ---
 ```
 
 `${GC_RIG:+--rig="$GC_RIG"}` scopes the query to this refinery's rig
@@ -209,6 +211,29 @@ database. Without it, `gc bd list` routes to the HQ database and never
 sees rig-scoped work beads — the `assignee` field alone does not route
 by namespace. For HQ-only refineries `$GC_RIG` is empty and the flag
 expands to nothing.
+
+**`--status=open,in_progress`, never `--status=open` alone (gcp-s14g).** A
+bead that is `in_progress`, assigned to this refinery, and carrying
+`metadata.branch` is real merge work on your hook. Scanning only `open` made
+it invisible forever, and the resulting stall is *self-concealing*: every
+patrol legitimately concludes "no work", writes `IDLE`, and exits, so no wake
+signal ever fires and the queue looks healthy from outside. One such bead sat
+for ~19h and gated a nine-bead wave; the merge itself landed in one try once
+the bead was actually seen.
+
+That state is not an edge case. It arises on the **normal polecat submit
+path** — the polecat reassigns the bead to the refinery and the status does
+not always come back to `open` — as well as on crash recovery, where the
+refinery claimed the bead on an earlier pass and died before closing it.
+Either way, the correct reading is the same: a bead assigned to you with a
+branch and no close is unfinished work, not someone else's in-flight work.
+
+Re-entering a bead the refinery already claimed is safe because the
+merge-push step discriminates before it acts — the already-merged
+short-circuit (ancestor + `fork_sha` commit count) closes a branch that
+previously landed, and the false-completion guard refuses a branch that
+introduces no change. Status was never the thing protecting that; it was only
+hiding the work.
 
 If found: read the bead metadata to confirm it has a branch:
 ```bash
