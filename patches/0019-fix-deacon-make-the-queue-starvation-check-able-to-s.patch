@@ -1,0 +1,160 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 13 Aug 2026 13:07:46 -0400
+Subject: [PATCH 19/19] fix(deacon): make the queue-starvation-check able to
+ see a queue (gcp-wzhy)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The queue-starvation-check step exists to catch a session whose poll filter
+resolves to an identity that doesn't match its own — the refinery self-polled
+for 13h42m with seven beads queued and no visible work signal. The step's own
+query had the same class of bug, so it reported a flat zero queue for every
+session: the one check whose entire job is catching a wrong queue count was
+itself producing a wrong queue count.
+
+Three defects, each independently sufficient to zero the result. It enumerated
+sessions with `gc agents list`, which yields only the agent alias, then filtered
+beads by that single string — but a session is addressed by at least three
+identities depending on what assigned the work (alias on molecule wisps, session
+bead id on mail, session name on polecat claims). It omitted `--include-infra`,
+without which wisps, molecules, sessions and messages are invisible — nearly
+everything a coordination session is ever assigned. And it read the hq/city
+store as `gc bd --rig=<name>`, a form that fails with `rig not found` while
+exiting 0, silently contributing an empty queue; the city must be read with a
+bare `gc bd list`, iterating only non-hq rigs.
+
+The corrected query reads the actual assignee strings out of the bead data and
+joins them against every identity form `gc session list` reports, matching
+exactly via `$ids | index($a)`. The obvious-looking `[.assignee] | inside($ids)`
+is wrong: jq's `inside` reduces to `contains`, which on strings is substring
+matching, so assignee `gc-t` would match session id `gc-ttk`.
+
+This text is not new — it has been running in the city-local shadow at
+~/gc/formulas/mol-deacon-patrol.toml since city commit 3702456. That shadow is a
+whole-file override, and the city-local formulas dir is the highest-precedence
+layer, so it froze the file against every unrelated upstream change: the pin
+move a4be2064 -> fe7e0d3 silently reverted gascity-packs#241's wisp-reconcile
+fix, caught only by the pack-drift-local tripwire and folded back by hand.
+Upstreaming the block makes the pack a strict superset of the shadow so the
+shadow can be deleted rather than hand-folded again.
+
+The orchestration contract in scripts/gascity_pack_inference_gate.py pinned the
+naive query verbatim as a required fragment, so it had to move with the formula.
+Rather than drop the anchor, it now pins the three properties that were broken —
+`gc session list` enumeration, the bare `gc bd list --include-infra` read, and
+the exact-match `$ids | index($a)` — so a regression to any single defect fails
+the gate instead of silently restoring the zero-queue behaviour.
+
+Validation: gofumpt/go vet/go build/go test -race and golangci-lint clean;
+python3 validate_registry.py ok; `make test-patch-guard` 7/7; pytest 106 passed.
+The formula parses as TOML with all 8 steps intact.
+
+Deleting the city-local shadow and dropping its check_fork watch from
+pack-drift-local.sh is the mayor's half, after this merges and the pin moves.
+Pre-existing and NOT touched here: tests/test_no_bare_bd_commands.py fails at
+fork point fe7e0d3 on gastown/tests/test_merge_approval_gate.sh; filed as
+gcp-gfjg (discovered-from gcp-wzhy).
+---
+ gastown/formulas/mol-deacon-patrol.toml | 55 ++++++++++++++++++++++---
+ scripts/gascity_pack_inference_gate.py  | 14 ++++++-
+ 2 files changed, 62 insertions(+), 7 deletions(-)
+
+diff --git a/gastown/formulas/mol-deacon-patrol.toml b/gastown/formulas/mol-deacon-patrol.toml
+index cae6ef2..033cfb6 100644
+--- a/gastown/formulas/mol-deacon-patrol.toml
++++ b/gastown/formulas/mol-deacon-patrol.toml
+@@ -205,15 +205,58 @@ closes that gap.
+ - `A` = count of open beads assigned to the session's agent identity
+ - `B` = the most recent bead.updated_at across those beads (work signal)
+ 
++Read the ACTUAL assignee strings out of the bead data and join them against
++every identity form a session carries. Never pre-filter the naive way —
++
++    gc bd list --status=open --assignee=<one guessed identity>
++
++— because a session is addressed by at least three
++different strings depending on what assigned the work: the agent alias
++(`gastown.deacon`, on molecule wisps), the session bead id (`gc-ttk`, on mail
++messages), and the session name (`gastown__polecat-gc-qkw`, on polecat
++claims). Filtering by any single one silently reports zero — which is the
++very failure mode this step exists to catch.
++
++Match identities EXACTLY. `[.assignee] | inside($ids)` looks right and is not:
++jq's `inside` reduces to `contains`, which on strings is substring matching, so
++assignee `gc-t` matches session id `gc-ttk` and `deacon` matches
++`gastown.deacon`. A step whose whole job is catching a wrong queue count must
++not report a wrong queue count. `$ids | index($a)` is the exact-match form.
++
++Two more things this query gets right, both of which returned a flat zero for
++every session before:
++- `--include-infra` is REQUIRED. Wisps, molecules, sessions and messages live
++  in the wisps table and are invisible without it — that is nearly everything
++  a coordination session is ever assigned.
++- The hq/city store is NOT addressable as `gc bd --rig=<name>`, even though
++  `gc rig list` reports it. That form fails with `rig "<name>" not found` AND
++  exits 0, so it silently contributes an empty queue. Read the city with a
++  bare `gc bd list` and iterate only non-hq rigs.
++
+ ```bash
+-gc agents list --json --active | jq -r '.[] | .agent_id' | while read -r AGENT; do
+-    ASSIGNED=$(gc bd list --status=open --assignee="$AGENT" --json --limit=0 | jq 'length')
+-    LATEST=$(gc bd list --status=open --assignee="$AGENT" --json --limit=0 \\
+-        | jq -r '[.[].updated_at] | max // ""')
+-    printf '%s\\t%s\\t%s\\n' "$AGENT" "$ASSIGNED" "$LATEST"
+-done
++QUEUES=$(
++  { gc bd list --status=open --include-infra --json --limit=0
++    for RIG in $(gc rig list --json | jq -r '.rigs[] | select(.hq != true) | .name'); do
++        gc bd --rig="$RIG" list --status=open --include-infra --json --limit=0
++    done
++  } | jq -s 'add | map(select((.assignee // "") != ""))'
++)
++
++# Fail closed: an empty $QUEUES makes --argjson a parse error, not an empty
++# queue report.
++printf '%s' "$QUEUES" | jq -e 'type == "array"' >/dev/null 2>&1 || QUEUES='[]'
++
++gc session list --state active --json | jq -r --argjson q "$QUEUES" '
++  .sessions[] as $s
++  | [ $s.agent_name, ($s.id // ""), ($s.alias // ""), ($s.session_name // "") ] as $ids
++  | ($q | map(select(.assignee as $a | $ids | index($a)))) as $mine
++  | [ $s.agent_name, ($mine | length), ($mine | map(.updated_at) | max // "") ]
++  | @tsv'
+ ```
+ 
++Any assignee in `$QUEUES` that matches no active session is orphaned work —
++a queue whose owner is gone. Worth a look in the same pass.
++
+ The latest bead.updated_at is the cheapest proxy for "did this session
+ move work recently?" — every claim, status transition, metadata update,
+ or note bumps it.
+diff --git a/scripts/gascity_pack_inference_gate.py b/scripts/gascity_pack_inference_gate.py
+index c072189..de23a53 100644
+--- a/scripts/gascity_pack_inference_gate.py
++++ b/scripts/gascity_pack_inference_gate.py
+@@ -151,7 +151,19 @@ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
+     "mol-deacon-patrol": (
+         "Work-layer health",
+         "queue-starvation-check",
+-        "gc agents list --json --active",
++        # The starvation check's own query is the thing most able to fail
++        # silently: each of these three anchors replaces a defect that made the
++        # step report a flat zero queue for every session (gcp-wzhy). Session
++        # enumeration must come from `gc session list`, which carries every
++        # identity form an assignee can take — `gc agents list` yields only the
++        # alias. The city/hq store answers to a bare `gc bd list` and NOT to
++        # `--rig=<name>`, which fails while exiting 0. And `--include-infra` is
++        # what makes wisps, molecules, sessions and messages visible at all.
++        "gc session list --state active --json",
++        "gc bd list --status=open --include-infra --json --limit=0",
++        # Exact match, not jq's `inside`/`contains` substring semantics, which
++        # matched `gc-t` against session id `gc-ttk`.
++        "$ids | index($a)",
+         "gc bd create --type=task --label=warrant",
+         "\"gc.routed_to\":\"{{binding_prefix}}dog\"",
+     ),
+-- 
+2.50.1 (Apple Git-155)
+
