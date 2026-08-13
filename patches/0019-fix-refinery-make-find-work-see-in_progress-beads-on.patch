@@ -1,0 +1,474 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 13 Aug 2026 12:40:54 -0400
+Subject: [PATCH 19/19] fix(refinery): make find-work see in_progress beads on
+ its own hook (gcp-s14g)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+mol-refinery-patrol's find-work step scanned with --status=open, so a bead
+that was in_progress, assigned to the refinery, and carrying metadata.branch
+was invisible to the merge queue forever. The startup orphan scan — the
+fallback that exists for exactly the beads the patrol query misses — filtered
+--status=open too, so it did not cover the gap either.
+
+The resulting stall is self-concealing, which is why it went unnoticed for as
+long as it did: each patrol legitimately concludes "no work", writes
+"IDLE: no work, exiting turn.", and exits, so no wake signal fires and the
+queue looks healthy from outside. One bead sat ~19h and gated a nine-bead
+wave; the merge landed in one try once the bead was actually seen. The
+mitigation in force was a planning seat hand-checking the refinery's query
+after every polecat submit, which only works while that seat is awake.
+
+The invisible state is not the crash-recovery edge case the original analysis
+framed it as. It arises on the NORMAL polecat submit path: the polecat
+reassigns the bead to the refinery and the status does not always come back to
+open. So both scans now sweep --status=open,in_progress. Re-entering a bead
+the refinery already claimed is safe because merge-push discriminates before
+it acts — the already-merged short-circuit (ancestor + fork_sha commit count)
+closes a branch that previously landed, and the false-completion guard refuses
+a branch that introduces no change. Status was never what protected that path;
+it was only hiding the work. The assignee and has-metadata-key=branch filters,
+not the status filter, are what keep the refinery out of a polecat's live
+work.
+
+The bead's second suggested fix — normalise status at handoff — was already
+written into mol-polecat-work step 6 as --status=open and is precisely the
+write observed not to stick. It now reads the status back and corrects it
+once, so a bead does not sit in_progress with nobody working it, and warns
+rather than aborting if it still will not settle: the branch is already pushed
+by then, and the widened find-work scan means an unsettled status can no
+longer hide the bead. Fixing only the handoff would have left the larger hole
+open, so the queue-side fix is the load-bearing one.
+
+Validation: gastown/tests/test_refinery_find_work.sh extracts the shipped
+query text from the formula between sentinels and EXECUTES it against a stub
+gc bd list, so the regression shows up as "the in_progress bead was not found"
+rather than as a flag-string grep that proves nothing about which beads come
+back. Verified red against the pre-fix query text (the in_progress case fails,
+the open case still passes) and green after. Full gastown shell suite, go
+vet/build/test -race, golangci-lint and validate_registry.py all pass.
+
+Discovered, not fixed here: tests/test_no_bare_bd_commands.py fails on a clean
+integration checkout (bare `bd` strings inside test_merge_approval_gate.sh's gc
+stub) — filed as gcp-nduz.
+---
+ gastown/agents/refinery/prompt.template.md |   7 +-
+ gastown/formulas/mol-polecat-work.toml     |  13 +
+ gastown/formulas/mol-refinery-patrol.toml  |  27 +-
+ gastown/tests/test_refinery_find_work.sh   | 307 +++++++++++++++++++++
+ 4 files changed, 351 insertions(+), 3 deletions(-)
+ create mode 100755 gastown/tests/test_refinery_find_work.sh
+
+diff --git a/gastown/agents/refinery/prompt.template.md b/gastown/agents/refinery/prompt.template.md
+index 2a3534f..c98e639 100644
+--- a/gastown/agents/refinery/prompt.template.md
++++ b/gastown/agents/refinery/prompt.template.md
+@@ -138,7 +138,10 @@ without catching the mismatch (upstream #1833).
+ # (e.g. controller restart, host wake, claim race). Their branch ships
+ # but you never see the mail. Scan metadata for orphans before the
+ # normal patrol — these are real merge candidates that need rescuing.
+-ORPHANS=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --metadata-field gc.routed_to="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}refinery" --status=open --json 2>/dev/null \
++# --status=open,in_progress, never open alone (gcp-s14g): a bead routed here
++# with a branch and no close is unfinished merge work whatever its status, and
++# an open-only scan hides exactly the beads this fallback exists to catch.
++ORPHANS=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --metadata-field gc.routed_to="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}refinery" --status=open,in_progress --json 2>/dev/null \
+   | jq -r '.[] | select(.metadata.branch != null) | .id')
+ for ORPHAN in $ORPHANS; do
+   echo "orphan-merge candidate: $ORPHAN"
+@@ -318,7 +321,7 @@ alert the witness, not `gc mail send`.
+ | Pour next wisp | Run `mol-refinery-patrol` step `next-iteration`, section 2. The bare `gc bd mol wisp` call under Startup is the cold-start bootstrap only — it skips the validate/assign/burn ordering. |
+ | Burn current wisp | Follow Patrol Lifecycle Discipline Rule 1: pour next wisp, validate `NEXT`, assign it to `$GC_AGENT`, then burn `$CURRENT_WISP`. Never run a standalone burn. |
+ | Reject a bead to the pool | Run `mol-refinery-patrol` step `rebase` (conflict) or `handle-failures` (test failure). The update must set `gc.routed_to` or the bead is silently orphaned. |
+-| Find assigned work | `gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee="$GC_AGENT" --status=open` |
++| Find assigned work | `gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee="$GC_AGENT" --status=open,in_progress` (never `--status=open` alone — an `in_progress` bead with a branch is merge work, and an open-only scan hides it forever) |
+ | Snapshot event position | `gc events --seq` |
+ | Wait for assignment | `gc events --watch --type=bead.updated --after=$SEQ` |
+ | Read work metadata | `gc bd show $WORK --json \| jq '.[0].metadata'` |
+diff --git a/gastown/formulas/mol-polecat-work.toml b/gastown/formulas/mol-polecat-work.toml
+index 52b4d0d..bcd709a 100644
+--- a/gastown/formulas/mol-polecat-work.toml
++++ b/gastown/formulas/mol-polecat-work.toml
+@@ -444,6 +444,19 @@ the PR is open and matches the branch, base, and origin repository.
+ ```bash
+ REFINERY_TARGET="${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery"
+ gc bd update "$WORK_BEAD_ID" --status=open --assignee="$REFINERY_TARGET" --set-metadata gc.routed_to=""
++# The handoff is the assignee write; `--status=open` is bookkeeping that has
++# been observed not to stick (gcp-s14g). Read it back and correct it once, so
++# the bead does not sit in_progress with nobody working it. This is best-effort
++# on purpose: the refinery's find-work scans open,in_progress precisely so a
++# status that refuses to settle cannot hide the bead again. Never abort the
++# handoff over it — the branch is already pushed.
++HANDOFF_STATUS=$(gc bd show "$WORK_BEAD_ID" --json 2>/dev/null | jq -r '.[0].status // empty')
++if [ "$HANDOFF_STATUS" != "open" ]; then
++    gc bd update "$WORK_BEAD_ID" --status=open >/dev/null 2>&1
++    HANDOFF_STATUS=$(gc bd show "$WORK_BEAD_ID" --json 2>/dev/null | jq -r '.[0].status // empty')
++    [ "$HANDOFF_STATUS" = "open" ] ||
++        echo "WARN $WORK_BEAD_ID handed off to $REFINERY_TARGET with status=${HANDOFF_STATUS:-unreadable}, not open; the refinery still sees it (find-work scans open,in_progress)."
++fi
+ ```
+ 
+ `${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery` resolves to
+diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
+index 58e5901..6dee9b0 100644
+--- a/gastown/formulas/mol-refinery-patrol.toml
++++ b/gastown/formulas/mol-refinery-patrol.toml
+@@ -200,8 +200,10 @@ description = """
+ 
+ Search for work beads assigned to you with branch metadata:
+ ```bash
+-WORK=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee=$GC_AGENT --status=open \
++# --- find-work-query:begin ---
++WORK=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee=$GC_AGENT --status=open,in_progress \
+   --exclude-type=epic --has-metadata-key=branch --limit=1 --json | jq -r '.[0].id // empty')
++# --- find-work-query:end ---
+ ```
+ 
+ `${GC_RIG:+--rig="$GC_RIG"}` scopes the query to this refinery's rig
+@@ -210,6 +212,29 @@ sees rig-scoped work beads — the `assignee` field alone does not route
+ by namespace. For HQ-only refineries `$GC_RIG` is empty and the flag
+ expands to nothing.
+ 
++**`--status=open,in_progress`, never `--status=open` alone (gcp-s14g).** A
++bead that is `in_progress`, assigned to this refinery, and carrying
++`metadata.branch` is real merge work on your hook. Scanning only `open` made
++it invisible forever, and the resulting stall is *self-concealing*: every
++patrol legitimately concludes "no work", writes `IDLE`, and exits, so no wake
++signal ever fires and the queue looks healthy from outside. One such bead sat
++for ~19h and gated a nine-bead wave; the merge itself landed in one try once
++the bead was actually seen.
++
++That state is not an edge case. It arises on the **normal polecat submit
++path** — the polecat reassigns the bead to the refinery and the status does
++not always come back to `open` — as well as on crash recovery, where the
++refinery claimed the bead on an earlier pass and died before closing it.
++Either way, the correct reading is the same: a bead assigned to you with a
++branch and no close is unfinished work, not someone else's in-flight work.
++
++Re-entering a bead the refinery already claimed is safe because the
++merge-push step discriminates before it acts — the already-merged
++short-circuit (ancestor + `fork_sha` commit count) closes a branch that
++previously landed, and the false-completion guard refuses a branch that
++introduces no change. Status was never the thing protecting that; it was only
++hiding the work.
++
+ If found: read the bead metadata to confirm it has a branch:
+ ```bash
+ gc bd show $WORK --json | jq '.[0].metadata'
+diff --git a/gastown/tests/test_refinery_find_work.sh b/gastown/tests/test_refinery_find_work.sh
+new file mode 100755
+index 0000000..880dbac
+--- /dev/null
++++ b/gastown/tests/test_refinery_find_work.sh
+@@ -0,0 +1,307 @@
++#!/usr/bin/env bash
++# Contract tests for the refinery patrol's find-work query (gcp-s14g).
++#
++# `mol-refinery-patrol` step find-work scanned with `--status=open`, so a bead
++# that was `in_progress`, assigned to the refinery, and carrying
++# `metadata.branch` was invisible to the queue forever. The resulting stall is
++# self-concealing: every patrol legitimately concludes "no work", writes
++# `IDLE: no work, exiting turn.`, and exits, so no wake signal fires and the
++# queue looks healthy from outside. One such bead sat ~19h and gated a
++# nine-bead wave.
++#
++# That state is not an edge case reachable only through crash recovery: it
++# arises on the normal polecat submit path, where the polecat reassigns the
++# bead to the refinery and the status does not always come back to `open`.
++#
++# These tests never assert the fix by grepping the flag alone — a flag string
++# proves nothing about which beads come back. The shipped query text is
++# extracted from the formula between its sentinels and EXECUTED against a stub
++# `gc bd list` that filters a fixture the way the real one does, so a
++# regression to an open-only scan shows up here as "the in_progress bead was
++# not found" rather than as a silent queue stall in production.
++set -uo pipefail
++
++ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
++FORMULA="$ROOT/gastown/formulas/mol-refinery-patrol.toml"
++REFINERY_PROMPT="$ROOT/gastown/agents/refinery/prompt.template.md"
++POLECAT_FORMULA="$ROOT/gastown/formulas/mol-polecat-work.toml"
++
++FAILURES=0
++
++fail() {
++    echo "FAIL: $*" >&2
++    FAILURES=$((FAILURES + 1))
++}
++
++# The block under test is the shipped formula text, extracted between its
++# sentinels — not a transcription that could drift from what the refinery runs.
++extract_find_work_query() {
++    python3 - "$FORMULA" "$1" <<'PY'
++import sys
++import tomllib
++
++formula, out = sys.argv[1], sys.argv[2]
++begin = "# --- find-work-query:begin ---"
++end = "# --- find-work-query:end ---"
++
++with open(formula, "rb") as handle:
++    doc = tomllib.load(handle)
++
++blocks = [
++    text.split(begin, 1)[1].split(end, 1)[0]
++    for text in (step.get("description", "") for step in doc["steps"])
++    if begin in text and end in text
++]
++if len(blocks) != 1:
++    sys.exit(f"expected exactly one find-work-query block, found {len(blocks)}")
++
++with open(out, "w") as handle:
++    handle.write(blocks[0])
++PY
++}
++
++# Stub `gc` implementing just enough of `bd list` to answer the shipped query:
++# assignee equality, a comma-separated status filter, --has-metadata-key,
++# --exclude-type, and --limit. Anything else is an error, so a query that grows
++# a flag this stub does not model fails loudly instead of passing vacuously.
++write_gc_stub() {
++    local dir="$1"
++    cat >"$dir/gc" <<'STUB'
++#!/usr/bin/env bash
++if [ "${1:-}" != "bd" ] || [ "${2:-}" != "list" ]; then
++    echo "stub gc: unexpected invocation: $*" >&2
++    exit 64
++fi
++shift 2
++printf '%s\n' "$*" >>"$GC_STUB_LOG"
++exec python3 "$GC_STUB_FILTER" "$GC_STUB_FIXTURE" "$@"
++STUB
++    chmod +x "$dir/gc"
++
++    cat >"$dir/filter.py" <<'PY'
++import json
++import sys
++
++fixture, *args = sys.argv[1:]
++with open(fixture) as handle:
++    beads = json.load(handle)
++
++assignee = None
++statuses = None
++metadata_key = None
++excluded_types = set()
++limit = None
++
++for arg in args:
++    if arg == "--json":
++        continue
++    if arg.startswith("--rig="):
++        continue
++    if arg.startswith("--assignee="):
++        assignee = arg.split("=", 1)[1]
++    elif arg.startswith("--status="):
++        statuses = set(arg.split("=", 1)[1].split(","))
++    elif arg.startswith("--has-metadata-key="):
++        metadata_key = arg.split("=", 1)[1]
++    elif arg.startswith("--exclude-type="):
++        excluded_types.update(arg.split("=", 1)[1].split(","))
++    elif arg.startswith("--limit="):
++        limit = int(arg.split("=", 1)[1])
++    else:
++        sys.exit(f"stub gc bd list: unmodelled flag {arg!r}")
++
++# `bd list` hides closed issues unless asked; the stub mirrors that so a query
++# cannot appear to work by sweeping closed beads back into the queue.
++matched = [
++    bead
++    for bead in beads
++    if bead.get("status") != "closed"
++    and (assignee is None or bead.get("assignee") == assignee)
++    and (statuses is None or bead.get("status") in statuses)
++    and (metadata_key is None or (bead.get("metadata") or {}).get(metadata_key))
++    and bead.get("issue_type") not in excluded_types
++]
++if limit:
++    matched = matched[:limit]
++print(json.dumps(matched))
++PY
++}
++
++bead() {
++    # bead <id> <status> <assignee> [branch] [type]
++    python3 - "$@" <<'PY'
++import json
++import sys
++
++bead_id, status, assignee = sys.argv[1:4]
++branch = sys.argv[4] if len(sys.argv) > 4 else ""
++issue_type = sys.argv[5] if len(sys.argv) > 5 else "task"
++print(json.dumps({
++    "id": bead_id,
++    "status": status,
++    "assignee": assignee,
++    "issue_type": issue_type,
++    "metadata": {"branch": branch} if branch else {},
++}))
++PY
++}
++
++# Run the shipped query against a fixture and echo the WORK it resolves.
++run_find_work() {
++    local fixture_json="$1"
++    local agent="$2"
++    local rig="${3:-}"
++    local out
++
++    printf '%s' "$fixture_json" >"$TMP/fixture.json"
++    : >"$TMP/stub.log"
++    out=$(
++        PATH="$TMP/bin:$PATH" \
++        GC_STUB_FIXTURE="$TMP/fixture.json" \
++        GC_STUB_FILTER="$TMP/bin/filter.py" \
++        GC_STUB_LOG="$TMP/stub.log" \
++        GC_AGENT="$agent" \
++        GC_RIG="$rig" \
++            bash -c 'set -uo pipefail; . "$1"; printf "%s" "$WORK"' _ "$TMP/find-work.sh" 2>&1
++    ) || {
++        echo "__ERROR__ $out"
++        return
++    }
++    printf '%s' "$out"
++}
++
++fixture() {
++    python3 -c 'import json,sys; print(json.dumps([json.loads(a) for a in sys.argv[1:]]))' "$@"
++}
++
++test_in_progress_bead_with_branch_is_found() {
++    # The regression. Before gcp-s14g this returned empty and the patrol wrote
++    # IDLE while a real merge candidate sat on its hook.
++    local got
++    got=$(run_find_work \
++        "$(fixture "$(bead winnow-l0cj.6 in_progress winnow/gastown.refinery polecat/winnow-l0cj.6)")" \
++        winnow/gastown.refinery winnow)
++    [[ "$got" == "winnow-l0cj.6" ]] ||
++        fail "an in_progress bead assigned to the refinery with metadata.branch must be found, got '$got'"
++}
++
++test_open_bead_with_branch_is_still_found() {
++    local got
++    got=$(run_find_work \
++        "$(fixture "$(bead winnow-451o open winnow/gastown.refinery polecat/winnow-451o)")" \
++        winnow/gastown.refinery winnow)
++    [[ "$got" == "winnow-451o" ]] ||
++        fail "the open path must keep working, got '$got'"
++}
++
++test_mixed_queue_returns_a_single_candidate() {
++    local got
++    got=$(run_find_work \
++        "$(fixture \
++            "$(bead winnow-451o open winnow/gastown.refinery polecat/winnow-451o)" \
++            "$(bead winnow-l0cj.6 in_progress winnow/gastown.refinery polecat/winnow-l0cj.6)")" \
++        winnow/gastown.refinery winnow)
++    [[ "$got" == "winnow-451o" || "$got" == "winnow-l0cj.6" ]] ||
++        fail "a mixed queue must yield exactly one candidate, got '$got'"
++}
++
++test_bead_without_branch_is_not_merge_work() {
++    # --has-metadata-key=branch is what separates merge candidates from
++    # ordinary assigned beads. Widening the status filter must not widen this.
++    local got
++    got=$(run_find_work \
++        "$(fixture "$(bead winnow-nobranch in_progress winnow/gastown.refinery)")" \
++        winnow/gastown.refinery winnow)
++    [[ -z "$got" ]] ||
++        fail "a bead with no metadata.branch is not merge work, got '$got'"
++}
++
++test_other_agents_in_progress_work_is_not_stolen() {
++    # in_progress beads belonging to a polecat mid-implementation must stay
++    # invisible: the assignee filter, not the status filter, is what keeps the
++    # refinery out of live work.
++    local got
++    got=$(run_find_work \
++        "$(fixture "$(bead winnow-mine in_progress winnow/gastown.furiosa polecat/winnow-mine)")" \
++        winnow/gastown.refinery winnow)
++    [[ -z "$got" ]] ||
++        fail "work assigned to another agent must not be claimed, got '$got'"
++}
++
++test_epics_are_excluded() {
++    local got
++    got=$(run_find_work \
++        "$(fixture "$(bead winnow-epic in_progress winnow/gastown.refinery polecat/winnow-epic epic)")" \
++        winnow/gastown.refinery winnow)
++    [[ -z "$got" ]] ||
++        fail "epics must stay excluded from the merge queue, got '$got'"
++}
++
++test_empty_queue_yields_no_work() {
++    local got
++    got=$(run_find_work "$(fixture)" winnow/gastown.refinery winnow)
++    [[ -z "$got" ]] ||
++        fail "an empty queue must yield no work, got '$got'"
++}
++
++test_query_is_rig_scoped_when_gc_rig_is_set() {
++    run_find_work \
++        "$(fixture "$(bead winnow-451o open winnow/gastown.refinery polecat/winnow-451o)")" \
++        winnow/gastown.refinery winnow >/dev/null
++    grep -F -- '--rig=winnow' "$TMP/stub.log" >/dev/null ||
++        fail "the query must scope to the rig database when GC_RIG is set"
++
++    run_find_work \
++        "$(fixture "$(bead hq-451o open gastown.refinery polecat/hq-451o)")" \
++        gastown.refinery "" >/dev/null
++    ! grep -F -- '--rig' "$TMP/stub.log" >/dev/null ||
++        fail "the query must omit --rig for HQ-only refineries"
++}
++
++test_open_only_scans_are_not_reintroduced() {
++    # The same hole existed in the startup orphan scan, which is the fallback
++    # for exactly the beads the patrol query missed. Both must sweep both
++    # statuses, or the fallback cannot catch what the primary drops.
++    grep -F -- '--status=open,in_progress' "$REFINERY_PROMPT" >/dev/null ||
++        fail "the refinery startup orphan scan must sweep open,in_progress"
++    ! grep -E -- '--assignee=[^ ]*GC_AGENT[^ ]*" --status=open( |$)' "$REFINERY_PROMPT" >/dev/null ||
++        fail "the refinery prompt must not document an open-only assigned-work query"
++    ! grep -E -- '--status=open --json' "$REFINERY_PROMPT" >/dev/null ||
++        fail "the refinery orphan scan must not regress to an open-only filter"
++}
++
++test_polecat_handoff_verifies_the_status_it_writes() {
++    # The other half of gcp-s14g: the submit handoff writes --status=open and
++    # that write was observed not to stick. It reads back and corrects once,
++    # and it must never abort the handoff over bookkeeping — the branch is
++    # already pushed by then.
++    grep -F 'HANDOFF_STATUS=' "$POLECAT_FORMULA" >/dev/null ||
++        fail "the polecat submit handoff should read back the status it wrote"
++    grep -F 'find-work scans open,in_progress' "$POLECAT_FORMULA" >/dev/null ||
++        fail "the handoff warning should name the refinery behaviour that makes it non-fatal"
++    ! grep -A12 'HANDOFF_STATUS=' "$POLECAT_FORMULA" | grep -E 'exit [1-9]' >/dev/null ||
++        fail "a status that will not settle must not abort a handoff whose branch is already pushed"
++}
++
++TMP=$(mktemp -d "${TMPDIR:-/tmp}/gastown-find-work.XXXXXX") || exit 1
++trap 'rm -rf "$TMP"' EXIT
++mkdir -p "$TMP/bin"
++write_gc_stub "$TMP/bin"
++extract_find_work_query "$TMP/find-work.sh" || exit 1
++
++test_in_progress_bead_with_branch_is_found
++test_open_bead_with_branch_is_still_found
++test_mixed_queue_returns_a_single_candidate
++test_bead_without_branch_is_not_merge_work
++test_other_agents_in_progress_work_is_not_stolen
++test_epics_are_excluded
++test_empty_queue_yields_no_work
++test_query_is_rig_scoped_when_gc_rig_is_set
++test_open_only_scans_are_not_reintroduced
++test_polecat_handoff_verifies_the_status_it_writes
++
++if [ "$FAILURES" -ne 0 ]; then
++    echo "$FAILURES test(s) failed" >&2
++    exit 1
++fi
++echo "all find-work tests passed"
+-- 
+2.50.1 (Apple Git-155)
+
