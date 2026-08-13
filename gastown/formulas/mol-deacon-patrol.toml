@@ -455,9 +455,119 @@ Log `Dolt health: OK` and move on.
 **Exit criteria:** Health check run, alerts handled or escalated."""
 
 [[steps]]
+id = "dolt-push-divergence"
+title = "Check Dolt auto-push for a frozen watermark"
+needs = ["dolt-health"]
+description = """
+Detect a Dolt auto-push that has stopped landing. This is a SEPARATE step from
+`dolt-health` on purpose, and it must NOT be routed through `gc dolt health`.
+
+**Why this step exists.** `bd` does warn when auto-push fails — but only when it
+is neither quiet nor `--json`, and gc drives every bead WRITE through `bd` with
+exactly that flag. So the caller class that performs essentially all writes is
+precisely the class that cannot see the warning. On 2026-08-12 a winnow
+auto-push outage ran ~18h and nothing in this city noticed.
+
+**Why not `gc dolt health`.** That command observes the MANAGED city server
+only. The rig that went dark was pinned to an EXPLICIT endpoint (:3307, not the
+managed server), so a health-routed check is structurally blind to exactly the
+case this step exists to catch. The detector reaches every scope through
+`gc bd sql -C <scope path>`, which resolves that scope's own
+`.beads/config.yaml` — managed, inherited and explicit alike.
+
+**Step 1: Run the detector.**
+
+Pack assets install into a content-hashed cache directory this step cannot name,
+so the deacon's `pre_start` runs the script once at session start and records
+its own resolved path in the snapshot. Read that path back and re-run the sweep,
+so this cycle alerts on a FRESH measurement rather than a session-start reading:
+
+```bash
+SNAP="$GC_CITY/.gc/runtime/dolt-push-state.json"
+CHECK=$(jq -r '.script_path // empty' "$SNAP" 2>/dev/null || true)
+if [ -n "$CHECK" ] && [ -x "$CHECK" ]; then
+    RESULT=$("$CHECK" --json)
+else
+    # pre_start did not run (or the pack moved). Fall back to the last snapshot
+    # and say so — a missing detector is itself worth reporting, not a silent OK.
+    echo "dolt-push-divergence: detector not runnable; falling back to snapshot $SNAP"
+    RESULT=$(jq -c '.scopes[]?' "$SNAP" 2>/dev/null || true)
+fi
+printf '%s\\n' "$RESULT"
+```
+
+**Step 2: Read the verdicts.** One record per scope:
+
+| Verdict | Meaning | Action |
+|---------|---------|--------|
+| `OK` | Converged, or diverged but still inside the debounce window | None |
+| `SKIP` | Scope does not auto-push | None |
+| `STALE` | Sustained divergence past the threshold | Escalate (step 3) |
+| `UNKNOWN` | Store unreadable, or `last_commit` absent from its log | Investigate; never read as healthy |
+
+**Do not re-derive the threshold yourself, and do not alert on divergence.**
+`last_commit != head` is NORMAL: auto-push debounces on
+`dolt.auto-push-interval` (default 5m), so a healthy store sits diverged for up
+to a full interval on every sawtooth trough. A measured healthy trace showed
+`last_commit` trailing head for five consecutive minutes on a store that was
+working correctly. The detector alerts on divergence that FAILS TO CONVERGE —
+the oldest unpushed commit older than 3x the configured interval — and it reads
+the interval from each scope's config rather than hardcoding 5m.
+
+**Step 3: Escalate STALE scopes to mayor (CRITICAL), deduped.**
+
+Same escalation path the `dolt-health` step uses for CRITICAL. But a real outage
+stays STALE for hours across many patrol cycles, and mailing every cycle would
+bury the mayor and commit a bead per message — so mail ONCE per outage per
+scope, and nudge on subsequent cycles:
+
+```bash
+printf '%s\\n' "$RESULT" | jq -r 'select(.verdict == "STALE") | [.scope, .detail] | @tsv' |
+while IFS=$'\\t' read -r SCOPE DETAIL; do
+    MARK="$GC_CITY/.gc/runtime/dolt-push-escalated-$SCOPE"
+    if [ -f "$MARK" ]; then
+        gc session nudge mayor/ "Dolt auto-push still down on $SCOPE: $DETAIL"
+    else
+        mkdir -p "$(dirname "$MARK")"
+        gc mail send mayor/ -s "ESCALATION: Dolt auto-push not landing on $SCOPE [CRITICAL]" -m "$DETAIL
+
+Detected by mol-deacon-patrol dolt-push-divergence. The scope's last_commit
+watermark is frozen while last_push keeps advancing — commits are accumulating
+locally and are NOT reaching the remote. This is the failure mode that ran ~18h
+unnoticed on 2026-08-12.
+
+Note gc dolt health cannot confirm or deny this for an explicit-endpoint scope;
+it observes the managed city server only. Diagnose against the scope's own
+endpoint (read gc.endpoint_origin and dolt.host/dolt.port from its
+.beads/config.yaml)."
+        date -u +"%Y-%m-%dT%H:%M:%SZ" >"$MARK"
+    fi
+done
+```
+
+**Step 4: Clear the marker when a scope recovers**, so the next outage escalates
+as a fresh CRITICAL rather than being silently downgraded to a nudge forever:
+
+```bash
+printf '%s\\n' "$RESULT" | jq -r 'select(.verdict == "OK") | .scope' |
+while read -r SCOPE; do
+    rm -f "$GC_CITY/.gc/runtime/dolt-push-escalated-$SCOPE"
+done
+```
+
+**UNKNOWN is a finding, not a pass.** An unreadable store or a `last_commit` the
+store has never heard of is the same class of silence this step exists to break.
+Report it in the patrol log; escalate if it persists across cycles.
+
+**If everything is OK/SKIP:** log `Dolt push-state: OK` and move on.
+
+**Exit criteria:** Detector run for every active scope, STALE scopes escalated
+(deduped) and recovered scopes' markers cleared."""
+
+[[steps]]
 id = "system-health"
 title = "Run system diagnostics"
-needs = ["dolt-health"]
+needs = ["dolt-push-divergence"]
 description = """
 Run `gc doctor` for a quick workspace health check.
 

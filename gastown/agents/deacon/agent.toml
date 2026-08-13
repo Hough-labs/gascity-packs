@@ -1,6 +1,18 @@
 scope = "city"
 wake_mode = "fresh"
 work_dir = ".gc/agents/deacon"
+# Dolt auto-push outage detection. `bd` only warns about a failed auto-push when
+# it is neither quiet nor --json, and gc drives every bead WRITE through beads
+# with exactly that flag — so the caller class doing essentially all writes is
+# exactly the one that cannot see the warning. A winnow outage ran ~18h unnoticed
+# on that blind spot. Wired as pre_start because pack assets live in a content-hashed
+# cache directory that a formula step cannot name; {{.ConfigDir}} is the only
+# stable handle on the script. --snapshot writes
+# $GC_CITY/.gc/runtime/dolt-push-state.json, recording the script's own resolved
+# path so mol-deacon-patrol's dolt-push-divergence step can re-run the sweep
+# fresh on every patrol cycle rather than reading a session-start measurement.
+# Read-only: it queries each scope's dolt_log and writes nothing but the snapshot.
+pre_start = ["{{.ConfigDir}}/assets/scripts/dolt-push-state-check.sh --snapshot"]
 nudge = "Run 'gc prime' to check patrol status and begin heartbeat cycle."
 idle_timeout = "1h"
 max_active_sessions = 1

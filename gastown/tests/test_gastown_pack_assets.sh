@@ -325,9 +325,47 @@ PY
         fail "reaper must not default its log inside the rig repo"
 }
 
+test_dolt_push_outage_detection_is_wired() {
+    local check="$GASTOWN/assets/scripts/dolt-push-state-check.sh"
+    local deacon_cfg="$GASTOWN/agents/deacon/agent.toml"
+    local patrol="$GASTOWN/formulas/mol-deacon-patrol.toml"
+
+    [[ -f "$check" ]] || fail "missing dolt auto-push outage detector"
+    [[ -x "$check" ]] || fail "auto-push detector must be executable"
+    parse_toml "$deacon_cfg" "$patrol"
+
+    # Same constraint as the worktree reaper: a formula step cannot name the
+    # content-hashed pack cache, so pre_start is the only stable handle.
+    grep -F 'pre_start = ["{{.ConfigDir}}/assets/scripts/dolt-push-state-check.sh --snapshot"]' \
+        "$deacon_cfg" >/dev/null ||
+        fail "deacon must run the auto-push detector from pre_start"
+
+    grep -F 'id = "dolt-push-divergence"' "$patrol" >/dev/null ||
+        fail "deacon patrol should own an auto-push divergence step"
+    grep -F 'needs = ["dolt-push-divergence"]' "$patrol" >/dev/null ||
+        fail "the divergence step must be wired into the patrol chain, not orphaned"
+
+    # The point of the whole check is endpoint coverage. `gc dolt health` sees
+    # the MANAGED server only, and the rig that went dark for 18h was pinned to
+    # its own explicit endpoint — so the detector must reach each scope by that
+    # scope's own path. Comments are stripped before the negative assertion:
+    # the header explains why gc dolt health is wrong, and saying so must not
+    # read as using it.
+    grep -F 'gc bd sql -C' "$check" >/dev/null ||
+        fail "detector must query each scope through its own path (gc bd sql -C)"
+    ! grep -vE '^[[:space:]]*#' "$check" | grep -E 'gc dolt (health|sync)' >/dev/null ||
+        fail "detector must not route through gc dolt health/sync (endpoint-blind for explicit rigs)"
+
+    # gcp-qhx1 scoped dolt-remotes-patrol and gc dolt sync OUT: they are an
+    # upstream-pinned order and a gc binary change, not this pack's to touch.
+    ! grep -F 'dolt-remotes-patrol' "$patrol" >/dev/null ||
+        fail "deacon patrol must not take over dolt-remotes-patrol"
+}
+
 test_dog_assets_are_pack_local
 test_retired_dog_formulas_are_not_reintroduced
 test_post_merge_worktree_teardown_has_an_owner
+test_dolt_push_outage_detection_is_wired
 test_shutdown_dance_contracts_are_executable
 test_shutdown_dance_lifecycle_and_audit_contracts
 test_composition_is_documented
