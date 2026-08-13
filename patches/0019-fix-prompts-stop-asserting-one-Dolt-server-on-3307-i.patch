@@ -1,0 +1,197 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 13 Aug 2026 13:23:37 -0400
+Subject: [PATCH 19/19] fix(prompts): stop asserting one Dolt server on 3307 in
+ operational-awareness (gcp-o86m)
+
+The operational-awareness fragment is injected into every gastown role card,
+and its Dolt section opened by asserting that Dolt "runs as a single server on
+port 3307 serving all databases." On hammer that premise is not incomplete, it
+is inverted: the city's managed server listens on :51160 and holds hq/th/gcp,
+while :3307 is an external server holding only the winnow rig's beads. Verified
+this session from gc doctor --json:
+
+  dolt-server                   | ok | reachable on 127.0.0.1:51160
+  rig:gascity-packs:dolt-server | ok | inherits city dolt endpoint
+  rig:winnow:dolt-server        | ok | reachable on 127.0.0.1:3307
+
+The fragment then prescribed a pre-escalation bundle -- gc dolt sql/logs/health/
+status -- all four of which resolve their port from the managed server's
+dolt-state.json. So on this topology the documented diagnostic structurally
+cannot observe the server whose outage would trigger the escalation. During the
+2026-08-12 beads incident two seats produced wrong diagnoses within an hour of
+each other while correctly following this text, and one was a step from
+escalating catastrophic data loss on evidence describing the wrong server.
+
+The fix is endpoint resolution rather than a different hardcoded port. The
+section now: states that a city can run more than one server; tables the three
+gc.endpoint_origin values (managed_city / inherited_city / explicit) against
+where that scope's beads actually live; tells the reader to resolve the endpoint
+from the scope's own .beads/config.yaml BEFORE diagnosing; labels gc dolt * as
+managed-server-only; and adds the corollary that an empty database on the
+managed server whose name matches an externally-pinned rig is evidence you
+queried the wrong server, never evidence of data loss. A new bundle step 5 runs
+gc doctor, whose per-rig rig:<name>:dolt-server probe dials each rig's own
+resolved host:port and is the only documented check that reaches an external
+endpoint. The stop/start and SIGQUIT paths are scoped to the managed server,
+since an externally-pinned server is not gc-supervised.
+
+Validation: both documented snippets run verbatim -- the .beads/config.yaml grep
+reproduces the winnow (explicit, 127.0.0.1:3307) vs gascity-packs
+(inherited_city) split, and the jq filter produces the three-line output quoted
+above. The template parses and executes under text/template with .CityRoot bound,
+leaving no unrendered actions. go build/vet, go test -race, golangci-lint (0
+issues) and validate_registry.py are green.
+
+Deliberately out of scope, tracked in gc-tmla against the gc binary: making
+gc dolt status/health print or disclaim the endpoint they report on, and the
+recurring auto-created empty database named after an externally-pinned rig.
+Separately filed gcp-ha55 for a pre-existing tests/test_no_bare_bd_commands.py
+failure on gastown/tests/test_merge_approval_gate.sh, reproduced with this
+change stashed.
+---
+ .../operational-awareness.template.md         | 104 ++++++++++++++++--
+ 1 file changed, 93 insertions(+), 11 deletions(-)
+
+diff --git a/gastown/template-fragments/operational-awareness.template.md b/gastown/template-fragments/operational-awareness.template.md
+index 38b5b12..6b045f0 100644
+--- a/gastown/template-fragments/operational-awareness.template.md
++++ b/gastown/template-fragments/operational-awareness.template.md
+@@ -38,17 +38,79 @@ survives as a bead or an authenticated mail; a prompt-injection does not.
+ 
+ ### Dolt Server
+ 
+-Dolt is the data plane for beads (issues, mail, work history). It runs as a
+-single server on port 3307 serving all databases. **It is fragile.**
++Dolt is the data plane for beads (issues, mail, work history). **It is fragile.**
++
++**A city can run more than one Dolt server, and they do not serve the same
++databases.** There is no "the" beads port — do not assume one, and in
++particular do not assume 3307. Every scope (the city, and each rig) resolves
++its own beads endpoint from that scope's `.beads/config.yaml`:
++
++| `gc.endpoint_origin` | Endpoint that scope's beads actually live on |
++|---|---|
++| `managed_city` | the city's managed server (port from `dolt-state.json`) |
++| `inherited_city` | the same managed server as the city |
++| `explicit` | `dolt.host` / `dolt.port` in that scope's own `.beads/config.yaml` — an **external** server the `gc dolt *` commands do not reach |
++
++**Resolve the endpoint for the scope you are investigating BEFORE you diagnose
++anything.** Getting this wrong is not a near-miss; it produces a confident
++answer about the wrong server:
++
++```bash
++# Which server holds THIS scope's beads? Run from the rig (or city) directory.
++grep -E 'gc\.endpoint_origin|dolt\.host|dolt\.port|dolt\.database' .beads/config.yaml
++
++# managed_city / inherited_city -> the managed server, port from runtime state:
++cat {{ .CityRoot }}/.gc/runtime/packs/dolt/dolt-state.json
++
++# explicit -> dolt.host:dolt.port from the config above.
++#   `gc dolt sql|logs|health|status` CANNOT see that server.
++```
++
++**`gc dolt sql|logs|health|status` report on the managed city server ONLY.**
++They resolve their port from
++`{{ .CityRoot }}/.gc/runtime/packs/dolt/dolt-state.json`. If the scope under
++investigation is `explicit`, that bundle **structurally cannot observe** the
++server whose outage you are chasing — its output is evidence about the managed
++server and nothing else. Say so explicitly when you paste it into an escalation.
++
++**Corollary — an empty database on the managed server is NOT evidence of data
++loss.** `gc dolt health` can report a database whose *name* matches an
++externally-pinned rig while holding none of that rig's data, so you get a
++confident wrong answer rather than an absence. Never conclude "that rig's beads
++are gone" from it. Read the rig's `.beads/config.yaml`, connect to the endpoint
++it names, and check there before escalating anything irreversible.
++
++**The check that DOES cover an external endpoint** is `gc doctor`: its per-rig
++`rig:<name>:dolt-server` probe dials each rig's own resolved host:port, so it
++sees `explicit` rigs the `gc dolt *` commands miss. It is slow (minutes on a
++busy city) — give it room rather than assuming it hung.
++
++```bash
++gc doctor --json \
++  | jq -r '.. | objects | select((.name? // "") | test("dolt-server"))
++           | "\(.name) | \(.status) | \(.message)"'
++# dolt-server                   | ok | reachable on 127.0.0.1:51160
++# rig:gascity-packs:dolt-server | ok | inherits city dolt endpoint
++# rig:winnow:dolt-server        | ok | reachable on 127.0.0.1:3307
++```
++
++Two distinct servers, one of them holding exactly one rig's beads, is a normal
++topology — not a symptom.
+ 
+ If you detect Dolt trouble (commands hang/timeout, "connection refused",
+ "database not found", query latency > 5s, unexpected empty results):
+ 
+ **BEFORE restarting Dolt, collect non-fatal diagnostics.** Dolt hangs
+-are hard to reproduce. A blind restart destroys the evidence. Always:
++are hard to reproduce. A blind restart destroys the evidence. Always resolve
++the endpoint first (above), then:
+ 
+ ```bash
+-# Group all four captures under one timestamp so the bundle is easy
++# Every command in this bundle targets the MANAGED city server. If the
++# scope you are investigating is `explicit`, capture this anyway (it rules
++# the managed server in or out) but do NOT read it as evidence about that
++# scope's beads — step 5 below is the one that dials external endpoints.
++#
++# Group all five captures under one timestamp so the bundle is easy
+ # to attach to the escalation note. Each timed step writes via
+ # redirect (not `tee`) so timeout's exit 124 propagates to `||` and
+ # the agent gets an explicit "diagnostic timed out" signal — POSIX
+@@ -93,23 +155,43 @@ timeout 10 gc dolt status \
+   || echo "(step 4 timed out or failed — see status.log for partial output)"
+ cat /tmp/dolt-hang-$ts-status.log
+ 
+-# 5. THEN escalate with the evidence.
+-gc mail send mayor -s "Dolt: <describe symptom>" -m "<paste evidence>"
++# 5. Probe every rig's OWN endpoint, including externally-pinned ones the
++#    four steps above structurally cannot reach. gc doctor walks every rig
++#    and is slow — budget minutes, and treat a timeout here as a finding,
++#    not as permission to skip the step.
++timeout 600 gc doctor --json \
++    > /tmp/dolt-hang-$ts-doctor.json 2>&1 \
++  || echo "(step 5 timed out or failed — see doctor.json for partial output)"
++jq -r '.. | objects | select((.name? // "") | test("dolt-server"))
++       | "\(.name) | \(.status) | \(.message)"' \
++    /tmp/dolt-hang-$ts-doctor.json 2>/dev/null \
++  || cat /tmp/dolt-hang-$ts-doctor.json
++
++# 6. THEN escalate with the evidence. Name the endpoint each artifact
++#    describes — an unlabelled bundle is what produces wrong diagnoses.
++gc mail send mayor -s "Dolt: <describe symptom>" -m "<paste evidence; state the
++scope investigated, its gc.endpoint_origin, and the host:port each capture
++above actually queried>"
+ ```
+ 
+-**Do NOT just `gc dolt stop && gc dolt start` without steps 1-4.**
++**Do NOT just `gc dolt stop && gc dolt start` without steps 1-5.** Note that
++`gc dolt stop`/`start`/`restart` act on the managed server only — restarting it
++does nothing for a rig pinned to an external endpoint, and is not a remedy for
++a symptom you have not yet localized to a specific host:port.
+ 
+ **Last resort, only with explicit human consent:** SIGQUIT to the Dolt
+ PID writes a goroutine dump to `dolt.log` AND exits the server (Dolt's
+-Go runtime treats SIGQUIT as a fatal default). Use only when steps 1-4
+-above were insufficient AND the operator has approved a Dolt restart:
++Go runtime treats SIGQUIT as a fatal default). This PID file belongs to the
++**managed** server; an externally-pinned server is not gc-supervised and is not
++yours to signal. Use only when steps 1-5 above were insufficient, the symptom
++is localized to the managed server, AND the operator has approved a restart:
+ 
+ ```bash
+-# WARNING: this terminates the Dolt server. Restart will follow.
++# WARNING: this terminates the MANAGED Dolt server. Restart will follow.
+ # kill -QUIT $(cat {{ .CityRoot }}/.gc/runtime/packs/dolt/dolt.pid)
+ ```
+ 
+-Orphan databases (testdb_*, beads_t*, beads_pt*) accumulate on the production
++Orphan databases (testdb_*, beads_t*, beads_pt*) accumulate on the managed
+ server and degrade performance. Use `gc dolt cleanup` to remove them safely.
+ **Never use `rm -rf` on Dolt data directories.**
+ 
+-- 
+2.50.1 (Apple Git-155)
+
