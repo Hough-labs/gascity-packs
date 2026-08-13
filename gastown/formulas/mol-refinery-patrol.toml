@@ -251,8 +251,10 @@ fi
 
 Search for work beads assigned to you — unclaimed, or already claimed by you:
 ```bash
+# --- find-work-query:begin ---
 WORK=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee=$GC_AGENT --status=open,in_progress \
   --exclude-type=epic --has-metadata-key=branch --limit=1 --json | jq -r '.[0].id // empty')
+# --- find-work-query:end ---
 ```
 
 `${GC_RIG:+--rig="$GC_RIG"}` scopes the query to this refinery's rig

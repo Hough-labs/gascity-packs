@@ -139,7 +139,10 @@ without catching the mismatch (upstream #1833).
 # (e.g. controller restart, host wake, claim race). Their branch ships
 # but you never see the mail. Scan metadata for orphans before the
 # normal patrol — these are real merge candidates that need rescuing.
-ORPHANS=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --metadata-field gc.routed_to="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}refinery" --status=open --json 2>/dev/null \
+# --status=open,in_progress, never open alone (gcp-s14g): a bead routed here
+# with a branch and no close is unfinished merge work whatever its status, and
+# an open-only scan hides exactly the beads this fallback exists to catch.
+ORPHANS=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --metadata-field gc.routed_to="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}refinery" --status=open,in_progress --json 2>/dev/null \
   | jq -r '.[] | select(.metadata.branch != null) | .id')
 for ORPHAN in $ORPHANS; do
   echo "orphan-merge candidate: $ORPHAN"
