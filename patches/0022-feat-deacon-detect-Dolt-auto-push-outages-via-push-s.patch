@@ -1,0 +1,945 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 13 Aug 2026 17:31:55 -0400
+Subject: [PATCH 22/22] feat(deacon): detect Dolt auto-push outages via
+ push-state divergence (gcp-qhx1)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The 2026-08-12 winnow outage ran ~18h with a broken dolt auto-push and nothing
+in the city noticing. Two independent causes; this commit fixes the second.
+
+`bd` DOES warn when auto-push fails, but only when it is neither quiet nor
+--json — and gc drives every bead WRITE through beads with exactly that flag,
+so the caller class performing essentially all writes is precisely the class
+that cannot see the warning. That half is upstream gastownhall/beads and is out
+of scope. The half fixed here is that no patrol covered it.
+
+The detector is a new pack script wired into mol-deacon-patrol as a
+`dolt-push-divergence` step after `dolt-health`. It deliberately does NOT go
+through `gc dolt health`: that command observes the MANAGED city server only,
+and the rig that went dark is pinned to an EXPLICIT endpoint (:3307, not the
+managed :51160), so a health-routed check is structurally blind to exactly the
+case being caught. Every scope is reached through `gc bd sql -C <scope path>`,
+which resolves that scope's own .beads/config.yaml — managed, inherited and
+explicit alike.
+
+The hard part is the false positive, and it drove the whole design. Auto-push
+debounces on `dolt.auto-push-interval`, so on a perfectly HEALTHY store
+`last_commit` trails head for up to a full interval on every sawtooth trough —
+a measured healthy trace shows it trailing for five consecutive minutes. A
+naive "alert when last_commit != head" check fires there. So the signal is not
+divergence but divergence that FAILS TO CONVERGE, and the measured quantity is
+the age of the OLDEST UNPUSHED COMMIT: bounded by one interval on a healthy
+store, unbounded during an outage. Alert at >= 3x the interval, read per-scope
+from config rather than hardcoded. Measuring the oldest unpushed commit rather
+than "how long since last_commit was written" is also what keeps a long-idle
+store from false-positiving when its first new commit lands.
+
+Wired as deacon `pre_start` because pack assets install into a content-hashed
+cache directory a formula step cannot name; {{.ConfigDir}} is the only stable
+handle (same constraint as the witness worktree reaper). --snapshot records the
+script's own resolved path so the patrol step re-runs the sweep each cycle
+instead of reading a session-start measurement.
+
+Validation: 9 new assertions in gastown/tests/test_dolt_push_state_check.sh,
+including the bead's measured 14:08-14:15 healthy trough replayed sample by
+sample (all 8 stay OK), the 18h-frozen outage shape, exact threshold boundary
+(899s OK / 900s STALE), config-driven interval in both flat and nested YAML
+spellings, explicit-endpoint coverage asserted via the recorded argv, and
+UNKNOWN-not-OK for unreadable stores. Also verified live: the check fired on a
+real in-progress winnow outage, crossing OK(890s) -> STALE(924s) at the
+threshold and naming the frozen commit (filed as gcp-02bm).
+
+dolt-remotes-patrol and `gc dolt sync` are untouched, as the bead requires; a
+contract test in test_gastown_pack_assets.sh pins that along with the wiring.
+
+Escalation mails mayor once per outage per scope and nudges thereafter, since a
+real outage stays STALE across many patrol cycles and a mail per cycle would
+both bury the mayor and commit a bead per message.
+
+Pre-existing test failures on the fork point (bare-bd guard plus gascity/
+discord/github suites) are unrelated and filed as gcp-gsif; this branch's
+failure set is a strict subset of the fork point's.
+---
+ gastown/agents/deacon/agent.toml              |  12 +
+ .../assets/scripts/dolt-push-state-check.sh   | 302 +++++++++++++++
+ gastown/formulas/mol-deacon-patrol.toml       | 112 +++++-
+ gastown/tests/test_dolt_push_state_check.sh   | 353 ++++++++++++++++++
+ gastown/tests/test_gastown_pack_assets.sh     |  38 ++
+ 5 files changed, 816 insertions(+), 1 deletion(-)
+ create mode 100755 gastown/assets/scripts/dolt-push-state-check.sh
+ create mode 100755 gastown/tests/test_dolt_push_state_check.sh
+
+diff --git a/gastown/agents/deacon/agent.toml b/gastown/agents/deacon/agent.toml
+index 29b7595..80e9765 100644
+--- a/gastown/agents/deacon/agent.toml
++++ b/gastown/agents/deacon/agent.toml
+@@ -1,6 +1,18 @@
+ scope = "city"
+ wake_mode = "fresh"
+ work_dir = ".gc/agents/deacon"
++# Dolt auto-push outage detection. `bd` only warns about a failed auto-push when
++# it is neither quiet nor --json, and gc drives every bead WRITE through beads
++# with exactly that flag — so the caller class doing essentially all writes is
++# exactly the one that cannot see the warning. A winnow outage ran ~18h unnoticed
++# on that blind spot. Wired as pre_start because pack assets live in a content-hashed
++# cache directory that a formula step cannot name; {{.ConfigDir}} is the only
++# stable handle on the script. --snapshot writes
++# $GC_CITY/.gc/runtime/dolt-push-state.json, recording the script's own resolved
++# path so mol-deacon-patrol's dolt-push-divergence step can re-run the sweep
++# fresh on every patrol cycle rather than reading a session-start measurement.
++# Read-only: it queries each scope's dolt_log and writes nothing but the snapshot.
++pre_start = ["{{.ConfigDir}}/assets/scripts/dolt-push-state-check.sh --snapshot"]
+ nudge = "Run 'gc prime' to check patrol status and begin heartbeat cycle."
+ idle_timeout = "1h"
+ max_active_sessions = 1
+diff --git a/gastown/assets/scripts/dolt-push-state-check.sh b/gastown/assets/scripts/dolt-push-state-check.sh
+new file mode 100755
+index 0000000..e418f58
+--- /dev/null
++++ b/gastown/assets/scripts/dolt-push-state-check.sh
+@@ -0,0 +1,302 @@
++#!/usr/bin/env bash
++# dolt-push-state-check.sh — detect Dolt auto-push outages from push-state drift.
++#
++# The gap this closes: `bd` DOES warn when auto-push fails, but only when it is
++# neither quiet nor `--json` — and gc drives every bead WRITE through beads with
++# exactly that flag. So the caller class performing essentially all writes is
++# exactly the class that cannot see the warning. On 2026-08-12 a winnow auto-push
++# outage ran ~18h with nothing in the city noticing.
++#
++# Why not `gc dolt health`: that command observes the MANAGED city server only.
++# The rig that went dark (winnow) is pinned to an EXPLICIT endpoint (:3307, not
++# the managed :51160), so a health-routed check is structurally blind to it.
++# Everything here goes through `gc bd sql -C <scope-path>`, which resolves each
++# scope's OWN endpoint from that scope's .beads/config.yaml — managed, inherited
++# and explicit alike.
++#
++# THE SIGNAL — divergence that FAILS TO CONVERGE, not divergence itself.
++#
++# `bd` writes .beads/push-state.json per scope:
++#     { "last_push": "...", "last_commit": "<dolt hash>" }
++# On success it records both. On FAILURE it deliberately records last_push but
++# NOT last_commit, so change-detection still fires once the remote recovers.
++# That asymmetry is the free signal: during an outage last_push keeps advancing
++# while last_commit stays frozen behind the store head.
++#
++# But `last_commit != head` is NOT an alertable condition. Auto-push debounces on
++# `dolt.auto-push-interval` (default 5m), so on a perfectly HEALTHY store
++# last_commit trails head for up to a full interval on every sawtooth trough —
++# a naive "alert when last_commit != head" check fires on a store that is working
++# correctly. What distinguishes an outage is that the trough never drains.
++#
++# So the measured quantity is the AGE OF THE OLDEST UNPUSHED COMMIT: the commit
++# that has been waiting longest for a push that never came. On a healthy store
++# that age is bounded by one debounce interval; during an outage it grows without
++# bound. Alert at >= multiplier (default 3) x the configured interval.
++#
++# Measuring the oldest unpushed commit — rather than "how long ago was
++# last_commit written" — is also what keeps a long-idle store from
++# false-positiving: when a first commit lands after hours of quiet, the age
++# starts at ~0 and only crosses the threshold if pushes genuinely stop landing.
++#
++# Verdicts (one record per scope, on stdout):
++#   OK      converged, or diverged but still inside the debounce window
++#   STALE   sustained divergence >= threshold — THE ALERT
++#   SKIP    scope does not auto-push (no push-state.json, or auto-push disabled)
++#   UNKNOWN store unreadable, or last_commit absent from this store's log
++#
++# Env:
++#   GC_PUSH_STALE_MULTIPLIER  threshold multiple of the interval (default 3)
++#   GC_PUSH_DEFAULT_INTERVAL  fallback interval seconds when unconfigured (300)
++#
++# Usage:
++#   dolt-push-state-check.sh            # TSV: scope verdict age_s threshold_s detail
++#   dolt-push-state-check.sh --json     # one JSON object per scope, per line
++#   dolt-push-state-check.sh --snapshot # sweep + write $GC_CITY/.gc/runtime/dolt-push-state.json
++#
++# --snapshot exists because pack assets install into a content-hashed cache
++# directory that a formula step cannot name — `{{.ConfigDir}}` in agent.toml is
++# the only stable handle on this file. So the deacon's `pre_start` runs
++# --snapshot, and the snapshot records this script's own resolved path under
++# `script_path`. The patrol step reads that path back and re-runs the sweep
++# itself, so each patrol cycle alerts on a FRESH measurement rather than on a
++# reading taken once at session start.
++#
++# Exit: 0 when the sweep ran (verdicts are in the output, including STALE);
++#       2 on a usage or environment error. A STALE scope is a finding to be
++#       read out of the output, not a crash — one bad rig must not abort the
++#       sweep over the others.
++
++set -euo pipefail
++
++SELF=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
++
++JSON=0
++SNAPSHOT=0
++case "${1:-}" in
++  --json) JSON=1 ;;
++  --snapshot) SNAPSHOT=1; JSON=1 ;;
++  "") ;;
++  *)
++    echo "dolt-push-state-check: unknown argument '$1' (expected --json or --snapshot)" >&2
++    exit 2
++    ;;
++esac
++
++# --snapshot needs the city root to place its output. Env wins; otherwise walk
++# up from cwd for city.toml, the same discovery the churn watcher uses.
++if [ "$SNAPSHOT" -eq 1 ]; then
++  if [ -z "${GC_CITY:-}" ]; then
++    dir=$(pwd)
++    while [ "$dir" != "/" ]; do
++      if [ -f "$dir/city.toml" ]; then
++        GC_CITY="$dir"
++        break
++      fi
++      dir=$(dirname "$dir")
++    done
++  fi
++  if [ -z "${GC_CITY:-}" ] || [ ! -f "$GC_CITY/city.toml" ]; then
++    echo "dolt-push-state-check: --snapshot needs GC_CITY (no city.toml found)" >&2
++    exit 2
++  fi
++  SNAPSHOT_FILE="${GC_PUSH_SNAPSHOT_FILE:-$GC_CITY/.gc/runtime/dolt-push-state.json}"
++  mkdir -p "$(dirname "$SNAPSHOT_FILE")"
++fi
++
++MULTIPLIER="${GC_PUSH_STALE_MULTIPLIER:-3}"
++DEFAULT_INTERVAL="${GC_PUSH_DEFAULT_INTERVAL:-300}"
++
++# Dolt commit hashes are 32 base32 chars. Validated before interpolation: the
++# value comes off disk, and it lands inside a SQL string literal.
++HASH_RE='^[0-9a-z]{32}$'
++
++# parse_duration <value> — Go-style duration ("5m", "300s", "2h") or bare
++# seconds, to seconds. Echoes nothing when unparseable so the caller can fall
++# back rather than silently threshold on garbage.
++parse_duration() {
++  local v="$1" num unit
++  v="${v//[[:space:]]/}"
++  [ -n "$v" ] || return 0
++  if [[ "$v" =~ ^([0-9]+)([smh]?)$ ]]; then
++    num="${BASH_REMATCH[1]}"
++    unit="${BASH_REMATCH[2]}"
++    case "$unit" in
++      h) echo $((num * 3600)) ;;
++      m) echo $((num * 60)) ;;
++      *) echo "$num" ;;
++    esac
++  fi
++}
++
++# config_value <config.yaml> <key> — read a scalar out of a .beads config,
++# tolerating both the flat dotted form (`dolt.auto-push-interval: 5m`) and the
++# nested form (`dolt:` / `  auto-push-interval: 5m`). Both spellings appear in
++# real configs in the same file, so keying on the leaf name covers both. The
++# key must be followed by a colon, which is what keeps `auto-push` from
++# matching `auto-push-interval`.
++config_value() {
++  local cfg="$1" key="$2" out=""
++  [ -f "$cfg" ] || return 0
++  # `|| true`: an unmatched key is the common case, and grep's exit 1 under
++  # `set -o pipefail` would otherwise take the whole sweep down.
++  out=$(sed -e 's/#.*$//' "$cfg" \
++    | grep -E "(^|[.[:space:]])${key}[[:space:]]*:" \
++    | head -1 \
++    | sed -E "s/.*${key}[[:space:]]*:[[:space:]]*//" \
++    | tr -d '"'\''\r' \
++    | sed -e 's/[[:space:]]*$//' || true)
++  printf '%s' "$out"
++}
++
++emit() {
++  local scope="$1" verdict="$2" age="$3" threshold="$4" detail="$5"
++  if [ "$JSON" -eq 1 ]; then
++    jq -cn \
++      --arg scope "$scope" --arg verdict "$verdict" --arg detail "$detail" \
++      --argjson age "${age:-null}" --argjson threshold "${threshold:-null}" \
++      '{scope:$scope, verdict:$verdict, oldest_unpushed_age_s:$age, threshold_s:$threshold, detail:$detail}'
++  else
++    printf '%s\t%s\t%s\t%s\t%s\n' "$scope" "$verdict" "${age:-null}" "${threshold:-null}" "$detail"
++  fi
++}
++
++RIGS_JSON=$(gc rig list --json 2>/dev/null || true)
++if ! printf '%s' "$RIGS_JSON" | jq -e '.rigs | type == "array"' >/dev/null 2>&1; then
++  echo "dolt-push-state-check: could not enumerate rigs via 'gc rig list --json'" >&2
++  exit 2
++fi
++
++# Every scope with its own ledger — the city (the hq rig) and each rig. Suspended
++# rigs are skipped: they are not writing beads, so a frozen watermark there is
++# expected rather than a finding.
++sweep() {
++  while IFS=$'\t' read -r NAME PATH_; do
++    [ -n "$NAME" ] || continue
++
++    BEADS_DIR="$PATH_/.beads"
++    STATE_FILE="$BEADS_DIR/push-state.json"
++    CONFIG="$BEADS_DIR/config.yaml"
++
++    # No push-state file means auto-push has never run here — nothing to measure.
++    if [ ! -f "$STATE_FILE" ]; then
++      emit "$NAME" SKIP "" "" "no push-state.json (scope does not auto-push)"
++      continue
++    fi
++
++    # An explicit `dolt.auto-push: false` with a lingering state file is a scope
++    # that USED to auto-push. Its watermark is frozen by design, not by failure.
++    if [ "$(config_value "$CONFIG" 'auto-push')" = "false" ]; then
++      emit "$NAME" SKIP "" "" "dolt.auto-push disabled (stale push-state.json)"
++      continue
++    fi
++
++    LAST_PUSH=$(jq -r '.last_push // ""' "$STATE_FILE" 2>/dev/null || echo "")
++    LAST_COMMIT=$(jq -r '.last_commit // ""' "$STATE_FILE" 2>/dev/null || echo "")
++
++    INTERVAL=$(parse_duration "$(config_value "$CONFIG" 'auto-push-interval')")
++    [ -n "$INTERVAL" ] || INTERVAL="$DEFAULT_INTERVAL"
++    THRESHOLD=$((INTERVAL * MULTIPLIER))
++
++    # The watermark clause. With a recorded last_commit, "unpushed" means every
++    # commit newer than it. With NO last_commit, push-state exists only because a
++    # push ran and failed before ever recording one — so nothing in this store has
++    # been confirmed pushed, and the whole log is unpushed. A genuinely new store
++    # hits that branch too, and correctly stays OK: its oldest commit is recent.
++    if [ -n "$LAST_COMMIT" ]; then
++      if ! [[ "$LAST_COMMIT" =~ $HASH_RE ]]; then
++        emit "$NAME" UNKNOWN "" "$THRESHOLD" "malformed last_commit in push-state.json"
++        continue
++      fi
++      WATERMARK="(SELECT date FROM dolt_log WHERE commit_hash = '$LAST_COMMIT')"
++      UNPUSHED_WHERE="date > $WATERMARK"
++      FOUND_EXPR="(SELECT COUNT(*) FROM dolt_log WHERE commit_hash = '$LAST_COMMIT')"
++    else
++      UNPUSHED_WHERE="1 = 1"
++      FOUND_EXPR="1"
++    fi
++
++    # UTC_TIMESTAMP(), not NOW(): dolt_log.date is UTC while NOW() is server-local,
++    # and mixing them yields an age off by the server's UTC offset (negative ages
++    # west of Greenwich). The comparison stays server-side so it is the same clock
++    # that wrote the commit dates.
++    QUERY="SELECT
++      $FOUND_EXPR AS watermark_found,
++      (SELECT COUNT(*) FROM dolt_log WHERE $UNPUSHED_WHERE) AS unpushed_count,
++      TIMESTAMPDIFF(SECOND,
++        (SELECT MIN(date) FROM dolt_log WHERE $UNPUSHED_WHERE),
++        UTC_TIMESTAMP()) AS oldest_unpushed_age_s"
++
++    if ! RESULT=$(gc bd sql -C "$PATH_" --json "$QUERY" 2>/dev/null); then
++      emit "$NAME" UNKNOWN "" "$THRESHOLD" "store unreachable at its own endpoint"
++      continue
++    fi
++
++    FOUND=$(printf '%s' "$RESULT" | jq -r 'if type == "array" then .[0].watermark_found else empty end' 2>/dev/null || echo "")
++    UNPUSHED=$(printf '%s' "$RESULT" | jq -r 'if type == "array" then .[0].unpushed_count else empty end' 2>/dev/null || echo "")
++    AGE=$(printf '%s' "$RESULT" | jq -r 'if type == "array" then (.[0].oldest_unpushed_age_s // empty) else empty end' 2>/dev/null || echo "")
++
++    # Numeric-guard before any arithmetic test: a non-numeric here would abort the
++    # whole sweep under `set -e` rather than reporting one bad scope.
++    if ! [[ "$FOUND" =~ ^[0-9]+$ ]] || ! [[ "$UNPUSHED" =~ ^[0-9]+$ ]]; then
++      emit "$NAME" UNKNOWN "" "$THRESHOLD" "unreadable dolt_log result"
++      continue
++    fi
++
++    # last_commit names a commit this store has never heard of — the watermark and
++    # the ledger have diverged in a way the age math cannot describe. Report it
++    # rather than reading the empty result as convergence.
++    if [ "$FOUND" -eq 0 ]; then
++      emit "$NAME" UNKNOWN "" "$THRESHOLD" "last_commit $LAST_COMMIT not present in this store's dolt_log"
++      continue
++    fi
++
++    if [ "$UNPUSHED" -eq 0 ]; then
++      emit "$NAME" OK 0 "$THRESHOLD" "converged (last_commit is head)"
++      continue
++    fi
++
++    if ! [[ "$AGE" =~ ^-?[0-9]+$ ]]; then
++      emit "$NAME" UNKNOWN "" "$THRESHOLD" "unpushed commits present but age unreadable"
++      continue
++    fi
++
++    # A negative age means the oldest unpushed commit is dated in the future
++    # relative to the server clock — clock skew, not a push outage. Never alert.
++    if [ "$AGE" -lt 0 ]; then
++      emit "$NAME" UNKNOWN "$AGE" "$THRESHOLD" "negative age (clock skew between commit dates and server UTC)"
++      continue
++    fi
++
++    if [ "$AGE" -ge "$THRESHOLD" ]; then
++      emit "$NAME" STALE "$AGE" "$THRESHOLD" \
++        "auto-push not landing: $UNPUSHED commit(s) unpushed, oldest ${AGE}s >= ${THRESHOLD}s (${MULTIPLIER}x ${INTERVAL}s interval); last_commit frozen at $LAST_COMMIT, last_push $LAST_PUSH"
++    else
++      emit "$NAME" OK "$AGE" "$THRESHOLD" \
++        "diverged but inside the debounce window: $UNPUSHED commit(s) unpushed, oldest ${AGE}s < ${THRESHOLD}s"
++    fi
++  done < <(printf '%s' "$RIGS_JSON" | jq -r '.rigs[] | select(.suspended != true) | [.name, .path] | @tsv')
++}
++
++OUTPUT=$(sweep)
++
++if [ "$SNAPSHOT" -eq 0 ]; then
++  if [ -n "$OUTPUT" ]; then
++    printf '%s\n' "$OUTPUT"
++  fi
++  exit 0
++fi
++
++# Snapshot mode. `script_path` is the whole point of the file: it is the handle
++# the patrol step uses to re-run this sweep on its own cadence, since it cannot
++# name the content-hashed pack cache directory itself.
++GENERATED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
++if [ -n "$OUTPUT" ]; then
++  printf '%s\n' "$OUTPUT" | jq -s \
++    --arg script "$SELF" --arg at "$GENERATED_AT" \
++    '{generated_at: $at, script_path: $script, scopes: .}' >"$SNAPSHOT_FILE"
++else
++  jq -n --arg script "$SELF" --arg at "$GENERATED_AT" \
++    '{generated_at: $at, script_path: $script, scopes: []}' >"$SNAPSHOT_FILE"
++fi
++printf '%s\n' "$SNAPSHOT_FILE"
+diff --git a/gastown/formulas/mol-deacon-patrol.toml b/gastown/formulas/mol-deacon-patrol.toml
+index 033cfb6..9658c31 100644
+--- a/gastown/formulas/mol-deacon-patrol.toml
++++ b/gastown/formulas/mol-deacon-patrol.toml
+@@ -454,10 +454,120 @@ Log `Dolt health: OK` and move on.
+ 
+ **Exit criteria:** Health check run, alerts handled or escalated."""
+ 
++[[steps]]
++id = "dolt-push-divergence"
++title = "Check Dolt auto-push for a frozen watermark"
++needs = ["dolt-health"]
++description = """
++Detect a Dolt auto-push that has stopped landing. This is a SEPARATE step from
++`dolt-health` on purpose, and it must NOT be routed through `gc dolt health`.
++
++**Why this step exists.** `bd` does warn when auto-push fails — but only when it
++is neither quiet nor `--json`, and gc drives every bead WRITE through `bd` with
++exactly that flag. So the caller class that performs essentially all writes is
++precisely the class that cannot see the warning. On 2026-08-12 a winnow
++auto-push outage ran ~18h and nothing in this city noticed.
++
++**Why not `gc dolt health`.** That command observes the MANAGED city server
++only. The rig that went dark was pinned to an EXPLICIT endpoint (:3307, not the
++managed server), so a health-routed check is structurally blind to exactly the
++case this step exists to catch. The detector reaches every scope through
++`gc bd sql -C <scope path>`, which resolves that scope's own
++`.beads/config.yaml` — managed, inherited and explicit alike.
++
++**Step 1: Run the detector.**
++
++Pack assets install into a content-hashed cache directory this step cannot name,
++so the deacon's `pre_start` runs the script once at session start and records
++its own resolved path in the snapshot. Read that path back and re-run the sweep,
++so this cycle alerts on a FRESH measurement rather than a session-start reading:
++
++```bash
++SNAP="$GC_CITY/.gc/runtime/dolt-push-state.json"
++CHECK=$(jq -r '.script_path // empty' "$SNAP" 2>/dev/null || true)
++if [ -n "$CHECK" ] && [ -x "$CHECK" ]; then
++    RESULT=$("$CHECK" --json)
++else
++    # pre_start did not run (or the pack moved). Fall back to the last snapshot
++    # and say so — a missing detector is itself worth reporting, not a silent OK.
++    echo "dolt-push-divergence: detector not runnable; falling back to snapshot $SNAP"
++    RESULT=$(jq -c '.scopes[]?' "$SNAP" 2>/dev/null || true)
++fi
++printf '%s\\n' "$RESULT"
++```
++
++**Step 2: Read the verdicts.** One record per scope:
++
++| Verdict | Meaning | Action |
++|---------|---------|--------|
++| `OK` | Converged, or diverged but still inside the debounce window | None |
++| `SKIP` | Scope does not auto-push | None |
++| `STALE` | Sustained divergence past the threshold | Escalate (step 3) |
++| `UNKNOWN` | Store unreadable, or `last_commit` absent from its log | Investigate; never read as healthy |
++
++**Do not re-derive the threshold yourself, and do not alert on divergence.**
++`last_commit != head` is NORMAL: auto-push debounces on
++`dolt.auto-push-interval` (default 5m), so a healthy store sits diverged for up
++to a full interval on every sawtooth trough. A measured healthy trace showed
++`last_commit` trailing head for five consecutive minutes on a store that was
++working correctly. The detector alerts on divergence that FAILS TO CONVERGE —
++the oldest unpushed commit older than 3x the configured interval — and it reads
++the interval from each scope's config rather than hardcoding 5m.
++
++**Step 3: Escalate STALE scopes to mayor (CRITICAL), deduped.**
++
++Same escalation path the `dolt-health` step uses for CRITICAL. But a real outage
++stays STALE for hours across many patrol cycles, and mailing every cycle would
++bury the mayor and commit a bead per message — so mail ONCE per outage per
++scope, and nudge on subsequent cycles:
++
++```bash
++printf '%s\\n' "$RESULT" | jq -r 'select(.verdict == "STALE") | [.scope, .detail] | @tsv' |
++while IFS=$'\\t' read -r SCOPE DETAIL; do
++    MARK="$GC_CITY/.gc/runtime/dolt-push-escalated-$SCOPE"
++    if [ -f "$MARK" ]; then
++        gc session nudge mayor/ "Dolt auto-push still down on $SCOPE: $DETAIL"
++    else
++        mkdir -p "$(dirname "$MARK")"
++        gc mail send mayor/ -s "ESCALATION: Dolt auto-push not landing on $SCOPE [CRITICAL]" -m "$DETAIL
++
++Detected by mol-deacon-patrol dolt-push-divergence. The scope's last_commit
++watermark is frozen while last_push keeps advancing — commits are accumulating
++locally and are NOT reaching the remote. This is the failure mode that ran ~18h
++unnoticed on 2026-08-12.
++
++Note gc dolt health cannot confirm or deny this for an explicit-endpoint scope;
++it observes the managed city server only. Diagnose against the scope's own
++endpoint (read gc.endpoint_origin and dolt.host/dolt.port from its
++.beads/config.yaml)."
++        date -u +"%Y-%m-%dT%H:%M:%SZ" >"$MARK"
++    fi
++done
++```
++
++**Step 4: Clear the marker when a scope recovers**, so the next outage escalates
++as a fresh CRITICAL rather than being silently downgraded to a nudge forever:
++
++```bash
++printf '%s\\n' "$RESULT" | jq -r 'select(.verdict == "OK") | .scope' |
++while read -r SCOPE; do
++    rm -f "$GC_CITY/.gc/runtime/dolt-push-escalated-$SCOPE"
++done
++```
++
++**UNKNOWN is a finding, not a pass.** An unreadable store or a `last_commit` the
++store has never heard of is the same class of silence this step exists to break.
++Report it in the patrol log; escalate if it persists across cycles.
++
++**If everything is OK/SKIP:** log `Dolt push-state: OK` and move on.
++
++**Exit criteria:** Detector run for every active scope, STALE scopes escalated
++(deduped) and recovered scopes' markers cleared."""
++
+ [[steps]]
+ id = "system-health"
+ title = "Run system diagnostics"
+-needs = ["dolt-health"]
++needs = ["dolt-push-divergence"]
+ description = """
+ Run `gc doctor` for a quick workspace health check.
+ 
+diff --git a/gastown/tests/test_dolt_push_state_check.sh b/gastown/tests/test_dolt_push_state_check.sh
+new file mode 100755
+index 0000000..1bbe59d
+--- /dev/null
++++ b/gastown/tests/test_dolt_push_state_check.sh
+@@ -0,0 +1,353 @@
++#!/usr/bin/env bash
++# test_dolt_push_state_check.sh — regression tests for the auto-push outage
++# detector (gastown/assets/scripts/dolt-push-state-check.sh).
++#
++# The detector's whole difficulty is the false positive. Auto-push debounces on
++# `dolt.auto-push-interval`, so a HEALTHY store sits with `last_commit != head`
++# for up to a full interval on every sawtooth trough. The negative test below
++# replays a real measured trough (winnow, 14:08-14:15, sampled once a minute on
++# a recovered store with no manual push) and requires the check to stay silent
++# across all eight samples. A naive "alert when last_commit != head" check fires
++# on six of them.
++#
++# Run: bash gastown/tests/test_dolt_push_state_check.sh
++set -euo pipefail
++
++ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
++SCRIPT="$ROOT/gastown/assets/scripts/dolt-push-state-check.sh"
++
++PASS=0
++FAIL=0
++
++fail() {
++    echo "FAIL: $*" >&2
++    FAIL=$((FAIL + 1))
++}
++
++pass() {
++    echo "  ok: $*"
++    PASS=$((PASS + 1))
++}
++
++# ── Harness ──────────────────────────────────────────────────────────────────
++# A stub `gc` answers the only two calls the detector makes:
++#   gc rig list --json          -> $GC_RIGS_JSON
++#   gc bd sql -C <path> --json  -> $GC_SQL_DIR/<basename of path>.json
++# Every invocation is appended to $GC_ARGV_LOG so tests can assert HOW the store
++# was reached — the endpoint-agnostic `-C <scope path>` form, and never
++# `gc dolt health`.
++write_gc_stub() {
++    local bin="$1"
++    mkdir -p "$bin"
++    cat >"$bin/gc" <<'SH'
++#!/usr/bin/env bash
++printf '%s\n' "$*" >>"$GC_ARGV_LOG"
++case "$1" in
++    rig)
++        cat "$GC_RIGS_JSON"
++        ;;
++    bd)
++        # Locate the -C value; the detector must always scope the query to a path.
++        scope=""
++        prev=""
++        for arg in "$@"; do
++            [ "$prev" = "-C" ] && scope="$arg"
++            prev="$arg"
++        done
++        [ -n "$scope" ] || { echo "stub gc bd sql called without -C" >&2; exit 9; }
++        result="$GC_SQL_DIR/$(basename "$scope").json"
++        if [ -f "$result" ]; then
++            cat "$result"
++        else
++            echo '{"error":"unreachable"}'
++            exit 1
++        fi
++        ;;
++    *)
++        echo "stub gc: unexpected command $1" >&2
++        exit 9
++        ;;
++esac
++SH
++    chmod +x "$bin/gc"
++}
++
++# make_scope <city-root> <name> [last_commit] [config-body]
++# Creates a rig root with a .beads dir. Omit last_commit to skip push-state.json
++# entirely (a scope that does not auto-push).
++make_scope() {
++    local root="$1" name="$2" last_commit="${3:-}" config="${4:-}"
++    local dir="$root/$name/.beads"
++    mkdir -p "$dir"
++    printf '%s\n' "issue_prefix: $name" >"$dir/config.yaml"
++    [ -n "$config" ] && printf '%s\n' "$config" >>"$dir/config.yaml"
++    if [ -n "$last_commit" ]; then
++        cat >"$dir/push-state.json" <<JSON
++{
++  "last_push": "2026-08-13T18:08:35Z",
++  "last_commit": "$last_commit"
++}
++JSON
++    fi
++    return 0
++}
++
++# rigs_json <city-root> <name>... — the `gc rig list --json` fixture.
++rigs_json() {
++    local root="$1"
++    shift
++    local out="{\"rigs\":["
++    local sep=""
++    for name in "$@"; do
++        out+="$sep{\"name\":\"$name\",\"path\":\"$root/$name\",\"suspended\":false}"
++        sep=","
++    done
++    printf '%s]}' "$out"
++}
++
++# store_result <sql-dir> <name> <watermark_found> <unpushed> <age>
++# Stands in for what the scope's own dolt_log reports. An empty age emits SQL
++# NULL, which is what a converged store returns for MIN(date) over no rows.
++store_result() {
++    local dir="$1" name="$2" found="$3" unpushed="$4" age="${5:-}"
++    mkdir -p "$dir"
++    cat >"$dir/$name.json" <<JSON
++[
++  {
++    "watermark_found": $found,
++    "unpushed_count": $unpushed,
++    "oldest_unpushed_age_s": ${age:-null}
++  }
++]
++JSON
++}
++
++# run_check <city-root> <sql-dir> <rigs-json-file> <argv-log> — returns the
++# detector's JSON-lines output.
++run_check() {
++    GC_RIGS_JSON="$3" GC_SQL_DIR="$2" GC_ARGV_LOG="$4" PATH="$BIN:$PATH" \
++        bash "$SCRIPT" --json
++}
++
++verdict_for() {
++    printf '%s' "$1" | jq -r --arg s "$2" 'select(.scope == $s) | .verdict'
++}
++
++SCRATCH=$(mktemp -d)
++trap 'rm -rf "$SCRATCH"' EXIT
++BIN="$SCRATCH/bin"
++write_gc_stub "$BIN"
++
++# ── 1. The healthy sawtooth trough must NOT fire ─────────────────────────────
++# The measured trace, with the store state each sample implies. Auto-push landed
++# three times ~5m20s apart (interval 5m); between landings `last_commit` trails
++# head, which is normal debounce, not an outage.
++#
++#   sample  last_push  last_commit  head       unpushed  oldest-unpushed age
++#   14:08   14:03:11   ppgaq46k     ms3gscos   1         30s
++#   14:09   14:08:35   ms3gscos     ms3gscos   0         -    (converged)
++#   14:10   14:08:35   ms3gscos     ms3gscos   0         -    (converged)
++#   14:11   14:08:35   ms3gscos     f62i9npv   1         20s
++#   14:12   14:08:35   ms3gscos     1f7hvh54   2         80s
++#   14:13   14:08:35   ms3gscos     1f7hvh54   2         140s
++#   14:14   14:13:55   1f7hvh54     1f7hvh54   0         -    (converged)
++#   14:15   14:13:55   1f7hvh54     1f7hvh54   0         -    (converged)
++#
++# Peak unpushed age across the whole trough is 140s — far under the 900s
++# threshold (3 x the 5m interval).
++test_healthy_sawtooth_never_fires() {
++    local city="$SCRATCH/healthy" sql="$SCRATCH/healthy-sql" rigs="$SCRATCH/healthy-rigs.json"
++    local log="$SCRATCH/healthy-argv.log"
++    mkdir -p "$city"
++    make_scope "$city" winnow "v7369kk5kh68bo5lv6ctal41bhppdnpf"
++    rigs_json "$city" winnow >"$rigs"
++
++    # Each sample is "<unpushed_count> <oldest-unpushed age>"; an empty age is a
++    # converged sample (MIN(date) over no rows -> SQL NULL).
++    local samples=("1 30" "0 " "0 " "1 20" "2 80" "2 140" "0 " "0 ")
++    local sample fired=0
++    for sample in "${samples[@]}"; do
++        local unpushed="${sample%% *}" age="${sample#* }"
++        : >"$log"
++        store_result "$sql" winnow 1 "$unpushed" "$age"
++        local out v
++        out=$(run_check "$city" "$sql" "$rigs" "$log")
++        v=$(verdict_for "$out" winnow)
++        [ "$v" = "OK" ] || { fired=1; fail "healthy trough sample (unpushed=$unpushed age=${age:-0}) reported $v, want OK"; }
++    done
++    [ "$fired" -eq 0 ] && pass "healthy 14:08-14:15 sawtooth trough stays silent across all 8 samples"
++}
++
++# ── 2. A frozen watermark past the threshold MUST fire ───────────────────────
++# The winnow outage shape: `last_push` keeps advancing while `last_commit` stays
++# put, so unpushed commits pile up and the oldest ages without bound.
++test_sustained_divergence_fires() {
++    local city="$SCRATCH/outage" sql="$SCRATCH/outage-sql" rigs="$SCRATCH/outage-rigs.json"
++    local log="$SCRATCH/outage-argv.log"
++    mkdir -p "$city"
++    make_scope "$city" winnow "v7369kk5kh68bo5lv6ctal41bhppdnpf"
++    rigs_json "$city" winnow >"$rigs"
++    store_result "$sql" winnow 1 412 64800   # 18h frozen, the real outage duration
++
++    local out
++    out=$(run_check "$city" "$sql" "$rigs" "$log")
++    [ "$(verdict_for "$out" winnow)" = "STALE" ] ||
++        fail "an 18h-frozen last_commit did not report STALE"
++    printf '%s' "$out" | jq -e 'select(.scope=="winnow") | .detail | test("v7369kk5kh68bo5lv6ctal41bhppdnpf")' >/dev/null ||
++        fail "the STALE alert does not name the frozen commit"
++    printf '%s' "$out" | jq -e 'select(.scope=="winnow") | .oldest_unpushed_age_s == 64800' >/dev/null ||
++        fail "the STALE alert does not carry the measured age"
++    pass "sustained divergence (18h frozen watermark) reports STALE and names the frozen commit"
++
++    # Just below the line stays quiet: the boundary is >= threshold, not >.
++    store_result "$sql" winnow 1 3 899
++    out=$(run_check "$city" "$sql" "$rigs" "$log")
++    [ "$(verdict_for "$out" winnow)" = "OK" ] ||
++        fail "age 899s (one second under the 900s threshold) wrongly fired"
++    store_result "$sql" winnow 1 3 900
++    out=$(run_check "$city" "$sql" "$rigs" "$log")
++    [ "$(verdict_for "$out" winnow)" = "STALE" ] ||
++        fail "age 900s (exactly the threshold) did not fire"
++    pass "threshold boundary is exact: 899s OK, 900s STALE"
++}
++
++# ── 3. The interval comes from config, never hardcoded ───────────────────────
++# Same 200s age, two scopes: one with a 1m interval (threshold 180s -> STALE),
++# one on the 5m default (threshold 900s -> OK). A hardcoded 5m would miss the
++# first; a hardcoded 1m would false-positive the second.
++test_interval_is_read_from_config() {
++    local city="$SCRATCH/interval" sql="$SCRATCH/interval-sql" rigs="$SCRATCH/interval-rigs.json"
++    local log="$SCRATCH/interval-argv.log"
++    mkdir -p "$city"
++    make_scope "$city" fastrig "v7369kk5kh68bo5lv6ctal41bhppdnpf" "dolt.auto-push-interval: 1m"
++    make_scope "$city" defaultrig "v7369kk5kh68bo5lv6ctal41bhppdnpf"
++    rigs_json "$city" fastrig defaultrig >"$rigs"
++    store_result "$sql" fastrig 1 5 200
++    store_result "$sql" defaultrig 1 5 200
++
++    local out
++    out=$(run_check "$city" "$sql" "$rigs" "$log")
++    [ "$(verdict_for "$out" fastrig)" = "STALE" ] ||
++        fail "200s under a configured 1m interval (threshold 180s) did not fire"
++    [ "$(verdict_for "$out" defaultrig)" = "OK" ] ||
++        fail "200s under the default 5m interval (threshold 900s) wrongly fired"
++    printf '%s' "$out" | jq -e 'select(.scope=="fastrig") | .threshold_s == 180' >/dev/null ||
++        fail "configured 1m interval did not yield a 180s threshold"
++    pass "threshold tracks the configured dolt.auto-push-interval, not a hardcoded 5m"
++
++    # The nested YAML spelling must resolve identically to the flat dotted one.
++    local city2="$SCRATCH/interval2" rigs2="$SCRATCH/interval2-rigs.json"
++    mkdir -p "$city2"
++    make_scope "$city2" fastrig "v7369kk5kh68bo5lv6ctal41bhppdnpf" "$(printf 'dolt:\n  auto-push-interval: 1m')"
++    rigs_json "$city2" fastrig >"$rigs2"
++    out=$(GC_RIGS_JSON="$rigs2" GC_SQL_DIR="$sql" GC_ARGV_LOG="$log" PATH="$BIN:$PATH" bash "$SCRIPT" --json)
++    printf '%s' "$out" | jq -e 'select(.scope=="fastrig") | .threshold_s == 180' >/dev/null ||
++        fail "nested 'dolt:/auto-push-interval' spelling was not honoured"
++    pass "nested and flat dotted config spellings both resolve the interval"
++}
++
++# ── 4. Explicit-endpoint rigs are covered, and gc dolt health is never used ──
++# The 18h outage happened on a rig pinned to its OWN endpoint (:3307), which
++# `gc dolt health` structurally cannot see. The detector must reach every scope
++# through `gc bd sql -C <scope path>`, which resolves that scope's own
++# .beads/config.yaml — and must never route through the managed-server view.
++test_reaches_each_scope_by_its_own_path() {
++    local city="$SCRATCH/endpoint" sql="$SCRATCH/endpoint-sql" rigs="$SCRATCH/endpoint-rigs.json"
++    local log="$SCRATCH/endpoint-argv.log"
++    mkdir -p "$city"
++    # An explicitly-pinned rig, exactly as winnow is configured.
++    make_scope "$city" winnow "v7369kk5kh68bo5lv6ctal41bhppdnpf" \
++        "$(printf 'gc.endpoint_origin: explicit\ndolt.host: 127.0.0.1\ndolt.port: 3307')"
++    rigs_json "$city" winnow >"$rigs"
++    store_result "$sql" winnow 1 412 64800
++    : >"$log"
++
++    local out
++    out=$(run_check "$city" "$sql" "$rigs" "$log")
++    [ "$(verdict_for "$out" winnow)" = "STALE" ] ||
++        fail "an explicit-endpoint rig was not evaluated"
++    grep -F -- "-C $city/winnow" "$log" >/dev/null ||
++        fail "the store was not queried through its own scope path (-C)"
++    ! grep -E 'dolt (health|sync)' "$log" >/dev/null ||
++        fail "the detector routed through gc dolt health/sync — endpoint-blind for explicit rigs"
++    pass "explicit-endpoint rig is reached via 'gc bd sql -C <scope path>', not gc dolt health"
++}
++
++# ── 5. Scopes that do not auto-push are skipped, not alerted ────────────────
++test_non_autopush_scopes_are_skipped() {
++    local city="$SCRATCH/skip" sql="$SCRATCH/skip-sql" rigs="$SCRATCH/skip-rigs.json"
++    local log="$SCRATCH/skip-argv.log"
++    mkdir -p "$city"
++    make_scope "$city" nopush ""            # no push-state.json at all
++    make_scope "$city" turnedoff "v7369kk5kh68bo5lv6ctal41bhppdnpf" "dolt.auto-push: false"
++    rigs_json "$city" nopush turnedoff >"$rigs"
++    store_result "$sql" turnedoff 1 999 99999
++
++    local out
++    out=$(run_check "$city" "$sql" "$rigs" "$log")
++    [ "$(verdict_for "$out" nopush)" = "SKIP" ] ||
++        fail "a scope with no push-state.json was not skipped"
++    [ "$(verdict_for "$out" turnedoff)" = "SKIP" ] ||
++        fail "a scope with dolt.auto-push disabled was not skipped despite a stale state file"
++    pass "scopes that do not auto-push are skipped, not alerted"
++}
++
++# ── 6. Unreadable stores are reported, never silently read as healthy ───────
++# The failure this guards: an absent or unmatched signal reported as OK is what
++# let the original outage look healthy for 18h.
++test_unreadable_store_is_unknown_not_ok() {
++    local city="$SCRATCH/unknown" sql="$SCRATCH/unknown-sql" rigs="$SCRATCH/unknown-rigs.json"
++    local log="$SCRATCH/unknown-argv.log"
++    mkdir -p "$city"
++    make_scope "$city" downrig "v7369kk5kh68bo5lv6ctal41bhppdnpf"
++    make_scope "$city" ghostrig "v7369kk5kh68bo5lv6ctal41bhppdnpf"
++    rigs_json "$city" downrig ghostrig >"$rigs"
++    # downrig: no fixture -> the stub exits non-zero, as an unreachable store does.
++    store_result "$sql" ghostrig 0 0        # watermark absent from this store's log
++
++    local out
++    out=$(run_check "$city" "$sql" "$rigs" "$log")
++    [ "$(verdict_for "$out" downrig)" = "UNKNOWN" ] ||
++        fail "an unreachable store was not reported UNKNOWN"
++    [ "$(verdict_for "$out" ghostrig)" = "UNKNOWN" ] ||
++        fail "a last_commit absent from the store's log was not reported UNKNOWN"
++    pass "unreachable store and missing watermark both report UNKNOWN, never OK"
++}
++
++# ── 7. One bad scope must not abort the sweep ───────────────────────────────
++test_sweep_continues_past_a_bad_scope() {
++    local city="$SCRATCH/sweep" sql="$SCRATCH/sweep-sql" rigs="$SCRATCH/sweep-rigs.json"
++    local log="$SCRATCH/sweep-argv.log"
++    mkdir -p "$city"
++    make_scope "$city" downrig "v7369kk5kh68bo5lv6ctal41bhppdnpf"
++    make_scope "$city" badhash "not-a-valid-dolt-hash"
++    make_scope "$city" goodrig "v7369kk5kh68bo5lv6ctal41bhppdnpf"
++    rigs_json "$city" downrig badhash goodrig >"$rigs"
++    store_result "$sql" goodrig 1 412 64800
++
++    local out rc=0
++    out=$(run_check "$city" "$sql" "$rigs" "$log") || rc=$?
++    [ "$rc" -eq 0 ] || fail "the sweep exited $rc instead of completing"
++    [ "$(verdict_for "$out" badhash)" = "UNKNOWN" ] ||
++        fail "a malformed last_commit was not reported UNKNOWN"
++    [ "$(verdict_for "$out" goodrig)" = "STALE" ] ||
++        fail "a later scope was not evaluated after earlier bad scopes"
++    [ "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" = "3" ] ||
++        fail "expected one verdict per scope"
++    pass "a bad scope is reported and the sweep continues to the remaining scopes"
++}
++
++test_healthy_sawtooth_never_fires
++test_sustained_divergence_fires
++test_interval_is_read_from_config
++test_reaches_each_scope_by_its_own_path
++test_non_autopush_scopes_are_skipped
++test_unreadable_store_is_unknown_not_ok
++test_sweep_continues_past_a_bad_scope
++
++echo
++if [ "$FAIL" -gt 0 ]; then
++    echo "dolt push-state check tests: $PASS passed, $FAIL FAILED" >&2
++    exit 1
++fi
++echo "dolt push-state check tests passed ($PASS assertions)"
+diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
+index d90eea1..c9e63b7 100755
+--- a/gastown/tests/test_gastown_pack_assets.sh
++++ b/gastown/tests/test_gastown_pack_assets.sh
+@@ -325,9 +325,47 @@ PY
+         fail "reaper must not default its log inside the rig repo"
+ }
+ 
++test_dolt_push_outage_detection_is_wired() {
++    local check="$GASTOWN/assets/scripts/dolt-push-state-check.sh"
++    local deacon_cfg="$GASTOWN/agents/deacon/agent.toml"
++    local patrol="$GASTOWN/formulas/mol-deacon-patrol.toml"
++
++    [[ -f "$check" ]] || fail "missing dolt auto-push outage detector"
++    [[ -x "$check" ]] || fail "auto-push detector must be executable"
++    parse_toml "$deacon_cfg" "$patrol"
++
++    # Same constraint as the worktree reaper: a formula step cannot name the
++    # content-hashed pack cache, so pre_start is the only stable handle.
++    grep -F 'pre_start = ["{{.ConfigDir}}/assets/scripts/dolt-push-state-check.sh --snapshot"]' \
++        "$deacon_cfg" >/dev/null ||
++        fail "deacon must run the auto-push detector from pre_start"
++
++    grep -F 'id = "dolt-push-divergence"' "$patrol" >/dev/null ||
++        fail "deacon patrol should own an auto-push divergence step"
++    grep -F 'needs = ["dolt-push-divergence"]' "$patrol" >/dev/null ||
++        fail "the divergence step must be wired into the patrol chain, not orphaned"
++
++    # The point of the whole check is endpoint coverage. `gc dolt health` sees
++    # the MANAGED server only, and the rig that went dark for 18h was pinned to
++    # its own explicit endpoint — so the detector must reach each scope by that
++    # scope's own path. Comments are stripped before the negative assertion:
++    # the header explains why gc dolt health is wrong, and saying so must not
++    # read as using it.
++    grep -F 'gc bd sql -C' "$check" >/dev/null ||
++        fail "detector must query each scope through its own path (gc bd sql -C)"
++    ! grep -vE '^[[:space:]]*#' "$check" | grep -E 'gc dolt (health|sync)' >/dev/null ||
++        fail "detector must not route through gc dolt health/sync (endpoint-blind for explicit rigs)"
++
++    # gcp-qhx1 scoped dolt-remotes-patrol and gc dolt sync OUT: they are an
++    # upstream-pinned order and a gc binary change, not this pack's to touch.
++    ! grep -F 'dolt-remotes-patrol' "$patrol" >/dev/null ||
++        fail "deacon patrol must not take over dolt-remotes-patrol"
++}
++
+ test_dog_assets_are_pack_local
+ test_retired_dog_formulas_are_not_reintroduced
+ test_post_merge_worktree_teardown_has_an_owner
++test_dolt_push_outage_detection_is_wired
+ test_shutdown_dance_contracts_are_executable
+ test_shutdown_dance_lifecycle_and_audit_contracts
+ test_composition_is_documented
+-- 
+2.50.1 (Apple Git-155)
+
