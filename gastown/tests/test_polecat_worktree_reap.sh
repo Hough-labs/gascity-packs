@@ -16,17 +16,38 @@ write_gc_stub() {
 #!/usr/bin/env sh
 # Serves the two reads polecat-worktree-reap.sh performs, in both their
 # rig-scoped and unscoped forms:
-#   gc bd --rig <rig> show <bead> --json
+#   gc bd --rig <rig> show <bead>... --json   (many ids in ONE call)
 #   gc session list --state=all --json
+#
+# Test hooks:
+#   GC_BD_CALLS      append one byte per `gc bd show` call, so a test can
+#                    assert the read is bulk and not per-worktree
+#   GC_BD_DELAY      seconds to stall a bead read (budget tests)
+#   GC_SESSION_DELAY seconds to stall a roster read (budget tests)
 case "$1" in
     session)
+        if [ -n "${GC_SESSION_DELAY:-}" ]; then sleep "$GC_SESSION_DELAY"; fi
         cat "$GC_SESSIONS_JSON"
         ;;
     bd)
         shift
         if [ "$1" = "--rig" ]; then shift 2; fi
         if [ "$1" = "show" ]; then
-            jq -c --arg id "$2" '[.[] | select(.id == $id)]' "$GC_BEADS_JSON"
+            shift
+            if [ -n "${GC_BD_CALLS:-}" ]; then printf 'x' >>"$GC_BD_CALLS"; fi
+            if [ -n "${GC_BD_DELAY:-}" ]; then sleep "$GC_BD_DELAY"; fi
+            ids=""
+            for a in "$@"; do
+                case "$a" in
+                    -*) continue ;;
+                esac
+                ids="$ids$a
+"
+            done
+            jq -c --arg ids "$ids" '
+                ($ids | split("\n") | map(select(length > 0))) as $want
+                | [ .[] | select(.id as $i | $want | index($i)) ]
+            ' "$GC_BEADS_JSON"
         else
             printf '[]'
         fi
@@ -287,9 +308,137 @@ JSON
     rm -rf "$tmp"
 }
 
+test_bead_status_is_read_in_one_bulk_query() {
+    # The N+1 that killed winnow's witness for 26h (gcp-ntbf): one
+    # `gc bd show` per candidate worktree, ~5.4s each against an external
+    # Dolt, inside a pre_start bounded at 10s. The read must be flat in the
+    # number of worktrees, so assert the CALL COUNT, not the wall time —
+    # a fast stub would hide a linear read on a slow store.
+    local tmp rig bin home beads sessions logdir calls
+    tmp=$(mktemp -d)
+    rig="$tmp/rig"
+    bin="$tmp/bin"
+    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
+    beads="$tmp/beads.json"
+    sessions="$tmp/sessions.json"
+    logdir="$tmp/logs"
+    calls="$tmp/bd-calls"
+    mkdir -p "$logdir"
+
+    setup_rig "$rig"
+    write_gc_stub "$bin"
+
+    add_bead_worktree "$rig" "$home" wt-one
+    add_bead_worktree "$rig" "$home" wt-two
+    add_bead_worktree "$rig" "$home" wt-three
+    add_bead_worktree "$rig" "$home" wt-four
+
+    cat >"$beads" <<'JSON'
+[
+  {"id":"wt-one","status":"closed","metadata":{"polecat_session":"deadsess"}},
+  {"id":"wt-two","status":"closed","metadata":{"polecat_session":"deadsess"}},
+  {"id":"wt-three","status":"open","metadata":{"polecat_session":"deadsess"}},
+  {"id":"wt-four","status":"closed","metadata":{"polecat_session":"deadsess"}}
+]
+JSON
+    printf '{"sessions":[]}' >"$sessions"
+
+    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+        GC_BD_CALLS="$calls" PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run \
+        >"$tmp/out.txt" 2>&1 || fail "reaper exited non-zero: $(cat "$tmp/out.txt")"
+
+    local n
+    n=$(wc -c <"$calls" | tr -d ' ')
+    [[ "$n" == "1" ]] ||
+        fail "bead status was read in $n calls for 4 worktrees; it must be one bulk query"
+
+    [[ ! -e "$home/worktrees/wt-one" && ! -e "$home/worktrees/wt-two" && ! -e "$home/worktrees/wt-four" ]] ||
+        fail "the bulk read lost a closed bead: a worktree that should have been reaped survived"
+    [[ -e "$home/worktrees/wt-three" ]] ||
+        fail "the bulk read mixed up bead identities: an open bead's worktree was reaped"
+
+    rm -rf "$tmp"
+}
+
+test_budget_expiry_yields_the_witness_start() {
+    # The invariant the header states and the outage broke: housekeeping must
+    # be incapable of preventing the witness from starting. Every slow read is
+    # bounded by the run's own budget, and an expired budget exits 0 having
+    # done what it could — it never waits to be SIGKILLed by the caller.
+    local tmp rig bin home beads sessions logdir started elapsed
+    tmp=$(mktemp -d)
+    rig="$tmp/rig"
+    bin="$tmp/bin"
+    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
+    beads="$tmp/beads.json"
+    sessions="$tmp/sessions.json"
+    logdir="$tmp/logs"
+    mkdir -p "$logdir"
+
+    setup_rig "$rig"
+    write_gc_stub "$bin"
+    add_bead_worktree "$rig" "$home" wt-alpha
+    add_bead_worktree "$rig" "$home" wt-beta
+
+    cat >"$beads" <<'JSON'
+[
+  {"id":"wt-alpha","status":"closed","metadata":{"polecat_session":"deadsess"}},
+  {"id":"wt-beta","status":"closed","metadata":{"polecat_session":"deadsess"}}
+]
+JSON
+    printf '{"sessions":[]}' >"$sessions"
+
+    # Case 1: the bead store is slower than the whole budget. The run must cut
+    # the read off itself and finish well before the stub would have returned.
+    # Budgeted through the env var so this stays a behavioural assertion — a
+    # build that simply ignores the budget hangs here and fails on elapsed
+    # time, rather than being let off with an unknown-flag error.
+    started=$SECONDS
+    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+        GC_BD_DELAY=20 GC_REAP_BUDGET_SECONDS=2 PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run \
+        >"$tmp/slow.txt" 2>&1 || fail "a slow bead store made the reaper exit non-zero: $(cat "$tmp/slow.txt")"
+    elapsed=$((SECONDS - started))
+
+    [[ "$elapsed" -lt 10 ]] ||
+        fail "the reaper waited ${elapsed}s on a 2s budget; a slow read is not bounded"
+    [[ -e "$home/worktrees/wt-alpha" ]] ||
+        fail "a worktree was reaped on a bead read that never answered"
+    grep -F '"event":"worktree_bead_query_failed"' "$logdir/polecat-worktree-reap.log" >/dev/null ||
+        fail "the timed-out bead query was not recorded"
+
+    # Case 2: the budget runs out mid-loop. Remaining candidates are deferred
+    # to the next cycle and the run still exits clean.
+    started=$SECONDS
+    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+        GC_SESSION_DELAY=20 PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run --budget 3 \
+        >"$tmp/mid.txt" 2>&1 || fail "an exhausted budget made the reaper exit non-zero: $(cat "$tmp/mid.txt")"
+    elapsed=$((SECONDS - started))
+
+    [[ "$elapsed" -lt 15 ]] ||
+        fail "the reaper waited ${elapsed}s on a 3s budget; the roster read is not bounded"
+    grep -F '"event":"worktree_budget_exhausted"' "$logdir/polecat-worktree-reap.log" >/dev/null ||
+        fail "an exhausted budget was not recorded"
+    [[ -e "$home/worktrees/wt-alpha" && -e "$home/worktrees/wt-beta" ]] ||
+        fail "a worktree was reaped with an unreadable session roster"
+    grep -F 'deferred to the next cycle' "$tmp/mid.txt" >/dev/null ||
+        fail "the run did not report the candidates it deferred"
+
+    # And the budget must be a real bound, not a way to disable the reaper:
+    # the same worktrees reap normally once the reads are fast again.
+    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/fast.txt" 2>&1 ||
+        fail "reaper exited non-zero on a fast run: $(cat "$tmp/fast.txt")"
+    [[ ! -e "$home/worktrees/wt-alpha" && ! -e "$home/worktrees/wt-beta" ]] ||
+        fail "the budgeted paths left the reaper inert on a healthy run"
+
+    rm -rf "$tmp"
+}
+
 test_reaps_only_closed_clean_unowned_bead_worktrees
 test_real_removal_is_opt_in
 test_unreadable_session_roster_skips_the_reap
 test_dry_run_removes_nothing_and_rerun_is_idempotent
+test_bead_status_is_read_in_one_bulk_query
+test_budget_expiry_yields_the_witness_start
 
 echo "polecat worktree reap tests passed"

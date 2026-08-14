@@ -323,6 +323,24 @@ PY
     # into it.
     ! grep -F 'LOG_DIR="$RIG_ROOT' "$reaper" >/dev/null ||
         fail "reaper must not default its log inside the rig repo"
+
+    # pre_start is bounded by [session] setup_timeout (10s) and SIGKILLed on
+    # overrun, which fails the session start and eventually latches the
+    # supervisor circuit breaker open — gcp-ntbf, where a per-worktree bead
+    # read cost winnow its witness for 26h. Two shape rules keep housekeeping
+    # incapable of blocking the start, and both are easy to undo by accident.
+    grep -F 'show "${BEAD_IDS_ARGV[@]}"' "$reaper" >/dev/null ||
+        fail "reaper must read every candidate bead in one bulk gc bd show, not one call per worktree"
+    ! grep -E 'gc_bd show|GC_BD\[@\]\}" show "\$BEAD"' "$reaper" >/dev/null ||
+        fail "reaper must not query beads per worktree; that is the N+1 that killed the witness"
+    grep -F 'budget_left' "$reaper" >/dev/null ||
+        fail "reaper must bound its own wall clock so it can never outlive the pre_start deadline"
+    grep -F 'worktree_budget_exhausted' "$reaper" >/dev/null ||
+        fail "reaper must record and yield when its budget expires rather than being SIGKILLed"
+    grep -F 'worktree_budget_exhausted' "$patrol" >/dev/null ||
+        fail "patrol log-review table must explain the budget-exhausted event the reaper can emit"
+    grep -F 'worktree_bead_query_failed' "$patrol" >/dev/null ||
+        fail "patrol log-review table must explain the bulk-query-failed event the reaper can emit"
 }
 
 test_dolt_push_outage_detection_is_wired() {

@@ -547,13 +547,24 @@ tail -n 50 "${LOG_DIR:-$GC_CITY/.gc/runtime/logs}/polecat-worktree-reap.log"
 | `worktree_dirty_kept` | Closed bead, uncommitted changes on disk | Salvage per Case C/D, then re-run |
 | `worktree_owner_live` | Closed bead, polecat still alive (PR rework) | None — expected; next cycle retries |
 | `worktree_owner_unconfirmed` | `gc session list` failed or did not parse, so liveness is unknown | If it persists, the session roster is broken — check `gc doctor`; nothing was removed |
-| `worktree_bead_unreadable` | `gc bd show` returned nothing | If it persists, check Dolt health |
+| `worktree_bead_unreadable` | The bulk `gc bd show` had no row for this bead | If it persists, check Dolt health |
 | `worktree_status_unreadable` | `git status` failed inside the worktree | Inspect by hand; likely a broken or moved checkout |
 | `worktree_reap_failed` | Directory survived removal | Investigate permissions/mounts, mail mayor |
+| `worktree_bead_query_failed` | The one bulk bead read returned nothing usable — store unreachable, or slower than the run's budget | Nothing was examined this cycle. If it repeats, the rig's Dolt endpoint is the problem, not the reaper |
+| `worktree_budget_exhausted` | The run hit its own wall-clock budget and stopped early | Routine on a rig with many candidates; the rest are deferred to the next cycle. Persistent + a growing candidate count means the store is too slow for the budget — raise `[session] setup_timeout` AND `GC_REAP_BUDGET_SECONDS` together, or investigate the endpoint |
 
 A `worktree_dirty_kept` that repeats across cycles means real work is
 stranded on disk under a bead that is already closed. Mail the mayor —
 that is a lost-work signal, not routine housekeeping.
+
+**Why it may stop early.** The reaper is the witness `pre_start`, so gascity
+bounds it by `[session] setup_timeout` (10s by default) and SIGKILLs an
+overrun — which fails the session start outright and, after six failures in an
+hour, latches the supervisor circuit breaker OPEN so the witness is never
+respawned (`gcp-ntbf`: winnow lost its witness for 26h that way). So the script
+holds itself to a budget inside that limit and exits cleanly when it expires.
+Partial cleanup is by design: the work is idempotent, the next cycle resumes
+it, and a witness that starts is worth more than a rig reaped in one pass.
 
 **Exit criteria:** Reaper log reviewed and any non-routine event acted on.
 Continue to `check-refinery` — do NOT exit the wisp here. The

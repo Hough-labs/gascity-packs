@@ -10,6 +10,13 @@ work_dir = ".gc/agents/{{.Rig}}/witness"
 # is dirty, not closed, or owned by a session it cannot confirm is gone — see
 # the script header for all four gates.
 #
+# BOUNDED: pre_start is killed at [session] setup_timeout (10s by default), and
+# a killed pre_start fails the whole start — six of those in an hour latch the
+# supervisor circuit breaker open and the rig loses its witness entirely
+# (gcp-ntbf). The script therefore holds itself to a budget inside that limit
+# (8s; GC_REAP_BUDGET_SECONDS / --budget) and exits 0 when it expires, reaping
+# the rest next cycle. Raise one only alongside the other.
+#
 # STAGED ROLLOUT: no --no-dry-run here, so this reports what it WOULD reap and
 # removes nothing. That matches the city's posture for the native gascity
 # reaper, which city.toml holds in dry-run until gc-zxxy is answered; two
