@@ -1,0 +1,785 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 14 Aug 2026 13:04:19 -0400
+Subject: [PATCH 23/23] fix(deacon): confirm auto-push outages against the
+ remote ref, not push-state (gcp-llja)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The push-state divergence detector (gcp-qhx1, merged 5e820ed) treated a frozen
+`push-state.json.last_commit` as proof that auto-push was not landing. That
+inference assumed bd records a success whenever a push actually lands, and bd
+does not: it wraps each auto-push in `dolt.auto-push-timeout` (default 30s) and
+takes the FAILURE path when the timer fires — recording last_push but not
+last_commit — even though the push completes server-side moments later.
+
+So on any store whose pushes routinely outrun that timeout, the watermark froze
+permanently while the remote kept advancing, and the detector read that as a
+sustained outage and escalated CRITICAL to the mayor forever. Measured on winnow
+2026-08-14 00:16-00:56Z: last_commit frozen at fqvpipur... for 40 minutes while
+remotes/origin/main moved 4o9gc4ck... -> 755lvh7f... in lockstep with last_push,
+with no fetch by the observer. A routine winnow push of a ~7min backlog measured
+41s against the 30s default, so essentially every cycle recorded failure.
+
+The watermark is now only the cheap first filter — it is free and it correctly
+flags every suspicious store — and the verdict is drawn from the remote's actual
+position, read out of that scope's own dolt_remote_branches. STALE now means the
+REMOTE is >= threshold behind local head. A frozen watermark over a current
+remote gets a new verdict, FROZEN: not an outage, but a real condition worth
+surfacing, because it means bd's change-detection is broken on that store and a
+genuine outage there would be indistinguishable from the state it is already in.
+mol-deacon-patrol nudges FROZEN rather than paging, and clears the STALE
+escalation marker on it (pushes are landing again) without clearing its own.
+
+Deliberate: the check does NOT fetch. `dolt push` updates the tracking ref
+itself, so the ref advances unaided on a store that auto-pushes — the winnow
+trace shows exactly that — and a ref that IS stale reads as "remote behind",
+which biases toward STALE. Declining to fetch can therefore only make this alert
+more, never less, so the real-outage path is not weakened. The reasoning is
+written into the script's header rather than left implicit. Where the remote's
+position cannot be established at all (no tracking ref, remote head absent from
+the local log, unreadable) the verdict is UNKNOWN, never STALE: an unproven
+outage must not page.
+
+Validation:
+- The detector suite goes red->green: the four new tests fail 12 assertions
+  against the pre-fix script and pass against this one.
+- Test 2b replays the measured winnow 00:16-00:56 trace as a fixture (acceptance
+  1); test 2 keeps the 18h-outage and exact 899/900 boundary cases green
+  (acceptance 2); test 2c pins two scopes with byte-identical watermarks to
+  FROZEN vs STALE purely on the remote's position (acceptance 3).
+- Reproduced end-to-end against a live Dolt store with a doctored watermark: the
+  pre-fix script reports STALE 85936s "auto-push not landing", this one reports
+  FROZEN with remotes/origin/main 2 commits / 97s behind.
+- All nine gastown/tests suites pass; shellcheck, gofumpt, go vet, go build,
+  go test -race, golangci-lint and validate_registry all clean.
+
+Also gates `pass` in the detector suite on the failure count, so a test that
+fails four assertions can no longer print an "ok:" line under them — that
+misleading green showed up while verifying the red state here.
+
+Pre-existing and untouched: tests/test_no_bare_bd_commands.py fails on
+origin/integration for unrelated files (stub case labels and comments in
+gastown/tests/test_merge_approval_gate.sh and test_refinery_find_work.sh).
+Filed as gcp-mvsm, discovered-from this bead, rather than fixed inline.
+---
+ .../assets/scripts/dolt-push-state-check.sh   | 164 ++++++++++-
+ gastown/formulas/mol-deacon-patrol.toml       |  69 ++++-
+ gastown/tests/test_dolt_push_state_check.sh   | 264 ++++++++++++++++--
+ 3 files changed, 463 insertions(+), 34 deletions(-)
+
+diff --git a/gastown/assets/scripts/dolt-push-state-check.sh b/gastown/assets/scripts/dolt-push-state-check.sh
+index e418f58..c2f69b1 100755
+--- a/gastown/assets/scripts/dolt-push-state-check.sh
++++ b/gastown/assets/scripts/dolt-push-state-check.sh
+@@ -39,15 +39,63 @@
+ # false-positiving: when a first commit lands after hours of quiet, the age
+ # starts at ~0 and only crosses the threshold if pushes genuinely stop landing.
+ #
++# BUT THE WATERMARK IS NOT GROUND TRUTH — it only says what bd BELIEVES.
++#
++# bd wraps each auto-push in `dolt.auto-push-timeout` (default 30s). When that
++# timer fires bd takes the failure path — recording last_push but NOT
++# last_commit — even though the push COMPLETES server-side moments later. So on
++# any store whose pushes routinely outrun the timeout, last_commit freezes
++# permanently while the remote keeps advancing. Measured on winnow 2026-08-14:
++# last_commit frozen at fqvpipur… for 40 minutes while remotes/origin/main moved
++# 4o9gc4ck… -> 755lvh7f… in lockstep with last_push, unaided. A watermark-only
++# check reports "auto-push not landing" there forever, and the escalation path
++# pages the mayor CRITICAL forever with it. That inference was wrong: the data
++# was on the remote, current to within one debounce interval.
++#
++# So the watermark is kept only as the cheap FIRST FILTER — it is free, and it
++# correctly flags every suspicious store — and the verdict is then drawn from
++# the remote's ACTUAL position, read out of this store's own tracking ref:
++#
++#     SELECT hash FROM dolt_remote_branches WHERE name = 'remotes/origin/<branch>'
++#
++# Alert only when the REMOTE is genuinely behind local head by >= threshold.
++# When the remote is current but the watermark is frozen, that is a real (and
++# different) condition — bd's own change-detection is broken on that store — so
++# it gets its own verdict rather than being reported as an outage or as OK.
++#
++# ON THE STALENESS OF THE TRACKING REF — a deliberate decision, not an oversight.
++#
++# `dolt_remote_branches` is a LOCAL tracking ref: it reflects the last push or
++# fetch this store performed, not a live read of the remote. This check does NOT
++# fetch. Two reasons, and the second is the one that makes it safe:
++#
++#   1. `dolt push` updates the tracking ref itself, so on a store that
++#      auto-pushes the ref advances on its own — that is exactly what the winnow
++#      trace above shows, with no fetch by the observer.
++#   2. The failure direction is safe. A tracking ref that is stale reads as "the
++#      remote is BEHIND", which biases toward STALE. Staleness can therefore
++#      only make this check alert MORE, never less — the real-outage path in
++#      acceptance is never weakened by declining to fetch.
++#
++# The cost of that choice: a store that has genuinely stopped pushing AND never
++# fetches will show a frozen tracking ref, which is precisely the alert we want.
++# A store whose pushes land but which never updates the ref by any route does
++# not exist — landing a push is what updates it.
++#
+ # Verdicts (one record per scope, on stdout):
+-#   OK      converged, or diverged but still inside the debounce window
+-#   STALE   sustained divergence >= threshold — THE ALERT
+-#   SKIP    scope does not auto-push (no push-state.json, or auto-push disabled)
+-#   UNKNOWN store unreadable, or last_commit absent from this store's log
++#   OK       converged, or diverged but still inside the debounce window
++#   STALE    the REMOTE is >= threshold behind local head — THE ALERT
++#   FROZEN   remote is current, but push-state's last_commit is stuck: pushes
++#            ARE landing while bd records failure (auto-push-timeout too low).
++#            Not an outage; bd's change-detection on that store is broken.
++#   SKIP     scope does not auto-push (no push-state.json, or auto-push disabled)
++#   UNKNOWN  store unreadable, last_commit absent from this store's log, or the
++#            remote's position could not be established
+ #
+ # Env:
+ #   GC_PUSH_STALE_MULTIPLIER  threshold multiple of the interval (default 3)
+ #   GC_PUSH_DEFAULT_INTERVAL  fallback interval seconds when unconfigured (300)
++#   GC_PUSH_REMOTE            remote whose tracking ref is ground truth (origin)
+ #
+ # Usage:
+ #   dolt-push-state-check.sh            # TSV: scope verdict age_s threshold_s detail
+@@ -106,11 +154,20 @@ fi
+ 
+ MULTIPLIER="${GC_PUSH_STALE_MULTIPLIER:-3}"
+ DEFAULT_INTERVAL="${GC_PUSH_DEFAULT_INTERVAL:-300}"
++# bd auto-pushes to `origin`; every scope in this city has exactly that one
++# remote. Overridable rather than hardcoded so a differently-wired store reports
++# UNKNOWN by configuration instead of by silent mismatch.
++REMOTE="${GC_PUSH_REMOTE:-origin}"
+ 
+ # Dolt commit hashes are 32 base32 chars. Validated before interpolation: the
+ # value comes off disk, and it lands inside a SQL string literal.
+ HASH_RE='^[0-9a-z]{32}$'
+ 
++# Branch and remote names reach SQL inside a string literal too, and both come
++# from outside this script (the store's active_branch(), the environment).
++# git-legal branch characters only — no quote can survive this.
++REF_RE='^[A-Za-z0-9._/-]+$'
++
+ # parse_duration <value> — Go-style duration ("5m", "300s", "2h") or bare
+ # seconds, to seconds. Echoes nothing when unparseable so the caller can fall
+ # back rather than silently threshold on garbage.
+@@ -220,7 +277,10 @@ sweep() {
+     # and mixing them yields an age off by the server's UTC offset (negative ages
+     # west of Greenwich). The comparison stays server-side so it is the same clock
+     # that wrote the commit dates.
++    # active_branch() rides along on the first query so the remote cross-check
++    # below costs no extra round trip to learn which tracking ref to read.
+     QUERY="SELECT
++      active_branch() AS branch,
+       $FOUND_EXPR AS watermark_found,
+       (SELECT COUNT(*) FROM dolt_log WHERE $UNPUSHED_WHERE) AS unpushed_count,
+       TIMESTAMPDIFF(SECOND,
+@@ -232,6 +292,7 @@ sweep() {
+       continue
+     fi
+ 
++    BRANCH=$(printf '%s' "$RESULT" | jq -r 'if type == "array" then (.[0].branch // empty) else empty end' 2>/dev/null || echo "")
+     FOUND=$(printf '%s' "$RESULT" | jq -r 'if type == "array" then .[0].watermark_found else empty end' 2>/dev/null || echo "")
+     UNPUSHED=$(printf '%s' "$RESULT" | jq -r 'if type == "array" then .[0].unpushed_count else empty end' 2>/dev/null || echo "")
+     AGE=$(printf '%s' "$RESULT" | jq -r 'if type == "array" then (.[0].oldest_unpushed_age_s // empty) else empty end' 2>/dev/null || echo "")
+@@ -268,12 +329,99 @@ sweep() {
+       continue
+     fi
+ 
+-    if [ "$AGE" -ge "$THRESHOLD" ]; then
+-      emit "$NAME" STALE "$AGE" "$THRESHOLD" \
+-        "auto-push not landing: $UNPUSHED commit(s) unpushed, oldest ${AGE}s >= ${THRESHOLD}s (${MULTIPLIER}x ${INTERVAL}s interval); last_commit frozen at $LAST_COMMIT, last_push $LAST_PUSH"
+-    else
++    if [ "$AGE" -lt "$THRESHOLD" ]; then
+       emit "$NAME" OK "$AGE" "$THRESHOLD" \
+         "diverged but inside the debounce window: $UNPUSHED commit(s) unpushed, oldest ${AGE}s < ${THRESHOLD}s"
++      continue
++    fi
++
++    # ── Past the cheap filter. Now establish GROUND TRUTH before alerting. ──
++    # Everything above is bd's opinion of where the remote is. bd records that
++    # opinion as a FAILURE whenever its auto-push-timeout fires, including on
++    # pushes that land — so a frozen watermark past the threshold is suspicion,
++    # not evidence. The remote's real position decides the verdict.
++    WATERMARK_NOTE="watermark says $UNPUSHED commit(s) unpushed, oldest ${AGE}s >= ${THRESHOLD}s (${MULTIPLIER}x ${INTERVAL}s interval); last_commit frozen at $LAST_COMMIT, last_push $LAST_PUSH"
++
++    if ! [[ "$BRANCH" =~ $REF_RE ]] || ! [[ "$REMOTE" =~ $REF_RE ]]; then
++      emit "$NAME" UNKNOWN "$AGE" "$THRESHOLD" \
++        "cannot name this store's tracking ref (branch='$BRANCH' remote='$REMOTE'); remote position unverifiable, so not alerting on the watermark alone — $WATERMARK_NOTE"
++      continue
++    fi
++    REMOTE_REF="remotes/$REMOTE/$BRANCH"
++
++    # Same shape as the watermark query, with the remote's head as the
++    # reference point instead of push-state's. No rows means this store has no
++    # such tracking ref at all.
++    REMOTE_QUERY="SELECT
++      r.hash AS remote_hash,
++      (SELECT COUNT(*) FROM dolt_log WHERE commit_hash = r.hash) AS remote_head_found,
++      (SELECT COUNT(*) FROM dolt_log
++        WHERE date > (SELECT date FROM dolt_log WHERE commit_hash = r.hash)) AS remote_unpushed_count,
++      TIMESTAMPDIFF(SECOND,
++        (SELECT MIN(date) FROM dolt_log
++          WHERE date > (SELECT date FROM dolt_log WHERE commit_hash = r.hash)),
++        UTC_TIMESTAMP()) AS remote_unpushed_age_s
++      FROM dolt_remote_branches r WHERE r.name = '$REMOTE_REF'"
++
++    if ! REMOTE_RESULT=$(gc bd sql -C "$PATH_" --json "$REMOTE_QUERY" 2>/dev/null); then
++      emit "$NAME" UNKNOWN "$AGE" "$THRESHOLD" \
++        "could not read $REMOTE_REF from this store; remote position unverifiable — $WATERMARK_NOTE"
++      continue
++    fi
++
++    if ! printf '%s' "$REMOTE_RESULT" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
++      emit "$NAME" UNKNOWN "$AGE" "$THRESHOLD" \
++        "no $REMOTE_REF tracking ref in this store — nothing has ever pushed or fetched it, so whether pushes are landing cannot be established here — $WATERMARK_NOTE"
++      continue
++    fi
++
++    REMOTE_HASH=$(printf '%s' "$REMOTE_RESULT" | jq -r '.[0].remote_hash // empty' 2>/dev/null || echo "")
++    REMOTE_FOUND=$(printf '%s' "$REMOTE_RESULT" | jq -r '.[0].remote_head_found' 2>/dev/null || echo "")
++    REMOTE_UNPUSHED=$(printf '%s' "$REMOTE_RESULT" | jq -r '.[0].remote_unpushed_count' 2>/dev/null || echo "")
++    REMOTE_AGE=$(printf '%s' "$REMOTE_RESULT" | jq -r '.[0].remote_unpushed_age_s // empty' 2>/dev/null || echo "")
++
++    if ! [[ "$REMOTE_FOUND" =~ ^[0-9]+$ ]] || ! [[ "$REMOTE_UNPUSHED" =~ ^[0-9]+$ ]]; then
++      emit "$NAME" UNKNOWN "$AGE" "$THRESHOLD" \
++        "unreadable $REMOTE_REF position — $WATERMARK_NOTE"
++      continue
++    fi
++
++    # The remote head is not in this store's log: the remote holds commits this
++    # store does not, so local is not "ahead" and the age math has no meaning.
++    # Whatever that is, it is not auto-push failing to land.
++    if [ "$REMOTE_FOUND" -eq 0 ]; then
++      emit "$NAME" UNKNOWN "$AGE" "$THRESHOLD" \
++        "$REMOTE_REF is at $REMOTE_HASH, which is absent from this store's dolt_log (remote ahead of, or diverged from, local) — $WATERMARK_NOTE"
++      continue
++    fi
++
++    if [ "$REMOTE_UNPUSHED" -eq 0 ]; then
++      emit "$NAME" FROZEN 0 "$THRESHOLD" \
++        "pushes ARE landing: $REMOTE_REF is at local head ($REMOTE_HASH), but push-state disagrees — $WATERMARK_NOTE. bd is recording success as failure on this store; the usual cause is dolt.auto-push-timeout firing on a push that completes anyway."
++      continue
++    fi
++
++    if ! [[ "$REMOTE_AGE" =~ ^-?[0-9]+$ ]]; then
++      emit "$NAME" UNKNOWN "$AGE" "$THRESHOLD" \
++        "$REMOTE_REF is behind local head but its age is unreadable — $WATERMARK_NOTE"
++      continue
++    fi
++
++    if [ "$REMOTE_AGE" -lt 0 ]; then
++      emit "$NAME" UNKNOWN "$REMOTE_AGE" "$THRESHOLD" \
++        "negative age against $REMOTE_REF (clock skew between commit dates and server UTC) — $WATERMARK_NOTE"
++      continue
++    fi
++
++    if [ "$REMOTE_AGE" -ge "$THRESHOLD" ]; then
++      emit "$NAME" STALE "$REMOTE_AGE" "$THRESHOLD" \
++        "auto-push not landing: $REMOTE_REF is $REMOTE_UNPUSHED commit(s) behind local head, oldest ${REMOTE_AGE}s >= ${THRESHOLD}s (${MULTIPLIER}x ${INTERVAL}s interval); remote head $REMOTE_HASH, last_commit $LAST_COMMIT, last_push $LAST_PUSH"
++    else
++      # The watermark tripped the filter but the remote is current to within the
++      # debounce window — the same trough the OK branch above describes, seen
++      # from the ref that actually matters.
++      emit "$NAME" FROZEN "$REMOTE_AGE" "$THRESHOLD" \
++        "pushes ARE landing: $REMOTE_REF is only $REMOTE_UNPUSHED commit(s) behind local head, oldest ${REMOTE_AGE}s < ${THRESHOLD}s, but push-state disagrees — $WATERMARK_NOTE. bd is recording success as failure on this store; the usual cause is dolt.auto-push-timeout firing on a push that completes anyway."
+     fi
+   done < <(printf '%s' "$RIGS_JSON" | jq -r '.rigs[] | select(.suspended != true) | [.name, .path] | @tsv')
+ }
+diff --git a/gastown/formulas/mol-deacon-patrol.toml b/gastown/formulas/mol-deacon-patrol.toml
+index 9658c31..297e9b2 100644
+--- a/gastown/formulas/mol-deacon-patrol.toml
++++ b/gastown/formulas/mol-deacon-patrol.toml
+@@ -502,8 +502,9 @@ printf '%s\\n' "$RESULT"
+ |---------|---------|--------|
+ | `OK` | Converged, or diverged but still inside the debounce window | None |
+ | `SKIP` | Scope does not auto-push | None |
+-| `STALE` | Sustained divergence past the threshold | Escalate (step 3) |
+-| `UNKNOWN` | Store unreadable, or `last_commit` absent from its log | Investigate; never read as healthy |
++| `STALE` | The REMOTE is >= threshold behind local head | Escalate (step 3) |
++| `FROZEN` | Remote is current, but `push-state.json` says otherwise: pushes ARE landing while bd records failure | Report (step 3b); NOT an outage |
++| `UNKNOWN` | Store unreadable, `last_commit` absent from its log, or the remote's position could not be established | Investigate; never read as healthy |
+ 
+ **Do not re-derive the threshold yourself, and do not alert on divergence.**
+ `last_commit != head` is NORMAL: auto-push debounces on
+@@ -514,6 +515,20 @@ working correctly. The detector alerts on divergence that FAILS TO CONVERGE —
+ the oldest unpushed commit older than 3x the configured interval — and it reads
+ the interval from each scope's config rather than hardcoding 5m.
+ 
++**And do not treat `push-state.json` as ground truth — the detector no longer
++does.** bd wraps each auto-push in `dolt.auto-push-timeout` (default 30s) and
++takes the FAILURE path when that timer fires, recording `last_push` but not
++`last_commit`, even when the push completes server-side straight afterwards. On
++a store whose pushes routinely outrun the timeout the watermark therefore
++freezes permanently while the remote keeps advancing — measured on winnow
++2026-08-14, where `last_commit` sat frozen for 40 minutes as
++`remotes/origin/main` moved in lockstep with `last_push`. A watermark-only check
++calls that "auto-push not landing" and pages CRITICAL forever. So the detector
++uses the watermark only as a cheap first filter and then confirms against the
++scope's own `dolt_remote_branches` ref before emitting STALE. `FROZEN` is that
++confirmation coming back negative: the pushes are fine, bd's change-detection on
++that store is not.
++
+ **Step 3: Escalate STALE scopes to mayor (CRITICAL), deduped.**
+ 
+ Same escalation path the `dolt-health` step uses for CRITICAL. But a real outage
+@@ -545,24 +560,60 @@ endpoint (read gc.endpoint_origin and dolt.host/dolt.port from its
+ done
+ ```
+ 
+-**Step 4: Clear the marker when a scope recovers**, so the next outage escalates
+-as a fresh CRITICAL rather than being silently downgraded to a nudge forever:
++**Step 3b: Report FROZEN scopes — nudge only, never CRITICAL.**
++
++A FROZEN scope is NOT down. Its data is reaching the remote; what is broken is
++bd's record of that fact, and the consequence is that the city's own outage
++detection is blind on that store — a real outage there would look identical to
++the state it is already in. Worth surfacing, worth fixing, not worth paging.
++
++The remedy is on the scope, not here: raise its `dolt.auto-push-timeout` in
++`.beads/config.yaml` so a routine push finishes inside the timer. Nudge (do not
++mail — this recurs every cycle until someone tunes the store, and a mail per
++cycle commits a bead per cycle), and dedupe so it is said once per condition:
+ 
+ ```bash
+-printf '%s\\n' "$RESULT" | jq -r 'select(.verdict == "OK") | .scope' |
++printf '%s\\n' "$RESULT" | jq -r 'select(.verdict == "FROZEN") | [.scope, .detail] | @tsv' |
++while IFS=$'\\t' read -r SCOPE DETAIL; do
++    MARK="$GC_CITY/.gc/runtime/dolt-push-frozen-$SCOPE"
++    [ -f "$MARK" ] && continue
++    mkdir -p "$(dirname "$MARK")"
++    gc session nudge mayor/ "Dolt push-state watermark frozen on $SCOPE (pushes ARE landing; bd is recording success as failure). Raise dolt.auto-push-timeout in $SCOPE's .beads/config.yaml — until then auto-push outage detection is blind on that store. $DETAIL"
++    date -u +"%Y-%m-%dT%H:%M:%SZ" >"$MARK"
++done
++```
++
++**Step 4: Clear the markers when a scope recovers**, so the next outage escalates
++as a fresh CRITICAL rather than being silently downgraded to a nudge forever.
++
++A scope that goes STALE -> FROZEN has recovered as far as the outage marker is
++concerned — its pushes are landing again — so FROZEN clears the escalation
++marker too. It does NOT clear its own marker, or the frozen nudge would repeat
++every cycle:
++
++```bash
++printf '%s\\n' "$RESULT" | jq -r 'select(.verdict == "OK" or .verdict == "FROZEN") | .scope' |
+ while read -r SCOPE; do
+     rm -f "$GC_CITY/.gc/runtime/dolt-push-escalated-$SCOPE"
+ done
++printf '%s\\n' "$RESULT" | jq -r 'select(.verdict == "OK") | .scope' |
++while read -r SCOPE; do
++    rm -f "$GC_CITY/.gc/runtime/dolt-push-frozen-$SCOPE"
++done
+ ```
+ 
+-**UNKNOWN is a finding, not a pass.** An unreadable store or a `last_commit` the
+-store has never heard of is the same class of silence this step exists to break.
+-Report it in the patrol log; escalate if it persists across cycles.
++**UNKNOWN is a finding, not a pass.** An unreadable store, a `last_commit` the
++store has never heard of, or a remote whose position could not be established is
++the same class of silence this step exists to break. Report it in the patrol log;
++escalate if it persists across cycles. Note the detector deliberately declines to
++alert on an unverifiable remote — an unproven outage must not page — so a
++persistent UNKNOWN is the only thing standing between a real outage and silence.
+ 
+ **If everything is OK/SKIP:** log `Dolt push-state: OK` and move on.
+ 
+ **Exit criteria:** Detector run for every active scope, STALE scopes escalated
+-(deduped) and recovered scopes' markers cleared."""
++(deduped), FROZEN scopes nudged (deduped), and recovered scopes' markers
++cleared."""
+ 
+ [[steps]]
+ id = "system-health"
+diff --git a/gastown/tests/test_dolt_push_state_check.sh b/gastown/tests/test_dolt_push_state_check.sh
+index 1bbe59d..510264e 100755
+--- a/gastown/tests/test_dolt_push_state_check.sh
++++ b/gastown/tests/test_dolt_push_state_check.sh
+@@ -2,13 +2,26 @@
+ # test_dolt_push_state_check.sh — regression tests for the auto-push outage
+ # detector (gastown/assets/scripts/dolt-push-state-check.sh).
+ #
+-# The detector's whole difficulty is the false positive. Auto-push debounces on
+-# `dolt.auto-push-interval`, so a HEALTHY store sits with `last_commit != head`
+-# for up to a full interval on every sawtooth trough. The negative test below
+-# replays a real measured trough (winnow, 14:08-14:15, sampled once a minute on
+-# a recovered store with no manual push) and requires the check to stay silent
+-# across all eight samples. A naive "alert when last_commit != head" check fires
+-# on six of them.
++# The detector's whole difficulty is the false positive, and there are TWO of
++# them. Both negative tests replay real measured traces rather than invented
++# ones, because both false positives look perfectly reasonable in the abstract.
++#
++#   1. THE DEBOUNCE TROUGH (test 1). Auto-push debounces on
++#      `dolt.auto-push-interval`, so a HEALTHY store sits with
++#      `last_commit != head` for up to a full interval on every sawtooth trough.
++#      Replays winnow 14:08-14:15, sampled once a minute on a recovered store
++#      with no manual push, and requires silence across all eight samples. A
++#      naive "alert when last_commit != head" check fires on six of them.
++#
++#   2. THE LYING WATERMARK (test 2b, gcp-llja). bd records auto-push FAILURE
++#      whenever its `dolt.auto-push-timeout` fires — including on pushes that
++#      complete server-side moments later — so `last_commit` freezes
++#      permanently on any store whose pushes outrun that timer, while the remote
++#      keeps advancing. Replays winnow 00:16-00:56, where the watermark sat
++#      frozen for 40 minutes as remotes/origin/main moved in lockstep with
++#      last_push. A watermark-only check calls that an 1845s outage and pages
++#      CRITICAL forever. The fix is to decide from the remote's actual position;
++#      test 2c pins that the verdict turns on the remote and nothing else.
+ #
+ # Run: bash gastown/tests/test_dolt_push_state_check.sh
+ set -euo pipefail
+@@ -18,6 +31,12 @@ SCRIPT="$ROOT/gastown/assets/scripts/dolt-push-state-check.sh"
+ 
+ PASS=0
+ FAIL=0
++# FAIL count as of the last verdict. `pass` reports only when nothing has
++# tripped since — otherwise a test that failed four assertions still prints an
++# "ok:" line underneath them, which is the same class of misleading green this
++# suite exists to prevent. Keeping the gate inside `pass` means every test gets
++# it, including ones added later that forget to ask for it.
++LAST_VERDICT_FAIL=0
+ 
+ fail() {
+     echo "FAIL: $*" >&2
+@@ -25,6 +44,10 @@ fail() {
+ }
+ 
+ pass() {
++    if [ "$FAIL" -ne "$LAST_VERDICT_FAIL" ]; then
++        LAST_VERDICT_FAIL="$FAIL"
++        return 0
++    fi
+     echo "  ok: $*"
+     PASS=$((PASS + 1))
+ }
+@@ -33,6 +56,12 @@ pass() {
+ # A stub `gc` answers the only two calls the detector makes:
+ #   gc rig list --json          -> $GC_RIGS_JSON
+ #   gc bd sql -C <path> --json  -> $GC_SQL_DIR/<basename of path>.json
++# The detector issues TWO distinct queries per suspicious scope — the watermark
++# sweep against dolt_log, then the ground-truth read of the remote tracking ref
++# out of dolt_remote_branches — so the stub dispatches on the query text and
++# serves `<name>.remote.json` for the second. A scope with no `.remote.json`
++# fixture has never had its remote consulted, which is itself an assertion:
++# the healthy path must not pay for the extra round trip.
+ # Every invocation is appended to $GC_ARGV_LOG so tests can assert HOW the store
+ # was reached — the endpoint-agnostic `-C <scope path>` form, and never
+ # `gc dolt health`.
+@@ -50,12 +79,16 @@ case "$1" in
+         # Locate the -C value; the detector must always scope the query to a path.
+         scope=""
+         prev=""
++        query=""
+         for arg in "$@"; do
+             [ "$prev" = "-C" ] && scope="$arg"
++            case "$arg" in *dolt_log*|*dolt_remote_branches*) query="$arg" ;; esac
+             prev="$arg"
+         done
+         [ -n "$scope" ] || { echo "stub gc bd sql called without -C" >&2; exit 9; }
+-        result="$GC_SQL_DIR/$(basename "$scope").json"
++        suffix=""
++        case "$query" in *dolt_remote_branches*) suffix=".remote" ;; esac
++        result="$GC_SQL_DIR/$(basename "$scope")$suffix.json"
+         if [ -f "$result" ]; then
+             cat "$result"
+         else
+@@ -105,15 +138,17 @@ rigs_json() {
+     printf '%s]}' "$out"
+ }
+ 
+-# store_result <sql-dir> <name> <watermark_found> <unpushed> <age>
+-# Stands in for what the scope's own dolt_log reports. An empty age emits SQL
+-# NULL, which is what a converged store returns for MIN(date) over no rows.
++# store_result <sql-dir> <name> <watermark_found> <unpushed> <age> [branch]
++# Stands in for what the scope's own dolt_log reports, measured against the
++# push-state watermark. An empty age emits SQL NULL, which is what a converged
++# store returns for MIN(date) over no rows.
+ store_result() {
+-    local dir="$1" name="$2" found="$3" unpushed="$4" age="${5:-}"
++    local dir="$1" name="$2" found="$3" unpushed="$4" age="${5:-}" branch="${6:-main}"
+     mkdir -p "$dir"
+     cat >"$dir/$name.json" <<JSON
+ [
+   {
++    "branch": "$branch",
+     "watermark_found": $found,
+     "unpushed_count": $unpushed,
+     "oldest_unpushed_age_s": ${age:-null}
+@@ -122,6 +157,32 @@ store_result() {
+ JSON
+ }
+ 
++# remote_result <sql-dir> <name> <remote_hash> <head_found> <unpushed> <age>
++# Stands in for where remotes/origin/<branch> ACTUALLY is — the ground truth the
++# detector consults before alerting. unpushed=0 means the remote is at local
++# head, i.e. pushes are landing whatever push-state claims.
++remote_result() {
++    local dir="$1" name="$2" hash="$3" found="$4" unpushed="$5" age="${6:-}"
++    mkdir -p "$dir"
++    cat >"$dir/$name.remote.json" <<JSON
++[
++  {
++    "remote_hash": "$hash",
++    "remote_head_found": $found,
++    "remote_unpushed_count": $unpushed,
++    "remote_unpushed_age_s": ${age:-null}
++  }
++]
++JSON
++}
++
++# no_remote_ref <sql-dir> <name> — the store has no such tracking ref at all;
++# Dolt returns an empty result set.
++no_remote_ref() {
++    mkdir -p "$1"
++    printf '[]\n' >"$1/$2.remote.json"
++}
++
+ # run_check <city-root> <sql-dir> <rigs-json-file> <argv-log> — returns the
+ # detector's JSON-lines output.
+ run_check() {
+@@ -178,9 +239,10 @@ test_healthy_sawtooth_never_fires() {
+     [ "$fired" -eq 0 ] && pass "healthy 14:08-14:15 sawtooth trough stays silent across all 8 samples"
+ }
+ 
+-# ── 2. A frozen watermark past the threshold MUST fire ───────────────────────
++# ── 2. A genuinely-behind remote past the threshold MUST fire ────────────────
+ # The winnow outage shape: `last_push` keeps advancing while `last_commit` stays
+-# put, so unpushed commits pile up and the oldest ages without bound.
++# put, so unpushed commits pile up and the oldest ages without bound — and the
++# remote ref is stuck right alongside, because the pushes really are failing.
+ test_sustained_divergence_fires() {
+     local city="$SCRATCH/outage" sql="$SCRATCH/outage-sql" rigs="$SCRATCH/outage-rigs.json"
+     local log="$SCRATCH/outage-argv.log"
+@@ -188,29 +250,188 @@ test_sustained_divergence_fires() {
+     make_scope "$city" winnow "v7369kk5kh68bo5lv6ctal41bhppdnpf"
+     rigs_json "$city" winnow >"$rigs"
+     store_result "$sql" winnow 1 412 64800   # 18h frozen, the real outage duration
++    # The remote never moved either — a real outage, not a lying watermark.
++    remote_result "$sql" winnow "v7369kk5kh68bo5lv6ctal41bhppdnpf" 1 412 64800
+ 
+     local out
+     out=$(run_check "$city" "$sql" "$rigs" "$log")
+     [ "$(verdict_for "$out" winnow)" = "STALE" ] ||
+-        fail "an 18h-frozen last_commit did not report STALE"
++        fail "an 18h-behind remote did not report STALE"
+     printf '%s' "$out" | jq -e 'select(.scope=="winnow") | .detail | test("v7369kk5kh68bo5lv6ctal41bhppdnpf")' >/dev/null ||
+         fail "the STALE alert does not name the frozen commit"
+     printf '%s' "$out" | jq -e 'select(.scope=="winnow") | .oldest_unpushed_age_s == 64800' >/dev/null ||
+         fail "the STALE alert does not carry the measured age"
+-    pass "sustained divergence (18h frozen watermark) reports STALE and names the frozen commit"
++    pass "sustained divergence (18h behind remote) reports STALE and names the frozen commit"
+ 
+-    # Just below the line stays quiet: the boundary is >= threshold, not >.
++    # Just below the line stays quiet: the boundary is >= threshold, not >. The
++    # 899s case never reaches the remote query — the cheap filter answers it.
+     store_result "$sql" winnow 1 3 899
+     out=$(run_check "$city" "$sql" "$rigs" "$log")
+     [ "$(verdict_for "$out" winnow)" = "OK" ] ||
+         fail "age 899s (one second under the 900s threshold) wrongly fired"
+     store_result "$sql" winnow 1 3 900
++    remote_result "$sql" winnow "v7369kk5kh68bo5lv6ctal41bhppdnpf" 1 3 900
+     out=$(run_check "$city" "$sql" "$rigs" "$log")
+     [ "$(verdict_for "$out" winnow)" = "STALE" ] ||
+         fail "age 900s (exactly the threshold) did not fire"
+     pass "threshold boundary is exact: 899s OK, 900s STALE"
+ }
+ 
++# ── 2b. A frozen watermark over an ADVANCING remote must NOT fire ────────────
++# THE FALSE POSITIVE THIS CHECK EXISTS TO AVOID (gcp-llja).
++#
++# bd wraps auto-push in `dolt.auto-push-timeout` (default 30s) and takes the
++# failure path when it fires — recording last_push but NOT last_commit — even
++# though the push completes server-side afterwards. On winnow a routine push of
++# a ~7min backlog measured 41s against that 30s timeout, so essentially every
++# cycle recorded failure and the watermark froze permanently.
++#
++# Measured on winnow, 2026-08-14 00:16-00:56 UTC. last_commit frozen at
++# fqvpipur… (dated 00:16:02) for 40 minutes across every sample, while the
++# remote advanced on its own, unaided, in lockstep with last_push:
++#
++#   sample    last_push  remote_head  local_head
++#   00:48:41  00:45:20   4o9gc4ck…    dlnl2o5o…
++#   00:49:55  00:45:20   4o9gc4ck…    hdh653nh…
++#   00:51:14  00:50:57   755lvh7f…    luf5m0rd…
++#   00:52:31  00:50:57   755lvh7f…    p01ltfgu…
++#
++# The watermark-only check reported STALE 1845 900 "auto-push not landing: 135
++# commit(s) unpushed" at that exact moment. It was false — the data was on the
++# remote, current to within one debounce interval — and it would have paged the
++# mayor CRITICAL forever.
++test_frozen_watermark_over_live_remote_does_not_fire() {
++    local city="$SCRATCH/frozen" sql="$SCRATCH/frozen-sql" rigs="$SCRATCH/frozen-rigs.json"
++    local log="$SCRATCH/frozen-argv.log"
++    mkdir -p "$city"
++    make_scope "$city" winnow "fqvpipurtkajfdpcbgic5dquran54u57"
++    rigs_json "$city" winnow >"$rigs"
++
++    # Each sample: watermark age (frozen, growing past 1845s) paired with where
++    # the remote actually is. The remote trails local head by at most a debounce
++    # interval — commits keep arriving while a push is in flight.
++    #   "<watermark_unpushed> <watermark_age> <remote_hash> <remote_unpushed> <remote_age>"
++    local samples=(
++        "125 1719 4o9gc4ckqjjcvo0dvjnhs4rvgm0mek9j 2 74"
++        "129 1793 4o9gc4ckqjjcvo0dvjnhs4rvgm0mek9j 4 148"
++        "133 1872 755lvh7f3f4pbn8vknv5okrn6ho9vejh 1 17"
++        "135 1949 755lvh7f3f4pbn8vknv5okrn6ho9vejh 3 94"
++    )
++    local sample fired=0
++    for sample in "${samples[@]}"; do
++        # shellcheck disable=SC2086
++        set -- $sample
++        : >"$log"
++        store_result "$sql" winnow 1 "$1" "$2"
++        remote_result "$sql" winnow "$3" 1 "$4" "$5"
++        local out v
++        out=$(run_check "$city" "$sql" "$rigs" "$log")
++        v=$(verdict_for "$out" winnow)
++        [ "$v" = "FROZEN" ] || { fired=1; fail "frozen-watermark sample (watermark age $2, remote age $5) reported $v, want FROZEN"; }
++    done
++    [ "$fired" -eq 0 ] &&
++        pass "a frozen watermark over a remote that is current reports FROZEN, never STALE"
++
++    # The alert-worthy fact must be legible: the remote's position, and that bd
++    # is the thing that is broken here — not the push path.
++    store_result "$sql" winnow 1 135 1845
++    remote_result "$sql" winnow "755lvh7f3f4pbn8vknv5okrn6ho9vejh" 1 0 ""
++    local out
++    out=$(run_check "$city" "$sql" "$rigs" "$log")
++    [ "$(verdict_for "$out" winnow)" = "FROZEN" ] ||
++        fail "a remote sitting exactly at local head did not report FROZEN"
++    printf '%s' "$out" | jq -e 'select(.scope=="winnow") | .detail | test("755lvh7f3f4pbn8vknv5okrn6ho9vejh")' >/dev/null ||
++        fail "the FROZEN record does not name the remote head it verified against"
++    printf '%s' "$out" | jq -e 'select(.scope=="winnow") | .detail | test("auto-push-timeout")' >/dev/null ||
++        fail "the FROZEN record does not point at the actual cause (bd's auto-push-timeout)"
++    ! printf '%s' "$out" | jq -e 'select(.scope=="winnow") | .detail | test("not landing")' >/dev/null ||
++        fail "the FROZEN record still claims auto-push is not landing"
++    pass "the FROZEN record names the verified remote head and blames bd's watermark, not the push"
++}
++
++# ── 2c. The verdict is drawn from the remote, not from watermark heuristics ──
++# Same frozen watermark, same age, same everything on disk — only the remote's
++# position differs. The verdicts must differ with it. This is what makes the
++# distinction structural rather than a guess about how old a watermark is.
++test_verdict_follows_the_remote_position() {
++    local city="$SCRATCH/pivot" sql="$SCRATCH/pivot-sql" rigs="$SCRATCH/pivot-rigs.json"
++    local log="$SCRATCH/pivot-argv.log"
++    mkdir -p "$city"
++    make_scope "$city" liverig "fqvpipurtkajfdpcbgic5dquran54u57"
++    make_scope "$city" deadrig "fqvpipurtkajfdpcbgic5dquran54u57"
++    rigs_json "$city" liverig deadrig >"$rigs"
++    store_result "$sql" liverig 1 135 1845
++    store_result "$sql" deadrig 1 135 1845
++    remote_result "$sql" liverig "755lvh7f3f4pbn8vknv5okrn6ho9vejh" 1 2 74
++    remote_result "$sql" deadrig "fqvpipurtkajfdpcbgic5dquran54u57" 1 135 1845
++
++    local out
++    out=$(run_check "$city" "$sql" "$rigs" "$log")
++    [ "$(verdict_for "$out" liverig)" = "FROZEN" ] ||
++        fail "identical watermarks: the scope whose remote is current did not report FROZEN"
++    [ "$(verdict_for "$out" deadrig)" = "STALE" ] ||
++        fail "identical watermarks: the scope whose remote is behind did not report STALE"
++    printf '%s' "$out" | jq -e 'select(.scope=="deadrig") | .oldest_unpushed_age_s == 1845' >/dev/null ||
++        fail "the STALE age is not the remote-derived one"
++    pass "identical watermarks yield FROZEN vs STALE purely on the remote's position"
++}
++
++# ── 2d. An unverifiable remote is UNKNOWN, never a CRITICAL page ─────────────
++# The tracking ref is a local ref: it can be missing (nothing has ever pushed or
++# fetched it), name a commit this store does not have (remote ahead/diverged),
++# or be unreadable. None of those establish that auto-push has stopped landing,
++# and the whole point of this bead is that an unestablished inference must not
++# page. They surface as UNKNOWN — a finding the patrol investigates.
++test_unverifiable_remote_is_unknown_not_stale() {
++    local city="$SCRATCH/noref" sql="$SCRATCH/noref-sql" rigs="$SCRATCH/noref-rigs.json"
++    local log="$SCRATCH/noref-argv.log"
++    mkdir -p "$city"
++    make_scope "$city" norefrig "fqvpipurtkajfdpcbgic5dquran54u57"
++    make_scope "$city" aheadrig "fqvpipurtkajfdpcbgic5dquran54u57"
++    make_scope "$city" unreadrig "fqvpipurtkajfdpcbgic5dquran54u57"
++    rigs_json "$city" norefrig aheadrig unreadrig >"$rigs"
++    store_result "$sql" norefrig 1 135 1845
++    store_result "$sql" aheadrig 1 135 1845
++    store_result "$sql" unreadrig 1 135 1845
++    no_remote_ref "$sql" norefrig
++    remote_result "$sql" aheadrig "9zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz" 0 0
++    # unreadrig: no .remote.json fixture -> the stub exits non-zero, as an
++    # endpoint that dies between the two queries does.
++
++    local out
++    out=$(run_check "$city" "$sql" "$rigs" "$log")
++    [ "$(verdict_for "$out" norefrig)" = "UNKNOWN" ] ||
++        fail "a missing remote tracking ref did not report UNKNOWN"
++    [ "$(verdict_for "$out" aheadrig)" = "UNKNOWN" ] ||
++        fail "a remote head absent from the local log did not report UNKNOWN"
++    [ "$(verdict_for "$out" unreadrig)" = "UNKNOWN" ] ||
++        fail "an unreadable remote position did not report UNKNOWN"
++    pass "a remote position that cannot be established reports UNKNOWN, never STALE"
++}
++
++# ── 2e. The healthy path must not pay for the cross-check ────────────────────
++# The remote read is the expensive half (a second round trip per scope), and it
++# is only ever justified once the free watermark filter has flagged the scope.
++# A store inside the debounce window must be answered without it.
++test_healthy_scope_never_queries_the_remote() {
++    local city="$SCRATCH/cheap" sql="$SCRATCH/cheap-sql" rigs="$SCRATCH/cheap-rigs.json"
++    local log="$SCRATCH/cheap-argv.log"
++    mkdir -p "$city"
++    make_scope "$city" healthyrig "fqvpipurtkajfdpcbgic5dquran54u57"
++    rigs_json "$city" healthyrig >"$rigs"
++    store_result "$sql" healthyrig 1 2 140
++    remote_result "$sql" healthyrig "755lvh7f3f4pbn8vknv5okrn6ho9vejh" 1 0 ""
++    : >"$log"
++
++    local out
++    out=$(run_check "$city" "$sql" "$rigs" "$log")
++    [ "$(verdict_for "$out" healthyrig)" = "OK" ] ||
++        fail "a scope inside the debounce window did not report OK"
++    ! grep -F 'dolt_remote_branches' "$log" >/dev/null ||
++        fail "the remote was queried for a scope the cheap filter already cleared"
++    pass "a scope inside the debounce window is answered without reading the remote"
++}
++
+ # ── 3. The interval comes from config, never hardcoded ───────────────────────
+ # Same 200s age, two scopes: one with a 1m interval (threshold 180s -> STALE),
+ # one on the 5m default (threshold 900s -> OK). A hardcoded 5m would miss the
+@@ -224,6 +445,9 @@ test_interval_is_read_from_config() {
+     rigs_json "$city" fastrig defaultrig >"$rigs"
+     store_result "$sql" fastrig 1 5 200
+     store_result "$sql" defaultrig 1 5 200
++    # fastrig's remote is behind by the same 200s, so the verdict turns purely
++    # on the threshold. defaultrig never reaches the remote query.
++    remote_result "$sql" fastrig "v7369kk5kh68bo5lv6ctal41bhppdnpf" 1 5 200
+ 
+     local out
+     out=$(run_check "$city" "$sql" "$rigs" "$log")
+@@ -260,6 +484,7 @@ test_reaches_each_scope_by_its_own_path() {
+         "$(printf 'gc.endpoint_origin: explicit\ndolt.host: 127.0.0.1\ndolt.port: 3307')"
+     rigs_json "$city" winnow >"$rigs"
+     store_result "$sql" winnow 1 412 64800
++    remote_result "$sql" winnow "v7369kk5kh68bo5lv6ctal41bhppdnpf" 1 412 64800
+     : >"$log"
+ 
+     local out
+@@ -324,6 +549,7 @@ test_sweep_continues_past_a_bad_scope() {
+     make_scope "$city" goodrig "v7369kk5kh68bo5lv6ctal41bhppdnpf"
+     rigs_json "$city" downrig badhash goodrig >"$rigs"
+     store_result "$sql" goodrig 1 412 64800
++    remote_result "$sql" goodrig "v7369kk5kh68bo5lv6ctal41bhppdnpf" 1 412 64800
+ 
+     local out rc=0
+     out=$(run_check "$city" "$sql" "$rigs" "$log") || rc=$?
+@@ -339,6 +565,10 @@ test_sweep_continues_past_a_bad_scope() {
+ 
+ test_healthy_sawtooth_never_fires
+ test_sustained_divergence_fires
++test_frozen_watermark_over_live_remote_does_not_fire
++test_verdict_follows_the_remote_position
++test_unverifiable_remote_is_unknown_not_stale
++test_healthy_scope_never_queries_the_remote
+ test_interval_is_read_from_config
+ test_reaches_each_scope_by_its_own_path
+ test_non_autopush_scopes_are_skipped
+-- 
+2.50.1 (Apple Git-155)
+
