@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 14 Aug 2026 13:21:31 -0400
+Subject: [PATCH 26/26] test(drift): route the new detector's own bd references
+ through gc (gcp-ex1s)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Self-review catch: tests/test_no_bare_bd_commands.py scans every tracked
+file, and it does not exempt sibling test modules the way it exempts
+itself. The three places the new detector *names* the broken invocation —
+the BD_LIST_SEARCH comment, the bd_list_search_violations docstring, and
+the violation message — each wrote `bd list` bare, so adding the detector
+tripped the bare-bd scanner three times.
+
+Prefix all three with `gc`. They are prose naming a command, not calls, so
+this is a wording change only; gc_routes_bd() accepts `gc bd list` and the
+BD_LIST_SEARCH pattern itself is unaffected (it spells the gap `\s+`, which
+the bare-bd regex does not match).
+---
+ tests/test_prompt_formula_command_drift.py | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/tests/test_prompt_formula_command_drift.py b/tests/test_prompt_formula_command_drift.py
+index 573d341..f0ec319 100644
+--- a/tests/test_prompt_formula_command_drift.py
++++ b/tests/test_prompt_formula_command_drift.py
+@@ -34,7 +34,7 @@ FENCE_CLOSE = re.compile(r"^\s*```\s*$")
+ 
+ POOL_RETURN_ASSIGNEE = re.compile(r"""--assignee=(?:""|'')""")
+ 
+-# `bd list ... --search`, with no backtick in between. The backtick clause is
++# `gc bd list ... --search`, with no backtick in between. The backtick clause is
+ # what separates an invocation from the prose warning against one: a sentence
+ # naming the broken flag puts `gc bd list` and `--search` in two different
+ # inline-code spans, while a real command — fenced, or quoted whole in a
+@@ -187,7 +187,7 @@ def bail_without_drain_violations(path: Path, text: str) -> list[str]:
+ 
+ 
+ def bd_list_search_violations(path: Path, text: str) -> list[str]:
+-    """`bd list` has no `--search` flag, and the failure mode is invisible.
++    """`gc bd list` has no `--search` flag, and the failure mode is invisible.
+ 
+     `gc bd list --search "<query>"` does not search weakly — it never runs.
+     It exits non-zero with ``unknown flag: --search``, and piped to jq or head
+@@ -208,7 +208,7 @@ def bd_list_search_violations(path: Path, text: str) -> list[str]:
+         if not BD_LIST_SEARCH.search(command):
+             continue
+         violations.append(
+-            f"{path.relative_to(REPO_ROOT)}:{number}: bd list has no --search flag "
++            f"{path.relative_to(REPO_ROOT)}:{number}: gc bd list has no --search flag "
+             "(use `gc bd search` or `gc bd list --title-contains`)"
+         )
+     return violations
+-- 
+2.50.1 (Apple Git-155)
+
