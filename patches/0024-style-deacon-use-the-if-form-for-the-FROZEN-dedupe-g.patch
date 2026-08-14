@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 14 Aug 2026 13:11:01 -0400
+Subject: [PATCH 24/24] style(deacon): use the if-form for the FROZEN dedupe
+ guard (gcp-llja)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Self-review touch-up. Step 3b's dedupe guard was written as
+`[ -f "$MARK" ] && continue`, while the STALE escalation directly above it —
+the block this one is modelled on — uses `if [ -f "$MARK" ]; then ... fi`.
+These blocks are prose the deacon copies and runs, so the two guards reading
+differently invites the reader to wonder whether the difference is meaningful.
+It is not; match the neighbour.
+---
+ gastown/formulas/mol-deacon-patrol.toml | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/gastown/formulas/mol-deacon-patrol.toml b/gastown/formulas/mol-deacon-patrol.toml
+index 297e9b2..baaed4b 100644
+--- a/gastown/formulas/mol-deacon-patrol.toml
++++ b/gastown/formulas/mol-deacon-patrol.toml
+@@ -576,7 +576,7 @@ cycle commits a bead per cycle), and dedupe so it is said once per condition:
+ printf '%s\\n' "$RESULT" | jq -r 'select(.verdict == "FROZEN") | [.scope, .detail] | @tsv' |
+ while IFS=$'\\t' read -r SCOPE DETAIL; do
+     MARK="$GC_CITY/.gc/runtime/dolt-push-frozen-$SCOPE"
+-    [ -f "$MARK" ] && continue
++    if [ -f "$MARK" ]; then continue; fi
+     mkdir -p "$(dirname "$MARK")"
+     gc session nudge mayor/ "Dolt push-state watermark frozen on $SCOPE (pushes ARE landing; bd is recording success as failure). Raise dolt.auto-push-timeout in $SCOPE's .beads/config.yaml — until then auto-push outage detection is blind on that store. $DETAIL"
+     date -u +"%Y-%m-%dT%H:%M:%SZ" >"$MARK"
+-- 
+2.50.1 (Apple Git-155)
+
