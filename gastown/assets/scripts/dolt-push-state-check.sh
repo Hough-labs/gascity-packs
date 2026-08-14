@@ -39,15 +39,63 @@
 # false-positiving: when a first commit lands after hours of quiet, the age
 # starts at ~0 and only crosses the threshold if pushes genuinely stop landing.
 #
+# BUT THE WATERMARK IS NOT GROUND TRUTH — it only says what bd BELIEVES.
+#
+# bd wraps each auto-push in `dolt.auto-push-timeout` (default 30s). When that
+# timer fires bd takes the failure path — recording last_push but NOT
+# last_commit — even though the push COMPLETES server-side moments later. So on
+# any store whose pushes routinely outrun the timeout, last_commit freezes
+# permanently while the remote keeps advancing. Measured on winnow 2026-08-14:
+# last_commit frozen at fqvpipur… for 40 minutes while remotes/origin/main moved
+# 4o9gc4ck… -> 755lvh7f… in lockstep with last_push, unaided. A watermark-only
+# check reports "auto-push not landing" there forever, and the escalation path
+# pages the mayor CRITICAL forever with it. That inference was wrong: the data
+# was on the remote, current to within one debounce interval.
+#
+# So the watermark is kept only as the cheap FIRST FILTER — it is free, and it
+# correctly flags every suspicious store — and the verdict is then drawn from
+# the remote's ACTUAL position, read out of this store's own tracking ref:
+#
+#     SELECT hash FROM dolt_remote_branches WHERE name = 'remotes/origin/<branch>'
+#
+# Alert only when the REMOTE is genuinely behind local head by >= threshold.
+# When the remote is current but the watermark is frozen, that is a real (and
+# different) condition — bd's own change-detection is broken on that store — so
+# it gets its own verdict rather than being reported as an outage or as OK.
+#
+# ON THE STALENESS OF THE TRACKING REF — a deliberate decision, not an oversight.
+#
+# `dolt_remote_branches` is a LOCAL tracking ref: it reflects the last push or
+# fetch this store performed, not a live read of the remote. This check does NOT
+# fetch. Two reasons, and the second is the one that makes it safe:
+#
+#   1. `dolt push` updates the tracking ref itself, so on a store that
+#      auto-pushes the ref advances on its own — that is exactly what the winnow
+#      trace above shows, with no fetch by the observer.
+#   2. The failure direction is safe. A tracking ref that is stale reads as "the
+#      remote is BEHIND", which biases toward STALE. Staleness can therefore
+#      only make this check alert MORE, never less — the real-outage path in
+#      acceptance is never weakened by declining to fetch.
+#
+# The cost of that choice: a store that has genuinely stopped pushing AND never
+# fetches will show a frozen tracking ref, which is precisely the alert we want.
+# A store whose pushes land but which never updates the ref by any route does
+# not exist — landing a push is what updates it.
+#
 # Verdicts (one record per scope, on stdout):
-#   OK      converged, or diverged but still inside the debounce window
-#   STALE   sustained divergence >= threshold — THE ALERT
-#   SKIP    scope does not auto-push (no push-state.json, or auto-push disabled)
-#   UNKNOWN store unreadable, or last_commit absent from this store's log
+#   OK       converged, or diverged but still inside the debounce window
+#   STALE    the REMOTE is >= threshold behind local head — THE ALERT
+#   FROZEN   remote is current, but push-state's last_commit is stuck: pushes
+#            ARE landing while bd records failure (auto-push-timeout too low).
+#            Not an outage; bd's change-detection on that store is broken.
+#   SKIP     scope does not auto-push (no push-state.json, or auto-push disabled)
+#   UNKNOWN  store unreadable, last_commit absent from this store's log, or the
+#            remote's position could not be established
 #
 # Env:
 #   GC_PUSH_STALE_MULTIPLIER  threshold multiple of the interval (default 3)
 #   GC_PUSH_DEFAULT_INTERVAL  fallback interval seconds when unconfigured (300)
+#   GC_PUSH_REMOTE            remote whose tracking ref is ground truth (origin)
 #
 # Usage:
 #   dolt-push-state-check.sh            # TSV: scope verdict age_s threshold_s detail
@@ -106,10 +154,19 @@ fi
 
 MULTIPLIER="${GC_PUSH_STALE_MULTIPLIER:-3}"
 DEFAULT_INTERVAL="${GC_PUSH_DEFAULT_INTERVAL:-300}"
+# bd auto-pushes to `origin`; every scope in this city has exactly that one
+# remote. Overridable rather than hardcoded so a differently-wired store reports
+# UNKNOWN by configuration instead of by silent mismatch.
+REMOTE="${GC_PUSH_REMOTE:-origin}"
 
 # Dolt commit hashes are 32 base32 chars. Validated before interpolation: the
 # value comes off disk, and it lands inside a SQL string literal.
 HASH_RE='^[0-9a-z]{32}$'
+
+# Branch and remote names reach SQL inside a string literal too, and both come
+# from outside this script (the store's active_branch(), the environment).
+# git-legal branch characters only — no quote can survive this.
+REF_RE='^[A-Za-z0-9._/-]+$'
 
 # parse_duration <value> — Go-style duration ("5m", "300s", "2h") or bare
 # seconds, to seconds. Echoes nothing when unparseable so the caller can fall
@@ -220,7 +277,10 @@ sweep() {
     # and mixing them yields an age off by the server's UTC offset (negative ages
     # west of Greenwich). The comparison stays server-side so it is the same clock
     # that wrote the commit dates.
+    # active_branch() rides along on the first query so the remote cross-check
+    # below costs no extra round trip to learn which tracking ref to read.
     QUERY="SELECT
+      active_branch() AS branch,
       $FOUND_EXPR AS watermark_found,
       (SELECT COUNT(*) FROM dolt_log WHERE $UNPUSHED_WHERE) AS unpushed_count,
       TIMESTAMPDIFF(SECOND,
@@ -232,6 +292,7 @@ sweep() {
       continue
     fi
 
+    BRANCH=$(printf '%s' "$RESULT" | jq -r 'if type == "array" then (.[0].branch // empty) else empty end' 2>/dev/null || echo "")
     FOUND=$(printf '%s' "$RESULT" | jq -r 'if type == "array" then .[0].watermark_found else empty end' 2>/dev/null || echo "")
     UNPUSHED=$(printf '%s' "$RESULT" | jq -r 'if type == "array" then .[0].unpushed_count else empty end' 2>/dev/null || echo "")
     AGE=$(printf '%s' "$RESULT" | jq -r 'if type == "array" then (.[0].oldest_unpushed_age_s // empty) else empty end' 2>/dev/null || echo "")
@@ -268,12 +329,99 @@ sweep() {
       continue
     fi
 
-    if [ "$AGE" -ge "$THRESHOLD" ]; then
-      emit "$NAME" STALE "$AGE" "$THRESHOLD" \
-        "auto-push not landing: $UNPUSHED commit(s) unpushed, oldest ${AGE}s >= ${THRESHOLD}s (${MULTIPLIER}x ${INTERVAL}s interval); last_commit frozen at $LAST_COMMIT, last_push $LAST_PUSH"
-    else
+    if [ "$AGE" -lt "$THRESHOLD" ]; then
       emit "$NAME" OK "$AGE" "$THRESHOLD" \
         "diverged but inside the debounce window: $UNPUSHED commit(s) unpushed, oldest ${AGE}s < ${THRESHOLD}s"
+      continue
+    fi
+
+    # ── Past the cheap filter. Now establish GROUND TRUTH before alerting. ──
+    # Everything above is bd's opinion of where the remote is. bd records that
+    # opinion as a FAILURE whenever its auto-push-timeout fires, including on
+    # pushes that land — so a frozen watermark past the threshold is suspicion,
+    # not evidence. The remote's real position decides the verdict.
+    WATERMARK_NOTE="watermark says $UNPUSHED commit(s) unpushed, oldest ${AGE}s >= ${THRESHOLD}s (${MULTIPLIER}x ${INTERVAL}s interval); last_commit frozen at $LAST_COMMIT, last_push $LAST_PUSH"
+
+    if ! [[ "$BRANCH" =~ $REF_RE ]] || ! [[ "$REMOTE" =~ $REF_RE ]]; then
+      emit "$NAME" UNKNOWN "$AGE" "$THRESHOLD" \
+        "cannot name this store's tracking ref (branch='$BRANCH' remote='$REMOTE'); remote position unverifiable, so not alerting on the watermark alone — $WATERMARK_NOTE"
+      continue
+    fi
+    REMOTE_REF="remotes/$REMOTE/$BRANCH"
+
+    # Same shape as the watermark query, with the remote's head as the
+    # reference point instead of push-state's. No rows means this store has no
+    # such tracking ref at all.
+    REMOTE_QUERY="SELECT
+      r.hash AS remote_hash,
+      (SELECT COUNT(*) FROM dolt_log WHERE commit_hash = r.hash) AS remote_head_found,
+      (SELECT COUNT(*) FROM dolt_log
+        WHERE date > (SELECT date FROM dolt_log WHERE commit_hash = r.hash)) AS remote_unpushed_count,
+      TIMESTAMPDIFF(SECOND,
+        (SELECT MIN(date) FROM dolt_log
+          WHERE date > (SELECT date FROM dolt_log WHERE commit_hash = r.hash)),
+        UTC_TIMESTAMP()) AS remote_unpushed_age_s
+      FROM dolt_remote_branches r WHERE r.name = '$REMOTE_REF'"
+
+    if ! REMOTE_RESULT=$(gc bd sql -C "$PATH_" --json "$REMOTE_QUERY" 2>/dev/null); then
+      emit "$NAME" UNKNOWN "$AGE" "$THRESHOLD" \
+        "could not read $REMOTE_REF from this store; remote position unverifiable — $WATERMARK_NOTE"
+      continue
+    fi
+
+    if ! printf '%s' "$REMOTE_RESULT" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+      emit "$NAME" UNKNOWN "$AGE" "$THRESHOLD" \
+        "no $REMOTE_REF tracking ref in this store — nothing has ever pushed or fetched it, so whether pushes are landing cannot be established here — $WATERMARK_NOTE"
+      continue
+    fi
+
+    REMOTE_HASH=$(printf '%s' "$REMOTE_RESULT" | jq -r '.[0].remote_hash // empty' 2>/dev/null || echo "")
+    REMOTE_FOUND=$(printf '%s' "$REMOTE_RESULT" | jq -r '.[0].remote_head_found' 2>/dev/null || echo "")
+    REMOTE_UNPUSHED=$(printf '%s' "$REMOTE_RESULT" | jq -r '.[0].remote_unpushed_count' 2>/dev/null || echo "")
+    REMOTE_AGE=$(printf '%s' "$REMOTE_RESULT" | jq -r '.[0].remote_unpushed_age_s // empty' 2>/dev/null || echo "")
+
+    if ! [[ "$REMOTE_FOUND" =~ ^[0-9]+$ ]] || ! [[ "$REMOTE_UNPUSHED" =~ ^[0-9]+$ ]]; then
+      emit "$NAME" UNKNOWN "$AGE" "$THRESHOLD" \
+        "unreadable $REMOTE_REF position — $WATERMARK_NOTE"
+      continue
+    fi
+
+    # The remote head is not in this store's log: the remote holds commits this
+    # store does not, so local is not "ahead" and the age math has no meaning.
+    # Whatever that is, it is not auto-push failing to land.
+    if [ "$REMOTE_FOUND" -eq 0 ]; then
+      emit "$NAME" UNKNOWN "$AGE" "$THRESHOLD" \
+        "$REMOTE_REF is at $REMOTE_HASH, which is absent from this store's dolt_log (remote ahead of, or diverged from, local) — $WATERMARK_NOTE"
+      continue
+    fi
+
+    if [ "$REMOTE_UNPUSHED" -eq 0 ]; then
+      emit "$NAME" FROZEN 0 "$THRESHOLD" \
+        "pushes ARE landing: $REMOTE_REF is at local head ($REMOTE_HASH), but push-state disagrees — $WATERMARK_NOTE. bd is recording success as failure on this store; the usual cause is dolt.auto-push-timeout firing on a push that completes anyway."
+      continue
+    fi
+
+    if ! [[ "$REMOTE_AGE" =~ ^-?[0-9]+$ ]]; then
+      emit "$NAME" UNKNOWN "$AGE" "$THRESHOLD" \
+        "$REMOTE_REF is behind local head but its age is unreadable — $WATERMARK_NOTE"
+      continue
+    fi
+
+    if [ "$REMOTE_AGE" -lt 0 ]; then
+      emit "$NAME" UNKNOWN "$REMOTE_AGE" "$THRESHOLD" \
+        "negative age against $REMOTE_REF (clock skew between commit dates and server UTC) — $WATERMARK_NOTE"
+      continue
+    fi
+
+    if [ "$REMOTE_AGE" -ge "$THRESHOLD" ]; then
+      emit "$NAME" STALE "$REMOTE_AGE" "$THRESHOLD" \
+        "auto-push not landing: $REMOTE_REF is $REMOTE_UNPUSHED commit(s) behind local head, oldest ${REMOTE_AGE}s >= ${THRESHOLD}s (${MULTIPLIER}x ${INTERVAL}s interval); remote head $REMOTE_HASH, last_commit $LAST_COMMIT, last_push $LAST_PUSH"
+    else
+      # The watermark tripped the filter but the remote is current to within the
+      # debounce window — the same trough the OK branch above describes, seen
+      # from the ref that actually matters.
+      emit "$NAME" FROZEN "$REMOTE_AGE" "$THRESHOLD" \
+        "pushes ARE landing: $REMOTE_REF is only $REMOTE_UNPUSHED commit(s) behind local head, oldest ${REMOTE_AGE}s < ${THRESHOLD}s, but push-state disagrees — $WATERMARK_NOTE. bd is recording success as failure on this store; the usual cause is dolt.auto-push-timeout firing on a push that completes anyway."
     fi
   done < <(printf '%s' "$RIGS_JSON" | jq -r '.rigs[] | select(.suspended != true) | [.name, .path] | @tsv')
 }

@@ -502,8 +502,9 @@ printf '%s\\n' "$RESULT"
 |---------|---------|--------|
 | `OK` | Converged, or diverged but still inside the debounce window | None |
 | `SKIP` | Scope does not auto-push | None |
-| `STALE` | Sustained divergence past the threshold | Escalate (step 3) |
-| `UNKNOWN` | Store unreadable, or `last_commit` absent from its log | Investigate; never read as healthy |
+| `STALE` | The REMOTE is >= threshold behind local head | Escalate (step 3) |
+| `FROZEN` | Remote is current, but `push-state.json` says otherwise: pushes ARE landing while bd records failure | Report (step 3b); NOT an outage |
+| `UNKNOWN` | Store unreadable, `last_commit` absent from its log, or the remote's position could not be established | Investigate; never read as healthy |
 
 **Do not re-derive the threshold yourself, and do not alert on divergence.**
 `last_commit != head` is NORMAL: auto-push debounces on
@@ -513,6 +514,20 @@ to a full interval on every sawtooth trough. A measured healthy trace showed
 working correctly. The detector alerts on divergence that FAILS TO CONVERGE —
 the oldest unpushed commit older than 3x the configured interval — and it reads
 the interval from each scope's config rather than hardcoding 5m.
+
+**And do not treat `push-state.json` as ground truth — the detector no longer
+does.** bd wraps each auto-push in `dolt.auto-push-timeout` (default 30s) and
+takes the FAILURE path when that timer fires, recording `last_push` but not
+`last_commit`, even when the push completes server-side straight afterwards. On
+a store whose pushes routinely outrun the timeout the watermark therefore
+freezes permanently while the remote keeps advancing — measured on winnow
+2026-08-14, where `last_commit` sat frozen for 40 minutes as
+`remotes/origin/main` moved in lockstep with `last_push`. A watermark-only check
+calls that "auto-push not landing" and pages CRITICAL forever. So the detector
+uses the watermark only as a cheap first filter and then confirms against the
+scope's own `dolt_remote_branches` ref before emitting STALE. `FROZEN` is that
+confirmation coming back negative: the pushes are fine, bd's change-detection on
+that store is not.
 
 **Step 3: Escalate STALE scopes to mayor (CRITICAL), deduped.**
 
@@ -545,24 +560,60 @@ endpoint (read gc.endpoint_origin and dolt.host/dolt.port from its
 done
 ```
 
-**Step 4: Clear the marker when a scope recovers**, so the next outage escalates
-as a fresh CRITICAL rather than being silently downgraded to a nudge forever:
+**Step 3b: Report FROZEN scopes — nudge only, never CRITICAL.**
+
+A FROZEN scope is NOT down. Its data is reaching the remote; what is broken is
+bd's record of that fact, and the consequence is that the city's own outage
+detection is blind on that store — a real outage there would look identical to
+the state it is already in. Worth surfacing, worth fixing, not worth paging.
+
+The remedy is on the scope, not here: raise its `dolt.auto-push-timeout` in
+`.beads/config.yaml` so a routine push finishes inside the timer. Nudge (do not
+mail — this recurs every cycle until someone tunes the store, and a mail per
+cycle commits a bead per cycle), and dedupe so it is said once per condition:
 
 ```bash
-printf '%s\\n' "$RESULT" | jq -r 'select(.verdict == "OK") | .scope' |
-while read -r SCOPE; do
-    rm -f "$GC_CITY/.gc/runtime/dolt-push-escalated-$SCOPE"
+printf '%s\\n' "$RESULT" | jq -r 'select(.verdict == "FROZEN") | [.scope, .detail] | @tsv' |
+while IFS=$'\\t' read -r SCOPE DETAIL; do
+    MARK="$GC_CITY/.gc/runtime/dolt-push-frozen-$SCOPE"
+    [ -f "$MARK" ] && continue
+    mkdir -p "$(dirname "$MARK")"
+    gc session nudge mayor/ "Dolt push-state watermark frozen on $SCOPE (pushes ARE landing; bd is recording success as failure). Raise dolt.auto-push-timeout in $SCOPE's .beads/config.yaml — until then auto-push outage detection is blind on that store. $DETAIL"
+    date -u +"%Y-%m-%dT%H:%M:%SZ" >"$MARK"
 done
 ```
 
-**UNKNOWN is a finding, not a pass.** An unreadable store or a `last_commit` the
-store has never heard of is the same class of silence this step exists to break.
-Report it in the patrol log; escalate if it persists across cycles.
+**Step 4: Clear the markers when a scope recovers**, so the next outage escalates
+as a fresh CRITICAL rather than being silently downgraded to a nudge forever.
+
+A scope that goes STALE -> FROZEN has recovered as far as the outage marker is
+concerned — its pushes are landing again — so FROZEN clears the escalation
+marker too. It does NOT clear its own marker, or the frozen nudge would repeat
+every cycle:
+
+```bash
+printf '%s\\n' "$RESULT" | jq -r 'select(.verdict == "OK" or .verdict == "FROZEN") | .scope' |
+while read -r SCOPE; do
+    rm -f "$GC_CITY/.gc/runtime/dolt-push-escalated-$SCOPE"
+done
+printf '%s\\n' "$RESULT" | jq -r 'select(.verdict == "OK") | .scope' |
+while read -r SCOPE; do
+    rm -f "$GC_CITY/.gc/runtime/dolt-push-frozen-$SCOPE"
+done
+```
+
+**UNKNOWN is a finding, not a pass.** An unreadable store, a `last_commit` the
+store has never heard of, or a remote whose position could not be established is
+the same class of silence this step exists to break. Report it in the patrol log;
+escalate if it persists across cycles. Note the detector deliberately declines to
+alert on an unverifiable remote — an unproven outage must not page — so a
+persistent UNKNOWN is the only thing standing between a real outage and silence.
 
 **If everything is OK/SKIP:** log `Dolt push-state: OK` and move on.
 
 **Exit criteria:** Detector run for every active scope, STALE scopes escalated
-(deduped) and recovered scopes' markers cleared."""
+(deduped), FROZEN scopes nudged (deduped), and recovered scopes' markers
+cleared."""
 
 [[steps]]
 id = "system-health"
