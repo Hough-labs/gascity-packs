@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 14 Aug 2026 14:56:26 -0400
+Subject: [PATCH 28/28] fix(gastown): keep the bulk bead payload out of argv
+ (gcp-ntbf)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Self-review follow-up on the bulk read. Handing the bulk `gc bd show` result
+to the join as `--argjson` puts the entire payload — whole bead records,
+descriptions included — into jq's argv. Bead descriptions run to kilobytes
+apiece, so a rig with enough candidates to need reaping is exactly the rig
+that trips the limit: macOS ARG_MAX is 1MB (25 fat beads reproduce it locally
+with "Argument list too long"), and Linux caps a SINGLE argument at 128KB,
+which a real 81-worktree rig clears with room to spare.
+
+The failure is silent, which is what makes it worth a commit of its own: jq
+never runs, the join comes back empty, every candidate falls out of the loop,
+and the run reports a clean "would reap=0 skipped=0 of 25" cycle that examined
+nothing. That reads as a healthy reaper right up until someone asks why the
+worktree count never drops.
+
+The bulk read now streams straight to a temp file and the join reads it with
+--slurpfile, so payload size is bounded by disk rather than by argv. The
+sessions temp file moves up to share the one EXIT trap.
+
+Validation: new test test_a_large_candidate_set_does_not_overflow_the_join
+builds 25 beads x 60KB (1.5MB) and asserts all 25 reach a decision. Verified
+red against the --argjson form — "the bulk join dropped candidates on a large
+set: would reap=0 skipped=0 of 25" — and green after. Whole gastown shell
+suite passes; shellcheck clean.
+---
+ .../assets/scripts/polecat-worktree-reap.sh   | 20 ++++---
+ gastown/tests/test_polecat_worktree_reap.sh   | 54 +++++++++++++++++++
+ 2 files changed, 68 insertions(+), 6 deletions(-)
+
+diff --git a/gastown/assets/scripts/polecat-worktree-reap.sh b/gastown/assets/scripts/polecat-worktree-reap.sh
+index 1170e9f..59755a3 100755
+--- a/gastown/assets/scripts/polecat-worktree-reap.sh
++++ b/gastown/assets/scripts/polecat-worktree-reap.sh
+@@ -287,9 +287,19 @@ $(printf '%s\n' "$CANDIDATES" | while IFS= read -r wt; do
+ done | sort -u)
+ EOF
+ 
+-BEADS_JSON=$(run_bounded "$(budget_left)" "${GC_BD[@]}" show "${BEAD_IDS_ARGV[@]}" --json 2>/dev/null || true)
++# Straight to a file, never to a variable: bead descriptions run to kilobytes
++# apiece, and handing dozens of them to jq as an --argjson would put the whole
++# payload in argv, where a large candidate set trips ARG_MAX. That failure is
++# silent — jq never runs, the join comes back empty, and the summary reports a
++# clean cycle that examined nothing.
++BEADS_FILE=$(mktemp)
++SESSIONS_FILE=$(mktemp)
++trap 'rm -f "$BEADS_FILE" "$SESSIONS_FILE"' EXIT
++
++run_bounded "$(budget_left)" "${GC_BD[@]}" show "${BEAD_IDS_ARGV[@]}" --json \
++    >"$BEADS_FILE" 2>/dev/null || true
+ 
+-if ! printf '%s' "$BEADS_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
++if ! jq -e 'type == "array"' "$BEADS_FILE" >/dev/null 2>&1; then
+     # No usable answer for ANY bead — the store is unreachable, too slow, or
+     # spoke a shape we do not recognise. An unreadable bead is not proof the
+     # work is done, so nothing is a candidate for removal this cycle.
+@@ -305,8 +315,8 @@ fi
+ # character, so `read` silently collapses the empty leading fields an unreadable
+ # bead produces and shifts the path into $STATUS. US is neither whitespace nor
+ # legal in a bead id or a path, so every field survives, empty or not.
+-DECISIONS=$(printf '%s\n' "$CANDIDATES" | jq -R -r -s --argjson beads "$BEADS_JSON" '
+-    ( $beads
++DECISIONS=$(printf '%s\n' "$CANDIDATES" | jq -R -r -s --slurpfile bead_docs "$BEADS_FILE" '
++    ( ($bead_docs[0] // [])
+       | map(select(type == "object"))
+       | map({ key:   (.id // "" | tostring),
+               value: { status: (.status // "" | tostring),
+@@ -333,8 +343,6 @@ DECISIONS=$(printf '%s\n' "$CANDIDATES" | jq -R -r -s --argjson beads "$BEADS_JS
+ # mol-witness-patrol's absent-confirm discipline (gcp-g98) applied to the same
+ # subsystem: a confirmation read that fails is not proof of absence. A read cut
+ # short by the budget is one more way to land in `unconfirmed`.
+-SESSIONS_FILE=$(mktemp)
+-trap 'rm -f "$SESSIONS_FILE"' EXIT
+ ROSTER_STATE="unconfirmed"
+ ROSTER_FETCHED=0
+ 
+diff --git a/gastown/tests/test_polecat_worktree_reap.sh b/gastown/tests/test_polecat_worktree_reap.sh
+index 569b5a4..bcd3911 100644
+--- a/gastown/tests/test_polecat_worktree_reap.sh
++++ b/gastown/tests/test_polecat_worktree_reap.sh
+@@ -360,6 +360,59 @@ JSON
+     rm -rf "$tmp"
+ }
+ 
++test_a_large_candidate_set_does_not_overflow_the_join() {
++    # The bulk read answers with whole bead records, and bead descriptions run
++    # to kilobytes each. Handing that payload to jq as a command-line argument
++    # trips ARG_MAX (or Linux's 128KB-per-argument limit) on exactly the rigs
++    # that need reaping most — and it fails SILENTLY: jq never runs, the join
++    # is empty, and the run reports a clean cycle that examined nothing. So
++    # this fixture is deliberately fat rather than merely numerous.
++    local tmp rig bin home beads sessions logdir
++    tmp=$(mktemp -d)
++    rig="$tmp/rig"
++    bin="$tmp/bin"
++    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
++    beads="$tmp/beads.json"
++    sessions="$tmp/sessions.json"
++    logdir="$tmp/logs"
++    mkdir -p "$logdir"
++
++    setup_rig "$rig"
++    write_gc_stub "$bin"
++
++    local i ids=()
++    for i in $(seq 1 25); do
++        add_bead_worktree "$rig" "$home" "wt-bulk-$i"
++        ids+=("wt-bulk-$i")
++    done
++
++    # ~40KB of description per bead: ~1.6MB across the set, past both limits.
++    jq -n --args '[ $ARGS.positional[] | {
++            id: .,
++            status: "closed",
++            metadata: { polecat_session: "deadsess" },
++            description: ("x" * 60000)
++        } ]' "${ids[@]}" >"$beads"
++    printf '{"sessions":[]}' >"$sessions"
++
++    # Dry run, and a budget far larger than this fixture needs: what is under
++    # test is whether every candidate reaches a decision, not how many removals
++    # fit in a cycle. A real removal pass would hit the budget partway through
++    # (by design) and mask the thing being measured.
++    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
++        GC_REAP_BUDGET_SECONDS=120 PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --dry-run \
++        >"$tmp/out.txt" 2>&1 || fail "reaper exited non-zero on a large candidate set: $(cat "$tmp/out.txt")"
++
++    grep -F 'would reap=25 skipped=0 of 25' "$tmp/out.txt" >/dev/null ||
++        fail "the bulk join dropped candidates on a large set: $(cat "$tmp/out.txt")"
++    local decided
++    decided=$(grep -c -F '"event":"worktree_reap_pending"' "$logdir/polecat-worktree-reap.log")
++    [[ "$decided" == "25" ]] ||
++        fail "only $decided of 25 candidates reached a decision"
++
++    rm -rf "$tmp"
++}
++
+ test_budget_expiry_yields_the_witness_start() {
+     # The invariant the header states and the outage broke: housekeeping must
+     # be incapable of preventing the witness from starting. Every slow read is
+@@ -439,6 +492,7 @@ test_real_removal_is_opt_in
+ test_unreadable_session_roster_skips_the_reap
+ test_dry_run_removes_nothing_and_rerun_is_idempotent
+ test_bead_status_is_read_in_one_bulk_query
++test_a_large_candidate_set_does_not_overflow_the_join
+ test_budget_expiry_yields_the_witness_start
+ 
+ echo "polecat worktree reap tests passed"
+-- 
+2.50.1 (Apple Git-155)
+
