@@ -287,9 +287,19 @@ $(printf '%s\n' "$CANDIDATES" | while IFS= read -r wt; do
 done | sort -u)
 EOF
 
-BEADS_JSON=$(run_bounded "$(budget_left)" "${GC_BD[@]}" show "${BEAD_IDS_ARGV[@]}" --json 2>/dev/null || true)
+# Straight to a file, never to a variable: bead descriptions run to kilobytes
+# apiece, and handing dozens of them to jq as an --argjson would put the whole
+# payload in argv, where a large candidate set trips ARG_MAX. That failure is
+# silent — jq never runs, the join comes back empty, and the summary reports a
+# clean cycle that examined nothing.
+BEADS_FILE=$(mktemp)
+SESSIONS_FILE=$(mktemp)
+trap 'rm -f "$BEADS_FILE" "$SESSIONS_FILE"' EXIT
 
-if ! printf '%s' "$BEADS_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
+run_bounded "$(budget_left)" "${GC_BD[@]}" show "${BEAD_IDS_ARGV[@]}" --json \
+    >"$BEADS_FILE" 2>/dev/null || true
+
+if ! jq -e 'type == "array"' "$BEADS_FILE" >/dev/null 2>&1; then
     # No usable answer for ANY bead — the store is unreachable, too slow, or
     # spoke a shape we do not recognise. An unreadable bead is not proof the
     # work is done, so nothing is a candidate for removal this cycle.
@@ -305,8 +315,8 @@ fi
 # character, so `read` silently collapses the empty leading fields an unreadable
 # bead produces and shifts the path into $STATUS. US is neither whitespace nor
 # legal in a bead id or a path, so every field survives, empty or not.
-DECISIONS=$(printf '%s\n' "$CANDIDATES" | jq -R -r -s --argjson beads "$BEADS_JSON" '
-    ( $beads
+DECISIONS=$(printf '%s\n' "$CANDIDATES" | jq -R -r -s --slurpfile bead_docs "$BEADS_FILE" '
+    ( ($bead_docs[0] // [])
       | map(select(type == "object"))
       | map({ key:   (.id // "" | tostring),
               value: { status: (.status // "" | tostring),
@@ -333,8 +343,6 @@ DECISIONS=$(printf '%s\n' "$CANDIDATES" | jq -R -r -s --argjson beads "$BEADS_JS
 # mol-witness-patrol's absent-confirm discipline (gcp-g98) applied to the same
 # subsystem: a confirmation read that fails is not proof of absence. A read cut
 # short by the budget is one more way to land in `unconfirmed`.
-SESSIONS_FILE=$(mktemp)
-trap 'rm -f "$SESSIONS_FILE"' EXIT
 ROSTER_STATE="unconfirmed"
 ROSTER_FETCHED=0
 

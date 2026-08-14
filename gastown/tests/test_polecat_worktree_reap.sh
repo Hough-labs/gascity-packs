@@ -360,6 +360,59 @@ JSON
     rm -rf "$tmp"
 }
 
+test_a_large_candidate_set_does_not_overflow_the_join() {
+    # The bulk read answers with whole bead records, and bead descriptions run
+    # to kilobytes each. Handing that payload to jq as a command-line argument
+    # trips ARG_MAX (or Linux's 128KB-per-argument limit) on exactly the rigs
+    # that need reaping most — and it fails SILENTLY: jq never runs, the join
+    # is empty, and the run reports a clean cycle that examined nothing. So
+    # this fixture is deliberately fat rather than merely numerous.
+    local tmp rig bin home beads sessions logdir
+    tmp=$(mktemp -d)
+    rig="$tmp/rig"
+    bin="$tmp/bin"
+    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
+    beads="$tmp/beads.json"
+    sessions="$tmp/sessions.json"
+    logdir="$tmp/logs"
+    mkdir -p "$logdir"
+
+    setup_rig "$rig"
+    write_gc_stub "$bin"
+
+    local i ids=()
+    for i in $(seq 1 25); do
+        add_bead_worktree "$rig" "$home" "wt-bulk-$i"
+        ids+=("wt-bulk-$i")
+    done
+
+    # ~40KB of description per bead: ~1.6MB across the set, past both limits.
+    jq -n --args '[ $ARGS.positional[] | {
+            id: .,
+            status: "closed",
+            metadata: { polecat_session: "deadsess" },
+            description: ("x" * 60000)
+        } ]' "${ids[@]}" >"$beads"
+    printf '{"sessions":[]}' >"$sessions"
+
+    # Dry run, and a budget far larger than this fixture needs: what is under
+    # test is whether every candidate reaches a decision, not how many removals
+    # fit in a cycle. A real removal pass would hit the budget partway through
+    # (by design) and mask the thing being measured.
+    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+        GC_REAP_BUDGET_SECONDS=120 PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --dry-run \
+        >"$tmp/out.txt" 2>&1 || fail "reaper exited non-zero on a large candidate set: $(cat "$tmp/out.txt")"
+
+    grep -F 'would reap=25 skipped=0 of 25' "$tmp/out.txt" >/dev/null ||
+        fail "the bulk join dropped candidates on a large set: $(cat "$tmp/out.txt")"
+    local decided
+    decided=$(grep -c -F '"event":"worktree_reap_pending"' "$logdir/polecat-worktree-reap.log")
+    [[ "$decided" == "25" ]] ||
+        fail "only $decided of 25 candidates reached a decision"
+
+    rm -rf "$tmp"
+}
+
 test_budget_expiry_yields_the_witness_start() {
     # The invariant the header states and the outage broke: housekeeping must
     # be incapable of preventing the witness from starting. Every slow read is
@@ -439,6 +492,7 @@ test_real_removal_is_opt_in
 test_unreadable_session_roster_skips_the_reap
 test_dry_run_removes_nothing_and_rerun_is_idempotent
 test_bead_status_is_read_in_one_bulk_query
+test_a_large_candidate_set_does_not_overflow_the_join
 test_budget_expiry_yields_the_witness_start
 
 echo "polecat worktree reap tests passed"
