@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 31 Jul 2026 15:14:03 -0400
-Subject: [PATCH 03/26] feat(refinery): gate mol-refinery-patrol merges on the
+Subject: [PATCH 03/27] feat(refinery): gate mol-refinery-patrol merges on the
  approval signal (gcp-dc8)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

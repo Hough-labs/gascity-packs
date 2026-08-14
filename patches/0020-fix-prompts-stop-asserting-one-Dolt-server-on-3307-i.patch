@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 13 Aug 2026 13:23:37 -0400
-Subject: [PATCH 20/26] fix(prompts): stop asserting one Dolt server on 3307 in
+Subject: [PATCH 20/27] fix(prompts): stop asserting one Dolt server on 3307 in
  operational-awareness (gcp-o86m)
 
 The operational-awareness fragment is injected into every gastown role card,

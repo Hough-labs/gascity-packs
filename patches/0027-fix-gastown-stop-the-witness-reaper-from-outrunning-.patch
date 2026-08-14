@@ -1,0 +1,690 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 14 Aug 2026 14:49:42 -0400
+Subject: [PATCH 27/27] fix(gastown): stop the witness reaper from outrunning
+ its pre_start deadline (gcp-ntbf)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+polecat-worktree-reap.sh runs as the witness pre_start, which gascity bounds
+by [session] setup_timeout (10s by default) and SIGKILLs on overrun. The
+script issued one `gc bd show` per candidate worktree, serially. On winnow
+that was 81 candidates x ~5.4s against an external Dolt — roughly 7 minutes of
+work inside a 10s window, so every start attempt died in pre_start[0], and
+after six failures in an hour the supervisor circuit breaker latched OPEN and
+stopped respawning. The busiest rig in the city ran 26h with no witness at
+all. It was not slow, it was arithmetically impossible, and the candidate set
+only grows: the reaper is staged at dry-run and the native gascity reaper it
+defers to is a documented macOS no-op (gc-zxxy), so nothing shrinks the work
+set. gascity-packs was at 16 candidates on the same trajectory.
+
+Two changes restore the invariant the script's own header states — housekeeping
+must never block the witness from starting:
+
+- Bead status for every candidate now comes from ONE bulk `gc bd show` with
+  all ids, joined back to the worktree paths in a single jq pass. Cost is flat
+  in the number of worktrees instead of linear. Results are keyed by the id
+  the store echoed rather than the id requested, so the fuzzy matching in the
+  bead lookup can no longer let one worktree inherit another bead's status —
+  a no-exact-echo lands in the same "unreadable, skip" bucket as before.
+- The run holds itself to a wall-clock budget (8s default, --budget /
+  GC_REAP_BUDGET_SECONDS) well inside the caller's, and every external command
+  is bounded by the time remaining in it. When the budget expires it records
+  worktree_budget_exhausted and exits 0 having reaped what it could. A reaper
+  that runs out of time must yield the start, not lose a race with SIGKILL;
+  the deferred candidates are picked up next cycle, since the work is
+  idempotent. run_bounded prefers coreutils timeout and falls back to a
+  background-and-kill poll, because a pre_start that cannot bound its own
+  children is the exact failure being fixed.
+
+All four safety gates are untouched, as is the staged dry-run rollout. The
+loop's field separator is the ASCII unit separator, not tab: tab is an IFS
+whitespace character, so `read` silently collapses the empty leading fields an
+unreadable bead produces and shifts the path into $STATUS.
+
+Deliberately not moving the reaper off the start path into mol-witness-patrol:
+{{.ConfigDir}} is the only stable handle on a content-hashed pack asset, which
+is why pre_start was chosen, and a bounded pre_start no longer needs the move.
+
+Validation: gastown/tests/test_polecat_worktree_reap.sh gains two tests, both
+verified red against the pre-change script — the bulk-read test fails with
+"bead status was read in 4 calls for 4 worktrees", and the budget test hangs
+41s on a 2s budget before failing "a slow read is not bounded" — and green
+after (6.3s). Whole gastown shell suite passes, shellcheck clean, go
+vet/build/test and golangci-lint/validate_registry green.
+
+Follow-ups: restoring winnow needs `gc session reset winnow/gastown.witness`
+once this ships — the circuit breaker latches. Two pytest suites already fail
+on integration and are unrelated to this change; filed as gcp-yrwk.
+---
+ gastown/agents/witness/agent.toml             |   7 +
+ .../assets/scripts/polecat-worktree-reap.sh   | 238 +++++++++++++++---
+ gastown/formulas/mol-witness-patrol.toml      |  13 +-
+ gastown/tests/test_gastown_pack_assets.sh     |  18 ++
+ gastown/tests/test_polecat_worktree_reap.sh   | 153 ++++++++++-
+ 5 files changed, 395 insertions(+), 34 deletions(-)
+
+diff --git a/gastown/agents/witness/agent.toml b/gastown/agents/witness/agent.toml
+index 938dc73..bb35180 100644
+--- a/gastown/agents/witness/agent.toml
++++ b/gastown/agents/witness/agent.toml
+@@ -10,6 +10,13 @@ work_dir = ".gc/agents/{{.Rig}}/witness"
+ # is dirty, not closed, or owned by a session it cannot confirm is gone — see
+ # the script header for all four gates.
+ #
++# BOUNDED: pre_start is killed at [session] setup_timeout (10s by default), and
++# a killed pre_start fails the whole start — six of those in an hour latch the
++# supervisor circuit breaker open and the rig loses its witness entirely
++# (gcp-ntbf). The script therefore holds itself to a budget inside that limit
++# (8s; GC_REAP_BUDGET_SECONDS / --budget) and exits 0 when it expires, reaping
++# the rest next cycle. Raise one only alongside the other.
++#
+ # STAGED ROLLOUT: no --no-dry-run here, so this reports what it WOULD reap and
+ # removes nothing. That matches the city's posture for the native gascity
+ # reaper, which city.toml holds in dry-run until gc-zxxy is answered; two
+diff --git a/gastown/assets/scripts/polecat-worktree-reap.sh b/gastown/assets/scripts/polecat-worktree-reap.sh
+index b45b00c..1170e9f 100755
+--- a/gastown/assets/scripts/polecat-worktree-reap.sh
++++ b/gastown/assets/scripts/polecat-worktree-reap.sh
+@@ -30,6 +30,27 @@
+ #      (metadata.polecat_session). A roster read that fails or does not parse
+ #      is `unconfirmed`, not `absent`, and skips the reap.
+ #
++# COST MODEL — why this script is shaped the way it is (gcp-ntbf):
++#   It runs as the witness pre_start, which gascity bounds by [session]
++#   setup_timeout (10s by default) and SIGKILLs on overrun. A killed pre_start
++#   fails the whole session start, and after six such failures in an hour the
++#   supervisor's circuit breaker latches OPEN and stops respawning entirely —
++#   winnow's witness was dead for 26h that way, with no health monitor on the
++#   city's busiest rig. Housekeeping must be structurally incapable of
++#   preventing the witness from starting, so:
++#     - Bead status for EVERY candidate is fetched in ONE bulk `gc bd show`.
++#       The per-worktree `gc bd show` this replaced cost ~5.4s per call against
++#       an external Dolt, which is ~7 minutes across winnow's 81 candidates —
++#       not slow, impossible. Candidate sets only grow (the reaper is staged at
++#       dry-run and the native gascity reaper is a documented macOS no-op,
++#       gc-zxxy), so a per-item round trip is a cliff every rig walks toward.
++#     - The script enforces its OWN wall-clock budget, well inside the caller's,
++#       and every external command is bounded by the time remaining in it. When
++#       the budget expires the script reports what it examined and exits 0. A
++#       reaper that runs out of time must YIELD THE START, not lose a race with
++#       SIGKILL. Reaping fewer worktrees per cycle is free; the work is
++#       idempotent and the next cycle resumes it.
++#
+ # Staged rollout: REAL REMOVAL IS OPT-IN. The script dry-runs unless it is
+ # given --no-dry-run, and the witness pre_start wiring deliberately does not
+ # pass it. The city holds the native gascity reaper to the same staged rollout
+@@ -57,6 +78,10 @@
+ #                      would litter the canonical checkout with untracked files.
+ #   --dry-run          report what would be reaped, remove nothing (the default)
+ #   --no-dry-run       opt in to real removal
++#   --budget <secs> | GC_REAP_BUDGET_SECONDS
++#                      wall-clock budget for the whole run (default 8s). Must
++#                      stay well inside the caller's [session] setup_timeout;
++#                      raise it only alongside a matching setup_timeout bump.
+ #
+ # Usage:
+ #   GC_RIG=helm polecat-worktree-reap.sh                    # dry run
+@@ -69,6 +94,8 @@ set -euo pipefail
+ DRY_RUN=1
+ RIG_ROOT=""
+ RIG_NAME="${GC_RIG:-}"
++# Well inside gascity's 10s default [session] setup_timeout — see COST MODEL.
++BUDGET_SECONDS="${GC_REAP_BUDGET_SECONDS:-8}"
+ 
+ while [ "$#" -gt 0 ]; do
+     case "$1" in
+@@ -79,12 +106,24 @@ while [ "$#" -gt 0 ]; do
+             [ "$#" -gt 0 ] || { echo "polecat-worktree-reap: --rig needs a value" >&2; exit 2; }
+             RIG_NAME="$1"
+             ;;
++        --budget)
++            shift
++            [ "$#" -gt 0 ] || { echo "polecat-worktree-reap: --budget needs a value" >&2; exit 2; }
++            BUDGET_SECONDS="$1"
++            ;;
+         -*) echo "polecat-worktree-reap: unknown flag $1" >&2; exit 2 ;;
+         *) RIG_ROOT="$1" ;;
+     esac
+     shift
+ done
+ 
++case "$BUDGET_SECONDS" in
++    '' | *[!0-9]* | 0)
++        echo "polecat-worktree-reap: budget must be a positive whole number of seconds" >&2
++        exit 2
++        ;;
++esac
++
+ if [ -z "$RIG_ROOT" ]; then
+     RIG_ROOT="${GC_RIG_ROOT:-}"
+ fi
+@@ -117,17 +156,71 @@ if ! mkdir -p "$LOG_DIR" 2>/dev/null || ! touch "$LOG_FILE" 2>/dev/null; then
+ fi
+ 
+ TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
++START_EPOCH=$(date +%s)
+ 
+-# `gc bd` is rig-scoped when a rig name is known; keep the unscoped form working
+-# so the script is still runnable by hand from inside a rig repo.
+-gc_bd() {
+-    if [ -n "$RIG_NAME" ]; then
+-        gc bd --rig "$RIG_NAME" "$@"
+-    else
+-        gc bd "$@"
++# Seconds left in this run's budget, floored at 0. Every external command is
++# bounded by this, so no single hung call can outlive the budget either.
++budget_left() {
++    local left=$((BUDGET_SECONDS - ($(date +%s) - START_EPOCH)))
++    if [ "$left" -lt 0 ]; then
++        left=0
++    fi
++    printf '%s\n' "$left"
++}
++
++TIMEOUT_BIN=""
++if command -v timeout >/dev/null 2>&1; then
++    TIMEOUT_BIN=timeout
++elif command -v gtimeout >/dev/null 2>&1; then
++    TIMEOUT_BIN=gtimeout
++fi
++
++# run_bounded <seconds> <cmd...> — run a command under a hard time limit,
++# returning 124 if it does not finish in time (matching timeout(1)).
++#
++# The fallback matters: coreutils `timeout` is not on a stock macOS, and a
++# pre_start that cannot bound its own children is precisely the failure this
++# script exists to prevent. So the fallback actually kills rather than merely
++# giving up on waiting.
++run_bounded() {
++    local limit="$1"
++    shift
++    if [ "$limit" -le 0 ]; then
++        return 124
++    fi
++    if [ -n "$TIMEOUT_BIN" ]; then
++        local rc=0
++        "$TIMEOUT_BIN" "$limit" "$@" || rc=$?
++        return "$rc"
+     fi
++    local pid waited=0 rc=0
++    "$@" &
++    pid=$!
++    while kill -0 "$pid" 2>/dev/null; do
++        if [ "$waited" -ge "$limit" ]; then
++            kill -TERM "$pid" 2>/dev/null || true
++            sleep 1
++            kill -KILL "$pid" 2>/dev/null || true
++            wait "$pid" 2>/dev/null || true
++            return 124
++        fi
++        sleep 1
++        waited=$((waited + 1))
++    done
++    wait "$pid" || rc=$?
++    return "$rc"
+ }
+ 
++# `gc bd` is rig-scoped when a rig name is known; keep the unscoped form working
++# so the script is still runnable by hand from inside a rig repo. Held as an
++# argv array rather than a function because run_bounded/timeout runs a real
++# command, not a shell function.
++if [ -n "$RIG_NAME" ]; then
++    GC_BD=(gc bd --rig "$RIG_NAME")
++else
++    GC_BD=(gc bd)
++fi
++
+ record() {
+     # record <event> <bead> <worktree> <detail>
+     jq -cn \
+@@ -145,9 +238,10 @@ record() {
+ 
+ # Clear metadata for worktrees already removed from disk so the candidate list
+ # reflects reality rather than stale administrative entries.
+-git -C "$RIG_ROOT" worktree prune >/dev/null 2>&1 || true
++run_bounded "$(budget_left)" git -C "$RIG_ROOT" worktree prune >/dev/null 2>&1 || true
+ 
+-CANDIDATES=$(git -C "$RIG_ROOT" worktree list --porcelain 2>/dev/null \
++WT_LIST=$(run_bounded "$(budget_left)" git -C "$RIG_ROOT" worktree list --porcelain 2>/dev/null || true)
++CANDIDATES=$(printf '%s\n' "$WT_LIST" \
+     | sed -n 's/^worktree //p' \
+     | while IFS= read -r wt; do
+         # Gate 1: per-bead polecat worktree shape. The parent directory must be
+@@ -171,24 +265,90 @@ if [ -z "$CANDIDATES" ]; then
+     exit 0
+ fi
+ 
+-# Session roster, fetched once. `gc session list --json` returns an OBJECT
+-# ({sessions:[...]}), not a top-level array, and its fields are lowercase
+-# snake_case — same schema facts mol-witness-patrol's liveness map depends on.
++TOTAL=$(printf '%s\n' "$CANDIDATES" | grep -c . || true)
++
++# ONE bead read for the whole candidate set. `gc bd show` takes many ids and
++# answers in a single round trip, so the cost of this step is flat in the
++# number of worktrees instead of linear in it — the entire point of gcp-ntbf.
++#
++# Unknown ids are reported on stderr and simply omitted from the array, so a
++# stale worktree does not poison the batch. Results are keyed back by the id
++# the store ECHOED, not by the id we asked for: the lookup fuzzy-matches, and
++# a fuzzy hit would otherwise let one worktree inherit a different bead's status.
++# An id with no exact echo lands in the same "unreadable" bucket as before.
++BEAD_IDS_ARGV=()
++while IFS= read -r bead_id; do
++    if [ -n "$bead_id" ]; then
++        BEAD_IDS_ARGV+=("$bead_id")
++    fi
++done <<EOF
++$(printf '%s\n' "$CANDIDATES" | while IFS= read -r wt; do
++    if [ -n "$wt" ]; then basename "$wt"; fi
++done | sort -u)
++EOF
++
++BEADS_JSON=$(run_bounded "$(budget_left)" "${GC_BD[@]}" show "${BEAD_IDS_ARGV[@]}" --json 2>/dev/null || true)
++
++if ! printf '%s' "$BEADS_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
++    # No usable answer for ANY bead — the store is unreachable, too slow, or
++    # spoke a shape we do not recognise. An unreadable bead is not proof the
++    # work is done, so nothing is a candidate for removal this cycle.
++    record worktree_bead_query_failed "" "" \
++        "bulk gc bd show returned no usable JSON for ${#BEAD_IDS_ARGV[@]} bead(s)"
++    echo "polecat-worktree-reap: bead query failed or timed out; reaped=0 skipped=$TOTAL (log: $LOG_FILE)"
++    exit 0
++fi
++
++# Join the candidate paths to their bead facts once, in jq, so the loop below
++# does no per-worktree querying at all: <status>US<owner>US<worktree>, where US
++# is the ASCII unit separator. Deliberately not @tsv: tab is an IFS WHITESPACE
++# character, so `read` silently collapses the empty leading fields an unreadable
++# bead produces and shifts the path into $STATUS. US is neither whitespace nor
++# legal in a bead id or a path, so every field survives, empty or not.
++DECISIONS=$(printf '%s\n' "$CANDIDATES" | jq -R -r -s --argjson beads "$BEADS_JSON" '
++    ( $beads
++      | map(select(type == "object"))
++      | map({ key:   (.id // "" | tostring),
++              value: { status: (.status // "" | tostring),
++                       owner:  (.metadata.polecat_session? // "" | tostring) } })
++      | from_entries ) as $by
++    | split("\n")
++    | map(select(length > 0))
++    | .[]
++    | . as $wt
++    | ($by[($wt | split("/") | last)] // { status: "", owner: "" }) as $bead
++    | [ $bead.status, $bead.owner, $wt ] | join("\u001f")
++' 2>/dev/null || true)
++
++# Session roster, fetched at most once and only when a closed bead actually
++# needs it — on a rig whose candidates are all still open it is pure cost.
++# `gc session list --json` returns an OBJECT ({sessions:[...]}), not a
++# top-level array, and its fields are lowercase snake_case — same schema facts
++# mol-witness-patrol's liveness map depends on.
+ #
+ # A roster read that FAILS is not proof the owning session is gone. Seed the
+ # roster state to `unconfirmed` and promote it only on a read that exited 0,
+ # wrote a non-empty file, AND parsed as the expected shape; every failure path
+ # then falls through to skip-this-worktree with no route to a removal. This is
+ # mol-witness-patrol's absent-confirm discipline (gcp-g98) applied to the same
+-# subsystem: a confirmation read that fails is not proof of absence.
++# subsystem: a confirmation read that fails is not proof of absence. A read cut
++# short by the budget is one more way to land in `unconfirmed`.
+ SESSIONS_FILE=$(mktemp)
+ trap 'rm -f "$SESSIONS_FILE"' EXIT
+ ROSTER_STATE="unconfirmed"
+-if gc session list --state=all --json >"$SESSIONS_FILE" 2>/dev/null &&
+-    [ -s "$SESSIONS_FILE" ] &&
+-    jq -e '(.sessions | type) == "array"' "$SESSIONS_FILE" >/dev/null 2>&1; then
+-    ROSTER_STATE="readable"
+-fi
++ROSTER_FETCHED=0
++
++ensure_roster() {
++    if [ "$ROSTER_FETCHED" -eq 1 ]; then
++        return
++    fi
++    ROSTER_FETCHED=1
++    if run_bounded "$(budget_left)" gc session list --state=all --json >"$SESSIONS_FILE" 2>/dev/null &&
++        [ -s "$SESSIONS_FILE" ] &&
++        jq -e '(.sessions | type) == "array"' "$SESSIONS_FILE" >/dev/null 2>&1; then
++        ROSTER_STATE="readable"
++    fi
++}
+ 
+ # Prints the liveness verdict for a bead's owning session:
+ #   live        — a matching session exists and is not closed
+@@ -226,18 +386,28 @@ session_state() {
+ 
+ REAPED=0
+ SKIPPED=0
++EXAMINED=0
++BUDGET_SPENT=0
+ 
+-while IFS= read -r WT; do
++while IFS=$'\037' read -r STATUS OWNER WT; do
+     [ -n "$WT" ] || continue
+-    BEAD=$(basename "$WT")
+ 
+-    BEAD_JSON=$(gc_bd show "$BEAD" --json 2>/dev/null || true)
+-    STATUS=$(printf '%s' "$BEAD_JSON" | jq -r '.[0].status // empty' 2>/dev/null || true)
++    # Yield the start rather than lose a race with SIGKILL. What is left
++    # unexamined stays a candidate for the next cycle; the work is idempotent.
++    if [ "$(budget_left)" -le 0 ]; then
++        BUDGET_SPENT=1
++        record worktree_budget_exhausted "" "" \
++            "${BUDGET_SECONDS}s budget spent after $EXAMINED of $TOTAL candidate(s); yielding the witness start"
++        break
++    fi
++    EXAMINED=$((EXAMINED + 1))
++
++    BEAD=$(basename "$WT")
+ 
+     if [ -z "$STATUS" ]; then
+         # An unreadable bead is not proof the work is done. Leave the worktree
+         # alone; a later cycle retries once bd is readable again.
+-        record worktree_bead_unreadable "$BEAD" "$WT" "gc bd show returned no status"
++        record worktree_bead_unreadable "$BEAD" "$WT" "bulk gc bd show returned no status"
+         SKIPPED=$((SKIPPED + 1))
+         continue
+     fi
+@@ -252,7 +422,7 @@ while IFS= read -r WT; do
+     # Gate 4: a polecat still reworking a FIX_NEEDED PR keeps its worktree even
+     # though the bead is already closed by the PR handoff. A roster we could not
+     # read tells us nothing about that polecat, so it skips too.
+-    OWNER=$(printf '%s' "$BEAD_JSON" | jq -r '.[0].metadata.polecat_session // empty' 2>/dev/null || true)
++    ensure_roster
+     case "$(session_state "$OWNER")" in
+         live)
+             record worktree_owner_live "$BEAD" "$WT" "session $OWNER still live"
+@@ -270,8 +440,9 @@ while IFS= read -r WT; do
+     # Gate 3: never discard uncommitted work. Ignored files are artifacts and
+     # are excluded by `git status --porcelain`; untracked non-ignored files are
+     # reported and block the reap so the witness can salvage them.
+-    if ! DIRTY=$(git -C "$WT" status --porcelain 2>/dev/null); then
+-        # A worktree git cannot even read is not one to delete on a guess.
++    if ! DIRTY=$(run_bounded "$(budget_left)" git -C "$WT" status --porcelain 2>/dev/null); then
++        # A worktree git cannot even read — or cannot read in the time left —
++        # is not one to delete on a guess.
+         record worktree_status_unreadable "$BEAD" "$WT" "git status failed in the worktree"
+         SKIPPED=$((SKIPPED + 1))
+         continue
+@@ -289,12 +460,12 @@ while IFS= read -r WT; do
+         continue
+     fi
+ 
+-    if ! git -C "$RIG_ROOT" worktree remove --force "$WT" >/dev/null 2>&1; then
++    if ! run_bounded "$(budget_left)" git -C "$RIG_ROOT" worktree remove --force "$WT" >/dev/null 2>&1; then
+         # Fallback for a worktree git refuses to administer (moved, partially
+         # deleted). Removing the directory then pruning restores consistency.
+         rm -rf "$WT"
+     fi
+-    git -C "$RIG_ROOT" worktree prune >/dev/null 2>&1 || true
++    run_bounded "$(budget_left)" git -C "$RIG_ROOT" worktree prune >/dev/null 2>&1 || true
+ 
+     if [ -e "$WT" ]; then
+         record worktree_reap_failed "$BEAD" "$WT" "directory still present after removal"
+@@ -305,11 +476,16 @@ while IFS= read -r WT; do
+     record worktree_reaped "$BEAD" "$WT" "bead closed"
+     REAPED=$((REAPED + 1))
+ done <<EOF
+-$CANDIDATES
++$DECISIONS
+ EOF
+ 
++BUDGET_NOTE=""
++if [ "$BUDGET_SPENT" -eq 1 ]; then
++    BUDGET_NOTE=" — budget spent, $((TOTAL - EXAMINED)) candidate(s) deferred to the next cycle"
++fi
++
+ if [ "$DRY_RUN" -eq 1 ]; then
+-    echo "polecat-worktree-reap: would reap=$REAPED skipped=$SKIPPED (dry run — nothing removed; pass --no-dry-run to reap; log: $LOG_FILE)"
++    echo "polecat-worktree-reap: would reap=$REAPED skipped=$SKIPPED of $TOTAL (dry run — nothing removed; pass --no-dry-run to reap; log: $LOG_FILE)$BUDGET_NOTE"
+ else
+-    echo "polecat-worktree-reap: reaped=$REAPED skipped=$SKIPPED (log: $LOG_FILE)"
++    echo "polecat-worktree-reap: reaped=$REAPED skipped=$SKIPPED of $TOTAL (log: $LOG_FILE)$BUDGET_NOTE"
+ fi
+diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
+index 50552ed..c33e05e 100644
+--- a/gastown/formulas/mol-witness-patrol.toml
++++ b/gastown/formulas/mol-witness-patrol.toml
+@@ -547,14 +547,25 @@ tail -n 50 "${LOG_DIR:-$GC_CITY/.gc/runtime/logs}/polecat-worktree-reap.log"
+ | `worktree_dirty_kept` | Closed bead, uncommitted changes on disk | Salvage per Case C/D, then re-run |
+ | `worktree_owner_live` | Closed bead, polecat still alive (PR rework) | None — expected; next cycle retries |
+ | `worktree_owner_unconfirmed` | `gc session list` failed or did not parse, so liveness is unknown | If it persists, the session roster is broken — check `gc doctor`; nothing was removed |
+-| `worktree_bead_unreadable` | `gc bd show` returned nothing | If it persists, check Dolt health |
++| `worktree_bead_unreadable` | The bulk `gc bd show` had no row for this bead | If it persists, check Dolt health |
+ | `worktree_status_unreadable` | `git status` failed inside the worktree | Inspect by hand; likely a broken or moved checkout |
+ | `worktree_reap_failed` | Directory survived removal | Investigate permissions/mounts, mail mayor |
++| `worktree_bead_query_failed` | The one bulk bead read returned nothing usable — store unreachable, or slower than the run's budget | Nothing was examined this cycle. If it repeats, the rig's Dolt endpoint is the problem, not the reaper |
++| `worktree_budget_exhausted` | The run hit its own wall-clock budget and stopped early | Routine on a rig with many candidates; the rest are deferred to the next cycle. Persistent + a growing candidate count means the store is too slow for the budget — raise `[session] setup_timeout` AND `GC_REAP_BUDGET_SECONDS` together, or investigate the endpoint |
+ 
+ A `worktree_dirty_kept` that repeats across cycles means real work is
+ stranded on disk under a bead that is already closed. Mail the mayor —
+ that is a lost-work signal, not routine housekeeping.
+ 
++**Why it may stop early.** The reaper is the witness `pre_start`, so gascity
++bounds it by `[session] setup_timeout` (10s by default) and SIGKILLs an
++overrun — which fails the session start outright and, after six failures in an
++hour, latches the supervisor circuit breaker OPEN so the witness is never
++respawned (`gcp-ntbf`: winnow lost its witness for 26h that way). So the script
++holds itself to a budget inside that limit and exits cleanly when it expires.
++Partial cleanup is by design: the work is idempotent, the next cycle resumes
++it, and a witness that starts is worth more than a rig reaped in one pass.
++
+ **Exit criteria:** Reaper log reviewed and any non-routine event acted on.
+ Continue to `check-refinery` — do NOT exit the wisp here. The
+ `next-iteration` step is the only place that pours the next wisp and burns
+diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
+index c9e63b7..2d656b8 100755
+--- a/gastown/tests/test_gastown_pack_assets.sh
++++ b/gastown/tests/test_gastown_pack_assets.sh
+@@ -323,6 +323,24 @@ PY
+     # into it.
+     ! grep -F 'LOG_DIR="$RIG_ROOT' "$reaper" >/dev/null ||
+         fail "reaper must not default its log inside the rig repo"
++
++    # pre_start is bounded by [session] setup_timeout (10s) and SIGKILLed on
++    # overrun, which fails the session start and eventually latches the
++    # supervisor circuit breaker open — gcp-ntbf, where a per-worktree bead
++    # read cost winnow its witness for 26h. Two shape rules keep housekeeping
++    # incapable of blocking the start, and both are easy to undo by accident.
++    grep -F 'show "${BEAD_IDS_ARGV[@]}"' "$reaper" >/dev/null ||
++        fail "reaper must read every candidate bead in one bulk gc bd show, not one call per worktree"
++    ! grep -E 'gc_bd show|GC_BD\[@\]\}" show "\$BEAD"' "$reaper" >/dev/null ||
++        fail "reaper must not query beads per worktree; that is the N+1 that killed the witness"
++    grep -F 'budget_left' "$reaper" >/dev/null ||
++        fail "reaper must bound its own wall clock so it can never outlive the pre_start deadline"
++    grep -F 'worktree_budget_exhausted' "$reaper" >/dev/null ||
++        fail "reaper must record and yield when its budget expires rather than being SIGKILLed"
++    grep -F 'worktree_budget_exhausted' "$patrol" >/dev/null ||
++        fail "patrol log-review table must explain the budget-exhausted event the reaper can emit"
++    grep -F 'worktree_bead_query_failed' "$patrol" >/dev/null ||
++        fail "patrol log-review table must explain the bulk-query-failed event the reaper can emit"
+ }
+ 
+ test_dolt_push_outage_detection_is_wired() {
+diff --git a/gastown/tests/test_polecat_worktree_reap.sh b/gastown/tests/test_polecat_worktree_reap.sh
+index 91abb5f..569b5a4 100644
+--- a/gastown/tests/test_polecat_worktree_reap.sh
++++ b/gastown/tests/test_polecat_worktree_reap.sh
+@@ -16,17 +16,38 @@ write_gc_stub() {
+ #!/usr/bin/env sh
+ # Serves the two reads polecat-worktree-reap.sh performs, in both their
+ # rig-scoped and unscoped forms:
+-#   gc bd --rig <rig> show <bead> --json
++#   gc bd --rig <rig> show <bead>... --json   (many ids in ONE call)
+ #   gc session list --state=all --json
++#
++# Test hooks:
++#   GC_BD_CALLS      append one byte per `gc bd show` call, so a test can
++#                    assert the read is bulk and not per-worktree
++#   GC_BD_DELAY      seconds to stall a bead read (budget tests)
++#   GC_SESSION_DELAY seconds to stall a roster read (budget tests)
+ case "$1" in
+     session)
++        if [ -n "${GC_SESSION_DELAY:-}" ]; then sleep "$GC_SESSION_DELAY"; fi
+         cat "$GC_SESSIONS_JSON"
+         ;;
+     bd)
+         shift
+         if [ "$1" = "--rig" ]; then shift 2; fi
+         if [ "$1" = "show" ]; then
+-            jq -c --arg id "$2" '[.[] | select(.id == $id)]' "$GC_BEADS_JSON"
++            shift
++            if [ -n "${GC_BD_CALLS:-}" ]; then printf 'x' >>"$GC_BD_CALLS"; fi
++            if [ -n "${GC_BD_DELAY:-}" ]; then sleep "$GC_BD_DELAY"; fi
++            ids=""
++            for a in "$@"; do
++                case "$a" in
++                    -*) continue ;;
++                esac
++                ids="$ids$a
++"
++            done
++            jq -c --arg ids "$ids" '
++                ($ids | split("\n") | map(select(length > 0))) as $want
++                | [ .[] | select(.id as $i | $want | index($i)) ]
++            ' "$GC_BEADS_JSON"
+         else
+             printf '[]'
+         fi
+@@ -287,9 +308,137 @@ JSON
+     rm -rf "$tmp"
+ }
+ 
++test_bead_status_is_read_in_one_bulk_query() {
++    # The N+1 that killed winnow's witness for 26h (gcp-ntbf): one
++    # `gc bd show` per candidate worktree, ~5.4s each against an external
++    # Dolt, inside a pre_start bounded at 10s. The read must be flat in the
++    # number of worktrees, so assert the CALL COUNT, not the wall time —
++    # a fast stub would hide a linear read on a slow store.
++    local tmp rig bin home beads sessions logdir calls
++    tmp=$(mktemp -d)
++    rig="$tmp/rig"
++    bin="$tmp/bin"
++    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
++    beads="$tmp/beads.json"
++    sessions="$tmp/sessions.json"
++    logdir="$tmp/logs"
++    calls="$tmp/bd-calls"
++    mkdir -p "$logdir"
++
++    setup_rig "$rig"
++    write_gc_stub "$bin"
++
++    add_bead_worktree "$rig" "$home" wt-one
++    add_bead_worktree "$rig" "$home" wt-two
++    add_bead_worktree "$rig" "$home" wt-three
++    add_bead_worktree "$rig" "$home" wt-four
++
++    cat >"$beads" <<'JSON'
++[
++  {"id":"wt-one","status":"closed","metadata":{"polecat_session":"deadsess"}},
++  {"id":"wt-two","status":"closed","metadata":{"polecat_session":"deadsess"}},
++  {"id":"wt-three","status":"open","metadata":{"polecat_session":"deadsess"}},
++  {"id":"wt-four","status":"closed","metadata":{"polecat_session":"deadsess"}}
++]
++JSON
++    printf '{"sessions":[]}' >"$sessions"
++
++    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
++        GC_BD_CALLS="$calls" PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run \
++        >"$tmp/out.txt" 2>&1 || fail "reaper exited non-zero: $(cat "$tmp/out.txt")"
++
++    local n
++    n=$(wc -c <"$calls" | tr -d ' ')
++    [[ "$n" == "1" ]] ||
++        fail "bead status was read in $n calls for 4 worktrees; it must be one bulk query"
++
++    [[ ! -e "$home/worktrees/wt-one" && ! -e "$home/worktrees/wt-two" && ! -e "$home/worktrees/wt-four" ]] ||
++        fail "the bulk read lost a closed bead: a worktree that should have been reaped survived"
++    [[ -e "$home/worktrees/wt-three" ]] ||
++        fail "the bulk read mixed up bead identities: an open bead's worktree was reaped"
++
++    rm -rf "$tmp"
++}
++
++test_budget_expiry_yields_the_witness_start() {
++    # The invariant the header states and the outage broke: housekeeping must
++    # be incapable of preventing the witness from starting. Every slow read is
++    # bounded by the run's own budget, and an expired budget exits 0 having
++    # done what it could — it never waits to be SIGKILLed by the caller.
++    local tmp rig bin home beads sessions logdir started elapsed
++    tmp=$(mktemp -d)
++    rig="$tmp/rig"
++    bin="$tmp/bin"
++    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
++    beads="$tmp/beads.json"
++    sessions="$tmp/sessions.json"
++    logdir="$tmp/logs"
++    mkdir -p "$logdir"
++
++    setup_rig "$rig"
++    write_gc_stub "$bin"
++    add_bead_worktree "$rig" "$home" wt-alpha
++    add_bead_worktree "$rig" "$home" wt-beta
++
++    cat >"$beads" <<'JSON'
++[
++  {"id":"wt-alpha","status":"closed","metadata":{"polecat_session":"deadsess"}},
++  {"id":"wt-beta","status":"closed","metadata":{"polecat_session":"deadsess"}}
++]
++JSON
++    printf '{"sessions":[]}' >"$sessions"
++
++    # Case 1: the bead store is slower than the whole budget. The run must cut
++    # the read off itself and finish well before the stub would have returned.
++    # Budgeted through the env var so this stays a behavioural assertion — a
++    # build that simply ignores the budget hangs here and fails on elapsed
++    # time, rather than being let off with an unknown-flag error.
++    started=$SECONDS
++    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
++        GC_BD_DELAY=20 GC_REAP_BUDGET_SECONDS=2 PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run \
++        >"$tmp/slow.txt" 2>&1 || fail "a slow bead store made the reaper exit non-zero: $(cat "$tmp/slow.txt")"
++    elapsed=$((SECONDS - started))
++
++    [[ "$elapsed" -lt 10 ]] ||
++        fail "the reaper waited ${elapsed}s on a 2s budget; a slow read is not bounded"
++    [[ -e "$home/worktrees/wt-alpha" ]] ||
++        fail "a worktree was reaped on a bead read that never answered"
++    grep -F '"event":"worktree_bead_query_failed"' "$logdir/polecat-worktree-reap.log" >/dev/null ||
++        fail "the timed-out bead query was not recorded"
++
++    # Case 2: the budget runs out mid-loop. Remaining candidates are deferred
++    # to the next cycle and the run still exits clean.
++    started=$SECONDS
++    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
++        GC_SESSION_DELAY=20 PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run --budget 3 \
++        >"$tmp/mid.txt" 2>&1 || fail "an exhausted budget made the reaper exit non-zero: $(cat "$tmp/mid.txt")"
++    elapsed=$((SECONDS - started))
++
++    [[ "$elapsed" -lt 15 ]] ||
++        fail "the reaper waited ${elapsed}s on a 3s budget; the roster read is not bounded"
++    grep -F '"event":"worktree_budget_exhausted"' "$logdir/polecat-worktree-reap.log" >/dev/null ||
++        fail "an exhausted budget was not recorded"
++    [[ -e "$home/worktrees/wt-alpha" && -e "$home/worktrees/wt-beta" ]] ||
++        fail "a worktree was reaped with an unreadable session roster"
++    grep -F 'deferred to the next cycle' "$tmp/mid.txt" >/dev/null ||
++        fail "the run did not report the candidates it deferred"
++
++    # And the budget must be a real bound, not a way to disable the reaper:
++    # the same worktrees reap normally once the reads are fast again.
++    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
++        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/fast.txt" 2>&1 ||
++        fail "reaper exited non-zero on a fast run: $(cat "$tmp/fast.txt")"
++    [[ ! -e "$home/worktrees/wt-alpha" && ! -e "$home/worktrees/wt-beta" ]] ||
++        fail "the budgeted paths left the reaper inert on a healthy run"
++
++    rm -rf "$tmp"
++}
++
+ test_reaps_only_closed_clean_unowned_bead_worktrees
+ test_real_removal_is_opt_in
+ test_unreadable_session_roster_skips_the_reap
+ test_dry_run_removes_nothing_and_rerun_is_idempotent
++test_bead_status_is_read_in_one_bulk_query
++test_budget_expiry_yields_the_witness_start
+ 
+ echo "polecat worktree reap tests passed"
+-- 
+2.50.1 (Apple Git-155)
+

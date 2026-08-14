@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 31 Jul 2026 15:13:48 -0400
-Subject: [PATCH 02/26] feat(refinery): add a gc-native merge approval signal
+Subject: [PATCH 02/27] feat(refinery): add a gc-native merge approval signal
  and fail-closed gate (gcp-dc8)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
