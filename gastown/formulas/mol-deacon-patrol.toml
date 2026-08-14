@@ -576,7 +576,7 @@ cycle commits a bead per cycle), and dedupe so it is said once per condition:
 printf '%s\\n' "$RESULT" | jq -r 'select(.verdict == "FROZEN") | [.scope, .detail] | @tsv' |
 while IFS=$'\\t' read -r SCOPE DETAIL; do
     MARK="$GC_CITY/.gc/runtime/dolt-push-frozen-$SCOPE"
-    [ -f "$MARK" ] && continue
+    if [ -f "$MARK" ]; then continue; fi
     mkdir -p "$(dirname "$MARK")"
     gc session nudge mayor/ "Dolt push-state watermark frozen on $SCOPE (pushes ARE landing; bd is recording success as failure). Raise dolt.auto-push-timeout in $SCOPE's .beads/config.yaml — until then auto-push outage detection is blind on that store. $DETAIL"
     date -u +"%Y-%m-%dT%H:%M:%SZ" >"$MARK"
