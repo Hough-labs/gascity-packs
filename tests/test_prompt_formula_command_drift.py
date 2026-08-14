@@ -41,6 +41,16 @@ POOL_RETURN_ASSIGNEE = re.compile(r"""--assignee=(?:""|'')""")
 # quick-reference table cell — has nothing but arguments between them.
 BD_LIST_SEARCH = re.compile(r"\bbd\s+list\b[^`\n]*--search")
 
+# `gc bd search ... --status <value>`, with the same no-backtick-in-between
+# clause as BD_LIST_SEARCH: prose naming the flag splits the verb and the flag
+# across two inline-code spans, a real invocation has only arguments between
+# them. The `-s` alternation is guarded so it cannot match inside `--status`.
+BD_SEARCH_STATUS = re.compile(
+    r"\bbd\s+search\b[^`\n]*?(?:--status|(?<![-\w])-s)[=\s]+([\w,]+)"
+)
+
+REFINERY_PATROL = Path("gastown/formulas/mol-refinery-patrol.toml")
+
 SCANNED_SUFFIXES = frozenset({".md", ".toml", ".sh"})
 
 
@@ -214,6 +224,57 @@ def bd_list_search_violations(path: Path, text: str) -> list[str]:
     return violations
 
 
+def bd_search_status_violations(path: Path, text: str) -> list[str]:
+    """`gc bd search` must not filter by `--status`. Both ways of doing it lie.
+
+    `gc bd search` already excludes closed issues — its own help says so — so
+    the default result set is exactly open + in_progress. Narrowing it is never
+    a widening, and both available narrowings fail invisibly:
+
+    ``--status=open`` drops in_progress. A duplicate that someone has already
+    started is still a duplicate, so the check reports zero and the caller files
+    the duplicate it was written to prevent. Nothing errors; there is no
+    fail-closed branch to catch it, because the command succeeded.
+
+    ``--status=open,in_progress`` looks like the fix and is worse. The
+    comma-separated form is a ``gc bd list`` feature; ``gc bd search`` returns
+    ``[]`` with exit 0 for it. Measured against this rig, on beads titled
+    "mol-polecat-work" (4 open, 1 in_progress)::
+
+        gc bd search "mol-polecat-work"                          -> 5
+        gc bd search "mol-polecat-work" --status=open            -> 4
+        gc bd search "mol-polecat-work" --status=in_progress     -> 1
+        gc bd search "mol-polecat-work" --status=open,in_progress -> 0   <-- exit 0
+
+    A check written that way is permanently blind and undetectable at runtime,
+    the same shape as the ``--search`` flag above. Note the asymmetry that makes
+    this worth a detector: ``gc bd list --status=open,in_progress`` *is* correct
+    and is required elsewhere (gcp-s14g), so the comma form cannot simply be
+    banned repo-wide — only on ``search``.
+
+    ``--status all`` is left alone: it is the documented way to include closed
+    issues, and it widens rather than narrows.
+    """
+    violations = []
+    for number, command in logical_commands(text):
+        match = BD_SEARCH_STATUS.search(command)
+        if not match:
+            continue
+        value = match.group(1)
+        location = f"{path.relative_to(REPO_ROOT)}:{number}"
+        if "," in value:
+            violations.append(
+                f"{location}: gc bd search --status={value} returns [] with exit 0 "
+                "(comma-separated status is a gc bd list feature — drop --status)"
+            )
+        elif value != "all":
+            violations.append(
+                f"{location}: gc bd search --status={value} hides in_progress beads "
+                "(search already excludes closed — drop --status)"
+            )
+    return violations
+
+
 def test_pool_returning_updates_declare_routing() -> None:
     violations = []
     for path in gastown_assets():
@@ -267,6 +328,54 @@ def test_no_asset_queries_beads_with_bd_list_search() -> None:
         "a duplicate check written with --search never runs: it errors, yields "
         "empty output, and the caller files a duplicate bead believing it "
         "checked:\n" + "\n".join(violations)
+    )
+
+
+def test_no_asset_filters_bd_search_by_status() -> None:
+    violations = []
+    for path in tracked_command_assets():
+        if path.resolve() == THIS_FILE:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        violations.extend(bd_search_status_violations(path, text))
+
+    assert not violations, (
+        "gc bd search already excludes closed issues, so every --status filter "
+        "on it narrows: =open drops in_progress, and the comma form returns [] "
+        "with exit 0. Both are invisible at runtime:\n" + "\n".join(violations)
+    )
+
+
+def test_refinery_duplicate_check_sees_in_progress_bugs() -> None:
+    """The dedup gate must match a duplicate someone has already started.
+
+    This is the specific instance the detector above generalises. The refinery
+    files a pre-existing-failure bead only when the check returns zero, so a
+    check blind to in_progress files a duplicate every time the original is
+    being worked — the exact pile-up the fail-closed block was built to stop.
+    """
+    path = REPO_ROOT / REFINERY_PATROL
+    text = path.read_text(encoding="utf-8")
+    checks = [
+        (number, command)
+        for number, command in logical_commands(text)
+        if "gc bd search" in command
+        and "DUP_KEYWORD" in command
+        and "--json" in command
+    ]
+
+    assert len(checks) == 1, (
+        f"expected exactly one duplicate-check invocation in {REFINERY_PATROL}, "
+        f"found {len(checks)} — the assertions below no longer cover the gate"
+    )
+    number, command = checks[0]
+    assert not bd_search_status_violations(path, command), (
+        f"{REFINERY_PATROL}:{number}: the duplicate check filters by --status, "
+        "so an in_progress duplicate is invisible and the refinery files a "
+        f"second bead for it:\n    {command}"
     )
 
 
@@ -361,4 +470,48 @@ def test_detectors_catch_the_drift_they_are_named_for() -> None:
     # inline-code spans, and must stay writable.
     assert not bd_list_search_violations(
         fixture, "`gc bd list` has no `--search` flag; use `gc bd search` instead."
+    )
+
+    # Narrowing a search to open hides the in_progress duplicate...
+    assert bd_search_status_violations(
+        fixture, 'gc bd search "$DUP_KEYWORD" --type=bug --status=open --json'
+    )
+    # ...and the comma form that looks like the fix returns [] with exit 0.
+    assert bd_search_status_violations(
+        fixture,
+        'gc bd search "$DUP_KEYWORD" --type=bug --status=open,in_progress --json',
+    )
+    # Both spellings of the flag, including the short form.
+    assert bd_search_status_violations(fixture, 'gc bd search "x" --status open')
+    assert bd_search_status_violations(fixture, 'gc bd search "x" -s open,in_progress')
+    # Continuation-joined, the form a formula is most likely to grow into.
+    assert bd_search_status_violations(
+        fixture,
+        "\n".join(
+            [
+                'gc bd search "$DUP_KEYWORD" \\',
+                "  --type=bug \\",
+                "  --status=open \\",
+                "  --json",
+            ]
+        ),
+    )
+    # The fix: no --status at all. Search already excludes closed issues.
+    assert not bd_search_status_violations(
+        fixture, 'gc bd search "$DUP_KEYWORD" --type=bug --json'
+    )
+    # `--status all` widens to include closed and is the documented way to do
+    # it, so it is not a narrowing and stays writable.
+    assert not bd_search_status_violations(fixture, 'gc bd search "x" --status all')
+    assert not bd_search_status_violations(fixture, 'gc bd search "x" --status=all')
+    # The asymmetry this detector exists to preserve: the comma form is correct
+    # on `gc bd list` (gcp-s14g requires it) and broken only on `gc bd search`.
+    assert not bd_search_status_violations(
+        fixture,
+        'gc bd list --assignee="$GC_AGENT" --status=open,in_progress --json',
+    )
+    # Prose naming the flag splits verb and flag across inline-code spans.
+    assert not bd_search_status_violations(
+        fixture,
+        "`gc bd search` takes no useful `--status=open` filter; drop the flag.",
     )

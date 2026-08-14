@@ -432,9 +432,18 @@ TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_bran
      # matches against titles, so a whole summary matches nothing and returns
      # [] — indistinguishable from a genuine miss. Use the failing test name,
      # the tool name, the CVE id (e.g. test_no_bare_bd_commands, govulncheck).
+     #
+     # NO `--status` FILTER, deliberately (gcp-h98d). `gc bd search` already
+     # excludes closed issues, so its default is exactly the wanted set: open
+     # + in_progress. Do not "fix" this by narrowing it — both narrowings lie,
+     # and neither trips the fail-closed branch below because both exit 0:
+     #   --status=open              drops in_progress, and a duplicate someone
+     #                              already STARTED is still a duplicate
+     #   --status=open,in_progress  returns [] — the comma form is a
+     #                              `gc bd list` feature, not a search one
      DUP_KEYWORD="<distinctive keyword from the failure>"
      DUP_ERR=$(mktemp)
-     DUP_JSON=$(gc bd search "$DUP_KEYWORD" --type=bug --status=open --json 2>"$DUP_ERR")
+     DUP_JSON=$(gc bd search "$DUP_KEYWORD" --type=bug --json 2>"$DUP_ERR")
      DUP_CODE=$?
      DUP_MSG=$(cat "$DUP_ERR"); rm -f "$DUP_ERR"
      DUP_COUNT=$(printf '%s' "$DUP_JSON" | jq 'length' 2>/dev/null)
