@@ -34,7 +34,7 @@ FENCE_CLOSE = re.compile(r"^\s*```\s*$")
 
 POOL_RETURN_ASSIGNEE = re.compile(r"""--assignee=(?:""|'')""")
 
-# `bd list ... --search`, with no backtick in between. The backtick clause is
+# `gc bd list ... --search`, with no backtick in between. The backtick clause is
 # what separates an invocation from the prose warning against one: a sentence
 # naming the broken flag puts `gc bd list` and `--search` in two different
 # inline-code spans, while a real command — fenced, or quoted whole in a
@@ -187,7 +187,7 @@ def bail_without_drain_violations(path: Path, text: str) -> list[str]:
 
 
 def bd_list_search_violations(path: Path, text: str) -> list[str]:
-    """`bd list` has no `--search` flag, and the failure mode is invisible.
+    """`gc bd list` has no `--search` flag, and the failure mode is invisible.
 
     `gc bd list --search "<query>"` does not search weakly — it never runs.
     It exits non-zero with ``unknown flag: --search``, and piped to jq or head
@@ -208,7 +208,7 @@ def bd_list_search_violations(path: Path, text: str) -> list[str]:
         if not BD_LIST_SEARCH.search(command):
             continue
         violations.append(
-            f"{path.relative_to(REPO_ROOT)}:{number}: bd list has no --search flag "
+            f"{path.relative_to(REPO_ROOT)}:{number}: gc bd list has no --search flag "
             "(use `gc bd search` or `gc bd list --title-contains`)"
         )
     return violations
