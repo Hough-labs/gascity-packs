@@ -26,12 +26,34 @@ import subprocess
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+THIS_FILE = Path(__file__).resolve()
 AGENT_PROMPT_GLOB = "gastown/agents/*/prompt.template.md"
 
 FENCE_OPEN = re.compile(r"^\s*```(\w*)\s*$")
 FENCE_CLOSE = re.compile(r"^\s*```\s*$")
 
 POOL_RETURN_ASSIGNEE = re.compile(r"""--assignee=(?:""|'')""")
+
+# `bd list ... --search`, with no backtick in between. The backtick clause is
+# what separates an invocation from the prose warning against one: a sentence
+# naming the broken flag puts `gc bd list` and `--search` in two different
+# inline-code spans, while a real command — fenced, or quoted whole in a
+# quick-reference table cell — has nothing but arguments between them.
+BD_LIST_SEARCH = re.compile(r"\bbd\s+list\b[^`\n]*--search")
+
+SCANNED_SUFFIXES = frozenset({".md", ".toml", ".sh"})
+
+
+def tracked_command_assets() -> list[Path]:
+    """Every tracked file in the repo that can carry an agent-facing command."""
+    result = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+    )
+    paths = [REPO_ROOT / part for part in result.stdout.decode().split("\0") if part]
+    return [path for path in paths if path.suffix in SCANNED_SUFFIXES]
 
 
 def gastown_assets() -> list[Path]:
@@ -164,6 +186,34 @@ def bail_without_drain_violations(path: Path, text: str) -> list[str]:
     return violations
 
 
+def bd_list_search_violations(path: Path, text: str) -> list[str]:
+    """`bd list` has no `--search` flag, and the failure mode is invisible.
+
+    `gc bd list --search "<query>"` does not search weakly — it never runs.
+    It exits non-zero with ``unknown flag: --search``, and piped to jq or head
+    that yields empty output, which the caller correctly reads as "nothing
+    matched". Every duplicate check written this way reports a clean miss.
+
+    That is not hypothetical either: mol-refinery-patrol's handle-failures step
+    prescribed exactly this before filing a pre-existing-failure bead, so the
+    dedup gate had never once searched anything. It produced six open beads for
+    the same seven govulncheck stdlib vulns in the winnow rig, and ~10 open
+    beads for the same test_no_bare_bd_commands failure in this one.
+
+    The verbs that actually query titles are ``gc bd search "<keyword>"`` and
+    ``gc bd list --title-contains "<keyword>"``.
+    """
+    violations = []
+    for number, command in logical_commands(text):
+        if not BD_LIST_SEARCH.search(command):
+            continue
+        violations.append(
+            f"{path.relative_to(REPO_ROOT)}:{number}: bd list has no --search flag "
+            "(use `gc bd search` or `gc bd list --title-contains`)"
+        )
+    return violations
+
+
 def test_pool_returning_updates_declare_routing() -> None:
     violations = []
     for path in gastown_assets():
@@ -199,6 +249,24 @@ def test_prompt_template_bail_paths_drain_ack() -> None:
     assert not violations, (
         "a session that exits without drain-ack is never recycled:\n"
         + "\n".join(violations)
+    )
+
+
+def test_no_asset_queries_beads_with_bd_list_search() -> None:
+    violations = []
+    for path in tracked_command_assets():
+        if path.resolve() == THIS_FILE:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        violations.extend(bd_list_search_violations(path, text))
+
+    assert not violations, (
+        "a duplicate check written with --search never runs: it errors, yields "
+        "empty output, and the caller files a duplicate bead believing it "
+        "checked:\n" + "\n".join(violations)
     )
 
 
@@ -255,4 +323,42 @@ def test_detectors_catch_the_drift_they_are_named_for() -> None:
     assert bail_without_drain_violations(fixture, "```bash\necho no\nexit 1\n```")
     assert not bail_without_drain_violations(
         fixture, "```bash\necho no\ngc runtime drain-ack\nexit 1\n```"
+    )
+
+    # Built line-by-line for the same reason as the warrant fixtures above: a
+    # literal backslash-n immediately before `gc` reads as a bare `bd`
+    # invocation to tests/test_no_bare_bd_commands.py's line-based scanner.
+    assert bd_list_search_violations(
+        fixture, 'gc bd list --type=bug --status=open --search "<failure summary>"'
+    )
+    # Continuation-joined, the form a formula is most likely to grow into.
+    assert bd_list_search_violations(
+        fixture,
+        "\n".join(
+            [
+                "gc bd list \\",
+                "  --type=bug \\",
+                '  --search "govulncheck"',
+            ]
+        ),
+    )
+    # The two verbs that actually query titles.
+    assert not bd_list_search_violations(
+        fixture, 'gc bd search "govulncheck" --type=bug --status=open --json'
+    )
+    assert not bd_list_search_violations(
+        fixture, 'gc bd list --status=open --title-contains "govulncheck"'
+    )
+    # `gh` genuinely has --search; only the beads CLI is being constrained.
+    assert not bd_list_search_violations(
+        fixture, 'gh issue list --repo gastownhall/gascity --search "<keywords>"'
+    )
+    # A quick-reference table cell quotes the whole command, so it is caught...
+    assert bd_list_search_violations(
+        fixture, '| Dedup check | `gc bd list --type=bug --search "<summary>"` |'
+    )
+    # ...but prose warning against the flag names the two halves in separate
+    # inline-code spans, and must stay writable.
+    assert not bd_list_search_violations(
+        fixture, "`gc bd list` has no `--search` flag; use `gc bd search` instead."
     )

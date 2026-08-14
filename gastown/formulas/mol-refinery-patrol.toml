@@ -421,14 +421,48 @@ TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_bran
    - Close this step after the current wisp is burned.
 
 3. If pre-existing on target:
-   - Check for duplicates first:
+   - Check for duplicates FIRST, and run the whole block — the check has to
+     fail closed. `gc bd list` has no `--search` flag; it exits non-zero with
+     `unknown flag: --search`, which piped to jq yields empty output that reads
+     exactly like "no duplicate exists". That is how one pre-existing failure
+     becomes ten identical open bug beads. `gc bd search` is the verb that
+     actually queries titles.
      ```bash
-     gc bd list --type=bug --status=open --search "<failure summary>"
+     # Search a DISTINCTIVE KEYWORD, not the failure sentence: `gc bd search`
+     # matches against titles, so a whole summary matches nothing and returns
+     # [] — indistinguishable from a genuine miss. Use the failing test name,
+     # the tool name, the CVE id (e.g. test_no_bare_bd_commands, govulncheck).
+     DUP_KEYWORD="<distinctive keyword from the failure>"
+     DUP_ERR=$(mktemp)
+     DUP_JSON=$(gc bd search "$DUP_KEYWORD" --type=bug --status=open --json 2>"$DUP_ERR")
+     DUP_CODE=$?
+     DUP_MSG=$(cat "$DUP_ERR"); rm -f "$DUP_ERR"
+     DUP_COUNT=$(printf '%s' "$DUP_JSON" | jq 'length' 2>/dev/null)
+     if [ "$DUP_CODE" -ne 0 ] || [ -z "$DUP_COUNT" ]; then
+       # FAIL CLOSED. An errored or unparseable duplicate check is NOT
+       # "no duplicate found" — filing here is the exact shape that produced
+       # the duplicate pile-ups. Halt and escalate; do NOT create a bead.
+       gc mail send mayor/ -s "ESCALATION: refinery duplicate check failed, not filing [HIGH]" -m "Work bead: $WORK
+     Keyword: $DUP_KEYWORD
+     Exit code: $DUP_CODE
+     Stderr: $DUP_MSG
+     Refused to file a pre-existing-failure bead on an unverified duplicate check."
+       gc session nudge "${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness" "DUP-CHECK HALT: $WORK — gc bd search failed (code $DUP_CODE); refused to file. Merge not attempted."
+       echo "STOP. Duplicate check did not run. NEVER fall through to filing."
+       gc runtime drain-ack
+       exit 1
+     fi
+     if [ "$DUP_COUNT" -gt 0 ]; then
+       printf '%s' "$DUP_JSON" | jq -r '.[] | "DUPLICATE \\(.id)  \\(.title)"'
+     fi
      ```
-   - If a matching bug already exists: note its ID and proceed with merge.
-   - If no duplicate: file a new bead:
+   - If `DUP_COUNT` > 0: note the matching bead ID and proceed with merge. Do
+     not file.
+   - If `DUP_COUNT` is 0 — a check that ran and genuinely found nothing — file
+     a new bead. Put `$DUP_KEYWORD` in the title verbatim, or the next patrol's
+     search cannot find what you just filed:
      ```bash
-     gc bd create --type=bug --priority=1 --title="Pre-existing failure: <summary>"
+     gc bd create --type=bug --priority=1 --title="Pre-existing failure: $DUP_KEYWORD — <summary>"
      ```
    - Proceed with merge (failure not caused by this branch)
 
