@@ -352,16 +352,38 @@ test_dolt_push_outage_detection_is_wired() {
     [[ -x "$check" ]] || fail "auto-push detector must be executable"
     parse_toml "$deacon_cfg" "$patrol"
 
-    # Same constraint as the worktree reaper: a formula step cannot name the
-    # content-hashed pack cache, so pre_start is the only stable handle.
-    grep -F 'pre_start = ["{{.ConfigDir}}/assets/scripts/dolt-push-state-check.sh --snapshot"]' \
-        "$deacon_cfg" >/dev/null ||
-        fail "deacon must run the auto-push detector from pre_start"
+    # gcp-oo0v: the detector USED to run from the deacon's pre_start. It cannot.
+    # The sweep is one `gc bd sql -C <scope>` per scope — 18.6s measured against
+    # a 10s [session] setup_timeout — and a pre_start killed on that deadline
+    # fails the whole session start, so six cycles latched the supervisor
+    # circuit breaker and the town lost its deacon for ~5h. No pre_start on this
+    # agent, and the pack-wide guard in test_agent_pre_start_budget.sh is what
+    # stops a new one arriving unmeasured on a pin bump.
+    ! grep -E '^[[:space:]]*pre_start[[:space:]]*=' "$deacon_cfg" >/dev/null ||
+        fail "deacon must not wire a pre_start; the auto-push sweep cannot fit setup_timeout (gcp-oo0v)"
 
     grep -F 'id = "dolt-push-divergence"' "$patrol" >/dev/null ||
         fail "deacon patrol should own an auto-push divergence step"
     grep -F 'needs = ["dolt-push-divergence"]' "$patrol" >/dev/null ||
         fail "the divergence step must be wired into the patrol chain, not orphaned"
+
+    # The detector moved INTO the patrol step, which has a whole cycle to run
+    # it. A formula step still cannot name the content-hashed pack cache, so it
+    # resolves the script from the formula's own resolved source path — the one
+    # candidate guaranteed present and version-coherent with the formula.
+    grep -F 'gc formula list' "$patrol" >/dev/null ||
+        fail "divergence step must resolve the detector from the formula's own source path"
+    grep -F 'assets/scripts/dolt-push-state-check.sh' "$patrol" >/dev/null ||
+        fail "divergence step must run the detector itself, not read a session-start snapshot"
+
+    # The old wiring fell back to the pre_start snapshot when the detector was
+    # unresolvable. That fallback is now a lie in two ways — no pre_start writes
+    # it, and a stale reading is not this cycle's measurement — so an
+    # unresolvable detector must be reported as blind, not passed over as OK.
+    ! grep -F 'falling back to snapshot' "$patrol" >/dev/null ||
+        fail "divergence step must not fall back to a stale snapshot as if it were a fresh reading"
+    grep -F 'BLIND this cycle' "$patrol" >/dev/null ||
+        fail "an unresolvable detector must be reported as a finding, not a silent OK"
 
     # The point of the whole check is endpoint coverage. `gc dolt health` sees
     # the MANAGED server only, and the rig that went dark for 18h was pinned to

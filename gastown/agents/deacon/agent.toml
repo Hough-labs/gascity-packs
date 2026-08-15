@@ -1,18 +1,28 @@
 scope = "city"
 wake_mode = "fresh"
 work_dir = ".gc/agents/deacon"
-# Dolt auto-push outage detection. `bd` only warns about a failed auto-push when
-# it is neither quiet nor --json, and gc drives every bead WRITE through beads
-# with exactly that flag — so the caller class doing essentially all writes is
-# exactly the one that cannot see the warning. A winnow outage ran ~18h unnoticed
-# on that blind spot. Wired as pre_start because pack assets live in a content-hashed
-# cache directory that a formula step cannot name; {{.ConfigDir}} is the only
-# stable handle on the script. --snapshot writes
-# $GC_CITY/.gc/runtime/dolt-push-state.json, recording the script's own resolved
-# path so mol-deacon-patrol's dolt-push-divergence step can re-run the sweep
-# fresh on every patrol cycle rather than reading a session-start measurement.
-# Read-only: it queries each scope's dolt_log and writes nothing but the snapshot.
-pre_start = ["{{.ConfigDir}}/assets/scripts/dolt-push-state-check.sh --snapshot"]
+# NO pre_start, deliberately — and adding one here needs a measurement first.
+#
+# Dolt auto-push outage detection used to run from this agent's pre_start as
+# `dolt-push-state-check.sh --snapshot`. It cannot: the sweep costs one
+# `gc bd sql -C <scope>` per scope at this city's ~5-8s per-gc-call, measured at
+# 18.6s wall clock, against a 10s [session] setup_timeout. pre_start is killed at
+# that deadline and a killed pre_start fails the WHOLE session start, so the
+# deacon died on every cycle and six failures in an hour latched the supervisor
+# circuit breaker open — town patrols dead ~5h (gcp-oo0v). The script was never
+# broken; it simply cannot fit that budget.
+#
+# The detection did not go away, it moved to where it has time: the
+# `dolt-push-divergence` step of mol-deacon-patrol, which resolves this pack's
+# copy of the script from the formula's own resolved source path and runs the
+# sweep on the patrol's cadence. A snapshot is periodic housekeeping — there is
+# no reason it must finish before the agent may boot.
+#
+# This is the second instance of the class (gcp-ntbf was the witness reaper).
+# `gastown/tests/test_agent_pre_start_budget.sh` is the pack-wide guard: any
+# pre_start wired anywhere in this pack must be recorded there with a measured
+# wall clock inside the budget, so a new one cannot arrive unmeasured on a pin
+# bump the way this one did.
 nudge = "Run 'gc prime' to check patrol status and begin heartbeat cycle."
 idle_timeout = "1h"
 max_active_sessions = 1

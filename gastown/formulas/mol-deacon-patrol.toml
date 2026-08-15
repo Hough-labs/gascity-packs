@@ -477,21 +477,53 @@ case this step exists to catch. The detector reaches every scope through
 
 **Step 1: Run the detector.**
 
+**The detector runs HERE, not from the deacon's `pre_start`, and it must not be
+put back there.** The sweep costs one `gc bd sql -C <scope>` per scope — 18.6s
+measured on this city — against a 10s `[session] setup_timeout`. A pre_start
+that overruns is SIGKILLed and takes the whole session start down with it; six
+of those in an hour latch the supervisor circuit breaker and the town loses its
+deacon entirely (gcp-oo0v, and gcp-ntbf before it on the witness). A push-state
+sweep is periodic housekeeping — a patrol cycle is exactly the budget it wants,
+and running it per cycle also means this alert reads a FRESH measurement rather
+than one taken once at session start.
+
 Pack assets install into a content-hashed cache directory this step cannot name,
-so the deacon's `pre_start` runs the script once at session start and records
-its own resolved path in the snapshot. Read that path back and re-run the sweep,
-so this cycle alerts on a FRESH measurement rather than a session-start reading:
+so resolve the detector from this formula's OWN resolved source path: the
+detector ships beside this formula in the same pack tree, making that the one
+candidate guaranteed to be present whenever the formula is and version-coherent
+with it (a formula from pin X can never reach a detector from pin Y).
+`gc formula list --json` reports that path for every formula gc can see,
+SHA-pinned packs included, and needs no environment beyond the city.
 
 ```bash
-SNAP="$GC_CITY/.gc/runtime/dolt-push-state.json"
-CHECK=$(jq -r '.script_path // empty' "$SNAP" 2>/dev/null || true)
-if [ -n "$CHECK" ] && [ -x "$CHECK" ]; then
+CITY="${GC_CITY:-${GC_CITY_PATH:-}}"
+if [ -n "$CITY" ]; then
+    FORMULA_JSON=$(gc formula list --city "$CITY" --json 2>/dev/null)
+else
+    FORMULA_JSON=$(gc formula list --json 2>/dev/null)
+fi
+FORMULA_SRC=$(printf '%s' "$FORMULA_JSON" \\
+    | jq -r '.formulas[]? | select(.name == "mol-deacon-patrol") | .source // empty' 2>/dev/null \\
+    | head -1)
+CHECK=""
+if [ -n "$FORMULA_SRC" ]; then
+    # <pack>/formulas/mol-deacon-patrol.toml -> <pack>/assets/scripts/<detector>
+    CHECK="$(dirname "$(dirname "$FORMULA_SRC")")/assets/scripts/dolt-push-state-check.sh"
+fi
+# GC_PACK_DIR is exported only when gc invokes a pack command, so it is a
+# fallback and never the primary — depending on it alone is what made the
+# refinery's approval gate permanently unresolvable (gcp-amo).
+if [ ! -x "$CHECK" ] && [ -n "${GC_PACK_DIR:-}" ]; then
+    CHECK="$GC_PACK_DIR/assets/scripts/dolt-push-state-check.sh"
+fi
+if [ -x "$CHECK" ]; then
     RESULT=$("$CHECK" --json)
 else
-    # pre_start did not run (or the pack moved). Fall back to the last snapshot
-    # and say so — a missing detector is itself worth reporting, not a silent OK.
-    echo "dolt-push-divergence: detector not runnable; falling back to snapshot $SNAP"
-    RESULT=$(jq -c '.scopes[]?' "$SNAP" 2>/dev/null || true)
+    # A detector that cannot be resolved is itself the finding. Nothing else in
+    # this city watches auto-push, so say it loudly rather than logging a silent
+    # OK — that silence is the exact failure mode this step exists to break.
+    echo "dolt-push-divergence: detector not runnable (resolved '$CHECK'); auto-push outage detection is BLIND this cycle — report it"
+    RESULT=""
 fi
 printf '%s\\n' "$RESULT"
 ```
@@ -613,7 +645,8 @@ persistent UNKNOWN is the only thing standing between a real outage and silence.
 
 **Exit criteria:** Detector run for every active scope, STALE scopes escalated
 (deduped), FROZEN scopes nudged (deduped), and recovered scopes' markers
-cleared."""
+cleared — or, if the detector could not be resolved at all, that reported as a
+finding rather than passed over as OK."""
 
 [[steps]]
 id = "system-health"

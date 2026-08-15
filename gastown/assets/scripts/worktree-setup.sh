@@ -10,8 +10,91 @@
 #
 # Called from pre_start in pack configs. Runs before the session is created
 # so the agent starts IN the worktree directory.
+#
+# BOUNDED: pre_start is killed at [session] setup_timeout (10s by default) and
+# a killed pre_start fails the WHOLE session start; six of those in an hour
+# latch the supervisor circuit breaker open and the rig loses that agent
+# entirely (gcp-ntbf on the witness, gcp-oo0v on the deacon). This script
+# therefore holds its NETWORK calls — the only ones that can block for an
+# unbounded time — to a wall-clock budget inside that limit
+# (6s; GC_WORKTREE_SETUP_BUDGET_SECONDS), and gives up on the sync rather than
+# on the session. A stale worktree is recoverable on the next cycle; a start
+# that never completes is not. Raise the budget only alongside setup_timeout.
+#
+# The local git plumbing below (worktree add, prune, submodule init) is
+# deliberately NOT budgeted: it is disk-bound, it is the reason this script
+# exists, and an agent whose worktree was not created has nothing to start in.
+# Only the calls that talk to a remote get a deadline.
+#
+#   GC_WORKTREE_SETUP_BUDGET_SECONDS
+#                      wall-clock budget shared by every network call in this
+#                      run (default 6s). Must stay well inside the caller's
+#                      [session] setup_timeout.
 
 set -eu
+
+# Well inside gascity's 10s default [session] setup_timeout — see BOUNDED above.
+SYNC_BUDGET_SECONDS="${GC_WORKTREE_SETUP_BUDGET_SECONDS:-6}"
+case "$SYNC_BUDGET_SECONDS" in
+    '' | *[!0-9]* | 0)
+        echo "worktree-setup: budget must be a positive whole number of seconds" >&2
+        exit 2
+        ;;
+esac
+
+BUDGET_START=$(date +%s)
+
+# Seconds left in this run's network budget, floored at 0. Every remote-facing
+# command is bounded by this, so no single hung fetch can outlive the budget.
+budget_left() {
+    _bl_left=$((SYNC_BUDGET_SECONDS - ($(date +%s) - BUDGET_START)))
+    [ "$_bl_left" -ge 0 ] || _bl_left=0
+    printf '%s\n' "$_bl_left"
+}
+
+TIMEOUT_BIN=""
+if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_BIN=timeout
+elif command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT_BIN=gtimeout
+fi
+
+# run_bounded <seconds> <cmd...> — run a command under a hard time limit,
+# returning 124 if it does not finish in time (matching timeout(1)).
+#
+# The fallback matters: coreutils `timeout` is not on a stock macOS, and a
+# pre_start that cannot bound its own children is precisely the failure this
+# bound exists to prevent. So the fallback actually kills rather than merely
+# giving up on waiting. Interrupting a fetch or a rebase this way is strictly
+# gentler than the status quo, where gc SIGKILLs the whole process group at
+# setup_timeout with no signal the child can act on at all.
+run_bounded() {
+    _rb_limit="$1"
+    shift
+    [ "$_rb_limit" -gt 0 ] || return 124
+    if [ -n "$TIMEOUT_BIN" ]; then
+        _rb_rc=0
+        "$TIMEOUT_BIN" "$_rb_limit" "$@" || _rb_rc=$?
+        return "$_rb_rc"
+    fi
+    "$@" &
+    _rb_pid=$!
+    _rb_waited=0
+    while kill -0 "$_rb_pid" 2>/dev/null; do
+        if [ "$_rb_waited" -ge "$_rb_limit" ]; then
+            kill -TERM "$_rb_pid" 2>/dev/null || true
+            sleep 1
+            kill -KILL "$_rb_pid" 2>/dev/null || true
+            wait "$_rb_pid" 2>/dev/null || true
+            return 124
+        fi
+        sleep 1
+        _rb_waited=$((_rb_waited + 1))
+    done
+    _rb_rc=0
+    wait "$_rb_pid" || _rb_rc=$?
+    return "$_rb_rc"
+}
 
 RIG_ROOT="${1:?usage: worktree-setup.sh <rig-root> <target-dir> <agent-name> [--sync]}"
 ARG2="${2:?missing target-dir}"
@@ -43,8 +126,11 @@ sync_worktree() {
     if ! git -C "$WT" remote get-url origin >/dev/null 2>&1; then
         return 0
     fi
-    git -C "$WT" fetch origin 2>/dev/null || true
-    git -C "$WT" pull --rebase 2>/dev/null || true
+    # Both calls talk to the remote and share the run's budget. Best-effort by
+    # design: a sync that times out leaves a worktree one fetch behind, which
+    # the next cycle fixes, and the session still starts.
+    run_bounded "$(budget_left)" git -C "$WT" fetch origin 2>/dev/null || true
+    run_bounded "$(budget_left)" git -C "$WT" pull --rebase 2>/dev/null || true
 }
 
 branch_name() {
@@ -119,7 +205,7 @@ BRANCH=$(branch_name)
 DEFAULT_REF=$(git -C "$RIG_ROOT" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null || true)
 if [ -n "$DEFAULT_REF" ]; then
     DEFAULT_BRANCH=${DEFAULT_REF#refs/remotes/origin/}
-    git -C "$RIG_ROOT" fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1 || true
+    run_bounded "$(budget_left)" git -C "$RIG_ROOT" fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1 || true
 fi
 
 if git -C "$RIG_ROOT" show-ref --verify --quiet "refs/heads/$BRANCH"; then
