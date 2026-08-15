@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 14 Aug 2026 13:21:31 -0400
-Subject: [PATCH 26/31] test(drift): route the new detector's own bd references
+Subject: [PATCH 26/32] test(drift): route the new detector's own bd references
  through gc (gcp-ex1s)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
