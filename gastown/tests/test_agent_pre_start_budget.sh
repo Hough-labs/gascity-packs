@@ -134,12 +134,13 @@ assert_bounded() {
         fail "$script must define budget_left and spend one shared wall clock, not bound each call independently"
 
     # And every call that can actually block for tens of seconds must go
-    # through it. Comments are stripped first: the headers explain the
-    # unbounded fetch that caused the incident, and saying so must not read as
-    # doing it.
+    # through it. Comments are dropped — the headers explain the unbounded
+    # fetch that caused the incident, and saying so must not read as doing it —
+    # but numbering happens FIRST, so the line this reports is the line in the
+    # file rather than an offset into the stripped stream.
     local unbounded
-    unbounded=$(grep -vE '^[[:space:]]*#' "$path" |
-        grep -nE '(^|[^-[:alnum:]_])git([[:space:]]|.*[[:space:]])(fetch|pull|push|clone|ls-remote)([[:space:]]|$)' |
+    unbounded=$(grep -nE '(^|[^-[:alnum:]_])git([[:space:]]|.*[[:space:]])(fetch|pull|push|clone|ls-remote)([[:space:]]|$)' "$path" |
+        grep -vE '^[0-9]+:[[:space:]]*#' |
         grep -v 'run_bounded' || true)
     [[ -z "$unbounded" ]] ||
         fail "$script calls a remote without a deadline: ${unbounded//$'\n'/ | }"
