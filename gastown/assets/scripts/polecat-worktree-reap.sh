@@ -68,6 +68,23 @@
 # summary on stdout. Idempotent and safe to re-run: a reaped worktree stops
 # being a candidate, so the work set shrinks to nothing.
 #
+# LOG SCHEMA — the log is forensics, so every line must be readable on its own
+# (gcp-mqu9):
+#   ts                 when THIS event happened. Not the run's start time: a
+#                      log where every line carries the start stamp cannot show
+#                      that a cycle spent eight seconds, or in what order.
+#   run_started        the run's start stamp, kept as its own field so lines
+#                      can still be grouped into cycles.
+#   budget_remaining   seconds left in the run's budget when the line was
+#                      written. 0 means the decision was the clock's, not the
+#                      subsystem's.
+#   reason             machine-readable WHY, because an event name alone cannot
+#                      separate "the command ran and failed" from "the command
+#                      never ran". Both used to be reported with the same
+#                      wording, which sent readers to a healthy Dolt server
+#                      twice in one night. `worktree_budget_truncated` is the
+#                      never-attempted case and names nothing external.
+#
 # Env / args:
 #   $1 | GC_RIG_ROOT   rig repo root (default: `git rev-parse --show-toplevel`)
 #   --rig <name>       rig name — scopes `gc bd`. Defaults to $GC_RIG. Needed
@@ -155,7 +172,7 @@ if ! mkdir -p "$LOG_DIR" 2>/dev/null || ! touch "$LOG_FILE" 2>/dev/null; then
     exit 0
 fi
 
-TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+RUN_STARTED=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 START_EPOCH=$(date +%s)
 
 # Seconds left in this run's budget, floored at 0. Every external command is
@@ -182,6 +199,11 @@ fi
 # pre_start that cannot bound its own children is precisely the failure this
 # script exists to prevent. So the fallback actually kills rather than merely
 # giving up on waiting.
+#
+# NOTE FOR CALLERS: a 124 from here means one of two very different things —
+# the command ran and overran, or the budget was already spent so it NEVER RAN.
+# Pass the limit you gave and the code you got to classify_outcome and report
+# what it says. Do not describe a 124 as a failure of the command.
 run_bounded() {
     local limit="$1"
     shift
@@ -221,17 +243,53 @@ else
     GC_BD=(gc bd)
 fi
 
+# classify_outcome <limit-given> <exit-code> — name what actually happened to a
+# bounded call: `skipped` (the budget was already spent, so the command never
+# ran), `timeout` (it ran and was killed at the limit), `failed` (it ran and
+# exited non-zero), `ok`.
+#
+# The limit is an argument rather than global state because the git-status call
+# site captures stdout in a command substitution, and anything run_bounded set
+# about itself would die with that subshell. Passing both halves of the verdict
+# down works from any call site.
+classify_outcome() {
+    if [ "$1" -le 0 ]; then
+        printf 'skipped\n'
+    elif [ "$2" -eq 124 ]; then
+        printf 'timeout\n'
+    elif [ "$2" -ne 0 ]; then
+        printf 'failed\n'
+    else
+        printf 'ok\n'
+    fi
+}
+
 record() {
-    # record <event> <bead> <worktree> <detail>
+    # record <event> <bead> <worktree> <detail> [reason]
+    #
+    # `ts` is stamped HERE, at the moment of the event. It used to be the run's
+    # start time on every line, which is the difference between a log you can
+    # reconstruct a slow cycle from and one where an eight-second run and an
+    # instant one are indistinguishable.
+    #
+    # `reason` is the machine-readable half of the same honesty rule the detail
+    # text follows: it must name what actually happened, never a cause the run
+    # did not observe. `budget_remaining` is read at record time, so a line
+    # reporting 0 is self-evidently the clock's doing.
     jq -cn \
-        --arg ts "$TS" \
+        --arg ts "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+        --arg run_started "$RUN_STARTED" \
         --arg event "$1" \
         --arg rig "$RIG_NAME" \
         --arg bead "$2" \
         --arg worktree "$3" \
         --arg detail "$4" \
+        --arg reason "${5:-}" \
+        --argjson budget_remaining "$(budget_left)" \
         --argjson dry_run "$DRY_RUN" \
-        '{ts:$ts, event:$event, rig:$rig, bead:$bead, worktree:$worktree, detail:$detail, dry_run:($dry_run == 1)}' \
+        '{ts:$ts, run_started:$run_started, event:$event, rig:$rig, bead:$bead,
+          worktree:$worktree, detail:$detail, reason:$reason,
+          budget_remaining:$budget_remaining, dry_run:($dry_run == 1)}' \
         >>"$LOG_FILE"
     echo "$1 $2 $3${4:+ ($4)}"
 }
@@ -240,7 +298,38 @@ record() {
 # reflects reality rather than stale administrative entries.
 run_bounded "$(budget_left)" git -C "$RIG_ROOT" worktree prune >/dev/null 2>&1 || true
 
-WT_LIST=$(run_bounded "$(budget_left)" git -C "$RIG_ROOT" worktree list --porcelain 2>/dev/null || true)
+WT_LIST_LIMIT=$(budget_left)
+WT_LIST_RC=0
+WT_LIST=$(run_bounded "$WT_LIST_LIMIT" git -C "$RIG_ROOT" worktree list --porcelain 2>/dev/null) || WT_LIST_RC=$?
+WT_LIST_OUTCOME=$(classify_outcome "$WT_LIST_LIMIT" "$WT_LIST_RC")
+if [ "$WT_LIST_OUTCOME" != ok ]; then
+    # "no per-bead polecat worktrees under $RIG_ROOT" is a claim about the rig.
+    # A run that never got the list is not entitled to make it — and this path
+    # used to make it anyway, while logging nothing at all: the quietest way
+    # this script could report a fact it had not observed.
+    case "$WT_LIST_OUTCOME" in
+        skipped)
+            record worktree_budget_truncated "" "" \
+                "the ${BUDGET_SECONDS}s budget was spent before the worktree list was read; no candidate was enumerated" \
+                budget_spent_before_worktree_list
+            echo "polecat-worktree-reap: budget spent before enumerating worktrees; examined=0 (log: $LOG_FILE)"
+            ;;
+        timeout)
+            record worktree_list_failed "" "" \
+                "git worktree list did not answer within the ${WT_LIST_LIMIT}s left of the ${BUDGET_SECONDS}s budget" \
+                worktree_list_timed_out
+            echo "polecat-worktree-reap: worktree list did not answer within ${WT_LIST_LIMIT}s; examined=0 (log: $LOG_FILE)"
+            ;;
+        *)
+            record worktree_list_failed "" "" \
+                "git worktree list exited $WT_LIST_RC in $RIG_ROOT" \
+                worktree_list_failed
+            echo "polecat-worktree-reap: worktree list failed (exit $WT_LIST_RC); examined=0 (log: $LOG_FILE)"
+            ;;
+    esac
+    exit 0
+fi
+
 CANDIDATES=$(printf '%s\n' "$WT_LIST" \
     | sed -n 's/^worktree //p' \
     | while IFS= read -r wt; do
@@ -296,16 +385,37 @@ BEADS_FILE=$(mktemp)
 SESSIONS_FILE=$(mktemp)
 trap 'rm -f "$BEADS_FILE" "$SESSIONS_FILE"' EXIT
 
-run_bounded "$(budget_left)" "${GC_BD[@]}" show "${BEAD_IDS_ARGV[@]}" --json \
-    >"$BEADS_FILE" 2>/dev/null || true
+BEAD_QUERY_LIMIT=$(budget_left)
+BEAD_QUERY_RC=0
+run_bounded "$BEAD_QUERY_LIMIT" "${GC_BD[@]}" show "${BEAD_IDS_ARGV[@]}" --json \
+    >"$BEADS_FILE" 2>/dev/null || BEAD_QUERY_RC=$?
+BEAD_QUERY_OUTCOME=$(classify_outcome "$BEAD_QUERY_LIMIT" "$BEAD_QUERY_RC")
 
 if ! jq -e 'type == "array"' "$BEADS_FILE" >/dev/null 2>&1; then
-    # No usable answer for ANY bead — the store is unreachable, too slow, or
-    # spoke a shape we do not recognise. An unreadable bead is not proof the
-    # work is done, so nothing is a candidate for removal this cycle.
-    record worktree_bead_query_failed "" "" \
-        "bulk gc bd show returned no usable JSON for ${#BEAD_IDS_ARGV[@]} bead(s)"
-    echo "polecat-worktree-reap: bead query failed or timed out; reaped=0 skipped=$TOTAL (log: $LOG_FILE)"
+    # No usable answer for ANY bead. An unreadable bead is not proof the work
+    # is done, so nothing is a candidate for removal this cycle — but WHY there
+    # is no answer decides who should look at it, so say which of the three it
+    # was instead of blaming the store for all of them.
+    case "$BEAD_QUERY_OUTCOME" in
+        skipped)
+            record worktree_budget_truncated "" "" \
+                "the ${BUDGET_SECONDS}s budget was spent before the bead read was issued; 0 of $TOTAL candidate(s) examined, $TOTAL deferred" \
+                budget_spent_before_bead_query
+            echo "polecat-worktree-reap: budget spent before the bead read; examined=0 deferred=$TOTAL of $TOTAL (log: $LOG_FILE)"
+            ;;
+        timeout)
+            record worktree_bead_query_failed "" "" \
+                "bulk gc bd show for ${#BEAD_IDS_ARGV[@]} bead(s) did not answer within the ${BEAD_QUERY_LIMIT}s left of the ${BUDGET_SECONDS}s budget" \
+                bead_query_timed_out
+            echo "polecat-worktree-reap: bead read timed out after ${BEAD_QUERY_LIMIT}s of the ${BUDGET_SECONDS}s budget; reaped=0 skipped=$TOTAL (log: $LOG_FILE)"
+            ;;
+        *)
+            record worktree_bead_query_failed "" "" \
+                "bulk gc bd show for ${#BEAD_IDS_ARGV[@]} bead(s) exited $BEAD_QUERY_RC and returned no usable JSON" \
+                bead_query_failed
+            echo "polecat-worktree-reap: bead read failed (exit $BEAD_QUERY_RC); reaped=0 skipped=$TOTAL (log: $LOG_FILE)"
+            ;;
+    esac
     exit 0
 fi
 
@@ -344,6 +454,12 @@ DECISIONS=$(printf '%s\n' "$CANDIDATES" | jq -R -r -s --slurpfile bead_docs "$BE
 # subsystem: a confirmation read that fails is not proof of absence. A read cut
 # short by the budget is one more way to land in `unconfirmed`.
 ROSTER_STATE="unconfirmed"
+# Why the roster is unconfirmed, carried alongside the verdict so the log can
+# say whether anyone actually asked the session roster anything this cycle.
+ROSTER_REASON="roster_read_failed"
+# Seconds the roster read was actually given, so a timeout can report the bound
+# it hit rather than implying the roster is broken.
+ROSTER_LIMIT=0
 ROSTER_FETCHED=0
 
 ensure_roster() {
@@ -351,10 +467,29 @@ ensure_roster() {
         return
     fi
     ROSTER_FETCHED=1
-    if run_bounded "$(budget_left)" gc session list --state=all --json >"$SESSIONS_FILE" 2>/dev/null &&
-        [ -s "$SESSIONS_FILE" ] &&
-        jq -e '(.sessions | type) == "array"' "$SESSIONS_FILE" >/dev/null 2>&1; then
+    local limit rc=0
+    limit=$(budget_left)
+    run_bounded "$limit" gc session list --state=all --json >"$SESSIONS_FILE" 2>/dev/null || rc=$?
+    case "$(classify_outcome "$limit" "$rc")" in
+        skipped)
+            ROSTER_REASON="budget_spent_before_roster_read"
+            return
+            ;;
+        timeout)
+            ROSTER_REASON="roster_read_timed_out"
+            ROSTER_LIMIT="$limit"
+            return
+            ;;
+        failed)
+            ROSTER_REASON="roster_read_failed"
+            return
+            ;;
+    esac
+    if [ -s "$SESSIONS_FILE" ] && jq -e '(.sessions | type) == "array"' "$SESSIONS_FILE" >/dev/null 2>&1; then
         ROSTER_STATE="readable"
+        ROSTER_REASON=""
+    else
+        ROSTER_REASON="roster_unparseable"
     fi
 }
 
@@ -396,6 +531,9 @@ REAPED=0
 SKIPPED=0
 EXAMINED=0
 BUDGET_SPENT=0
+# Set when a candidate was skipped because a check was never attempted — the
+# run's own clock, not the subsystem the skipped check would have talked to.
+TRUNCATED=0
 
 while IFS=$'\037' read -r STATUS OWNER WT; do
     [ -n "$WT" ] || continue
@@ -405,7 +543,8 @@ while IFS=$'\037' read -r STATUS OWNER WT; do
     if [ "$(budget_left)" -le 0 ]; then
         BUDGET_SPENT=1
         record worktree_budget_exhausted "" "" \
-            "${BUDGET_SECONDS}s budget spent after $EXAMINED of $TOTAL candidate(s); yielding the witness start"
+            "${BUDGET_SECONDS}s budget spent after $EXAMINED of $TOTAL candidate(s): reaped=$REAPED skipped=$SKIPPED deferred=$((TOTAL - EXAMINED)); yielding the witness start" \
+            budget_exhausted
         break
     fi
     EXAMINED=$((EXAMINED + 1))
@@ -415,7 +554,9 @@ while IFS=$'\037' read -r STATUS OWNER WT; do
     if [ -z "$STATUS" ]; then
         # An unreadable bead is not proof the work is done. Leave the worktree
         # alone; a later cycle retries once bd is readable again.
-        record worktree_bead_unreadable "$BEAD" "$WT" "bulk gc bd show returned no status"
+        record worktree_bead_unreadable "$BEAD" "$WT" \
+            "the bulk gc bd show answered, but echoed no row for this bead id" \
+            bead_absent_from_batch
         SKIPPED=$((SKIPPED + 1))
         continue
     fi
@@ -438,8 +579,26 @@ while IFS=$'\037' read -r STATUS OWNER WT; do
             continue
             ;;
         unconfirmed)
-            record worktree_owner_unconfirmed "$BEAD" "$WT" \
-                "session roster unreadable; a failed read is not proof of absence"
+            case "$ROSTER_REASON" in
+                budget_spent_before_roster_read)
+                    # Nobody asked the roster anything. Saying it was unreadable
+                    # would point at a subsystem this run never touched.
+                    TRUNCATED=1
+                    record worktree_budget_truncated "$BEAD" "$WT" \
+                        "the ${BUDGET_SECONDS}s budget was spent before the session roster was read; liveness unchecked at candidate $EXAMINED of $TOTAL" \
+                        "$ROSTER_REASON"
+                    ;;
+                roster_read_timed_out)
+                    record worktree_owner_unconfirmed "$BEAD" "$WT" \
+                        "gc session list did not answer within the ${ROSTER_LIMIT}s left of the ${BUDGET_SECONDS}s budget; a read cut short is not proof of absence" \
+                        "$ROSTER_REASON"
+                    ;;
+                *)
+                    record worktree_owner_unconfirmed "$BEAD" "$WT" \
+                        "session roster unreadable ($ROSTER_REASON); a failed read is not proof of absence" \
+                        "$ROSTER_REASON"
+                    ;;
+            esac
             SKIPPED=$((SKIPPED + 1))
             continue
             ;;
@@ -448,10 +607,32 @@ while IFS=$'\037' read -r STATUS OWNER WT; do
     # Gate 3: never discard uncommitted work. Ignored files are artifacts and
     # are excluded by `git status --porcelain`; untracked non-ignored files are
     # reported and block the reap so the witness can salvage them.
-    if ! DIRTY=$(run_bounded "$(budget_left)" git -C "$WT" status --porcelain 2>/dev/null); then
-        # A worktree git cannot even read — or cannot read in the time left —
-        # is not one to delete on a guess.
-        record worktree_status_unreadable "$BEAD" "$WT" "git status failed in the worktree"
+    STATUS_LIMIT=$(budget_left)
+    STATUS_RC=0
+    DIRTY=$(run_bounded "$STATUS_LIMIT" git -C "$WT" status --porcelain 2>/dev/null) || STATUS_RC=$?
+    STATUS_OUTCOME=$(classify_outcome "$STATUS_LIMIT" "$STATUS_RC")
+    if [ "$STATUS_OUTCOME" != ok ]; then
+        # A worktree git cannot read is not one to delete on a guess — and
+        # neither is one git was never asked about. Those are different
+        # incidents with different owners, so they get different events.
+        case "$STATUS_OUTCOME" in
+            skipped)
+                TRUNCATED=1
+                record worktree_budget_truncated "$BEAD" "$WT" \
+                    "the ${BUDGET_SECONDS}s budget was spent before git status ran; the worktree was never inspected, at candidate $EXAMINED of $TOTAL" \
+                    budget_spent_before_git_status
+                ;;
+            timeout)
+                record worktree_status_unreadable "$BEAD" "$WT" \
+                    "git status did not answer within the ${STATUS_LIMIT}s left of the ${BUDGET_SECONDS}s budget" \
+                    git_status_timed_out
+                ;;
+            *)
+                record worktree_status_unreadable "$BEAD" "$WT" \
+                    "git status exited $STATUS_RC in the worktree" \
+                    git_status_failed
+                ;;
+        esac
         SKIPPED=$((SKIPPED + 1))
         continue
     fi
@@ -487,9 +668,12 @@ done <<EOF
 $DECISIONS
 EOF
 
+# The stdout summary is what a patrol reads first, so it must not imply a clean
+# cycle when the clock cut one short — including when the truncation landed on
+# the LAST candidate and the loop head therefore never fired.
 BUDGET_NOTE=""
-if [ "$BUDGET_SPENT" -eq 1 ]; then
-    BUDGET_NOTE=" — budget spent, $((TOTAL - EXAMINED)) candidate(s) deferred to the next cycle"
+if [ "$BUDGET_SPENT" -eq 1 ] || [ "$TRUNCATED" -eq 1 ]; then
+    BUDGET_NOTE=" — budget spent: examined=$EXAMINED of $TOTAL, $((TOTAL - EXAMINED)) candidate(s) deferred to the next cycle"
 fi
 
 if [ "$DRY_RUN" -eq 1 ]; then

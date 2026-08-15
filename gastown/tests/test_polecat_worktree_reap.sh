@@ -60,6 +60,48 @@ SH
     chmod +x "$bin/gc"
 }
 
+write_git_stub() {
+    # Wraps the real git so the reaper's OWN git calls can be made slow or made
+    # to fail. That is the only way to drive the not-attempted / timed-out /
+    # failed classification from outside the script, and the distinction between
+    # those three is exactly what these tests exist to hold (gcp-mqu9).
+    #
+    # Test hooks:
+    #   GIT_PRUNE_DELAY   seconds to stall `git ... worktree prune`
+    #   GIT_STATUS_DELAY  seconds to stall `git ... status`
+    #   GIT_STATUS_FAIL   non-empty: `git ... status` exits 128 without running
+    local bin="$1" real
+    real=$(command -v git)
+    mkdir -p "$bin"
+    cat >"$bin/git" <<SH
+#!/usr/bin/env sh
+case " \$* " in
+    *" worktree prune "*)
+        if [ -n "\${GIT_PRUNE_DELAY:-}" ]; then sleep "\$GIT_PRUNE_DELAY"; fi
+        ;;
+    *" status "*)
+        if [ -n "\${GIT_STATUS_DELAY:-}" ]; then sleep "\$GIT_STATUS_DELAY"; fi
+        if [ -n "\${GIT_STATUS_FAIL:-}" ]; then
+            echo "fatal: simulated git status failure" >&2
+            exit 128
+        fi
+        ;;
+esac
+exec "$real" "\$@"
+SH
+    chmod +x "$bin/git"
+}
+
+# reason_for <log> <event> — the `reason` field of the last line carrying <event>.
+reason_for() {
+    jq -r --arg e "$2" 'select(.event == $e) | .reason' "$1" | tail -n 1
+}
+
+# detail_for <log> <event> — the `detail` field of the last line carrying <event>.
+detail_for() {
+    jq -r --arg e "$2" 'select(.event == $e) | .detail' "$1" | tail -n 1
+}
+
 setup_rig() {
     local rig="$1"
     mkdir -p "$rig"
@@ -487,6 +529,203 @@ JSON
     rm -rf "$tmp"
 }
 
+test_every_line_is_stamped_at_the_event_not_at_the_run() {
+    # The log is forensics. It used to stamp every line with the RUN's start
+    # time, so a cycle that spent its whole budget was indistinguishable from an
+    # instant one and the order of a slow cycle's decisions was unrecoverable.
+    # `ts` must advance with the events; `run_started` keeps the grouping.
+    local tmp rig bin home beads sessions logdir log stamps
+    tmp=$(mktemp -d)
+    rig="$tmp/rig"
+    bin="$tmp/bin"
+    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
+    beads="$tmp/beads.json"
+    sessions="$tmp/sessions.json"
+    logdir="$tmp/logs"
+    mkdir -p "$logdir"
+
+    setup_rig "$rig"
+    write_gc_stub "$bin"
+
+    # wt-early is decided at the top of the loop, before anything slow runs.
+    # wt-late is decided after the roster read, which the stub stalls for 2s.
+    add_bead_worktree "$rig" "$home" wt-early
+    add_bead_worktree "$rig" "$home" wt-late
+
+    cat >"$beads" <<'JSON'
+[{"id":"wt-late","status":"closed","metadata":{"polecat_session":"deadsess"}}]
+JSON
+    printf '{"sessions":[]}' >"$sessions"
+
+    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+        GC_SESSION_DELAY=2 GC_REAP_BUDGET_SECONDS=30 PATH="$bin:$PATH" \
+        bash "$SCRIPT" "$rig" --dry-run >"$tmp/out.txt" 2>&1 ||
+        fail "reaper exited non-zero: $(cat "$tmp/out.txt")"
+
+    log="$logdir/polecat-worktree-reap.log"
+    stamps=$(jq -r '.ts' "$log" | sort -u | wc -l | tr -d ' ')
+    [[ "$stamps" -ge 2 ]] ||
+        fail "all $stamps distinct ts value(s) across a run that spent 2s; lines are stamped with the run's start time, not the event's"
+
+    [[ "$(jq -r '.run_started' "$log" | sort -u | wc -l | tr -d ' ')" == "1" ]] ||
+        fail "run_started differs within one run; the log can no longer be grouped into cycles"
+
+    # And the budget field must be real, not a constant.
+    jq -e 'all(.budget_remaining; . <= 30 and . >= 0)' "$log" >/dev/null ||
+        fail "budget_remaining is not a plausible seconds-left reading"
+
+    rm -rf "$tmp"
+}
+
+test_budget_truncation_is_not_reported_as_an_external_failure() {
+    # The defect: a check the budget never let run was reported with the SAME
+    # wording as a check that ran and failed, naming a subsystem this run never
+    # spoke to. Twice that sent an investigation at a healthy Dolt server.
+    local tmp rig bin home beads sessions logdir log
+    tmp=$(mktemp -d)
+    rig="$tmp/rig"
+    bin="$tmp/bin"
+    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
+    beads="$tmp/beads.json"
+    sessions="$tmp/sessions.json"
+    logdir="$tmp/logs"
+    log="$logdir/polecat-worktree-reap.log"
+    mkdir -p "$logdir"
+
+    setup_rig "$rig"
+    write_gc_stub "$bin"
+    write_git_stub "$bin"
+    add_bead_worktree "$rig" "$home" wt-closed
+
+    cat >"$beads" <<'JSON'
+[{"id":"wt-closed","status":"closed","metadata":{"polecat_session":"deadsess"}}]
+JSON
+    printf '{"sessions":[]}' >"$sessions"
+
+    # Case 1: the budget is gone before the candidate list is even read. The run
+    # used to print "no per-bead polecat worktrees under <rig>" — a claim about
+    # the rig it had not looked at — and log nothing at all.
+    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+        GIT_PRUNE_DELAY=10 GC_REAP_BUDGET_SECONDS=2 PATH="$bin:$PATH" \
+        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/nolist.txt" 2>&1 ||
+        fail "reaper exited non-zero when the budget ran out early: $(cat "$tmp/nolist.txt")"
+
+    ! grep -F 'no per-bead polecat worktrees' "$tmp/nolist.txt" >/dev/null ||
+        fail "the run claimed the rig has no candidates without ever reading the worktree list"
+    [[ "$(reason_for "$log" worktree_budget_truncated)" == "budget_spent_before_worktree_list" ]] ||
+        fail "a worktree list the budget never allowed was not recorded as truncation"
+    [[ -e "$home/worktrees/wt-closed" ]] ||
+        fail "a worktree was reaped on a cycle that enumerated nothing"
+
+    # Case 2: the bead read RAN and overran. That is a real timeout, so it keeps
+    # worktree_bead_query_failed — but it must say it timed out and name the
+    # seconds it was given, not imply the store answered with garbage.
+    rm -f "$log"
+    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+        GC_BD_DELAY=20 GC_REAP_BUDGET_SECONDS=2 PATH="$bin:$PATH" \
+        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/slowbd.txt" 2>&1 ||
+        fail "reaper exited non-zero on a slow bead store: $(cat "$tmp/slowbd.txt")"
+
+    [[ "$(reason_for "$log" worktree_bead_query_failed)" == "bead_query_timed_out" ]] ||
+        fail "a bead read that overran was not reported as a timeout"
+    [[ "$(detail_for "$log" worktree_bead_query_failed)" == *"did not answer within"* ]] ||
+        fail "the bead-read timeout does not say how long it was given: $(detail_for "$log" worktree_bead_query_failed)"
+    [[ "$(detail_for "$log" worktree_bead_query_failed)" != *"no usable JSON"* ]] ||
+        fail "a timed-out bead read still claims the store returned unusable JSON"
+
+    # Case 3: the roster read overran. Same rule — it names the bound it hit, so
+    # a reader checks the budget before suspecting the session roster.
+    rm -f "$log"
+    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+        GC_SESSION_DELAY=20 GC_REAP_BUDGET_SECONDS=3 PATH="$bin:$PATH" \
+        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/slowsess.txt" 2>&1 ||
+        fail "reaper exited non-zero on a slow session roster: $(cat "$tmp/slowsess.txt")"
+
+    [[ "$(reason_for "$log" worktree_owner_unconfirmed)" == "roster_read_timed_out" ]] ||
+        fail "a roster read that overran was not distinguished from one that failed"
+    [[ "$(detail_for "$log" worktree_owner_unconfirmed)" == *"budget"* ]] ||
+        fail "the roster timeout does not point at the budget it hit"
+    [[ -e "$home/worktrees/wt-closed" ]] ||
+        fail "a worktree was reaped with liveness unconfirmed"
+
+    # Case 4: the roster command genuinely errors, and separately answers with a
+    # shape we do not recognise. Those are the two that DO implicate the roster.
+    rm -f "$log"
+    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" \
+        GC_SESSIONS_JSON="$tmp/no-such-roster.json" PATH="$bin:$PATH" \
+        bash "$SCRIPT" "$rig" --no-dry-run >/dev/null 2>&1 ||
+        fail "reaper exited non-zero on a failing roster read"
+    [[ "$(reason_for "$log" worktree_owner_unconfirmed)" == "roster_read_failed" ]] ||
+        fail "a roster command that errored was not reported as a failed read"
+
+    rm -f "$log"
+    printf 'not json at all' >"$tmp/bad.json"
+    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$tmp/bad.json" \
+        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run >/dev/null 2>&1 ||
+        fail "reaper exited non-zero on a malformed roster"
+    [[ "$(reason_for "$log" worktree_owner_unconfirmed)" == "roster_unparseable" ]] ||
+        fail "a roster that answered with an unknown shape was not distinguished from a failed read"
+
+    rm -rf "$tmp"
+}
+
+test_git_status_failure_is_distinguished_from_a_short_budget() {
+    # `worktree_status_unreadable` used to say "git status failed in the
+    # worktree" whether git status failed, was cut off, or was never run.
+    # gcp-3ty was labelled that way and its worktree is perfectly clean.
+    local tmp rig bin home beads sessions logdir log
+    tmp=$(mktemp -d)
+    rig="$tmp/rig"
+    bin="$tmp/bin"
+    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
+    beads="$tmp/beads.json"
+    sessions="$tmp/sessions.json"
+    logdir="$tmp/logs"
+    log="$logdir/polecat-worktree-reap.log"
+    mkdir -p "$logdir"
+
+    setup_rig "$rig"
+    write_gc_stub "$bin"
+    write_git_stub "$bin"
+    add_bead_worktree "$rig" "$home" wt-closed
+
+    cat >"$beads" <<'JSON'
+[{"id":"wt-closed","status":"closed","metadata":{"polecat_session":"deadsess"}}]
+JSON
+    printf '{"sessions":[]}' >"$sessions"
+
+    # Case 1: git status really did run and really did fail.
+    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+        GIT_STATUS_FAIL=1 GC_REAP_BUDGET_SECONDS=30 PATH="$bin:$PATH" \
+        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/failed.txt" 2>&1 ||
+        fail "reaper exited non-zero on a failing git status: $(cat "$tmp/failed.txt")"
+
+    [[ "$(reason_for "$log" worktree_status_unreadable)" == "git_status_failed" ]] ||
+        fail "a genuine git status failure was not reported as one"
+    [[ "$(detail_for "$log" worktree_status_unreadable)" == *"exited 128"* ]] ||
+        fail "the git status failure does not name the exit code: $(detail_for "$log" worktree_status_unreadable)"
+    [[ -e "$home/worktrees/wt-closed" ]] ||
+        fail "a worktree whose git status failed was reaped"
+
+    # Case 2: git status was cut off by the budget. Same event — it did run —
+    # but the reason and detail must send the reader at the clock, not at a
+    # checkout that is fine.
+    rm -f "$log"
+    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+        GIT_STATUS_DELAY=20 GC_REAP_BUDGET_SECONDS=3 PATH="$bin:$PATH" \
+        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/slow.txt" 2>&1 ||
+        fail "reaper exited non-zero on a slow git status: $(cat "$tmp/slow.txt")"
+
+    [[ "$(reason_for "$log" worktree_status_unreadable)" == "git_status_timed_out" ]] ||
+        fail "a git status cut short by the budget was reported as a failure of the checkout"
+    [[ "$(detail_for "$log" worktree_status_unreadable)" == *"budget"* ]] ||
+        fail "the git status timeout does not point at the budget it hit"
+    [[ -e "$home/worktrees/wt-closed" ]] ||
+        fail "a worktree was reaped without its status ever being read"
+
+    rm -rf "$tmp"
+}
+
 test_reaps_only_closed_clean_unowned_bead_worktrees
 test_real_removal_is_opt_in
 test_unreadable_session_roster_skips_the_reap
@@ -494,5 +733,8 @@ test_dry_run_removes_nothing_and_rerun_is_idempotent
 test_bead_status_is_read_in_one_bulk_query
 test_a_large_candidate_set_does_not_overflow_the_join
 test_budget_expiry_yields_the_witness_start
+test_every_line_is_stamped_at_the_event_not_at_the_run
+test_budget_truncation_is_not_reported_as_an_external_failure
+test_git_status_failure_is_distinguished_from_a_short_budget
 
 echo "polecat worktree reap tests passed"

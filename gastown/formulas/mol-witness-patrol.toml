@@ -540,18 +540,41 @@ repo). Read this cycle's lines:
 tail -n 50 "${LOG_DIR:-$GC_CITY/.gc/runtime/logs}/polecat-worktree-reap.log"
 ```
 
+**Read `reason` before you read the event name.** Every line carries a
+`reason` field naming what actually happened, because an event name alone
+cannot separate *the command ran and failed* from *the command never ran*.
+Confusing the two has already sent two investigations at a Dolt server that
+was healthy the whole time (`gcp-mqu9`). Two more fields make a line readable
+on its own:
+
+- `ts` is when THAT event happened, and `run_started` groups lines into
+  cycles. (Before `gcp-mqu9` every line carried the run's start time, so a
+  cycle that spent eight seconds looked instantaneous.)
+- `budget_remaining` is the seconds left in the run's budget when the line was
+  written. **A line with `budget_remaining: 0` is the reaper's own clock
+  talking, not the subsystem the event names.** Check this field first on any
+  event that sounds like an outage.
+
+```bash
+# This cycle's noteworthy lines, with the fields that decide who owns them.
+jq -r 'select(.reason != "") | [.ts, .event, .reason, .budget_remaining, .bead] | @tsv' \
+    "${LOG_DIR:-$GC_CITY/.gc/runtime/logs}/polecat-worktree-reap.log" | tail -n 50
+```
+
 | Event | Meaning | Action |
 |---|---|---|
 | `worktree_reap_pending` | Passed every gate; dry-run, so NOT removed | Routine while the rollout is staged — this is the would-reap set to review |
 | `worktree_reaped` | Removed. Routine, and only once `--no-dry-run` is wired. | Log only |
 | `worktree_dirty_kept` | Closed bead, uncommitted changes on disk | Salvage per Case C/D, then re-run |
 | `worktree_owner_live` | Closed bead, polecat still alive (PR rework) | None — expected; next cycle retries |
-| `worktree_owner_unconfirmed` | `gc session list` failed or did not parse, so liveness is unknown | If it persists, the session roster is broken — check `gc doctor`; nothing was removed |
-| `worktree_bead_unreadable` | The bulk `gc bd show` had no row for this bead | If it persists, check Dolt health |
-| `worktree_status_unreadable` | `git status` failed inside the worktree | Inspect by hand; likely a broken or moved checkout |
+| `worktree_budget_truncated` | A check was NEVER ATTEMPTED — the run's budget was already spent when it came due. Nothing external failed. `reason` names the check that did not happen (`budget_spent_before_worktree_list` / `_bead_query` / `_roster_read` / `_git_status`) | Not an outage; do not chase the named subsystem. Read it as "this cycle was too short", exactly like `worktree_budget_exhausted` below |
+| `worktree_owner_unconfirmed` | Liveness is unknown, so the reap was skipped. `reason`: `roster_read_timed_out` (the read did not finish in the budget left), `roster_read_failed` (`gc session list` errored), `roster_unparseable` (it answered with a shape we do not recognise) | **`roster_read_timed_out` → the budget is the suspect first**; the detail names the seconds it got. Only `roster_read_failed`/`roster_unparseable` implicate the roster itself — then check `gc doctor`. Nothing was removed either way |
+| `worktree_bead_unreadable` | The bulk `gc bd show` answered, but echoed no row for this bead id (`reason: bead_absent_from_batch`) | Usually a worktree whose bead was deleted or renamed. If it repeats across many beads, check Dolt health |
+| `worktree_status_unreadable` | `git status` actually ran inside the worktree and did not answer. `reason`: `git_status_timed_out` (cut short by the budget left) or `git_status_failed` (non-zero exit) | **`git_status_timed_out` → budget first.** `git_status_failed` is the real one: inspect by hand, likely a broken or moved checkout |
 | `worktree_reap_failed` | Directory survived removal | Investigate permissions/mounts, mail mayor |
-| `worktree_bead_query_failed` | The one bulk bead read returned nothing usable — store unreachable, or slower than the run's budget | Nothing was examined this cycle. If it repeats, the rig's Dolt endpoint is the problem, not the reaper |
-| `worktree_budget_exhausted` | The run hit its own wall-clock budget and stopped early | Routine on a rig with many candidates; the rest are deferred to the next cycle. Persistent + a growing candidate count means the store is too slow for the budget — raise `[session] setup_timeout` AND `GC_REAP_BUDGET_SECONDS` together, or investigate the endpoint |
+| `worktree_list_failed` | `git worktree list` ran and did not answer, so no candidate was enumerated. `reason`: `worktree_list_timed_out` or `worktree_list_failed` | Timed out → budget first. Failed → the rig checkout itself is unhealthy; inspect `$RIG_ROOT` by hand |
+| `worktree_bead_query_failed` | The one bulk bead read ran and did not answer. `reason`: `bead_query_timed_out` (slower than the seconds the run had left — the detail names them) or `bead_query_failed` (non-zero exit) | Nothing was examined this cycle. **`bead_query_timed_out` on a small remaining budget is the reaper's clock, not the store** — compare the detail's "Ns left of the Ms budget" before suspecting the endpoint. A `bead_query_failed`, or a timeout with most of the budget still unspent, is the rig's Dolt endpoint |
+| `worktree_budget_exhausted` | The run hit its own wall-clock budget and stopped at the top of the loop. The detail carries examined/skipped/deferred counts | Routine on a rig with many candidates; the rest are deferred to the next cycle. Persistent + a growing candidate count means the store is too slow for the budget — raise `[session] setup_timeout` AND `GC_REAP_BUDGET_SECONDS` together, or investigate the endpoint |
 
 A `worktree_dirty_kept` that repeats across cycles means real work is
 stranded on disk under a bead that is already closed. Mail the mayor —

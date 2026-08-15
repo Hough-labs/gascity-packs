@@ -341,6 +341,29 @@ PY
         fail "patrol log-review table must explain the budget-exhausted event the reaper can emit"
     grep -F 'worktree_bead_query_failed' "$patrol" >/dev/null ||
         fail "patrol log-review table must explain the bulk-query-failed event the reaper can emit"
+
+    # gcp-mqu9: budget truncation used to be reported with the same wording as a
+    # data-plane failure, which sent two investigations at a healthy Dolt server.
+    # A check the budget never allowed must name itself, not a subsystem the run
+    # never called.
+    grep -F 'worktree_budget_truncated' "$reaper" >/dev/null ||
+        fail "reaper must report a check its budget skipped as truncation, not as a failure of the subsystem it never called"
+    grep -F 'classify_outcome' "$reaper" >/dev/null ||
+        fail "reaper must classify each bounded call as skipped/timeout/failed; a bare 124 cannot tell not-attempted from overran"
+    ! grep -F 'git status failed in the worktree' "$reaper" >/dev/null ||
+        fail "reaper must not assert git status failed without knowing that it ran"
+
+    # The log is forensics, so a line must carry the time of ITS OWN event.
+    grep -F -e '--arg ts "$(date -u' "$reaper" >/dev/null ||
+        fail "reaper must stamp each log line when the event happens, not once at the start of the run"
+
+    # And the witness must be able to explain every line it can be handed.
+    local ev
+    while IFS= read -r ev; do
+        [[ -n "$ev" ]] || continue
+        grep -F "\`$ev\`" "$patrol" >/dev/null ||
+            fail "reaper event $ev has no entry in the mol-witness-patrol log-review table"
+    done < <(grep -oE 'record worktree_[a-z_]+' "$reaper" | awk '{print $2}' | sort -u)
 }
 
 test_dolt_push_outage_detection_is_wired() {
