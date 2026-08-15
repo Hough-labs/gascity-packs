@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 14 Aug 2026 22:57:24 -0400
+Subject: [PATCH 31/31] test(gastown): report the real file line in the
+ pre_start bound check (gcp-oo0v)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Self-review catch on the guard added in the previous commit. The
+unbounded-remote-call check stripped comments BEFORE numbering, so `grep -n`
+counted lines in the stripped stream and the failure message pointed at a line
+that does not exist in the file — mutation-testing the check reported line 83
+for a call that lives at line 132.
+
+Numbering now happens first and comments are dropped by matching the `NNN:#`
+prefix, so the reported location is the file's own line. Comments still have to
+be dropped: worktree-setup.sh's and polecat-worktree-reap.sh's headers describe
+the unbounded fetch that caused gcp-ntbf/gcp-oo0v, and explaining the incident
+must not read as committing it.
+
+Behaviour is otherwise unchanged — the check catches exactly the same
+mutations, verified by re-running all three (re-add the deacon pre_start, raise
+a budget past setup_timeout, unwrap a single fetch) and confirming the last now
+reports "132:" against a file whose own grep -n agrees.
+
+A wrong line number in a guard's failure message is worth its own commit: this
+test fires on someone else's pin bump months from now, and the first thing they
+will do is open the file at the line it names.
+---
+ gastown/tests/test_agent_pre_start_budget.sh | 11 ++++++-----
+ 1 file changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/gastown/tests/test_agent_pre_start_budget.sh b/gastown/tests/test_agent_pre_start_budget.sh
+index 770f070..b39ccb1 100755
+--- a/gastown/tests/test_agent_pre_start_budget.sh
++++ b/gastown/tests/test_agent_pre_start_budget.sh
+@@ -134,12 +134,13 @@ assert_bounded() {
+         fail "$script must define budget_left and spend one shared wall clock, not bound each call independently"
+ 
+     # And every call that can actually block for tens of seconds must go
+-    # through it. Comments are stripped first: the headers explain the
+-    # unbounded fetch that caused the incident, and saying so must not read as
+-    # doing it.
++    # through it. Comments are dropped — the headers explain the unbounded
++    # fetch that caused the incident, and saying so must not read as doing it —
++    # but numbering happens FIRST, so the line this reports is the line in the
++    # file rather than an offset into the stripped stream.
+     local unbounded
+-    unbounded=$(grep -vE '^[[:space:]]*#' "$path" |
+-        grep -nE '(^|[^-[:alnum:]_])git([[:space:]]|.*[[:space:]])(fetch|pull|push|clone|ls-remote)([[:space:]]|$)' |
++    unbounded=$(grep -nE '(^|[^-[:alnum:]_])git([[:space:]]|.*[[:space:]])(fetch|pull|push|clone|ls-remote)([[:space:]]|$)' "$path" |
++        grep -vE '^[0-9]+:[[:space:]]*#' |
+         grep -v 'run_bounded' || true)
+     [[ -z "$unbounded" ]] ||
+         fail "$script calls a remote without a deadline: ${unbounded//$'\n'/ | }"
+-- 
+2.50.1 (Apple Git-155)
+

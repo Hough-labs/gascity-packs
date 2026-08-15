@@ -1,0 +1,617 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 14 Aug 2026 22:49:08 -0400
+Subject: [PATCH 30/31] fix(gastown): stop the deacon's push-state sweep from
+ gating session start (gcp-oo0v)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The deacon could not start. `dolt-push-state-check.sh --snapshot` was wired as
+a BLOCKING pre_start in agents/deacon/agent.toml; measured by hand on the
+affected host it takes 18.565s (exit 0) against gascity's 10s [session]
+setup_timeout. gc SIGKILLs a pre_start on that deadline and a killed pre_start
+fails the WHOLE session start, so the deacon died on every cycle, six failures
+in an hour latched the supervisor circuit breaker, and town patrols were dead
+from 2026-08-14T20:10:40Z. The script was never broken — a sweep that issues
+one `gc bd sql -C <scope>` per scope simply cannot fit a start-up budget at
+this city's ~5-8s per-gc-call cost, and no budget flag would save it (gcp-uzq0
+shows the budget approach starves here).
+
+So the sweep moves to where it has time rather than being made smaller. The
+deacon carries no pre_start at all; mol-deacon-patrol's `dolt-push-divergence`
+step now runs the detector itself on the patrol cadence, which also means the
+alert reads a FRESH measurement instead of one taken once at session start.
+The step resolves the script from the formula's OWN resolved source path via
+`gc formula list --json` — pack assets live in a content-hashed cache a formula
+step cannot name, and the formula's sibling copy is the one candidate
+guaranteed present and version-coherent with it (a formula from pin X can never
+reach a detector from pin Y). GC_PACK_DIR is a fallback only; depending on it
+alone is what made the refinery's approval gate permanently unresolvable
+(gcp-amo). The old snapshot fallback is gone: nothing writes that file at start
+any more, and a stale reading presented as this cycle's is worse than silence,
+so an unresolvable detector is now reported as BLIND rather than logged as OK.
+`--snapshot` survives as an on-demand operator artifact.
+
+This is the SECOND instance of the class — gcp-ntbf was the witness reaper,
+same shape, different script — and both arrived unnoticed on a pin bump rather
+than from anyone editing an agent. So the durable part of this change is the
+pack-wide guard, tests/test_agent_pre_start_budget.sh: an INVENTORY of every
+pre_start in the repo, parsed from the TOML rather than grepped, so a new one
+fails the test until somebody measures it. It also asserts each inventoried
+script still DEFINES run_bounded/budget_left (not merely mentions them — a
+deleted helper with live call sites is how a bound rots away invisibly), that
+no remote-facing git call in those scripts is missing a deadline, and that each
+declared default budget is numerically inside setup_timeout, since "raise it to
+30s so it stops timing out" is the shape of the next incident.
+
+That guard found a third latent instance: worktree-setup.sh, the polecat and
+refinery pre_start, ran `git fetch` and `git pull --rebase` with no deadline at
+all. Whitelisting it would have built the hole straight into the guard, so its
+network calls now share a 6s budget (GC_WORKTREE_SETUP_BUDGET_SECONDS) and are
+abandoned rather than retried when it expires — a worktree one fetch behind is
+fixed next cycle; a session that never starts is not. Interrupting a rebase
+this way is strictly gentler than the status quo, where gc SIGKILLs the whole
+group at setup_timeout with no signal the child can act on. The local git
+plumbing is deliberately left unbudgeted: it is disk-bound and it is the reason
+the script exists.
+
+Validation. All 10 gastown/tests/*.sh pass, including the updated
+test_dolt_push_outage_detection_is_wired, which now asserts the inverse of what
+it asserted before (it was the RED test at the start of this change: "deacon
+must run the auto-push detector from pre_start"). The new guard was
+mutation-tested against the three regressions it exists to catch — re-adding
+the deacon's pre_start, raising a budget past setup_timeout, and removing the
+bound from worktree-setup.sh both by deleting the helper and by unwrapping a
+single fetch — and it fails on all three with the incident named in the
+message. worktree-setup.sh was smoke-tested end to end against a real
+origin (create, idempotent re-run, no --sync, invalid budget rejected), and
+its cutoff verified against a non-routable remote on both the coreutils
+`timeout` path and the no-timeout fallback: exit 0 at the budget in each case.
+shellcheck clean; go vet/build/test and golangci-lint green;
+validate_registry.py ok.
+
+Follow-ups. The city.toml `[[patches.agent]] name = "deacon"` interim patch
+that emptied the pre_start must be removed by the operator once this lands and
+the city's pin moves — it lives outside this repo, so it cannot be removed
+here. gcp-wggn: run_bounded's no-timeout fallback signals only its direct
+child, so a killed `git fetch` leaves its ssh behind on stock macOS; bounded
+and self-terminating, shared with the reaper, so filed rather than scoped in.
+gcp-p1q0: the CI pytest set is already red on the fork base; those failures are
+filed there and touch none of the files this commit changes.
+---
+ gastown/agents/deacon/agent.toml              |  34 ++--
+ .../assets/scripts/dolt-push-state-check.sh   |  32 +++-
+ gastown/assets/scripts/worktree-setup.sh      |  92 ++++++++-
+ gastown/formulas/mol-deacon-patrol.toml       |  55 ++++--
+ gastown/tests/test_agent_pre_start_budget.sh  | 175 ++++++++++++++++++
+ gastown/tests/test_gastown_pack_assets.sh     |  32 +++-
+ 6 files changed, 379 insertions(+), 41 deletions(-)
+ create mode 100755 gastown/tests/test_agent_pre_start_budget.sh
+
+diff --git a/gastown/agents/deacon/agent.toml b/gastown/agents/deacon/agent.toml
+index 80e9765..1e973fb 100644
+--- a/gastown/agents/deacon/agent.toml
++++ b/gastown/agents/deacon/agent.toml
+@@ -1,18 +1,28 @@
+ scope = "city"
+ wake_mode = "fresh"
+ work_dir = ".gc/agents/deacon"
+-# Dolt auto-push outage detection. `bd` only warns about a failed auto-push when
+-# it is neither quiet nor --json, and gc drives every bead WRITE through beads
+-# with exactly that flag — so the caller class doing essentially all writes is
+-# exactly the one that cannot see the warning. A winnow outage ran ~18h unnoticed
+-# on that blind spot. Wired as pre_start because pack assets live in a content-hashed
+-# cache directory that a formula step cannot name; {{.ConfigDir}} is the only
+-# stable handle on the script. --snapshot writes
+-# $GC_CITY/.gc/runtime/dolt-push-state.json, recording the script's own resolved
+-# path so mol-deacon-patrol's dolt-push-divergence step can re-run the sweep
+-# fresh on every patrol cycle rather than reading a session-start measurement.
+-# Read-only: it queries each scope's dolt_log and writes nothing but the snapshot.
+-pre_start = ["{{.ConfigDir}}/assets/scripts/dolt-push-state-check.sh --snapshot"]
++# NO pre_start, deliberately — and adding one here needs a measurement first.
++#
++# Dolt auto-push outage detection used to run from this agent's pre_start as
++# `dolt-push-state-check.sh --snapshot`. It cannot: the sweep costs one
++# `gc bd sql -C <scope>` per scope at this city's ~5-8s per-gc-call, measured at
++# 18.6s wall clock, against a 10s [session] setup_timeout. pre_start is killed at
++# that deadline and a killed pre_start fails the WHOLE session start, so the
++# deacon died on every cycle and six failures in an hour latched the supervisor
++# circuit breaker open — town patrols dead ~5h (gcp-oo0v). The script was never
++# broken; it simply cannot fit that budget.
++#
++# The detection did not go away, it moved to where it has time: the
++# `dolt-push-divergence` step of mol-deacon-patrol, which resolves this pack's
++# copy of the script from the formula's own resolved source path and runs the
++# sweep on the patrol's cadence. A snapshot is periodic housekeeping — there is
++# no reason it must finish before the agent may boot.
++#
++# This is the second instance of the class (gcp-ntbf was the witness reaper).
++# `gastown/tests/test_agent_pre_start_budget.sh` is the pack-wide guard: any
++# pre_start wired anywhere in this pack must be recorded there with a measured
++# wall clock inside the budget, so a new one cannot arrive unmeasured on a pin
++# bump the way this one did.
+ nudge = "Run 'gc prime' to check patrol status and begin heartbeat cycle."
+ idle_timeout = "1h"
+ max_active_sessions = 1
+diff --git a/gastown/assets/scripts/dolt-push-state-check.sh b/gastown/assets/scripts/dolt-push-state-check.sh
+index c2f69b1..bec6ef8 100755
+--- a/gastown/assets/scripts/dolt-push-state-check.sh
++++ b/gastown/assets/scripts/dolt-push-state-check.sh
+@@ -102,13 +102,23 @@
+ #   dolt-push-state-check.sh --json     # one JSON object per scope, per line
+ #   dolt-push-state-check.sh --snapshot # sweep + write $GC_CITY/.gc/runtime/dolt-push-state.json
+ #
+-# --snapshot exists because pack assets install into a content-hashed cache
+-# directory that a formula step cannot name — `{{.ConfigDir}}` in agent.toml is
+-# the only stable handle on this file. So the deacon's `pre_start` runs
+-# --snapshot, and the snapshot records this script's own resolved path under
+-# `script_path`. The patrol step reads that path back and re-runs the sweep
+-# itself, so each patrol cycle alerts on a FRESH measurement rather than on a
+-# reading taken once at session start.
++# THIS SCRIPT MUST NOT BE WIRED AS A `pre_start`. It was, once — the deacon's,
++# as `--snapshot` — and it cost the town its deacon for ~5h (gcp-oo0v). The
++# sweep issues one `gc bd sql -C <scope>` per scope; at a real city's ~5-8s per
++# gc call that measured 18.6s wall clock, against a 10s `[session]
++# setup_timeout`. gc SIGKILLs a pre_start at that deadline and a killed
++# pre_start fails the whole session start, so six cycles latched the supervisor
++# circuit breaker open. Nothing here is broken and no budget flag would save it:
++# a sweep that must visit every scope cannot fit a start-up deadline, so it does
++# not run at start-up. mol-deacon-patrol's `dolt-push-divergence` step owns the
++# call, resolves this file from the formula's own resolved source path (pack
++# assets live in a content-hashed cache directory a formula step cannot name),
++# and gets a whole patrol cycle to finish in.
++#
++# --snapshot therefore no longer feeds that step, and `script_path` is no longer
++# how the step finds this file. It stays as an on-demand artifact: a
++# timestamped, machine-readable sweep of every scope, written where an operator
++# or a later cycle can read it without paying for the sweep again.
+ #
+ # Exit: 0 when the sweep ran (verdicts are in the output, including STALE);
+ #       2 on a usage or environment error. A STALE scope is a finding to be
+@@ -435,9 +445,11 @@ if [ "$SNAPSHOT" -eq 0 ]; then
+   exit 0
+ fi
+ 
+-# Snapshot mode. `script_path` is the whole point of the file: it is the handle
+-# the patrol step uses to re-run this sweep on its own cadence, since it cannot
+-# name the content-hashed pack cache directory itself.
++# Snapshot mode — an on-demand artifact, not an input to the patrol step (which
++# resolves this file from the formula's own source path and runs the sweep
++# itself). `script_path` is kept for the reader: it records which pin's copy of
++# the detector produced these verdicts, which is the first thing anyone asks of
++# a snapshot found on disk.
+ GENERATED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+ if [ -n "$OUTPUT" ]; then
+   printf '%s\n' "$OUTPUT" | jq -s \
+diff --git a/gastown/assets/scripts/worktree-setup.sh b/gastown/assets/scripts/worktree-setup.sh
+index 0dfe4ef..1dc431c 100755
+--- a/gastown/assets/scripts/worktree-setup.sh
++++ b/gastown/assets/scripts/worktree-setup.sh
+@@ -10,9 +10,92 @@
+ #
+ # Called from pre_start in pack configs. Runs before the session is created
+ # so the agent starts IN the worktree directory.
++#
++# BOUNDED: pre_start is killed at [session] setup_timeout (10s by default) and
++# a killed pre_start fails the WHOLE session start; six of those in an hour
++# latch the supervisor circuit breaker open and the rig loses that agent
++# entirely (gcp-ntbf on the witness, gcp-oo0v on the deacon). This script
++# therefore holds its NETWORK calls — the only ones that can block for an
++# unbounded time — to a wall-clock budget inside that limit
++# (6s; GC_WORKTREE_SETUP_BUDGET_SECONDS), and gives up on the sync rather than
++# on the session. A stale worktree is recoverable on the next cycle; a start
++# that never completes is not. Raise the budget only alongside setup_timeout.
++#
++# The local git plumbing below (worktree add, prune, submodule init) is
++# deliberately NOT budgeted: it is disk-bound, it is the reason this script
++# exists, and an agent whose worktree was not created has nothing to start in.
++# Only the calls that talk to a remote get a deadline.
++#
++#   GC_WORKTREE_SETUP_BUDGET_SECONDS
++#                      wall-clock budget shared by every network call in this
++#                      run (default 6s). Must stay well inside the caller's
++#                      [session] setup_timeout.
+ 
+ set -eu
+ 
++# Well inside gascity's 10s default [session] setup_timeout — see BOUNDED above.
++SYNC_BUDGET_SECONDS="${GC_WORKTREE_SETUP_BUDGET_SECONDS:-6}"
++case "$SYNC_BUDGET_SECONDS" in
++    '' | *[!0-9]* | 0)
++        echo "worktree-setup: budget must be a positive whole number of seconds" >&2
++        exit 2
++        ;;
++esac
++
++BUDGET_START=$(date +%s)
++
++# Seconds left in this run's network budget, floored at 0. Every remote-facing
++# command is bounded by this, so no single hung fetch can outlive the budget.
++budget_left() {
++    _bl_left=$((SYNC_BUDGET_SECONDS - ($(date +%s) - BUDGET_START)))
++    [ "$_bl_left" -ge 0 ] || _bl_left=0
++    printf '%s\n' "$_bl_left"
++}
++
++TIMEOUT_BIN=""
++if command -v timeout >/dev/null 2>&1; then
++    TIMEOUT_BIN=timeout
++elif command -v gtimeout >/dev/null 2>&1; then
++    TIMEOUT_BIN=gtimeout
++fi
++
++# run_bounded <seconds> <cmd...> — run a command under a hard time limit,
++# returning 124 if it does not finish in time (matching timeout(1)).
++#
++# The fallback matters: coreutils `timeout` is not on a stock macOS, and a
++# pre_start that cannot bound its own children is precisely the failure this
++# bound exists to prevent. So the fallback actually kills rather than merely
++# giving up on waiting. Interrupting a fetch or a rebase this way is strictly
++# gentler than the status quo, where gc SIGKILLs the whole process group at
++# setup_timeout with no signal the child can act on at all.
++run_bounded() {
++    _rb_limit="$1"
++    shift
++    [ "$_rb_limit" -gt 0 ] || return 124
++    if [ -n "$TIMEOUT_BIN" ]; then
++        _rb_rc=0
++        "$TIMEOUT_BIN" "$_rb_limit" "$@" || _rb_rc=$?
++        return "$_rb_rc"
++    fi
++    "$@" &
++    _rb_pid=$!
++    _rb_waited=0
++    while kill -0 "$_rb_pid" 2>/dev/null; do
++        if [ "$_rb_waited" -ge "$_rb_limit" ]; then
++            kill -TERM "$_rb_pid" 2>/dev/null || true
++            sleep 1
++            kill -KILL "$_rb_pid" 2>/dev/null || true
++            wait "$_rb_pid" 2>/dev/null || true
++            return 124
++        fi
++        sleep 1
++        _rb_waited=$((_rb_waited + 1))
++    done
++    _rb_rc=0
++    wait "$_rb_pid" || _rb_rc=$?
++    return "$_rb_rc"
++}
++
+ RIG_ROOT="${1:?usage: worktree-setup.sh <rig-root> <target-dir> <agent-name> [--sync]}"
+ ARG2="${2:?missing target-dir}"
+ ARG3="${3:?missing agent-name}"
+@@ -43,8 +126,11 @@ sync_worktree() {
+     if ! git -C "$WT" remote get-url origin >/dev/null 2>&1; then
+         return 0
+     fi
+-    git -C "$WT" fetch origin 2>/dev/null || true
+-    git -C "$WT" pull --rebase 2>/dev/null || true
++    # Both calls talk to the remote and share the run's budget. Best-effort by
++    # design: a sync that times out leaves a worktree one fetch behind, which
++    # the next cycle fixes, and the session still starts.
++    run_bounded "$(budget_left)" git -C "$WT" fetch origin 2>/dev/null || true
++    run_bounded "$(budget_left)" git -C "$WT" pull --rebase 2>/dev/null || true
+ }
+ 
+ branch_name() {
+@@ -119,7 +205,7 @@ BRANCH=$(branch_name)
+ DEFAULT_REF=$(git -C "$RIG_ROOT" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null || true)
+ if [ -n "$DEFAULT_REF" ]; then
+     DEFAULT_BRANCH=${DEFAULT_REF#refs/remotes/origin/}
+-    git -C "$RIG_ROOT" fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1 || true
++    run_bounded "$(budget_left)" git -C "$RIG_ROOT" fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1 || true
+ fi
+ 
+ if git -C "$RIG_ROOT" show-ref --verify --quiet "refs/heads/$BRANCH"; then
+diff --git a/gastown/formulas/mol-deacon-patrol.toml b/gastown/formulas/mol-deacon-patrol.toml
+index baaed4b..3b19fc6 100644
+--- a/gastown/formulas/mol-deacon-patrol.toml
++++ b/gastown/formulas/mol-deacon-patrol.toml
+@@ -477,21 +477,53 @@ case this step exists to catch. The detector reaches every scope through
+ 
+ **Step 1: Run the detector.**
+ 
++**The detector runs HERE, not from the deacon's `pre_start`, and it must not be
++put back there.** The sweep costs one `gc bd sql -C <scope>` per scope — 18.6s
++measured on this city — against a 10s `[session] setup_timeout`. A pre_start
++that overruns is SIGKILLed and takes the whole session start down with it; six
++of those in an hour latch the supervisor circuit breaker and the town loses its
++deacon entirely (gcp-oo0v, and gcp-ntbf before it on the witness). A push-state
++sweep is periodic housekeeping — a patrol cycle is exactly the budget it wants,
++and running it per cycle also means this alert reads a FRESH measurement rather
++than one taken once at session start.
++
+ Pack assets install into a content-hashed cache directory this step cannot name,
+-so the deacon's `pre_start` runs the script once at session start and records
+-its own resolved path in the snapshot. Read that path back and re-run the sweep,
+-so this cycle alerts on a FRESH measurement rather than a session-start reading:
++so resolve the detector from this formula's OWN resolved source path: the
++detector ships beside this formula in the same pack tree, making that the one
++candidate guaranteed to be present whenever the formula is and version-coherent
++with it (a formula from pin X can never reach a detector from pin Y).
++`gc formula list --json` reports that path for every formula gc can see,
++SHA-pinned packs included, and needs no environment beyond the city.
+ 
+ ```bash
+-SNAP="$GC_CITY/.gc/runtime/dolt-push-state.json"
+-CHECK=$(jq -r '.script_path // empty' "$SNAP" 2>/dev/null || true)
+-if [ -n "$CHECK" ] && [ -x "$CHECK" ]; then
++CITY="${GC_CITY:-${GC_CITY_PATH:-}}"
++if [ -n "$CITY" ]; then
++    FORMULA_JSON=$(gc formula list --city "$CITY" --json 2>/dev/null)
++else
++    FORMULA_JSON=$(gc formula list --json 2>/dev/null)
++fi
++FORMULA_SRC=$(printf '%s' "$FORMULA_JSON" \\
++    | jq -r '.formulas[]? | select(.name == "mol-deacon-patrol") | .source // empty' 2>/dev/null \\
++    | head -1)
++CHECK=""
++if [ -n "$FORMULA_SRC" ]; then
++    # <pack>/formulas/mol-deacon-patrol.toml -> <pack>/assets/scripts/<detector>
++    CHECK="$(dirname "$(dirname "$FORMULA_SRC")")/assets/scripts/dolt-push-state-check.sh"
++fi
++# GC_PACK_DIR is exported only when gc invokes a pack command, so it is a
++# fallback and never the primary — depending on it alone is what made the
++# refinery's approval gate permanently unresolvable (gcp-amo).
++if [ ! -x "$CHECK" ] && [ -n "${GC_PACK_DIR:-}" ]; then
++    CHECK="$GC_PACK_DIR/assets/scripts/dolt-push-state-check.sh"
++fi
++if [ -x "$CHECK" ]; then
+     RESULT=$("$CHECK" --json)
+ else
+-    # pre_start did not run (or the pack moved). Fall back to the last snapshot
+-    # and say so — a missing detector is itself worth reporting, not a silent OK.
+-    echo "dolt-push-divergence: detector not runnable; falling back to snapshot $SNAP"
+-    RESULT=$(jq -c '.scopes[]?' "$SNAP" 2>/dev/null || true)
++    # A detector that cannot be resolved is itself the finding. Nothing else in
++    # this city watches auto-push, so say it loudly rather than logging a silent
++    # OK — that silence is the exact failure mode this step exists to break.
++    echo "dolt-push-divergence: detector not runnable (resolved '$CHECK'); auto-push outage detection is BLIND this cycle — report it"
++    RESULT=""
+ fi
+ printf '%s\\n' "$RESULT"
+ ```
+@@ -613,7 +645,8 @@ persistent UNKNOWN is the only thing standing between a real outage and silence.
+ 
+ **Exit criteria:** Detector run for every active scope, STALE scopes escalated
+ (deduped), FROZEN scopes nudged (deduped), and recovered scopes' markers
+-cleared."""
++cleared — or, if the detector could not be resolved at all, that reported as a
++finding rather than passed over as OK."""
+ 
+ [[steps]]
+ id = "system-health"
+diff --git a/gastown/tests/test_agent_pre_start_budget.sh b/gastown/tests/test_agent_pre_start_budget.sh
+new file mode 100755
+index 0000000..770f070
+--- /dev/null
++++ b/gastown/tests/test_agent_pre_start_budget.sh
+@@ -0,0 +1,175 @@
++#!/usr/bin/env bash
++# Pack-wide guard: nothing may be wired as a `pre_start` without a measured,
++# enforced wall-clock bound inside the session setup_timeout.
++#
++# WHY THIS EXISTS. Twice now the same bug has cost a city an agent for hours:
++#
++#   gcp-ntbf  the witness reaper read one bead per candidate worktree; on a rig
++#             with many worktrees that outran setup_timeout and winnow lost its
++#             witness for 26h.
++#   gcp-oo0v  the deacon's dolt-push-state sweep costs one `gc bd sql -C
++#             <scope>` per scope — 18.6s measured — and the town lost its
++#             deacon for ~5h, patrols dead, breaker latched.
++#
++# The mechanism is identical both times and it is not obvious from the diff
++# that adds it. `pre_start` runs before the session exists, gc bounds it by
++# `[session] setup_timeout` (10s by default) and SIGKILLs on overrun, and a
++# killed pre_start fails the WHOLE session start. Six failures in an hour latch
++# the supervisor's circuit breaker open, so the agent does not come back on its
++# own. Neither script was broken; both simply could not fit the budget, and
++# nothing anywhere asserted that they had to.
++#
++# gcp-oo0v also showed how such a line ARRIVES: not from someone editing an
++# agent, but from a pin bump pulling in a pack whose agent.toml gained a
++# pre_start. The reviewer verified the new formula content was live and never
++# thought to look for a new pre_start. So the guard is an INVENTORY, not a
++# heuristic: every pre_start in the repo must be listed below with the budget
++# that bounds it. A new one fails this test until somebody measures it, which
++# is exactly the step both incidents skipped.
++set -euo pipefail
++
++ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
++
++# gascity's default [session] setup_timeout. A pre_start's self-imposed budget
++# must sit strictly inside it, with room for process startup and the rest of
++# the pre_start list.
++SETUP_TIMEOUT_SECONDS=10
++
++fail() {
++    echo "FAIL: $*" >&2
++    exit 1
++}
++
++# ── The inventory ────────────────────────────────────────────────────────────
++# One line per wired pre_start: "<agent.toml path>\t<command>". Adding a
++# pre_start means adding it here, which means having measured it. Deleting one
++# means deleting its line. Anything else is a diff this test rejects.
++#
++#   gastown/agents/polecat, gastown/agents/refinery
++#       worktree-setup.sh --sync. Local git plumbing plus up to three calls to
++#       a remote; the remote calls share a 6s budget
++#       (GC_WORKTREE_SETUP_BUDGET_SECONDS) and are abandoned, not retried, when
++#       it expires — a worktree one fetch behind is fixed next cycle.
++#   gastown/agents/witness
++#       polecat-worktree-reap.sh. One bulk bead read plus per-worktree git
++#       status, held to 8s (GC_REAP_BUDGET_SECONDS); deferred candidates are
++#       reaped on the next patrol.
++EXPECTED_PRE_STARTS=$(
++    cat <<'INVENTORY'
++gastown/agents/polecat/agent.toml	{{.ConfigDir}}/assets/scripts/worktree-setup.sh {{.RigRoot}} {{.WorkDir}} {{.AgentBase}} --sync
++gastown/agents/refinery/agent.toml	{{.ConfigDir}}/assets/scripts/worktree-setup.sh {{.RigRoot}} {{.WorkDir}} {{.AgentBase}} --sync
++gastown/agents/witness/agent.toml	{{.ConfigDir}}/assets/scripts/polecat-worktree-reap.sh {{.RigRoot}} --rig {{.Rig}}
++INVENTORY
++)
++
++# ── What is actually wired ───────────────────────────────────────────────────
++# Parsed, not grepped: a pre_start can be a bare string or a list, and a
++# grep-shaped guard would miss the reformatting that a pin bump can bring.
++actual_pre_starts() {
++    python3 - "$ROOT" <<'PY'
++import pathlib
++import sys
++import tomllib
++
++root = pathlib.Path(sys.argv[1])
++rows = []
++for path in sorted(root.rglob("agent.toml")):
++    if ".git" in path.parts:
++        continue
++    with path.open("rb") as handle:
++        try:
++            data = tomllib.load(handle)
++        except tomllib.TOMLDecodeError as exc:
++            raise SystemExit(f"unparseable agent config {path.relative_to(root)}: {exc}")
++    value = data.get("pre_start")
++    if value is None:
++        continue
++    commands = [value] if isinstance(value, str) else list(value)
++    rel = path.relative_to(root).as_posix()
++    for command in commands:
++        rows.append(f"{rel}\t{command}")
++print("\n".join(rows))
++PY
++}
++
++test_every_pre_start_is_inventoried() {
++    local actual
++    actual=$(actual_pre_starts) || fail "could not read agent configs"
++
++    if [[ "$actual" != "$EXPECTED_PRE_STARTS" ]]; then
++        echo "pre_start inventory drifted." >&2
++        echo "--- expected (gastown/tests/test_agent_pre_start_budget.sh) ---" >&2
++        printf '%s\n' "$EXPECTED_PRE_STARTS" >&2
++        echo "--- actual (agent.toml files) ---" >&2
++        printf '%s\n' "$actual" >&2
++        echo >&2
++        echo "A NEW pre_start is not a formatting change. Measure its wall clock on a" >&2
++        echo "real city first: it must finish well inside [session] setup_timeout" >&2
++        echo "(${SETUP_TIMEOUT_SECONDS}s), enforce that budget itself, and exit 0 when the" >&2
++        echo "budget expires — a pre_start killed on the deadline fails the whole session" >&2
++        echo "start and latches the supervisor circuit breaker (gcp-ntbf, gcp-oo0v)." >&2
++        echo "Work that cannot fit belongs in a patrol formula step, not here." >&2
++        fail "pre_start inventory out of date"
++    fi
++}
++
++# A budget nobody enforces is a comment. For each script the inventory names,
++# assert the enforcement is still in the file and that its default actually
++# fits — a bump to 30s "to make it stop timing out" is the shape of the next
++# incident, so the number is asserted, not just its presence.
++assert_bounded() {
++    local script="$1" default_var="$2"
++    local path="$ROOT/gastown/assets/scripts/$script"
++    local budget
++
++    [[ -f "$path" ]] || fail "$script is wired as a pre_start but is missing"
++    [[ -x "$path" ]] || fail "$script is wired as a pre_start but is not executable"
++
++    # The DEFINITION, not a mention: deleting the helper while leaving call
++    # sites behind is exactly how a bound rots away without the diff looking
++    # like a removal.
++    grep -E '^run_bounded\(\)' "$path" >/dev/null ||
++        fail "$script must define run_bounded; an unbounded pre_start is gcp-ntbf/gcp-oo0v"
++    grep -E '^budget_left\(\)' "$path" >/dev/null ||
++        fail "$script must define budget_left and spend one shared wall clock, not bound each call independently"
++
++    # And every call that can actually block for tens of seconds must go
++    # through it. Comments are stripped first: the headers explain the
++    # unbounded fetch that caused the incident, and saying so must not read as
++    # doing it.
++    local unbounded
++    unbounded=$(grep -vE '^[[:space:]]*#' "$path" |
++        grep -nE '(^|[^-[:alnum:]_])git([[:space:]]|.*[[:space:]])(fetch|pull|push|clone|ls-remote)([[:space:]]|$)' |
++        grep -v 'run_bounded' || true)
++    [[ -z "$unbounded" ]] ||
++        fail "$script calls a remote without a deadline: ${unbounded//$'\n'/ | }"
++
++    budget=$(sed -n "s/.*\${$default_var:-\([0-9][0-9]*\)}.*/\1/p" "$path" | head -1)
++    [[ -n "$budget" ]] ||
++        fail "$script must declare a default budget via \${$default_var:-<seconds>}"
++    (( budget > 0 )) ||
++        fail "$script declares a non-positive $default_var default"
++    (( budget < SETUP_TIMEOUT_SECONDS )) ||
++        fail "$script's ${default_var} default (${budget}s) is not inside setup_timeout (${SETUP_TIMEOUT_SECONDS}s); raise the timeout in the same change or shrink the work"
++}
++
++test_inventoried_scripts_enforce_their_budget() {
++    assert_bounded worktree-setup.sh GC_WORKTREE_SETUP_BUDGET_SECONDS
++    assert_bounded polecat-worktree-reap.sh GC_REAP_BUDGET_SECONDS
++}
++
++# The deacon is the agent gcp-oo0v killed. Naming it directly means a revert of
++# that fix fails with the incident in the message, not just an inventory diff.
++test_deacon_carries_no_pre_start() {
++    local deacon="$ROOT/gastown/agents/deacon/agent.toml"
++
++    [[ -f "$deacon" ]] || fail "missing deacon agent config"
++    ! grep -E '^[[:space:]]*pre_start[[:space:]]*=' "$deacon" >/dev/null ||
++        fail "deacon must not wire a pre_start: its push-state sweep measured 18.6s against a ${SETUP_TIMEOUT_SECONDS}s setup_timeout and cost the town its patrols for ~5h (gcp-oo0v). The sweep belongs in mol-deacon-patrol."
++}
++
++test_every_pre_start_is_inventoried
++test_inventoried_scripts_enforce_their_budget
++test_deacon_carries_no_pre_start
++
++echo "agent pre_start budget guard passed"
+diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
+index 2d656b8..794a414 100755
+--- a/gastown/tests/test_gastown_pack_assets.sh
++++ b/gastown/tests/test_gastown_pack_assets.sh
+@@ -352,17 +352,39 @@ test_dolt_push_outage_detection_is_wired() {
+     [[ -x "$check" ]] || fail "auto-push detector must be executable"
+     parse_toml "$deacon_cfg" "$patrol"
+ 
+-    # Same constraint as the worktree reaper: a formula step cannot name the
+-    # content-hashed pack cache, so pre_start is the only stable handle.
+-    grep -F 'pre_start = ["{{.ConfigDir}}/assets/scripts/dolt-push-state-check.sh --snapshot"]' \
+-        "$deacon_cfg" >/dev/null ||
+-        fail "deacon must run the auto-push detector from pre_start"
++    # gcp-oo0v: the detector USED to run from the deacon's pre_start. It cannot.
++    # The sweep is one `gc bd sql -C <scope>` per scope — 18.6s measured against
++    # a 10s [session] setup_timeout — and a pre_start killed on that deadline
++    # fails the whole session start, so six cycles latched the supervisor
++    # circuit breaker and the town lost its deacon for ~5h. No pre_start on this
++    # agent, and the pack-wide guard in test_agent_pre_start_budget.sh is what
++    # stops a new one arriving unmeasured on a pin bump.
++    ! grep -E '^[[:space:]]*pre_start[[:space:]]*=' "$deacon_cfg" >/dev/null ||
++        fail "deacon must not wire a pre_start; the auto-push sweep cannot fit setup_timeout (gcp-oo0v)"
+ 
+     grep -F 'id = "dolt-push-divergence"' "$patrol" >/dev/null ||
+         fail "deacon patrol should own an auto-push divergence step"
+     grep -F 'needs = ["dolt-push-divergence"]' "$patrol" >/dev/null ||
+         fail "the divergence step must be wired into the patrol chain, not orphaned"
+ 
++    # The detector moved INTO the patrol step, which has a whole cycle to run
++    # it. A formula step still cannot name the content-hashed pack cache, so it
++    # resolves the script from the formula's own resolved source path — the one
++    # candidate guaranteed present and version-coherent with the formula.
++    grep -F 'gc formula list' "$patrol" >/dev/null ||
++        fail "divergence step must resolve the detector from the formula's own source path"
++    grep -F 'assets/scripts/dolt-push-state-check.sh' "$patrol" >/dev/null ||
++        fail "divergence step must run the detector itself, not read a session-start snapshot"
++
++    # The old wiring fell back to the pre_start snapshot when the detector was
++    # unresolvable. That fallback is now a lie in two ways — no pre_start writes
++    # it, and a stale reading is not this cycle's measurement — so an
++    # unresolvable detector must be reported as blind, not passed over as OK.
++    ! grep -F 'falling back to snapshot' "$patrol" >/dev/null ||
++        fail "divergence step must not fall back to a stale snapshot as if it were a fresh reading"
++    grep -F 'BLIND this cycle' "$patrol" >/dev/null ||
++        fail "an unresolvable detector must be reported as a finding, not a silent OK"
++
+     # The point of the whole check is endpoint coverage. `gc dolt health` sees
+     # the MANAGED server only, and the rig that went dark for 18h was pinned to
+     # its own explicit endpoint — so the detector must reach each scope by that
+-- 
+2.50.1 (Apple Git-155)
+
