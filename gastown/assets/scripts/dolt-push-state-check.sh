@@ -102,13 +102,23 @@
 #   dolt-push-state-check.sh --json     # one JSON object per scope, per line
 #   dolt-push-state-check.sh --snapshot # sweep + write $GC_CITY/.gc/runtime/dolt-push-state.json
 #
-# --snapshot exists because pack assets install into a content-hashed cache
-# directory that a formula step cannot name — `{{.ConfigDir}}` in agent.toml is
-# the only stable handle on this file. So the deacon's `pre_start` runs
-# --snapshot, and the snapshot records this script's own resolved path under
-# `script_path`. The patrol step reads that path back and re-runs the sweep
-# itself, so each patrol cycle alerts on a FRESH measurement rather than on a
-# reading taken once at session start.
+# THIS SCRIPT MUST NOT BE WIRED AS A `pre_start`. It was, once — the deacon's,
+# as `--snapshot` — and it cost the town its deacon for ~5h (gcp-oo0v). The
+# sweep issues one `gc bd sql -C <scope>` per scope; at a real city's ~5-8s per
+# gc call that measured 18.6s wall clock, against a 10s `[session]
+# setup_timeout`. gc SIGKILLs a pre_start at that deadline and a killed
+# pre_start fails the whole session start, so six cycles latched the supervisor
+# circuit breaker open. Nothing here is broken and no budget flag would save it:
+# a sweep that must visit every scope cannot fit a start-up deadline, so it does
+# not run at start-up. mol-deacon-patrol's `dolt-push-divergence` step owns the
+# call, resolves this file from the formula's own resolved source path (pack
+# assets live in a content-hashed cache directory a formula step cannot name),
+# and gets a whole patrol cycle to finish in.
+#
+# --snapshot therefore no longer feeds that step, and `script_path` is no longer
+# how the step finds this file. It stays as an on-demand artifact: a
+# timestamped, machine-readable sweep of every scope, written where an operator
+# or a later cycle can read it without paying for the sweep again.
 #
 # Exit: 0 when the sweep ran (verdicts are in the output, including STALE);
 #       2 on a usage or environment error. A STALE scope is a finding to be
@@ -435,9 +445,11 @@ if [ "$SNAPSHOT" -eq 0 ]; then
   exit 0
 fi
 
-# Snapshot mode. `script_path` is the whole point of the file: it is the handle
-# the patrol step uses to re-run this sweep on its own cadence, since it cannot
-# name the content-hashed pack cache directory itself.
+# Snapshot mode — an on-demand artifact, not an input to the patrol step (which
+# resolves this file from the formula's own source path and runs the sweep
+# itself). `script_path` is kept for the reader: it records which pin's copy of
+# the detector produced these verdicts, which is the first thing anyone asks of
+# a snapshot found on disk.
 GENERATED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 if [ -n "$OUTPUT" ]; then
   printf '%s\n' "$OUTPUT" | jq -s \
