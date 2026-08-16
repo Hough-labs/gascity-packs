@@ -738,10 +738,27 @@ pour a duplicate every cycle, and the prior wisp leaks. Query
 `open,in_progress`: a successor a crashed session already claimed is still
 yours to resume, and an open-only query leaves it stranded forever. Exclude
 the wisp you are on so this reconcile can never burn it out from under you.
+
+Both queries below use the SAME filter — `--status=open,in_progress ...
+--limit=0`. That is not cosmetic. Patrol wisps are poured `open` and nothing
+transitions them to `in_progress`, so an `--status=in_progress` resolver
+matches nothing on a normal cycle and CURRENT_WISP comes back empty; the
+surplus exclusion `select(.id != $cur)` then excludes nothing, the wisp you are
+running lands in its own surplus set, no successor is poured, and the loop
+stops advancing while every command still exits 0 (gcp-ah8h). Matching filters
+also guarantee CURRENT_WISP is the same element the surplus query lists first,
+so the exclusion always lands. Resolving CURRENT_WISP empty is a hard error,
+never a warning to continue past.
 ```bash
 CURRENT_WISP=${GC_BEAD_ID:-}
 if [ -z "$CURRENT_WISP" ]; then
-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
+  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json | jq -r '.[0].id // empty')
+fi
+if [ -z "$CURRENT_WISP" ]; then
+  echo "ERROR: could not resolve the current witness wisp: GC_BEAD_ID is unset and no open/in_progress patrol wisp is assigned to $GC_AGENT."
+  echo "ERROR: refusing to reconcile. With CURRENT_WISP empty the live wisp lands in its own surplus set, no successor is poured, and the patrol loop stops advancing without ever failing."
+  gc runtime drain-ack
+  exit 1
 fi
 SURPLUS_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json \
   | jq -r --arg cur "$CURRENT_WISP" '.[] | select(.id != $cur) | .id')
@@ -760,7 +777,9 @@ fi
 if [ -n "$CURRENT_WISP" ]; then
   gc bd mol burn "$CURRENT_WISP" --force
 else
-  echo "Could not resolve current witness wisp; not burning."
+  echo "ERROR: could not resolve the current witness wisp; not burning. The patrol loop cannot advance — this wisp leaks and no successor runs."
+  gc runtime drain-ack
+  exit 1
 fi
 ```
 

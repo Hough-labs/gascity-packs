@@ -148,7 +148,13 @@ wisp, burn the current wisp, then request a restart:
 ```bash
 CURRENT_WISP=${GC_BEAD_ID:-}
 if [ -z "$CURRENT_WISP" ]; then
-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
+  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json | jq -r '.[0].id // empty')
+fi
+if [ -z "$CURRENT_WISP" ]; then
+  echo "ERROR: could not resolve the current refinery wisp: GC_BEAD_ID is unset and no open/in_progress patrol wisp is assigned to $GC_AGENT."
+  echo "ERROR: refusing to continue. With CURRENT_WISP empty this cycle would pour a successor and never burn the wisp it is running, leaking one wisp every cycle, while every command still exits 0."
+  gc runtime drain-ack
+  exit 1
 fi
 NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
 if [ -z "$NEXT" ]; then
@@ -164,7 +170,7 @@ fi
 if [ -n "$CURRENT_WISP" ]; then
   gc bd mol burn "$CURRENT_WISP" --force
 else
-  echo "Could not resolve current wisp; not requesting restart."
+  echo "ERROR: could not resolve the current refinery wisp; not requesting restart. The patrol loop cannot advance — this wisp leaks and no successor runs."
   gc runtime drain-ack
   exit 1
 fi
@@ -296,7 +302,13 @@ gc bd update $WORK \
 ```bash
 CURRENT_WISP=${GC_BEAD_ID:-}
 if [ -z "$CURRENT_WISP" ]; then
-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
+  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json | jq -r '.[0].id // empty')
+fi
+if [ -z "$CURRENT_WISP" ]; then
+  echo "ERROR: could not resolve the current refinery wisp: GC_BEAD_ID is unset and no open/in_progress patrol wisp is assigned to $GC_AGENT."
+  echo "ERROR: refusing to continue. With CURRENT_WISP empty this cycle would pour a successor and never burn the wisp it is running, leaking one wisp every cycle, while every command still exits 0."
+  gc runtime drain-ack
+  exit 1
 fi
 NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
 if [ -z "$NEXT" ]; then
@@ -312,7 +324,7 @@ fi
 if [ -n "$CURRENT_WISP" ]; then
   gc bd mol burn "$CURRENT_WISP" --force
 else
-  echo "Could not resolve current wisp; not burning."
+  echo "ERROR: could not resolve the current refinery wisp; not burning. The patrol loop cannot advance — this wisp leaks and no successor runs."
   gc runtime drain-ack
   exit 1
 fi
@@ -397,7 +409,13 @@ TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_bran
      ```bash
      CURRENT_WISP=${GC_BEAD_ID:-}
      if [ -z "$CURRENT_WISP" ]; then
-       CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
+       CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json | jq -r '.[0].id // empty')
+     fi
+     if [ -z "$CURRENT_WISP" ]; then
+       echo "ERROR: could not resolve the current refinery wisp: GC_BEAD_ID is unset and no open/in_progress patrol wisp is assigned to $GC_AGENT."
+       echo "ERROR: refusing to continue. With CURRENT_WISP empty this cycle would pour a successor and never burn the wisp it is running, leaking one wisp every cycle, while every command still exits 0."
+       gc runtime drain-ack
+       exit 1
      fi
      NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
      if [ -z "$NEXT" ]; then
@@ -413,7 +431,7 @@ TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_bran
      if [ -n "$CURRENT_WISP" ]; then
        gc bd mol burn "$CURRENT_WISP" --force
      else
-       echo "Could not resolve current wisp; not burning."
+       echo "ERROR: could not resolve the current refinery wisp; not burning. The patrol loop cannot advance — this wisp leaks and no successor runs."
        gc runtime drain-ack
        exit 1
      fi
@@ -715,10 +733,10 @@ Branch: $BRANCH
 Target: $TARGET"
   CURRENT_WISP=${GC_BEAD_ID:-}
   if [ -z "$CURRENT_WISP" ]; then
-    CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
+    CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json | jq -r '.[0].id // empty')
   fi
   if [ -z "$CURRENT_WISP" ]; then
-    echo "Could not resolve current wisp; not burning."
+    echo "ERROR: could not resolve the current refinery wisp; not burning. The patrol loop cannot advance — this wisp leaks and no successor runs."
     echo "$reason"
     echo "STOP. Existing PR metadata needs human correction."
     gc runtime drain-ack
@@ -738,7 +756,7 @@ Target: $TARGET"
   if [ -n "$CURRENT_WISP" ]; then
     gc bd mol burn "$CURRENT_WISP" --force
   else
-    echo "Could not resolve current wisp; not burning."
+    echo "ERROR: could not resolve the current refinery wisp; not burning. The patrol loop cannot advance — this wisp leaks and no successor runs."
     echo "$reason"
     echo "STOP. Existing PR metadata needs human correction."
     gc runtime drain-ack
@@ -1704,7 +1722,13 @@ If auto_land = "false": skip this entirely.
 ```bash
 CURRENT_WISP=${GC_BEAD_ID:-}
 if [ -z "$CURRENT_WISP" ]; then
-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
+  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json | jq -r '.[0].id // empty')
+fi
+if [ -z "$CURRENT_WISP" ]; then
+  echo "ERROR: could not resolve the current refinery wisp: GC_BEAD_ID is unset and no open/in_progress patrol wisp is assigned to $GC_AGENT."
+  echo "ERROR: refusing to continue. With CURRENT_WISP empty this cycle would pour a successor and never burn the wisp it is running, leaking one wisp every cycle, while every command still exits 0."
+  gc runtime drain-ack
+  exit 1
 fi
 NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
 if [ -z "$NEXT" ]; then
@@ -1720,7 +1744,7 @@ fi
 if [ -n "$CURRENT_WISP" ]; then
   gc bd mol burn "$CURRENT_WISP" --force
 else
-  echo "Could not resolve current wisp; not burning."
+  echo "ERROR: could not resolve the current refinery wisp; not burning. The patrol loop cannot advance — this wisp leaks and no successor runs."
   gc runtime drain-ack
   exit 1
 fi
