@@ -3580,7 +3580,7 @@ class FormulaAssetTests(unittest.TestCase):
             "gc sling gc.run-operator {{code_review_formula}} --formula",
             "--var subject_path=\"$SUBJECT_PATH\"",
             "--var report_path=\"$REPORT_PATH\"",
-            "review-outcome \"$REPORT_PATH\"",
+            "github_reports.py review-outcome",
             "gc.github.reused_current_output=true",
             "do not\nlaunch the generic `review` formula",
             "leave the reused\nartifacts untouched",
@@ -3595,6 +3595,45 @@ class FormulaAssetTests(unittest.TestCase):
         ):
             with self.subTest(step="render-comment", fragment=fragment):
                 self.assertIn(fragment, render_comment)
+
+    def test_github_pr_review_run_review_gates_on_child_workflow_outcome(self) -> None:
+        """run-review must read the launched review workflow's outcome, not infer it.
+
+        The defect this pins: the step's only success criterion used to be "a
+        conformant report exists on disk", which any hand-authored bridging file
+        satisfies, so a review workflow that closed FAIL still walked the adapter
+        to a pass and posted a verdict to the PR.
+        """
+        root = pathlib.Path(__file__).resolve().parents[1]
+        data = resolve_formula(root, "github-pr-review")
+        run_review = node_description(root, next(step for step in data["steps"] if step["id"] == "run-review"))
+
+        for fragment in (
+            # The launch must be observable: capture the child workflow root id.
+            "--formula --json",
+            "workflow_id // .molecule_id",
+            "gc.github.review_workflow_id",
+            # The gate itself, and the two independent conditions it enforces.
+            "assets/scripts/workflow_outcome.py review-gate",
+            "--workflow-root \"$REVIEW_WORKFLOW_ID\"",
+            "gc.github.review_child_outcome",
+            # A non-pass child is a failed step, with the failure contract spelled out.
+            "gc.outcome=fail",
+            "gc.failure_class=hard",
+            "gc.on_fail=abort_scope",
+            # Findings are output, not execution failure.
+            "is NOT a workflow failure",
+            # The explicit prohibition on the route-around that was observed live.
+            "Never route around this gate",
+            "hand-author",
+        ):
+            with self.subTest(step="run-review", fragment=fragment):
+                self.assertIn(fragment, run_review)
+
+        self.assertTrue(
+            (root / "assets/scripts/workflow_outcome.py").exists(),
+            "run-review references workflow_outcome.py; the script must ship with the pack",
+        )
 
     def test_github_issue_fix_uses_implementation_plan_artifact_contract(self) -> None:
         root = pathlib.Path(__file__).resolve().parents[1]
