@@ -1,0 +1,214 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sun, 16 Aug 2026 21:56:39 -0400
+Subject: [PATCH 40/41] fix(github-pr-review): abort the comment steps when the
+ review scope fails (gcp-m7dn)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The previous commit gives run-review a real failure path, but a failed step
+alone does not stop this adapter. The four review/comment steps were chained
+with `needs` only, and `needs` is a READINESS edge, not an OUTCOME edge: once
+run-review CLOSES — pass or fail — render-comment, human-gate-comment and
+post-comment all become Ready and the run posts a verdict for a review that
+never succeeded. Detection without propagation would still put the comment on
+the pull request.
+
+graph.v2 ships the mechanism for exactly this. Marking the four steps
+`gc.scope_ref`/`gc.scope_role=member` with `gc.on_fail = "abort_scope"` and
+adding a `review-scope` body makes the orchestrator skip the remaining OPEN
+members and close the body `gc.outcome=fail` when any member fails
+(formula-spec-v2 section 3.5, implemented at
+internal/dispatch/runtime.go:reconcileTerminalScopedMember). finalize moves onto
+the body rather than post-comment so it still runs on the aborted path and
+records why — it is deliberately NOT a member, since a member would be skipped
+by the very abort it needs to describe.
+
+This wiring is not new code so much as relocated code: it has been running as a
+whole-file city-local fork of this formula since gc-kvqb, whose own header says
+it "belongs upstream — retire this fork the moment upstream carries it". The
+committed file is byte-identical to that fork apart from two deliberate
+differences: the `code_review_formula` default stays `review` here (moving it to
+`verdict-review` is gc-6l2k, a separate concern that depends on a formula this
+pack does not ship), and the scope body gets a `description_file`, which this
+pack's own test_formula_node_descriptions_delegate_to_shadowable_assets requires
+of every node.
+
+The selector-matrix test built its route map by indexing `gc.run_target` on
+every step, which KeyErrors on a latch step that has none. It now uses a
+worker_run_targets() helper that skips orchestrator-closed steps, which is the
+correct reading: latches are not routed to a worker.
+
+Validation: new test_github_pr_review_scopes_comment_steps_so_a_failed_review_aborts
+pins the member/body/finalize wiring. `gc lint gascity` is clean and the full
+`pytest tests gascity/tests` run is back to exactly the four failures that a
+clean checkout already has (test_no_bare_bd_commands and three
+test_city_claim_command_* subtests, all untouched by this branch).
+---
+ .../github-pr-review/review-scope.md          |  8 +++
+ .../formulas/github-pr-review.formula.toml    | 32 ++++++++++--
+ gascity/tests/test_formula_assets.py          | 49 ++++++++++++++++++-
+ 3 files changed, 82 insertions(+), 7 deletions(-)
+ create mode 100644 gascity/assets/workflows/github-pr-review/review-scope.md
+
+diff --git a/gascity/assets/workflows/github-pr-review/review-scope.md b/gascity/assets/workflows/github-pr-review/review-scope.md
+new file mode 100644
+index 0000000..4cdbe87
+--- /dev/null
++++ b/gascity/assets/workflows/github-pr-review/review-scope.md
+@@ -0,0 +1,8 @@
++Scope latch for the review, render, gate, and post steps of the PR review
++adapter. The orchestrator closes this bead; no worker claims it.
++
++Its members declare `gc.on_fail = "abort_scope"`, so a member that closes
++`gc.outcome=fail` — a review workflow that did not succeed, a gate the human
++rejected — makes the orchestrator skip the remaining open members and close
++this body failed, instead of letting readiness alone carry the run on to
++posting a verdict.
+diff --git a/gascity/formulas/github-pr-review.formula.toml b/gascity/formulas/github-pr-review.formula.toml
+index f29c521..912e2c0 100644
+--- a/gascity/formulas/github-pr-review.formula.toml
++++ b/gascity/formulas/github-pr-review.formula.toml
+@@ -68,37 +68,59 @@ needs = ["snapshot"]
+ metadata = { "gc.run_target" = "gc.run-operator" }
+ description_file = "../assets/workflows/github-pr-review/reuse-current-head.md"
+ 
++# The four review/comment steps are scope members with `gc.on_fail =
++# "abort_scope"`. `needs` alone is a READINESS edge, not an OUTCOME edge: a
++# run-review that closes gc.outcome=fail still lets render/gate/post become
++# Ready, so the adapter would post a verdict for a review that never succeeded.
++# abort_scope is the mechanism graph.v2 already ships for this
++# (formula-spec-v2 section 3.5) — when a member fails the orchestrator skips
++# the remaining OPEN members and closes the scope body gc.outcome=fail.
+ [[steps]]
+ id = "run-review"
+ title = "Run generic review"
+ needs = ["reuse-current-head"]
+-metadata = { "gc.run_target" = "gc.run-operator" }
++metadata = { "gc.run_target" = "gc.run-operator", "gc.scope_ref" = "review-scope", "gc.scope_role" = "member", "gc.on_fail" = "abort_scope" }
+ description_file = "../assets/workflows/github-pr-review/run-review.md"
+ 
+ [[steps]]
+ id = "render-comment"
+ title = "Render sticky PR comment"
+ needs = ["run-review"]
+-metadata = { "gc.run_target" = "gc.run-operator" }
++metadata = { "gc.run_target" = "gc.run-operator", "gc.scope_ref" = "review-scope", "gc.scope_role" = "member", "gc.on_fail" = "abort_scope" }
+ description_file = "../assets/workflows/github-pr-review/render-comment.md"
+ 
+ [[steps]]
+ id = "human-gate-comment"
+ title = "Gate PR review comment"
+ needs = ["render-comment"]
+-metadata = { "gc.run_target" = "gc.run-operator" }
++metadata = { "gc.run_target" = "gc.run-operator", "gc.scope_ref" = "review-scope", "gc.scope_role" = "member", "gc.on_fail" = "abort_scope" }
+ description_file = "../assets/workflows/github-pr-review/human-gate-comment.md"
+ 
+ [[steps]]
+ id = "post-comment"
+ title = "Create or update sticky PR comment"
+ needs = ["render-comment", "human-gate-comment"]
+-metadata = { "gc.run_target" = "gc.run-operator" }
++metadata = { "gc.run_target" = "gc.run-operator", "gc.scope_ref" = "review-scope", "gc.scope_role" = "member", "gc.on_fail" = "abort_scope" }
+ description_file = "../assets/workflows/github-pr-review/post-comment.md"
+ 
++# The scope body. `needs = ["post-comment"]` follows the spec's own example,
++# where the body depends on its members so it closes after them and aggregates
++# their result.
++[[steps]]
++id = "review-scope"
++title = "PR review scope"
++needs = ["post-comment"]
++metadata = { "gc.kind" = "scope", "gc.scope_name" = "pr-review", "gc.scope_role" = "body" }
++description_file = "../assets/workflows/github-pr-review/review-scope.md"
++
++# finalize hangs off the scope body rather than post-comment so it records run
++# metadata for an ABORTED run too — the body closes either way, so this stays
++# Ready-able and the diagnostics it writes survive the failure path. It is
++# deliberately NOT a scope member: making it one would skip the very step whose
++# job is to record why the run failed.
+ [[steps]]
+ id = "finalize"
+ title = "Finalize PR review result"
+-needs = ["post-comment"]
++needs = ["review-scope"]
+ metadata = { "gc.run_target" = "gc.run-operator" }
+ description_file = "../assets/workflows/github-pr-review/finalize.md"
+diff --git a/gascity/tests/test_formula_assets.py b/gascity/tests/test_formula_assets.py
+index aca4fd4..6b813e9 100755
+--- a/gascity/tests/test_formula_assets.py
++++ b/gascity/tests/test_formula_assets.py
+@@ -617,6 +617,20 @@ def formula_nodes(data: dict) -> list[dict]:
+     return nodes
+ 
+ 
++def worker_run_targets(data: dict) -> dict[str, str]:
++    """Map step id -> gc.run_target for the steps a worker actually claims.
++
++    Latch steps (scope bodies, cleanups) are closed by the orchestrator and
++    declare no run target, so they are absent from the result rather than
++    raising.
++    """
++    return {
++        step["id"]: step["metadata"]["gc.run_target"]
++        for step in data.get("steps", [])
++        if "gc.run_target" in step.get("metadata", {})
++    }
++
++
+ def node_description(root: pathlib.Path, node: dict) -> str:
+     description_file = node.get("description_file")
+     if description_file:
+@@ -2625,8 +2639,11 @@ class FormulaAssetTests(unittest.TestCase):
+                 issue_adapter = resolve_formula_from_dirs(formula_dirs, "github-issue-fix")
+                 self.assertFalse(pr_adapter["target_required"])
+                 self.assertFalse(issue_adapter["target_required"])
+-                pr_routes = {step["id"]: step["metadata"]["gc.run_target"] for step in pr_adapter["steps"]}
+-                issue_routes = {step["id"]: step["metadata"]["gc.run_target"] for step in issue_adapter["steps"]}
++                # Scope bodies and other latch steps are closed by the
++                # orchestrator, not claimed by a worker, so they carry no run
++                # target. Only worker steps are routed.
++                pr_routes = worker_run_targets(pr_adapter)
++                issue_routes = worker_run_targets(issue_adapter)
+                 self.assertEqual(pr_routes["run-review"], "gc.run-operator")
+                 self.assertEqual(issue_routes["build"], "gc.run-operator")
+ 
+@@ -3635,6 +3652,34 @@ class FormulaAssetTests(unittest.TestCase):
+             "run-review references workflow_outcome.py; the script must ship with the pack",
+         )
+ 
++    def test_github_pr_review_scopes_comment_steps_so_a_failed_review_aborts(self) -> None:
++        """A failed run-review must stop the adapter, not merely mark it failed.
++
++        `needs` is a readiness edge: without abort_scope, render-comment and
++        post-comment become Ready as soon as run-review CLOSES, whatever its
++        outcome, and the adapter posts a verdict for a review that failed.
++        """
++        root = pathlib.Path(__file__).resolve().parents[1]
++        data = tomllib.loads((root / "formulas" / "github-pr-review.formula.toml").read_text(encoding="utf-8"))
++        steps = {step["id"]: step for step in data["steps"]}
++
++        body = steps["review-scope"]
++        self.assertEqual(body["metadata"]["gc.kind"], "scope")
++        self.assertEqual(body["metadata"]["gc.scope_role"], "body")
++        self.assertNotIn("gc.run_target", body["metadata"], "a scope body is a latch, not worker work")
++
++        for step_id in ("run-review", "render-comment", "human-gate-comment", "post-comment"):
++            with self.subTest(step=step_id):
++                metadata = steps[step_id]["metadata"]
++                self.assertEqual(metadata["gc.scope_ref"], "review-scope")
++                self.assertEqual(metadata["gc.scope_role"], "member")
++                self.assertEqual(metadata["gc.on_fail"], "abort_scope")
++
++        # finalize records why an aborted run failed, so it hangs off the body
++        # and is deliberately not a member — a member would be skipped.
++        self.assertEqual(steps["finalize"]["needs"], ["review-scope"])
++        self.assertNotIn("gc.scope_ref", steps["finalize"]["metadata"])
++
+     def test_github_issue_fix_uses_implementation_plan_artifact_contract(self) -> None:
+         root = pathlib.Path(__file__).resolve().parents[1]
+         text = effective_formula_text(root, "github-issue-fix")
+-- 
+2.50.1 (Apple Git-155)
+

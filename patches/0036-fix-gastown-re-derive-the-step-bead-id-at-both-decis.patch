@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Mon, 17 Aug 2026 08:59:01 -0400
-Subject: [PATCH 36/38] fix(gastown): re-derive the step bead id at both
+Subject: [PATCH 36/41] fix(gastown): re-derive the step bead id at both
  decision points (gcp-rz8a)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

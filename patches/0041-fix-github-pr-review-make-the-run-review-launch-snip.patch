@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sun, 16 Aug 2026 22:02:24 -0400
+Subject: [PATCH 41/41] fix(github-pr-review): make the run-review launch
+ snippet copy-pasteable (gcp-m7dn)
+
+The outcome-gate commit put `gc bd update <root-bead-id> --set-metadata ...`
+inside a ```bash fence. The rest of this asset uses `<root-bead-id>` as a prose
+placeholder, which is fine in prose, but inside a shell block `<` is a
+redirection: an operator running the block verbatim gets a syntax error at the
+one line that persists the child workflow id, and loses the handle the gate
+needs.
+
+Bind it to $ROOT_BEAD_ID at the top of the block instead, with a comment naming
+where the value comes from. No behavior change; the block now runs as written.
+---
+ gascity/assets/workflows/github-pr-review/run-review.md | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/gascity/assets/workflows/github-pr-review/run-review.md b/gascity/assets/workflows/github-pr-review/run-review.md
+index 65f65d3..85fa26b 100644
+--- a/gascity/assets/workflows/github-pr-review/run-review.md
++++ b/gascity/assets/workflows/github-pr-review/run-review.md
+@@ -40,6 +40,7 @@ without it. If workflow root metadata already carries
+ launched the child — resume that id instead of slinging a second review.
+ 
+ ```bash
++ROOT_BEAD_ID="<root-bead-id>"   # gc.root_bead_id from this step's metadata
+ REVIEW_LAUNCH_JSON="$(gc sling gc.run-operator {{code_review_formula}} --formula --json \
+   --var context_path="{{context_path}}" \
+   --var subject_path="$SUBJECT_PATH" \
+@@ -48,7 +49,7 @@ REVIEW_LAUNCH_JSON="$(gc sling gc.run-operator {{code_review_formula}} --formula
+   --var review_mode="{{review_mode}}")"
+ REVIEW_WORKFLOW_ID="$(printf '%s' "$REVIEW_LAUNCH_JSON" | jq -r '.workflow_id // .molecule_id // empty')"
+ [ -n "$REVIEW_WORKFLOW_ID" ] || { echo "sling returned no workflow root id" >&2; exit 1; }
+-gc bd update <root-bead-id> --set-metadata gc.github.review_workflow_id="$REVIEW_WORKFLOW_ID"
++gc bd update "$ROOT_BEAD_ID" --set-metadata gc.github.review_workflow_id="$REVIEW_WORKFLOW_ID"
+ ```
+ 
+ If the selected formula does not declare the mode vars, omit the two mode
+-- 
+2.50.1 (Apple Git-155)
+

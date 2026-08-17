@@ -1,0 +1,782 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sun, 16 Aug 2026 21:51:09 -0400
+Subject: [PATCH 39/41] fix(github-pr-review): gate run-review on its review
+ workflow's outcome (gcp-m7dn)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+run-review launched the generic code-review formula with `gc sling ...
+--formula` and then never consulted the run it started. Its only success
+criterion was "REPORT_PATH exists and validates through github_reports.py
+review-outcome" — satisfied by ANY conformant file on disk, including one
+hand-authored to bridge a review that had already failed. A review workflow
+that closed FAIL therefore walked the adapter to a pass and a verdict got
+posted to GitHub anyway.
+
+Worse, the criterion was unsatisfiable on the failure path: when the child dies
+the report is never written, so the step had no legal exit at all. Two live
+runs hit it and resolved it opposite ways — th-9fd3 hand-authored a bridging
+verdict-report.md and closed PASS, th-kjcf closed fail and filed a bug. Whether
+this pipeline fails closed depended on how an LLM step chose to read an
+impossible instruction.
+
+graph.v2 already computes the answer this step needs. When a workflow's
+`workflow-finalize` runs, the orchestrator aggregates its steps into one
+pass/fail and closes the workflow ROOT with that outcome (formula-spec-v2
+section 3.5). This commit reads that engine-computed verdict instead of
+inferring one:
+
+- New `assets/scripts/workflow_outcome.py`. `root-outcome` resolves one
+  launched workflow's terminal outcome from `gc bd`, failing closed on an
+  unreadable, still-open, or unstamped root, and cross-checking members for a
+  terminal `gc.outcome=fail`. It mirrors the engine's retry firewall
+  (internal/dispatch/runtime.go:terminalAbortScopeFailure) by exempting
+  superseded `gc.attempt` beads and transient failure classes, so a retried
+  attempt cannot outvote the logical step that later passed. `review-gate`
+  composes that with verdict-report validation for this adapter.
+- run-review now slings with `--json`, records the child root id as
+  `gc.github.review_workflow_id` (so a retried step resumes the launch rather
+  than slinging a second review), polls the gate, and closes pass only when the
+  child terminated pass AND the report validates. A non-pass child closes the
+  step `gc.outcome=fail` / `gc.failure_class=hard` with
+  `gc.github.review_child_outcome` recorded.
+
+The gate deliberately keeps two things apart: a review report whose own verdict
+is `fail/minor|major|blocker` is a review FINDING, not a workflow failure — it
+still passes the gate and maps to comment/request_changes/block, matching the
+role contract that findings are output rather than execution failure. Only "the
+review did not run" stops the adapter. The step text also now names the
+route-around explicitly and forbids it, because prose that merely omits an
+option is what th-9fd3 filled in on its own.
+
+Validation: 20 new unit tests in gascity/tests/test_workflow_outcome.py cover
+the red case (child closed fail, valid report present -> gate refuses) and the
+green control (child closed pass -> gate approves; findings-bearing report
+still approves), plus incomplete/unknown/missing-root/retry-attempt/transient
+paths. A new contract test in test_formula_assets.py pins the step text to the
+gate. `gc lint gascity` is clean.
+
+Not covered here: propagating a failed run-review so render-comment and
+post-comment do not run. That is the abort_scope half, wired today only as a
+city-local whole-file fork of the formula; the next commit folds it upstream.
+
+Pre-existing and untouched: tests/test_no_bare_bd_commands.py and three
+test_city_claim_command_* subtests fail identically on a clean checkout.
+---
+ gascity/assets/scripts/workflow_outcome.py    | 293 ++++++++++++++++++
+ .../workflows/github-pr-review/run-review.md  |  72 ++++-
+ gascity/tests/test_formula_assets.py          |  41 ++-
+ gascity/tests/test_workflow_outcome.py        | 248 +++++++++++++++
+ 4 files changed, 646 insertions(+), 8 deletions(-)
+ create mode 100755 gascity/assets/scripts/workflow_outcome.py
+ create mode 100644 gascity/tests/test_workflow_outcome.py
+
+diff --git a/gascity/assets/scripts/workflow_outcome.py b/gascity/assets/scripts/workflow_outcome.py
+new file mode 100755
+index 0000000..a51002f
+--- /dev/null
++++ b/gascity/assets/scripts/workflow_outcome.py
+@@ -0,0 +1,293 @@
++#!/usr/bin/env python3
++"""Read the terminal outcome of a launched graph.v2 workflow.
++
++A step that launches a child workflow with `gc sling ... --formula` gets back a
++workflow root bead id and nothing else. The child's success or failure is not
++implied by the artifacts it leaves on disk: a review workflow can die with its
++report never written, or with a stale report from an earlier head SHA still
++sitting in the artifact directory. Inferring "the child passed" from "the file
++exists and parses" is how a failed gate walks a run to a pass.
++
++graph.v2 already computes the answer. When `workflow-finalize` becomes Ready the
++orchestrator aggregates its blockers into one pass/fail and closes the workflow
++ROOT with that outcome (formula-spec-v2 section 3.5, "Workflow finalize"). This
++module reads that engine-computed verdict instead of guessing, and it fails
++closed: an unreadable, still-open, or unstamped root is never reported as a pass.
++
++Commands:
++
++  root-outcome <root-bead-id>
++      Resolve one launched workflow's terminal outcome.
++
++  review-gate --workflow-root <id> --report <path>
++      The github-pr-review `run-review` gate: the child workflow must have
++      terminated pass AND the verdict report must validate. A review report
++      whose own verdict is `fail` is a review FINDING, not a workflow failure —
++      it still passes this gate and maps to comment/request_changes/block.
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import subprocess
++import sys
++from collections.abc import Callable, Sequence
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Any
++
++import github_reports
++import validate_verdict_report
++
++# Engine metadata keys (internal/beads/beadmeta). Kept as literals because this
++# script talks to `gc bd` over JSON, not to the Go package.
++OUTCOME_KEY = "gc.outcome"
++ROOT_BEAD_ID_KEY = "gc.root_bead_id"
++ATTEMPT_KEY = "gc.attempt"
++FAILURE_CLASS_KEY = "gc.failure_class"
++FAILURE_CLASS_TRANSIENT = "transient"
++
++OUTCOME_PASS = "pass"
++OUTCOME_FAIL = "fail"
++OUTCOME_INCOMPLETE = "incomplete"
++OUTCOME_UNKNOWN = "unknown"
++
++Runner = Callable[[Sequence[str]], str]
++
++
++class WorkflowOutcomeError(Exception):
++    pass
++
++
++CLI_ERROR_TYPES = (
++    OSError,
++    UnicodeDecodeError,
++    WorkflowOutcomeError,
++    github_reports.ValidationError,
++    validate_verdict_report.ValidationError,
++)
++
++
++@dataclass(frozen=True)
++class WorkflowResult:
++    root_bead_id: str
++    outcome: str
++    root_status: str
++    failed_members: list[str] = field(default_factory=list)
++    open_members: list[str] = field(default_factory=list)
++    detail: str = ""
++
++    @property
++    def passed(self) -> bool:
++        return self.outcome == OUTCOME_PASS
++
++    def as_dict(self) -> dict[str, Any]:
++        return {
++            "ok": self.passed,
++            "root_bead_id": self.root_bead_id,
++            "outcome": self.outcome,
++            "root_status": self.root_status,
++            "failed_members": self.failed_members,
++            "open_members": self.open_members,
++            "detail": self.detail,
++        }
++
++
++def default_runner(cmd: Sequence[str]) -> str:
++    proc = subprocess.run(list(cmd), text=True, capture_output=True, check=False)
++    if proc.returncode != 0:
++        detail = proc.stderr.strip() or proc.stdout.strip() or f"exited {proc.returncode}"
++        raise WorkflowOutcomeError(f"command failed: {' '.join(cmd)}: {detail}")
++    return proc.stdout
++
++
++def metadata_of(bead: dict[str, Any]) -> dict[str, str]:
++    raw = bead.get("metadata") or {}
++    if not isinstance(raw, dict):
++        return {}
++    return {str(key): str(value) for key, value in raw.items() if value is not None}
++
++
++def parse_bead_list(text: str, *, source: str) -> list[dict[str, Any]]:
++    stripped = text.strip()
++    if not stripped:
++        return []
++    try:
++        data = json.loads(stripped)
++    except json.JSONDecodeError as exc:
++        raise WorkflowOutcomeError(f"{source} returned invalid JSON: {exc}") from exc
++    if isinstance(data, dict):
++        data = [data]
++    if not isinstance(data, list):
++        raise WorkflowOutcomeError(f"{source} returned JSON that is not a bead list")
++    beads: list[dict[str, Any]] = []
++    for entry in data:
++        if not isinstance(entry, dict):
++            raise WorkflowOutcomeError(f"{source} returned a non-object bead entry")
++        beads.append(entry)
++    return beads
++
++
++def load_root(runner: Runner, root_bead_id: str) -> dict[str, Any]:
++    beads = parse_bead_list(runner(["gc", "bd", "show", root_bead_id, "--json"]), source="gc bd show")
++    if not beads:
++        raise WorkflowOutcomeError(f"workflow root {root_bead_id} not found")
++    return beads[0]
++
++
++def load_members(runner: Runner, root_bead_id: str) -> list[dict[str, Any]]:
++    beads = parse_bead_list(
++        runner(
++            [
++                "gc",
++                "bd",
++                "list",
++                "--all",
++                "--json",
++                "--limit",
++                "0",
++                "--metadata-field",
++                f"{ROOT_BEAD_ID_KEY}={root_bead_id}",
++            ]
++        ),
++        source="gc bd list",
++    )
++    return [bead for bead in beads if bead.get("id") != root_bead_id]
++
++
++def is_superseded_attempt(meta: dict[str, str]) -> bool:
++    """Attempt beads are exempt, mirroring the engine's retry firewall.
++
++    `internal/dispatch/runtime.go:terminalAbortScopeFailure` ignores beads that
++    carry `gc.attempt`: a failed attempt that a later attempt replaced must not
++    outvote the logical step's own final disposition.
++    """
++    return meta.get(ATTEMPT_KEY, "").strip() != ""
++
++
++def is_terminal_member_failure(bead: dict[str, Any]) -> bool:
++    if str(bead.get("status", "")).strip() != "closed":
++        return False
++    meta = metadata_of(bead)
++    if meta.get(OUTCOME_KEY, "").strip() != OUTCOME_FAIL:
++        return False
++    if is_superseded_attempt(meta):
++        return False
++    return meta.get(FAILURE_CLASS_KEY, "").strip() != FAILURE_CLASS_TRANSIENT
++
++
++def resolve_workflow_outcome(runner: Runner, root_bead_id: str) -> WorkflowResult:
++    root_bead_id = root_bead_id.strip()
++    if not root_bead_id:
++        raise WorkflowOutcomeError("workflow root bead id must not be empty")
++    root = load_root(runner, root_bead_id)
++    members = load_members(runner, root_bead_id)
++
++    root_status = str(root.get("status", "")).strip()
++    failed = sorted(str(bead.get("id", "")) for bead in members if is_terminal_member_failure(bead))
++    still_open = sorted(
++        str(bead.get("id", "")) for bead in members if str(bead.get("status", "")).strip() != "closed"
++    )
++
++    # A failed member is terminal evidence on its own. Reporting it before the
++    # open-member check keeps a workflow whose finalize never ran from being
++    # reported as merely "incomplete" when it has already definitively failed.
++    if failed:
++        return WorkflowResult(
++            root_bead_id=root_bead_id,
++            outcome=OUTCOME_FAIL,
++            root_status=root_status,
++            failed_members=failed,
++            open_members=still_open,
++            detail=f"workflow member(s) closed {OUTCOME_KEY}={OUTCOME_FAIL}: {', '.join(failed)}",
++        )
++
++    if root_status != "closed":
++        return WorkflowResult(
++            root_bead_id=root_bead_id,
++            outcome=OUTCOME_INCOMPLETE,
++            root_status=root_status,
++            open_members=still_open,
++            detail=f"workflow root is {root_status or 'unreadable'}; the workflow has not terminated yet",
++        )
++
++    stamped = metadata_of(root).get(OUTCOME_KEY, "").strip()
++    if not stamped:
++        return WorkflowResult(
++            root_bead_id=root_bead_id,
++            outcome=OUTCOME_UNKNOWN,
++            root_status=root_status,
++            open_members=still_open,
++            detail=f"workflow root closed without {OUTCOME_KEY}; treating as not passed",
++        )
++    return WorkflowResult(
++        root_bead_id=root_bead_id,
++        outcome=stamped,
++        root_status=root_status,
++        open_members=still_open,
++        detail=f"workflow root closed {OUTCOME_KEY}={stamped}",
++    )
++
++
++def review_gate(runner: Runner, root_bead_id: str, report_path: Path) -> dict[str, Any]:
++    """Gate `run-review`: the child workflow terminated pass AND the report validates.
++
++    The two conditions are independent and both are required. The workflow
++    outcome answers "did the review actually run to completion"; the report
++    answers "is there a verdict this adapter can map to a PR comment". Neither
++    substitutes for the other, which is the whole point: artifact existence is
++    not evidence that the workflow succeeded.
++    """
++    result = resolve_workflow_outcome(runner, root_bead_id)
++    payload = result.as_dict()
++    payload["report_path"] = str(report_path)
++    if not result.passed:
++        payload["ok"] = False
++        payload["review_outcome"] = ""
++        return payload
++
++    report = validate_verdict_report.validate_report_text(
++        report_path.read_text(encoding="utf-8"), expected_kind="review"
++    )
++    # A `fail` verdict here is a review finding, not a workflow failure: it maps
++    # to comment/request_changes/block and the adapter still posts it.
++    payload["review_outcome"] = github_reports.review_outcome(report.verdict, report.severity)
++    payload["report_verdict"] = report.verdict
++    payload["report_severity"] = report.severity
++    payload["ok"] = True
++    return payload
++
++
++def parse_args(argv: list[str]) -> argparse.Namespace:
++    parser = argparse.ArgumentParser(description="Read terminal outcomes of launched graph.v2 workflows")
++    subparsers = parser.add_subparsers(dest="command", required=True)
++
++    root_parser = subparsers.add_parser("root-outcome")
++    root_parser.add_argument("root_bead_id")
++
++    gate_parser = subparsers.add_parser("review-gate")
++    gate_parser.add_argument("--workflow-root", required=True)
++    gate_parser.add_argument("--report", type=Path, required=True)
++    return parser.parse_args(argv)
++
++
++def main(argv: list[str] | None = None, runner: Runner | None = None) -> int:
++    args = parse_args(argv if argv is not None else sys.argv[1:])
++    run = runner or default_runner
++    try:
++        if args.command == "root-outcome":
++            output = resolve_workflow_outcome(run, args.root_bead_id).as_dict()
++        elif args.command == "review-gate":
++            output = review_gate(run, args.workflow_root, args.report)
++        else:  # pragma: no cover
++            raise WorkflowOutcomeError(f"unsupported command {args.command}")
++    except CLI_ERROR_TYPES as exc:
++        print(f"error: {exc}", file=sys.stderr)
++        return 1
++    print(json.dumps(output, sort_keys=True))
++    return 0 if output.get("ok") else 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/gascity/assets/workflows/github-pr-review/run-review.md b/gascity/assets/workflows/github-pr-review/run-review.md
+index 4dbe6b7..65f65d3 100644
+--- a/gascity/assets/workflows/github-pr-review/run-review.md
++++ b/gascity/assets/workflows/github-pr-review/run-review.md
+@@ -33,22 +33,80 @@ gate. Pass review_mode {{review_mode}} and interaction_mode
+ {{interaction_mode}} through when the selected formula accepts them; the PR
+ adapter itself never mutates code regardless of review mode.
+ 
++Launch with `--json` and keep the child workflow root id: it is the only handle
++on the launched run's outcome, and this step is not allowed to close pass
++without it. If workflow root metadata already carries
++`gc.github.review_workflow_id`, a previous attempt at this step already
++launched the child — resume that id instead of slinging a second review.
++
+ ```bash
+-gc sling gc.run-operator {{code_review_formula}} --formula \
++REVIEW_LAUNCH_JSON="$(gc sling gc.run-operator {{code_review_formula}} --formula --json \
+   --var context_path="{{context_path}}" \
+   --var subject_path="$SUBJECT_PATH" \
+   --var report_path="$REPORT_PATH" \
+   --var interaction_mode="{{interaction_mode}}" \
+-  --var review_mode="{{review_mode}}"
++  --var review_mode="{{review_mode}}")"
++REVIEW_WORKFLOW_ID="$(printf '%s' "$REVIEW_LAUNCH_JSON" | jq -r '.workflow_id // .molecule_id // empty')"
++[ -n "$REVIEW_WORKFLOW_ID" ] || { echo "sling returned no workflow root id" >&2; exit 1; }
++gc bd update <root-bead-id> --set-metadata gc.github.review_workflow_id="$REVIEW_WORKFLOW_ID"
+ ```
+ 
+ If the selected formula does not declare the mode vars, omit the two mode
+-`--var` arguments rather than failing the launch.
++`--var` arguments rather than failing the launch. If the launch returns no
++workflow root id, close this step with `gc.outcome=fail` and
++`gc.failure_class=hard`: an unobservable child is indistinguishable from a
++failed one, and this step fails closed on both.
++
++## Outcome gate
++
++The launched workflow's own terminal outcome is the success criterion for this
++step — not the presence of a file. graph.v2 computes that outcome for you: when
++the child's `workflow-finalize` runs, the orchestrator aggregates its steps into
++one pass/fail and closes the child workflow ROOT with it (formula-spec-v2
++section 3.5). Read it:
++
++```bash
++{{pack_root}}/assets/scripts/workflow_outcome.py review-gate \
++  --workflow-root "$REVIEW_WORKFLOW_ID" \
++  --report "$REPORT_PATH"
++```
++
++The gate exits 0 only when BOTH hold: the child workflow terminated
++`gc.outcome=pass`, AND `REPORT_PATH` validates as a review verdict report. It
++reports `outcome=incomplete` while the child is still running — re-run the gate
++to poll, and do not close this step while it says `incomplete`. Anything else —
++`fail`, `unknown`, an unreadable root, a member step closed
++`gc.outcome=fail` — is a non-pass and blocks this step.
++
++A review verdict of `fail` is NOT a workflow failure. A child that ran to
++completion and reported `fail/minor`, `fail/major`, or `fail/blocker` passes
++this gate; that verdict is the review's output and maps to
++`comment`/`request_changes`/`block` downstream. The gate separates "the review
++did not run" from "the review found problems", and only the former stops the
++adapter.
++
++On a passing gate, persist the review handoff and result on workflow root
++metadata and close this step with `gc.outcome=pass`:
++
++```
++gc bd update <root-bead-id> --set-metadata gc.github.review_subject_path="$SUBJECT_PATH" --set-metadata gc.github.review_report_path="$REPORT_PATH" --set-metadata gc.github.review_workflow_id="$REVIEW_WORKFLOW_ID" --set-metadata gc.github.review_child_outcome=pass --set-metadata gc.github.review_outcome=<approve|comment|request_changes|block>
++```
++
++On a non-pass gate, record what the child actually did and fail this step —
++`gc bd update <root-bead-id> --set-metadata gc.github.review_child_outcome=<fail|incomplete|unknown>`,
++then close this step with `gc.outcome=fail`, `gc.failure_class=hard`, and the
++gate's `detail` string as the reason. Do not stamp `gc.github.review_outcome`.
++This step carries `gc.on_fail=abort_scope`, so that close is what stops
++`render-comment`, `human-gate-comment`, and `post-comment` from running: a run
++whose review failed must not post a verdict to the pull request.
+ 
+-Do not close this step until `REPORT_PATH` exists and validates through
+-`{{pack_root}}/assets/scripts/github_reports.py review-outcome "$REPORT_PATH"`.
+-Persist the review handoff and result on workflow root metadata:
+-`gc bd update <root-bead-id> --set-metadata gc.github.review_subject_path="$SUBJECT_PATH" --set-metadata gc.github.review_report_path="$REPORT_PATH" --set-metadata gc.github.review_outcome=<approve|comment|request_changes|block>`.
++Never route around this gate. Do not hand-author, patch, backfill, or otherwise
++repair `REPORT_PATH` so the validator passes, do not substitute a report from a
++different head SHA, and do not close this step pass on the grounds that a
++conformant file happens to exist. A bridging artifact written to satisfy the
++validator turns a failed review into a posted verdict, which is the exact
++failure this gate exists to prevent. If the gate cannot pass, the correct
++outcome is a failed step.
+ 
+ The adapter does not check out a mutation worktree, push commits, amend
+ contributor branches, submit formal GitHub review events, or create follow-up
+diff --git a/gascity/tests/test_formula_assets.py b/gascity/tests/test_formula_assets.py
+index 98252ae..aca4fd4 100755
+--- a/gascity/tests/test_formula_assets.py
++++ b/gascity/tests/test_formula_assets.py
+@@ -3580,7 +3580,7 @@ class FormulaAssetTests(unittest.TestCase):
+             "gc sling gc.run-operator {{code_review_formula}} --formula",
+             "--var subject_path=\"$SUBJECT_PATH\"",
+             "--var report_path=\"$REPORT_PATH\"",
+-            "review-outcome \"$REPORT_PATH\"",
++            "github_reports.py review-outcome",
+             "gc.github.reused_current_output=true",
+             "do not\nlaunch the generic `review` formula",
+             "leave the reused\nartifacts untouched",
+@@ -3596,6 +3596,45 @@ class FormulaAssetTests(unittest.TestCase):
+             with self.subTest(step="render-comment", fragment=fragment):
+                 self.assertIn(fragment, render_comment)
+ 
++    def test_github_pr_review_run_review_gates_on_child_workflow_outcome(self) -> None:
++        """run-review must read the launched review workflow's outcome, not infer it.
++
++        The defect this pins: the step's only success criterion used to be "a
++        conformant report exists on disk", which any hand-authored bridging file
++        satisfies, so a review workflow that closed FAIL still walked the adapter
++        to a pass and posted a verdict to the PR.
++        """
++        root = pathlib.Path(__file__).resolve().parents[1]
++        data = resolve_formula(root, "github-pr-review")
++        run_review = node_description(root, next(step for step in data["steps"] if step["id"] == "run-review"))
++
++        for fragment in (
++            # The launch must be observable: capture the child workflow root id.
++            "--formula --json",
++            "workflow_id // .molecule_id",
++            "gc.github.review_workflow_id",
++            # The gate itself, and the two independent conditions it enforces.
++            "assets/scripts/workflow_outcome.py review-gate",
++            "--workflow-root \"$REVIEW_WORKFLOW_ID\"",
++            "gc.github.review_child_outcome",
++            # A non-pass child is a failed step, with the failure contract spelled out.
++            "gc.outcome=fail",
++            "gc.failure_class=hard",
++            "gc.on_fail=abort_scope",
++            # Findings are output, not execution failure.
++            "is NOT a workflow failure",
++            # The explicit prohibition on the route-around that was observed live.
++            "Never route around this gate",
++            "hand-author",
++        ):
++            with self.subTest(step="run-review", fragment=fragment):
++                self.assertIn(fragment, run_review)
++
++        self.assertTrue(
++            (root / "assets/scripts/workflow_outcome.py").exists(),
++            "run-review references workflow_outcome.py; the script must ship with the pack",
++        )
++
+     def test_github_issue_fix_uses_implementation_plan_artifact_contract(self) -> None:
+         root = pathlib.Path(__file__).resolve().parents[1]
+         text = effective_formula_text(root, "github-issue-fix")
+diff --git a/gascity/tests/test_workflow_outcome.py b/gascity/tests/test_workflow_outcome.py
+new file mode 100644
+index 0000000..65ee8cf
+--- /dev/null
++++ b/gascity/tests/test_workflow_outcome.py
+@@ -0,0 +1,248 @@
++from __future__ import annotations
++
++import io
++import json
++import pathlib
++import sys
++import tempfile
++import unittest
++from contextlib import redirect_stdout
++
++sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "assets" / "scripts"))
++
++import workflow_outcome as script
++
++ROOT_ID = "gcp-root1"
++
++
++def bead(bead_id: str, status: str = "closed", **metadata: str) -> dict:
++    return {"id": bead_id, "status": status, "metadata": dict(metadata)}
++
++
++def fake_runner(root: dict, members: list[dict]):
++    """Stand in for `gc bd`, answering the two reads the script makes."""
++
++    calls: list[list[str]] = []
++
++    def run(cmd):
++        cmd = list(cmd)
++        calls.append(cmd)
++        if cmd[:3] == ["gc", "bd", "show"]:
++            return json.dumps([root]) if root is not None else "[]"
++        if cmd[:3] == ["gc", "bd", "list"]:
++            return json.dumps(members)
++        raise AssertionError(f"unexpected command: {cmd}")
++
++    run.calls = calls  # type: ignore[attr-defined]
++    return run
++
++
++PASSING_REPORT = """---
++schema: gc.verdict-report.v1
++kind: review
++verdict: pass
++severity: none
++findings: []
++---
++No blocking issues found.
++"""
++
++FAILING_VERDICT_REPORT = """---
++schema: gc.verdict-report.v1
++kind: review
++verdict: fail
++severity: major
++findings:
++  - id: F1
++    severity: major
++    title: Missing regression test
++    evidence: internal/thing.go:42 has no coverage
++    required_fix: Add a table-driven test for the new branch
++---
++One blocking finding.
++"""
++
++
++class ResolveWorkflowOutcomeTest(unittest.TestCase):
++    def test_closed_root_stamped_pass_is_a_pass(self) -> None:
++        runner = fake_runner(
++            bead(ROOT_ID, "closed", **{"gc.outcome": "pass"}),
++            [bead("gcp-step1", "closed", **{"gc.root_bead_id": ROOT_ID, "gc.outcome": "pass"})],
++        )
++        result = script.resolve_workflow_outcome(runner, ROOT_ID)
++        self.assertEqual(result.outcome, "pass")
++        self.assertTrue(result.passed)
++        self.assertEqual(result.failed_members, [])
++
++    def test_closed_root_stamped_fail_is_not_a_pass(self) -> None:
++        runner = fake_runner(bead(ROOT_ID, "closed", **{"gc.outcome": "fail"}), [])
++        result = script.resolve_workflow_outcome(runner, ROOT_ID)
++        self.assertEqual(result.outcome, "fail")
++        self.assertFalse(result.passed)
++
++    def test_failed_member_fails_even_when_root_is_stamped_pass(self) -> None:
++        runner = fake_runner(
++            bead(ROOT_ID, "closed", **{"gc.outcome": "pass"}),
++            [
++                bead("gcp-ok", "closed", **{"gc.root_bead_id": ROOT_ID, "gc.outcome": "pass"}),
++                bead("gcp-bad", "closed", **{"gc.root_bead_id": ROOT_ID, "gc.outcome": "fail"}),
++            ],
++        )
++        result = script.resolve_workflow_outcome(runner, ROOT_ID)
++        self.assertEqual(result.outcome, "fail")
++        self.assertEqual(result.failed_members, ["gcp-bad"])
++
++    def test_open_root_is_incomplete_not_pass(self) -> None:
++        runner = fake_runner(
++            bead(ROOT_ID, "open"),
++            [bead("gcp-step1", "in_progress", **{"gc.root_bead_id": ROOT_ID})],
++        )
++        result = script.resolve_workflow_outcome(runner, ROOT_ID)
++        self.assertEqual(result.outcome, "incomplete")
++        self.assertFalse(result.passed)
++        self.assertEqual(result.open_members, ["gcp-step1"])
++
++    def test_failed_member_outranks_an_unfinalized_root(self) -> None:
++        runner = fake_runner(
++            bead(ROOT_ID, "open"),
++            [
++                bead("gcp-bad", "closed", **{"gc.root_bead_id": ROOT_ID, "gc.outcome": "fail"}),
++                bead("gcp-next", "open", **{"gc.root_bead_id": ROOT_ID}),
++            ],
++        )
++        result = script.resolve_workflow_outcome(runner, ROOT_ID)
++        self.assertEqual(result.outcome, "fail")
++        self.assertEqual(result.failed_members, ["gcp-bad"])
++
++    def test_closed_root_without_outcome_is_unknown_not_pass(self) -> None:
++        runner = fake_runner(bead(ROOT_ID, "closed"), [])
++        result = script.resolve_workflow_outcome(runner, ROOT_ID)
++        self.assertEqual(result.outcome, "unknown")
++        self.assertFalse(result.passed)
++
++    def test_superseded_retry_attempt_failure_is_ignored(self) -> None:
++        runner = fake_runner(
++            bead(ROOT_ID, "closed", **{"gc.outcome": "pass"}),
++            [
++                bead(
++                    "gcp-attempt1",
++                    "closed",
++                    **{
++                        "gc.root_bead_id": ROOT_ID,
++                        "gc.outcome": "fail",
++                        "gc.attempt": "1",
++                        "gc.logical_bead_id": "gcp-step1",
++                    },
++                ),
++                bead("gcp-step1", "closed", **{"gc.root_bead_id": ROOT_ID, "gc.outcome": "pass"}),
++            ],
++        )
++        result = script.resolve_workflow_outcome(runner, ROOT_ID)
++        self.assertEqual(result.outcome, "pass")
++
++    def test_transient_failure_class_is_ignored(self) -> None:
++        runner = fake_runner(
++            bead(ROOT_ID, "closed", **{"gc.outcome": "pass"}),
++            [
++                bead(
++                    "gcp-blip",
++                    "closed",
++                    **{"gc.root_bead_id": ROOT_ID, "gc.outcome": "fail", "gc.failure_class": "transient"},
++                )
++            ],
++        )
++        result = script.resolve_workflow_outcome(runner, ROOT_ID)
++        self.assertEqual(result.outcome, "pass")
++
++    def test_missing_root_is_an_error(self) -> None:
++        runner = fake_runner(None, [])
++        with self.assertRaises(script.WorkflowOutcomeError):
++            script.resolve_workflow_outcome(runner, ROOT_ID)
++
++    def test_empty_root_id_is_rejected(self) -> None:
++        runner = fake_runner(bead(ROOT_ID), [])
++        with self.assertRaises(script.WorkflowOutcomeError):
++            script.resolve_workflow_outcome(runner, "   ")
++
++    def test_root_lookup_uses_metadata_filtered_list(self) -> None:
++        runner = fake_runner(bead(ROOT_ID, "closed", **{"gc.outcome": "pass"}), [])
++        script.resolve_workflow_outcome(runner, ROOT_ID)
++        list_cmd = next(cmd for cmd in runner.calls if cmd[:3] == ["gc", "bd", "list"])
++        self.assertIn("--all", list_cmd)
++        self.assertIn(f"gc.root_bead_id={ROOT_ID}", list_cmd)
++
++
++class ReviewGateTest(unittest.TestCase):
++    def gate(self, runner, text: str) -> tuple[int, dict]:
++        with tempfile.TemporaryDirectory() as tmp:
++            report = pathlib.Path(tmp) / "review-report.md"
++            report.write_text(text, encoding="utf-8")
++            buffer = io.StringIO()
++            with redirect_stdout(buffer):
++                code = script.main(
++                    ["review-gate", "--workflow-root", ROOT_ID, "--report", str(report)],
++                    runner=runner,
++                )
++            payload = json.loads(buffer.getvalue()) if buffer.getvalue().strip() else {}
++        return code, payload
++
++    def test_green_control_passing_child_and_passing_report(self) -> None:
++        runner = fake_runner(bead(ROOT_ID, "closed", **{"gc.outcome": "pass"}), [])
++        code, payload = self.gate(runner, PASSING_REPORT)
++        self.assertEqual(code, 0)
++        self.assertTrue(payload["ok"])
++        self.assertEqual(payload["review_outcome"], "approve")
++
++    def test_review_findings_are_output_not_workflow_failure(self) -> None:
++        runner = fake_runner(bead(ROOT_ID, "closed", **{"gc.outcome": "pass"}), [])
++        code, payload = self.gate(runner, FAILING_VERDICT_REPORT)
++        self.assertEqual(code, 0)
++        self.assertTrue(payload["ok"])
++        self.assertEqual(payload["review_outcome"], "request_changes")
++
++    def test_failed_child_workflow_blocks_even_with_a_valid_report(self) -> None:
++        runner = fake_runner(bead(ROOT_ID, "closed", **{"gc.outcome": "fail"}), [])
++        code, payload = self.gate(runner, PASSING_REPORT)
++        self.assertEqual(code, 1)
++        self.assertFalse(payload["ok"])
++        self.assertEqual(payload["outcome"], "fail")
++        self.assertEqual(payload["review_outcome"], "")
++
++    def test_unterminated_child_workflow_blocks(self) -> None:
++        runner = fake_runner(bead(ROOT_ID, "in_progress"), [])
++        code, payload = self.gate(runner, PASSING_REPORT)
++        self.assertEqual(code, 1)
++        self.assertEqual(payload["outcome"], "incomplete")
++
++    def test_passing_child_with_unparseable_report_blocks(self) -> None:
++        runner = fake_runner(bead(ROOT_ID, "closed", **{"gc.outcome": "pass"}), [])
++        code, payload = self.gate(runner, "not a verdict report\n")
++        self.assertEqual(code, 1)
++        self.assertEqual(payload, {})
++
++    def test_root_outcome_command_exits_nonzero_on_failure(self) -> None:
++        runner = fake_runner(bead(ROOT_ID, "closed", **{"gc.outcome": "fail"}), [])
++        buffer = io.StringIO()
++        with redirect_stdout(buffer):
++            code = script.main(["root-outcome", ROOT_ID], runner=runner)
++        self.assertEqual(code, 1)
++        self.assertEqual(json.loads(buffer.getvalue())["outcome"], "fail")
++
++
++class RunnerParsingTest(unittest.TestCase):
++    def test_invalid_json_is_reported(self) -> None:
++        with self.assertRaises(script.WorkflowOutcomeError):
++            script.parse_bead_list("{not json", source="gc bd show")
++
++    def test_blank_output_is_an_empty_list(self) -> None:
++        self.assertEqual(script.parse_bead_list("  \n", source="gc bd list"), [])
++
++    def test_single_object_is_wrapped(self) -> None:
++        self.assertEqual(
++            script.parse_bead_list('{"id": "x"}', source="gc bd show"),
++            [{"id": "x"}],
++        )
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.50.1 (Apple Git-155)
+
