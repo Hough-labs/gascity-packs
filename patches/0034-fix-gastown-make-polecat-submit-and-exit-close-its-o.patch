@@ -1,0 +1,563 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Mon, 17 Aug 2026 08:56:10 -0400
+Subject: [PATCH 34/34] fix(gastown): make polecat submit-and-exit close its
+ own step bead (gcp-rz8a)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+mol-polecat-work's submit-and-exit ended at `gc runtime drain-ack; exit` without
+closing its own step bead. The step bead stayed open and assigned to the session
+name, and because the molecule carries gc.session_affinity=require the pool kept
+respawning that same named session, whose `gc hook --claim --json` handed it the
+already-completed submit-and-exit with no context that the work was done. The
+respawn is not just noise: a re-run of the reassign step writes
+`--assignee=$REFINERY_TARGET --set-metadata gc.routed_to=""`, which on a bead the
+refinery parked with gc.routed_to="human" after refusing to land on an armed
+require_merge_approval gate would silently pull that bead back out of the
+operator escalation. Both things that prevented it on gcp-s14g were accidental:
+the branch-shape gate only failed closed because the branch had already been
+deleted, and the prompt-side ALREADY_SUBMITTED guard could not run at all
+because $GC_BEAD_ID was empty in that session.
+
+The primary fix is the one the bead and the mayor's direction both prefer: the
+step now resolves its own step bead up front (by `gc.step_ref`, scoped to this
+session's assignee — never $GC_BEAD_ID, which for a polecat is the convoy) and
+closes it before draining, so the step cannot be re-claimed at all. The
+auto_push=false halt closes it too, because that path reaches the step's
+contracted end; the push-failure paths deliberately do not, because the handoff
+never happened and the next session must re-claim and retry.
+
+Three further brakes, each requested by the bead:
+- An up-front already-submitted guard bails out before any bead write when all
+  three marks of a completed handoff are present (target recorded, branch on
+  origin at this commit, bead assigned to somebody who is not this session).
+  All three are required together: target alone can be set by a caller to pick
+  the base branch, and an unassigned bead whose branch is on origin is the shape
+  a witness salvage push leaves behind (gcp-7bo9).
+- The refinery handoff refuses to run when gc.routed_to reads "human", leaving
+  assignee and routing exactly as the escalation set them and noting the halt on
+  the bead. The branch is already pushed by then, so nothing is lost.
+- The prompt-side guard (duplicated in the polecat prompt and the
+  approval-fallacy fragment) recovers the convoy from the step bead's molecule
+  root when $GC_BEAD_ID is not exported, and now keys on positive evidence
+  instead of "no longer in_progress for me". That old predicate was doubly
+  wrong: a molecule's work bead is never assigned to the polecat session, so
+  making the guard runnable without fixing the predicate would have made it
+  report already-submitted on work that was never submitted, and drain with the
+  branch unpushed.
+
+Validation: new contract tests in gastown/tests/test_gastown_pack_assets.sh
+cover the step-bead close (including its ordering before the drain, and the
+push-failure paths that must NOT close it), the human-routing guard and its
+ordering before the update that clears gc.routed_to, the already-submitted guard
+running before the first bead write, and both copies of the prompt guard. Shown
+red against the pre-change assets and green after, one asset at a time. Full
+gastown shell suite, `go vet/build/test`, golangci-lint and validate_registry
+are clean; the 10 python failures in the wider suite reproduce unchanged on HEAD
+(GC_BIN leaking into the intake-service tests, bare `bd` strings in two gastown
+test scripts, and timeouts in the gascity claim tests) and are filed separately.
+---
+ gastown/agents/polecat/prompt.template.md     |  33 ++++-
+ gastown/formulas/mol-polecat-work.toml        | 137 +++++++++++++++---
+ .../approval-fallacy.template.md              |  35 ++++-
+ gastown/tests/test_gastown_pack_assets.sh     | 116 +++++++++++++++
+ 4 files changed, 286 insertions(+), 35 deletions(-)
+
+diff --git a/gastown/agents/polecat/prompt.template.md b/gastown/agents/polecat/prompt.template.md
+index 5bf6c00..a7a3bb6 100644
+--- a/gastown/agents/polecat/prompt.template.md
++++ b/gastown/agents/polecat/prompt.template.md
+@@ -390,16 +390,29 @@ refinery wake is a bug). Do not trust memory for this — check mechanically.
+ Derive the work bead from your convoy exactly as the formula's workspace-setup
+ step does (never pass a bare or guessed id to `bd`, which fuzzy-matches and can
+ reassign the wrong bead); `$GC_BEAD_ID` is the convoy the molecule was poured
+-on. If a clean read shows the work bead is no longer `in_progress` for this
+-session, submit-and-exit already ran — drain and exit. Otherwise run it:
++on, and when it is not exported the block below recovers the convoy from the
++step bead you are holding. Only positive evidence — the work bead closed, or
++handed to somebody else — means submit-and-exit already ran. Otherwise run it:
+ 
+ ```bash
+ EXPECTED_ASSIGNEE="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
++# `$GC_BEAD_ID` is not always exported — it was empty in gcp-rz8a's session, so
++# this guard could not run at all. Recover the convoy from the molecule root of
++# the step bead this session is holding rather than skipping the check.
++CONVOY_ID="${GC_BEAD_ID:-}"
++if [ -z "$CONVOY_ID" ]; then
++  ROOT_BEAD_ID=$(gc bd list --assignee="$EXPECTED_ASSIGNEE" --status=in_progress \
++    --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null |
++    jq -r '[.[] | .metadata."gc.root_bead_id" // empty] | .[0] // empty' 2>/dev/null)
++  if [ -n "$ROOT_BEAD_ID" ]; then
++    CONVOY_ID=$(gc bd show "$ROOT_BEAD_ID" --json 2>/dev/null |
++      jq -r '.[0].metadata."gc.input_convoy_id" // .[0].metadata."gc.var.convoy_id" // empty' 2>/dev/null)
++  fi
++fi
+ # Read the convoy + work bead with retry — same unreadable-is-not-terminal
+ # discipline as the claim block above. An unreadable state (empty JSON, a convoy
+ # blip, or 0/>=2 children so WORK_BEAD_ID is empty) is NOT proof that
+-# submit-and-exit already ran. Only a SUCCESSFUL read showing the bead genuinely
+-# moved off this session (closed, or reassigned to refinery) means it is done.
++# submit-and-exit already ran.
+ WORK_BEAD_ID=""
+ WORK_STATUS=""
+ WORK_ASSIGNEE=""
+@@ -407,7 +420,7 @@ READ_OK=0
+ READ_TRY=0
+ while [ "$READ_TRY" -lt 3 ]; do
+   READ_TRY=$((READ_TRY + 1))
+-  CONVOY_STATUS=$(gc convoy status "$GC_BEAD_ID" --json 2>/dev/null)
++  CONVOY_STATUS=$(gc convoy status "$CONVOY_ID" --json 2>/dev/null)
+   WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end' 2>/dev/null)
+   if [ -n "$WORK_BEAD_ID" ]; then
+     WORK_JSON=$(gc bd show "$WORK_BEAD_ID" --json 2>/dev/null)
+@@ -421,12 +434,18 @@ while [ "$READ_TRY" -lt 3 ]; do
+   fi
+   sleep 1
+ done
+-if [ "$READ_OK" -eq 1 ] && { [ "$WORK_STATUS" != "in_progress" ] || [ "$WORK_ASSIGNEE" != "$EXPECTED_ASSIGNEE" ]; }; then
++# Only POSITIVE evidence counts: the bead is closed, or it is assigned to
++# somebody who is not this session (the refinery). "Not in_progress for me" is
++# NOT evidence — a molecule's work bead is never assigned to the polecat
++# session in the first place, so that test reports already-submitted on work
++# that has not been submitted at all, and drains with the branch unpushed.
++if [ "$READ_OK" -eq 1 ] && { [ "$WORK_STATUS" = "closed" ] ||
++     { [ -n "$WORK_ASSIGNEE" ] && [ "$WORK_ASSIGNEE" != "$EXPECTED_ASSIGNEE" ]; }; }; then
+   echo "ALREADY_SUBMITTED $WORK_BEAD_ID status=$WORK_STATUS assignee=$WORK_ASSIGNEE — submit-and-exit already ran; draining."
+   gc runtime drain-ack
+   exit
+ fi
+-# Unreadable after retries, or still in_progress for this session: DO NOT assume
++# No positive evidence, or unreadable after retries: DO NOT assume
+ # already-submitted — fall through and run submit-and-exit. A stranded
+ # in_progress bead with an unpushed branch is the worse outcome.
+ ```
+diff --git a/gastown/formulas/mol-polecat-work.toml b/gastown/formulas/mol-polecat-work.toml
+index bcd709a..38f23b2 100644
+--- a/gastown/formulas/mol-polecat-work.toml
++++ b/gastown/formulas/mol-polecat-work.toml
+@@ -17,9 +17,12 @@ merge review.
+ The polecat sets `metadata.branch` and `metadata.target` on the work bead
+ and reassigns it to the refinery. The refinery merges and closes.
+ 
+-**NEVER CLOSE BEADS.** You must not run `gc bd close` or set status=closed.
+-Even if you believe the code is already merged, reassign to refinery —
+-only the refinery verifies merges and closes beads.
++**NEVER CLOSE THE WORK BEAD.** You must not run `gc bd close` or set
++status=closed on it. Even if you believe the code is already merged, reassign
++to refinery — only the refinery verifies merges and closes beads. The single
++exception is your own formula step beads, which you close as you finish each
++step; `submit-and-exit` closes its own step bead before draining, because a
++step bead left open is re-claimed by the next session the pool spawns.
+ `{{base_branch}}` may come from the work bead's own `metadata.target` or
+ be inherited from a parent convoy with `metadata.target` set.
+ 
+@@ -313,18 +316,75 @@ needs = ["self-review"]
+ description = """
+ Hand off your work and self-clean. You cease to exist after this step.
+ 
+-**1. Branch-shape gate (fails closed — non-negotiable).**
+-
+-Before anything else, verify you are on a per-bead branch. The refinery
+-merges the branch recorded in your bead's `metadata.branch`, which must
+-follow the `polecat/<bead-id>` convention; if you push from a different
+-branch (your agent home branch, a stray local checkout, etc.), the
+-handoff contract is broken and the bead is permanently stranded as
+-"assigned to refinery, no merge target". See gastownhall/gascity#2082.
++**1. Resolve the work bead and this step's own bead.**
+ 
+ ```bash
+ CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
+ WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
++STEP_SESSION="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
++STEP_BEAD_ID=$(gc bd list --assignee="$STEP_SESSION" --status=in_progress \
++  --metadata-field gc.step_ref=mol-polecat-work.submit-and-exit \
++  --include-infra --limit=0 --json 2>/dev/null | jq -r '.[0].id // empty')
++if [ -z "$STEP_BEAD_ID" ]; then
++    echo "WARN could not resolve this step's own bead; step 10 cannot close it."
++    echo "WARN an open submit-and-exit step bead is re-claimed by the next session the pool spawns."
++fi
++```
++
++`STEP_BEAD_ID` is closed in step 10, before the drain. That close is the
++whole reason this step can be trusted to run once: the molecule carries
++`gc.session_affinity=require`, so a step bead left open keeps the pool
++respawning the same named session, whose `gc hook --claim --json` hands it this
++already-completed step with no context that the work is done (gcp-rz8a). Never
++substitute `$GC_BEAD_ID` here — for a polecat that is the convoy the molecule
++was poured on, not this step, and closing it would close work that is still
++live.
++
++**2. Already-submitted guard (idempotent re-entry).**
++
++A re-entered submit-and-exit must not re-write bead state. Step 8 sets the
++assignee and clears `gc.routed_to`; run a second time on a bead the refinery
++has since parked, it silently pulls that bead back out of an escalation. Bail
++out before touching anything when all three marks of a completed handoff are
++present — target recorded, branch on origin at this commit, and the bead handed
++to somebody who is not this session:
++
++```bash
++SUBMITTED_JSON=$(gc bd show "$WORK_BEAD_ID" --json)
++SUBMITTED_TARGET=$(printf '%s' "$SUBMITTED_JSON" | jq -r '.[0].metadata.target // empty')
++SUBMITTED_BRANCH=$(printf '%s' "$SUBMITTED_JSON" | jq -r '.[0].metadata.branch // empty')
++SUBMITTED_ASSIGNEE=$(printf '%s' "$SUBMITTED_JSON" | jq -r '.[0].assignee // empty')
++SUBMITTED_REMOTE=""
++if [ -n "$SUBMITTED_BRANCH" ]; then
++    SUBMITTED_REMOTE=$(git ls-remote origin "refs/heads/$SUBMITTED_BRANCH" 2>/dev/null | awk '{print $1}')
++fi
++if [ -n "$SUBMITTED_TARGET" ] && [ -n "$SUBMITTED_REMOTE" ] &&
++   [ "$SUBMITTED_REMOTE" = "$(git rev-parse HEAD)" ] &&
++   [ -n "$SUBMITTED_ASSIGNEE" ] && [ "$SUBMITTED_ASSIGNEE" != "$STEP_SESSION" ]; then
++    echo "ALREADY_SUBMITTED $WORK_BEAD_ID target=$SUBMITTED_TARGET branch=$SUBMITTED_BRANCH assignee=$SUBMITTED_ASSIGNEE"
++    echo "Handoff already completed. Closing this step bead and draining without re-writing bead state."
++    [ -n "$STEP_BEAD_ID" ] && gc bd close "$STEP_BEAD_ID" --reason "submit-and-exit: already submitted; no bead state re-written"
++    gc runtime drain-ack
++    exit 0
++fi
++```
++
++All three marks are required together on purpose. `metadata.target` alone
++proves nothing — a caller may set it before dispatch to choose the base branch
++— and an unassigned bead with the branch on origin is the shape a witness
++salvage push leaves behind (gcp-7bo9), which is not a handoff this step
++performed.
++
++**3. Branch-shape gate (fails closed — non-negotiable).**
++
++Verify you are on a per-bead branch. The refinery merges the branch recorded
++in your bead's `metadata.branch`, which must follow the `polecat/<bead-id>`
++convention; if you push from a different branch (your agent home branch, a
++stray local checkout, etc.), the handoff contract is broken and the bead is
++permanently stranded as "assigned to refinery, no merge target". See
++gastownhall/gascity#2082.
++
++```bash
+ CURRENT_BRANCH=$(git branch --show-current)
+ EXPECTED_BRANCH="polecat/$WORK_BEAD_ID"
+ if [ "$CURRENT_BRANCH" != "$EXPECTED_BRANCH" ]; then
+@@ -357,7 +417,7 @@ if [ "$METADATA_BRANCH" != "$EXPECTED_BRANCH" ]; then
+ fi
+ ```
+ 
+-**2. Final clean-state verification (safeguard):**
++**4. Final clean-state verification (safeguard):**
+ ```bash
+ git status --porcelain
+ ```
+@@ -373,7 +433,7 @@ BODY
+ This is a belt-and-suspenders check — self-review should have caught this,
+ but we never push with untracked work left behind.
+ 
+-**3. Push your branch:**
++**5. Push your branch:**
+ ```bash
+ AUTO_PUSH=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata | if has("auto_push") then (.auto_push | tostring) else "" end')
+ if [ "$AUTO_PUSH" = "false" ]; then
+@@ -387,6 +447,7 @@ if [ "$AUTO_PUSH" = "false" ]; then
+     --set-metadata halt_reason=auto_push_false \
+     --set-metadata gc.routed_to="" \
+     --notes "Branch ready: auto_push=false (no push, no refinery handoff)"
++  [ -n "$STEP_BEAD_ID" ] && gc bd close "$STEP_BEAD_ID" --reason "submit-and-exit: halted at branch-ready (auto_push=false)"
+   gc runtime drain-ack
+   exit 0
+ fi
+@@ -421,14 +482,19 @@ if [ "$REMOTE_REF" != "$LOCAL_HEAD" ]; then
+ fi
+ ```
+ 
+-**4. Clean up local branch (prevent stale branch accumulation):**
++The `auto_push=false` halt closes this step bead because the step reached its
++contracted end; the push-failure paths deliberately do not. A failed push means
++the handoff never happened, so the step bead must stay open for the next
++session to re-claim and retry.
++
++**6. Clean up local branch (prevent stale branch accumulation):**
+ ```bash
+ BRANCH=$(git branch --show-current)
+ git checkout --detach                 # Detach so we can delete the branch
+ git branch -D "$BRANCH"              # Branch is pushed; refinery owns it now
+ ```
+ 
+-**5. Update metadata on the work bead:**
++**7. Update metadata on the work bead:**
+ ```bash
+ gc bd update "$WORK_BEAD_ID" \
+   --set-metadata target={{base_branch}} \
+@@ -440,9 +506,28 @@ provided by the caller, `metadata.existing_pr` is preserved for refinery
+ validation. The refinery records canonical `pr_url` only after verifying
+ the PR is open and matches the branch, base, and origin repository.
+ 
+-**6. Reassign to refinery:**
++**8. Reassign to refinery:**
+ ```bash
+ REFINERY_TARGET="${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery"
++# NEVER clear gc.routed_to when it reads `human`. That value is an operator
++# escalation — the refinery writes it when it REFUSES to land a bead, typically
++# on an armed require_merge_approval gate. Reassigning to the refinery there
++# does not resume the work, it silently undoes the one control that makes
++# reviewed merges real (gcp-rz8a). The branch is already pushed and recorded, so
++# halting here loses nothing: the human owns the next move.
++ROUTED_TO=$(gc bd show "$WORK_BEAD_ID" --json 2>/dev/null | jq -r '.[0].metadata."gc.routed_to" // empty')
++if [ "$ROUTED_TO" = "human" ]; then
++    echo "HANDOFF HALTED: $WORK_BEAD_ID is routed to human — an operator escalation."
++    echo "Branch is pushed and metadata.target is set; leaving assignee and gc.routed_to untouched."
++    gc bd note "$WORK_BEAD_ID" --stdin <<'HUMAN_HALT'
++Polecat submit-and-exit halted at the refinery handoff: gc.routed_to=human.
++Branch is pushed and metadata.target is recorded. Assignee and routing left as
++the escalation set them; a human decides whether this goes to the refinery.
++HUMAN_HALT
++    [ -n "$STEP_BEAD_ID" ] && gc bd close "$STEP_BEAD_ID" --reason "submit-and-exit: halted at refinery handoff (gc.routed_to=human)"
++    gc runtime drain-ack
++    exit 0
++fi
+ gc bd update "$WORK_BEAD_ID" --status=open --assignee="$REFINERY_TARGET" --set-metadata gc.routed_to=""
+ # The handoff is the assignee write; `--status=open` is bookkeeping that has
+ # been observed not to stick (gcp-s14g). Read it back and correct it once, so
+@@ -475,27 +560,39 @@ merge, and close the bead. If there's a conflict, the refinery puts the
+ bead back in the pool with `rejection_reason` metadata — a new polecat
+ picks it up and resumes from the existing branch.
+ 
+-**7. Signal refinery to check for work immediately (belt-and-suspenders):**
++**9. Signal refinery to check for work immediately (belt-and-suspenders):**
+ ```bash
+ REFINERY_TARGET="${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery"
+ gc session wake "$REFINERY_TARGET" || true
+ gc session nudge "$REFINERY_TARGET" "Run 'gc prime' to check merge queue and begin processing." || true
+ ```
+ 
+-The `gc bd update` in step 6 generates a `bead.updated` event the refinery's
++The `gc bd update` in step 8 generates a `bead.updated` event the refinery's
+ event-watch will see, but that can take up to `event_timeout` seconds. Wake
+ starts a stopped on_demand session; nudge leaves a visible prompt for a running
+ one as soon as it is ready for input. Failure is non-fatal: the refinery finds
+ the work on its next poll.
+ 
+-**8. Signal reconciler and exit.**
++**10. Close this step bead, then signal the reconciler and exit.**
+ ```bash
++if [ -n "$STEP_BEAD_ID" ]; then
++    gc bd close "$STEP_BEAD_ID" --reason "submit-and-exit: branch pushed, work bead handed to the refinery"
++else
++    echo "WARN this step's own bead was never resolved and stays open; the next session the pool spawns will re-claim a completed submit-and-exit."
++fi
+ gc runtime drain-ack
+ exit
+ ```
+ 
++Closing the step bead is not bookkeeping — it is what makes this step run once.
++The molecule carries `gc.session_affinity=require`, so an open step bead keeps
++the pool respawning this named session onto work that is already done, and the
++guard in step 2 is the only thing standing between that respawn and a second
++pass over the work bead's assignee and routing (gcp-rz8a). Close the step bead
++you resolved in step 1 — never the work bead, and never `$GC_BEAD_ID`.
++
+ `gc runtime drain-ack` tells the reconciler to kill this session. The
+ reconciler only restarts you if the pool check command finds more work.
+ You are GONE. Done means gone. There is no idle state.
+ 
+-**Exit criteria:** Branch pushed, metadata set, bead reassigned, refinery signaled, drain acknowledged, session exited."""
++**Exit criteria:** Branch pushed, metadata set, bead reassigned, refinery signaled, this step's bead closed, drain acknowledged, session exited."""
+diff --git a/gastown/template-fragments/approval-fallacy.template.md b/gastown/template-fragments/approval-fallacy.template.md
+index 1832190..ec850bc 100644
+--- a/gastown/template-fragments/approval-fallacy.template.md
++++ b/gastown/template-fragments/approval-fallacy.template.md
+@@ -27,17 +27,30 @@ reassignment, wake/nudge, and drain. **Run that step.**
+ Do not trust memory for this; check mechanically. Derive the work bead from your
+ convoy exactly as the formula's workspace-setup step does — never pass a bare or
+ guessed id to `bd`, which fuzzy-matches and can reassign the wrong bead.
+-`$GC_BEAD_ID` is the convoy the molecule was poured on. If a clean read shows
+-the work bead is no longer `in_progress` for this session, submit-and-exit
+-already reassigned it — drain and exit. Otherwise run it:
++`$GC_BEAD_ID` is the convoy the molecule was poured on, and when it is not
++exported the block below recovers the convoy from the step bead you are holding.
++Only positive evidence — the work bead closed, or handed to somebody else —
++means submit-and-exit already reassigned it. Otherwise run it:
+ 
+ ```bash
+ EXPECTED_ASSIGNEE="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
++# `$GC_BEAD_ID` is not always exported — it was empty in gcp-rz8a's session, so
++# this guard could not run at all. Recover the convoy from the molecule root of
++# the step bead this session is holding rather than skipping the check.
++CONVOY_ID="${GC_BEAD_ID:-}"
++if [ -z "$CONVOY_ID" ]; then
++  ROOT_BEAD_ID=$(gc bd list --assignee="$EXPECTED_ASSIGNEE" --status=in_progress \
++    --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null |
++    jq -r '[.[] | .metadata."gc.root_bead_id" // empty] | .[0] // empty' 2>/dev/null)
++  if [ -n "$ROOT_BEAD_ID" ]; then
++    CONVOY_ID=$(gc bd show "$ROOT_BEAD_ID" --json 2>/dev/null |
++      jq -r '.[0].metadata."gc.input_convoy_id" // .[0].metadata."gc.var.convoy_id" // empty' 2>/dev/null)
++  fi
++fi
+ # Read the convoy + work bead with retry — same unreadable-is-not-terminal
+ # discipline as the claim block. An unreadable state (empty JSON, a convoy blip,
+ # or 0/>=2 children so WORK_BEAD_ID is empty) is NOT proof that submit-and-exit
+-# already ran. Only a SUCCESSFUL read showing the bead genuinely moved off this
+-# session (closed, or reassigned to refinery) means it is done.
++# already ran.
+ WORK_BEAD_ID=""
+ WORK_STATUS=""
+ WORK_ASSIGNEE=""
+@@ -45,7 +58,7 @@ READ_OK=0
+ READ_TRY=0
+ while [ "$READ_TRY" -lt 3 ]; do
+   READ_TRY=$((READ_TRY + 1))
+-  CONVOY_STATUS=$(gc convoy status "$GC_BEAD_ID" --json 2>/dev/null)
++  CONVOY_STATUS=$(gc convoy status "$CONVOY_ID" --json 2>/dev/null)
+   WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end' 2>/dev/null)
+   if [ -n "$WORK_BEAD_ID" ]; then
+     WORK_JSON=$(gc bd show "$WORK_BEAD_ID" --json 2>/dev/null)
+@@ -59,12 +72,18 @@ while [ "$READ_TRY" -lt 3 ]; do
+   fi
+   sleep 1
+ done
+-if [ "$READ_OK" -eq 1 ] && { [ "$WORK_STATUS" != "in_progress" ] || [ "$WORK_ASSIGNEE" != "$EXPECTED_ASSIGNEE" ]; }; then
++# Only POSITIVE evidence counts: the bead is closed, or it is assigned to
++# somebody who is not this session (the refinery). "Not in_progress for me" is
++# NOT evidence — a molecule's work bead is never assigned to the polecat
++# session in the first place, so that test reports already-submitted on work
++# that has not been submitted at all, and drains with the branch unpushed.
++if [ "$READ_OK" -eq 1 ] && { [ "$WORK_STATUS" = "closed" ] ||
++     { [ -n "$WORK_ASSIGNEE" ] && [ "$WORK_ASSIGNEE" != "$EXPECTED_ASSIGNEE" ]; }; }; then
+   echo "ALREADY_SUBMITTED $WORK_BEAD_ID status=$WORK_STATUS assignee=$WORK_ASSIGNEE — draining."
+   gc runtime drain-ack
+   exit
+ fi
+-# Unreadable after retries, or still in_progress for this session: DO NOT assume
++# No positive evidence, or unreadable after retries: DO NOT assume
+ # already-submitted — fall through and run submit-and-exit. A stranded
+ # in_progress bead with an unpushed branch is the worse outcome.
+ ```
+diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
+index 97201db..24d1426 100755
+--- a/gastown/tests/test_gastown_pack_assets.sh
++++ b/gastown/tests/test_gastown_pack_assets.sh
+@@ -425,8 +425,124 @@ test_dolt_push_outage_detection_is_wired() {
+         fail "deacon patrol must not take over dolt-remotes-patrol"
+ }
+ 
++test_submit_and_exit_cannot_be_replayed() {
++    local formula prompt fragment submit_block
++    formula="$GASTOWN/formulas/mol-polecat-work.toml"
++    prompt="$GASTOWN/agents/polecat/prompt.template.md"
++    fragment="$GASTOWN/template-fragments/approval-fallacy.template.md"
++
++    parse_toml "$formula"
++
++    submit_block=$(python3 - "$formula" <<'PY'
++import sys
++import tomllib
++
++data = tomllib.load(open(sys.argv[1], "rb"))
++step = next(s for s in data["steps"] if s["id"] == "submit-and-exit")
++print(step["description"])
++PY
++)
++
++    # gcp-rz8a: the step ended at drain-ack without closing its own step bead.
++    # The molecule carries gc.session_affinity=require, so the pool respawned the
++    # same named session and `gc hook --claim` handed it the completed step
++    # again. Closing the step bead is what makes the step run once.
++    [[ "$submit_block" == *'--metadata-field gc.step_ref=mol-polecat-work.submit-and-exit'* ]] ||
++        fail "submit-and-exit must resolve its own step bead by step_ref, not guess at an id"
++    [[ "$submit_block" == *'gc bd close "$STEP_BEAD_ID"'* ]] ||
++        fail "submit-and-exit must close its own step bead so the pool cannot re-claim a completed submit"
++    [[ "$submit_block" != *'gc bd close "$GC_BEAD_ID"'* ]] ||
++        fail "for a polecat \$GC_BEAD_ID is the convoy, not this step; closing it closes live work"
++    [[ "$submit_block" != *'gc bd close "$WORK_BEAD_ID"'* ]] ||
++        fail "the polecat never closes the work bead; only the refinery does"
++
++    # The close has to happen BEFORE the drain, or the reconciler kills the
++    # session first and the step bead is left open exactly as before.
++    python3 - "$formula" <<'PY' || fail "submit-and-exit must close its step bead before draining"
++import sys
++import tomllib
++
++data = tomllib.load(open(sys.argv[1], "rb"))
++step = next(s for s in data["steps"] if s["id"] == "submit-and-exit")
++tail = step["description"]
++tail = tail[tail.index("**10."):]
++if tail.index('gc bd close "$STEP_BEAD_ID"') >= tail.index("gc runtime drain-ack"):
++    raise SystemExit(1)
++PY
++
++    # A halt that reached the step's contracted end must close the step bead
++    # too; a FAILED push must not, because the handoff never happened and the
++    # next session has to re-claim and retry it.
++    python3 - "$formula" <<'PY' || fail "auto_push=false must close the step bead; push failures must leave it open"
++import sys
++import tomllib
++
++data = tomllib.load(open(sys.argv[1], "rb"))
++step = next(s for s in data["steps"] if s["id"] == "submit-and-exit")
++text = step["description"]
++halt = text[text.index("auto_push=false: halting at branch-ready"):]
++halt = halt[: halt.index("git push origin HEAD")]
++if 'gc bd close "$STEP_BEAD_ID"' not in halt:
++    raise SystemExit(1)
++failed = text[text.index("PUSH FAILED (exit $PUSH_EXIT)"):]
++failed = failed[: failed.index("**6.")]
++if 'gc bd close "$STEP_BEAD_ID"' in failed:
++    raise SystemExit(1)
++PY
++
++    # gcp-rz8a's severity line: a replayed step 8 clears gc.routed_to="human",
++    # which is how a bead the refinery parked on an armed require_merge_approval
++    # gate gets pulled back out of an operator escalation. The guard must be
++    # read and acted on BEFORE the update that clears the routing.
++    [[ "$submit_block" == *'[ "$ROUTED_TO" = "human" ]'* ]] ||
++        fail "the refinery handoff must refuse to run when gc.routed_to is human"
++    python3 - "$formula" <<'PY' || fail "the human-routing guard must precede the update that clears gc.routed_to"
++import sys
++import tomllib
++
++data = tomllib.load(open(sys.argv[1], "rb"))
++step = next(s for s in data["steps"] if s["id"] == "submit-and-exit")
++reassign = step["description"]
++reassign = reassign[reassign.index("**8. Reassign to refinery"):]
++if reassign.index('[ "$ROUTED_TO" = "human" ]') >= reassign.index('--set-metadata gc.routed_to=""'):
++    raise SystemExit(1)
++PY
++
++    # Second brake: an idempotence guard that bails out before any bead write.
++    [[ "$submit_block" == *"ALREADY_SUBMITTED"* ]] ||
++        fail "submit-and-exit must detect a completed handoff before re-writing bead state"
++    python3 - "$formula" <<'PY' || fail "the already-submitted guard must run before the first bead write"
++import sys
++import tomllib
++
++data = tomllib.load(open(sys.argv[1], "rb"))
++step = next(s for s in data["steps"] if s["id"] == "submit-and-exit")
++text = step["description"]
++if text.index("ALREADY_SUBMITTED") >= text.index("gc bd update"):
++    raise SystemExit(1)
++PY
++
++    # The prompt-side guard could not run at all in the observed session:
++    # $GC_BEAD_ID was empty, so it never resolved a work bead. Both copies must
++    # recover the convoy, and both must key on POSITIVE evidence — a molecule's
++    # work bead is never assigned to the polecat session, so "not in_progress
++    # for me" reports already-submitted on work that was never submitted.
++    local guard
++    for guard in "$prompt" "$fragment"; do
++        grep -F 'CONVOY_ID="${GC_BEAD_ID:-}"' "$guard" >/dev/null ||
++            fail "$(basename "$guard") must not read the convoy straight from \$GC_BEAD_ID; it is not always exported"
++        grep -F 'gc.root_bead_id' "$guard" >/dev/null ||
++            fail "$(basename "$guard") must recover the convoy from the step bead's molecule root"
++        ! grep -F '[ "$WORK_STATUS" != "in_progress" ]' "$guard" >/dev/null ||
++            fail "$(basename "$guard") must not treat an unassigned work bead as already submitted"
++        grep -F '[ "$WORK_STATUS" = "closed" ]' "$guard" >/dev/null ||
++            fail "$(basename "$guard") must require positive evidence (closed, or handed to another assignee)"
++    done
++}
++
+ test_dog_assets_are_pack_local
+ test_retired_dog_formulas_are_not_reintroduced
++test_submit_and_exit_cannot_be_replayed
+ test_post_merge_worktree_teardown_has_an_owner
+ test_dolt_push_outage_detection_is_wired
+ test_shutdown_dance_contracts_are_executable
+-- 
+2.50.1 (Apple Git-155)
+
