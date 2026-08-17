@@ -137,6 +137,10 @@ def load_root(runner: Runner, root_bead_id: str) -> dict[str, Any]:
 
 
 def load_members(runner: Runner, root_bead_id: str) -> list[dict[str, Any]]:
+    # The include-* flags matter: a workflow's failure is often recorded on a
+    # check/scope-check/gate control bead, and `gc bd list` hides those classes
+    # by default. Scanning without them would silently skip exactly the beads a
+    # fail-closed reader needs to see.
     beads = parse_bead_list(
         runner(
             [
@@ -147,6 +151,9 @@ def load_members(runner: Runner, root_bead_id: str) -> list[dict[str, Any]]:
                 "--json",
                 "--limit",
                 "0",
+                "--include-templates",
+                "--include-infra",
+                "--include-gates",
                 "--metadata-field",
                 f"{ROOT_BEAD_ID_KEY}={root_bead_id}",
             ]

@@ -170,6 +170,10 @@ class ResolveWorkflowOutcomeTest(unittest.TestCase):
         list_cmd = next(cmd for cmd in runner.calls if cmd[:3] == ["gc", "bd", "list"])
         self.assertIn("--all", list_cmd)
         self.assertIn(f"gc.root_bead_id={ROOT_ID}", list_cmd)
+        # Control beads (check, scope-check, gates) are where a workflow's
+        # failure gets recorded, and gc bd list hides them by default.
+        for flag in ("--include-templates", "--include-infra", "--include-gates"):
+            self.assertIn(flag, list_cmd)
 
 
 class ReviewGateTest(unittest.TestCase):
