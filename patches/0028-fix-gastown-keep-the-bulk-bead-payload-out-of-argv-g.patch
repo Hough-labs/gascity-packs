@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 14 Aug 2026 14:56:26 -0400
-Subject: [PATCH 28/34] fix(gastown): keep the bulk bead payload out of argv
+Subject: [PATCH 28/35] fix(gastown): keep the bulk bead payload out of argv
  (gcp-ntbf)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
