@@ -21,6 +21,18 @@ executed lands in its own surplus set, and the loop stops advancing — again wi
 every command exiting 0. gcp-xbl fixed `--include-infra` at every site and left
 this facet unfixed at every site, which is precisely why the manual re-grep it
 relied on is replaced here by a test.
+
+The third facet (gcp-tl8) is the query that has no `--type` to fix in the first
+place. The patrol roles' Startup Step 1 was captioned "check for an in-progress
+patrol wisp" but ran `{{ .AssignedInProgressQuery }}` — a gc-provided expansion
+that lists in-progress beads by assignee, with no type filter at all and a
+`--limit=1` truncation. It returns the first in-progress bead of ANY type on the
+agent's hook, and that one row is all the agent sees. A
+refinery holding a work bead in_progress under a do-not-merge order therefore
+resumed that work bead as its patrol wisp on every restart, with the real wisp
+sorted below the cut and invisible. The two guards above cannot catch it (no
+`--type=molecule` on the line to inspect), so it is guarded structurally
+instead: patrol-role wisp probes must not use the generic hook query at all.
 """
 
 from __future__ import annotations
@@ -49,6 +61,34 @@ LIMIT_FLAG = re.compile(r"--limit[= ](\d+)")
 # Shell continuations split a single command over several source lines; join
 # them before checking so a flag on the continuation line still counts.
 LINE_CONTINUATION = re.compile(r"\\\r?\n[ \t]*")
+
+# The gc-provided expansion of "what is in_progress on my hook". It is correct
+# for roles whose hook carries work beads (mayor, crew, polecat, dog) and wrong
+# for the patrol roles, whose hook carries a wisp: it has no --type filter, so
+# it cannot tell the two apart.
+GENERIC_HOOK_QUERY = "{{ .AssignedInProgressQuery }}"
+
+# The roles whose startup probe is resolving a patrol wisp, and whose prompt
+# assets therefore must not reach for the generic hook query.
+PATROL_ROLES = ("witness", "refinery", "deacon")
+PATROL_ROLE_PROMPTS = tuple(
+    Path("gastown/agents") / role / "prompt.template.md" for role in PATROL_ROLES
+)
+PROPULSION_FRAGMENT = Path("gastown/template-fragments/propulsion.template.md")
+PATROL_PROPULSION_BLOCKS = tuple(f"propulsion-{role}" for role in PATROL_ROLES)
+
+# `{{ define "name" }}` … `{{ end }}` — propulsion.template.md ships one block
+# per role, so the per-role blocks have to be split out before checking: the
+# non-patrol blocks in the same file use the generic query legitimately.
+# `{{ if }}` / `{{ range }}` / `{{ with }}` / `{{ block }}` close with their own
+# `{{ end }}`, so the block scan has to count them alongside `{{ define }}` —
+# otherwise a nested action ends the enclosing define early and every line after
+# it is attributed to no role and silently skipped.
+TEMPLATE_ACTION = re.compile(
+    r'{{-?\s*(?:define\s+"(?P<define>[^"]+)"'
+    r"|(?P<open>if|range|with|block)\b"
+    r"|(?P<end>end)\s*-?}})"
+)
 
 
 def tracked_files() -> list[Path]:
@@ -128,6 +168,64 @@ def live_wisp_status_violations(path: Path, text: str) -> list[str]:
     return violations
 
 
+def _template_block_names(lines: list[str]) -> list[str | None]:
+    """Name the enclosing `{{ define }}` block for each line, or None outside one.
+
+    Depth-counted rather than paired to the next `{{ end }}`: a `{{ if }}` inside
+    a define closes with its own `{{ end }}`, and a naive pairing would end the
+    block there and stop attributing the rest of it to the role.
+    """
+    names: list[str | None] = []
+    stack: list[str | None] = []
+    for line in lines:
+        actions = list(TEMPLATE_ACTION.finditer(line))
+        opened = next((m.group("define") for m in actions if m.group("define")), None)
+        names.append(opened or next((name for name in reversed(stack) if name), None))
+        for match in actions:
+            if match.group("end"):
+                if stack:
+                    stack.pop()
+            else:
+                stack.append(match.group("define"))
+    return names
+
+
+def generic_hook_query_violations(path: Path, text: str) -> list[str]:
+    """Flag patrol-role wisp probes that resolve the wisp with the generic query.
+
+    `{{ .AssignedInProgressQuery }}` filters on status and assignee only, and
+    truncates at `--limit=1`. Used where the answer must be a patrol wisp, it
+    returns whichever in-progress bead sorts first on the agent's hook — a work
+    bead parked in_progress shadows the wisp completely, and the agent resumes it
+    as though it carried the patrol formula (gcp-tl8).
+
+    Only the patrol roles are constrained. Mayor, crew, polecat, and dog ask this
+    query the question it actually answers ("what work is on my hook?"), so their
+    use of it is correct and stays untouched.
+    """
+    violations = []
+    relative = path.relative_to(REPO_ROOT) if path.is_absolute() else path
+    if relative not in PATROL_ROLE_PROMPTS and relative != PROPULSION_FRAGMENT:
+        return violations
+
+    lines = text.splitlines()
+    blocks = (
+        _template_block_names(lines)
+        if relative == PROPULSION_FRAGMENT
+        else [None] * len(lines)
+    )
+    for index, line in enumerate(lines):
+        if GENERIC_HOOK_QUERY not in line:
+            continue
+        if relative == PROPULSION_FRAGMENT and blocks[index] not in PATROL_PROPULSION_BLOCKS:
+            continue
+        violations.append(
+            f"{relative}:{index + 1}: patrol wisp probe must filter --type=molecule, "
+            f"not the generic hook query: {line.strip()}"
+        )
+    return violations
+
+
 def test_shipped_molecule_queries_include_infra() -> None:
     violations = []
     for path in tracked_files():
@@ -160,6 +258,67 @@ def test_shipped_live_wisp_queries_cover_open_and_in_progress() -> None:
         "live-wisp queries that cannot see the wisp they are running:\n"
         + "\n".join(violations)
     )
+
+
+def test_patrol_startup_probes_do_not_use_the_generic_hook_query() -> None:
+    violations = []
+    for path in tracked_files():
+        if path.resolve() == THIS_FILE:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        violations.extend(generic_hook_query_violations(path, text))
+
+    assert not violations, (
+        "patrol startup probes that resume a parked work bead as the wisp:\n"
+        + "\n".join(violations)
+    )
+
+
+def test_generic_hook_query_detector_flags_the_gcp_tl8_shape() -> None:
+    broken = f"# Step 1: Check for an in-progress patrol wisp\n{GENERIC_HOOK_QUERY}\n"
+    fixed = (
+        "# Step 1: Check for an in-progress patrol wisp\n"
+        'WISP=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress '
+        "--type=molecule --include-infra --limit=0 --json | jq -r '.[0].id // empty')\n"
+    )
+
+    for role_prompt in PATROL_ROLE_PROMPTS:
+        assert generic_hook_query_violations(role_prompt, broken)
+        assert not generic_hook_query_violations(role_prompt, fixed)
+
+    # A role whose hook genuinely carries work beads asks this query the question
+    # it answers, so its prompt is not scanned at all.
+    assert not generic_hook_query_violations(
+        Path("gastown/agents/polecat/prompt.template.md"), broken
+    )
+
+
+def test_generic_hook_query_detector_scopes_propulsion_by_role_block() -> None:
+    fragment = (
+        '{{ define "propulsion-crew" }}\n'
+        f"1. Check for work (`{GENERIC_HOOK_QUERY}`)\n"
+        "{{ end }}\n"
+        '{{ define "propulsion-refinery" }}\n'
+        f"1. Check for an in-progress patrol wisp (`{GENERIC_HOOK_QUERY}`)\n"
+        "{{ end }}\n"
+    )
+
+    violations = generic_hook_query_violations(PROPULSION_FRAGMENT, fragment)
+    assert len(violations) == 1, violations
+    assert ":5:" in violations[0]  # the refinery block, not the crew block
+
+    # An `{{ if }}` nested in a role block must not end the block early, or every
+    # line after it would be attributed to no role and silently skipped.
+    nested = (
+        '{{ define "propulsion-witness" }}\n'
+        "{{ if .Something }}context{{ end }}\n"
+        f"1. Check for work (`{GENERIC_HOOK_QUERY}`)\n"
+        "{{ end }}\n"
+    )
+    assert generic_hook_query_violations(PROPULSION_FRAGMENT, nested)
 
 
 def test_live_wisp_detector_flags_the_gcp_ah8h_shape() -> None:

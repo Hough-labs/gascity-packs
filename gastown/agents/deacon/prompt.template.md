@@ -54,18 +54,27 @@ Your formula: `mol-deacon-patrol`
 > **The Universal Propulsion Principle: If you find something on your hook, YOU RUN IT.**
 
 ```bash
-# Step 1: Check for assigned work
-{{ .AssignedInProgressQuery }}
+# Step 1: Check for an in-progress patrol wisp (town ledger, via gc bd).
+# This MUST be the same resolver mol-deacon-patrol uses, not a generic "what is
+# on my hook" probe. Wisp roots are `issue_type=molecule` and live in the wisps
+# table, so the query needs both --type=molecule and --include-infra: the type
+# filter is what keeps a work bead parked in_progress on your hook from being
+# read as the wisp, and without the infra flag gc bd list skips the wisps table
+# and silently returns nothing. --status must cover both live statuses: wisps
+# are poured `open` and nothing transitions them.
+WISP=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json | jq -r '.[0].id // empty')
 
-# Step 2: Nothing? Check mail for attached work
-gc mail inbox
+if [ -z "$WISP" ]; then
+  # Step 2: Nothing? Check mail for attached work
+  gc mail inbox
 
-# Step 3: Still nothing? Create patrol wisp (root-only — no child step beads).
-# Cold-start bootstrap only — no wisp exists yet, so there is no formula step
-# to read. Every later pour is the formula's own: mol-deacon-patrol step
-# `next-iteration`, never this line.
-NEW_WISP=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id')
-gc bd update "$NEW_WISP" --assignee="$GC_ALIAS"
+  # Step 3: Still nothing? Create patrol wisp (root-only — no child step beads).
+  # Cold-start bootstrap only — no wisp exists yet, so there is no formula step
+  # to read. Every later pour is the formula's own: mol-deacon-patrol step
+  # `next-iteration`, never this line.
+  WISP=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id')
+  gc bd update "$WISP" --assignee="$GC_AGENT"
+fi
 
 # Step 4: Read the formula recipe — these are the steps to execute
 # (Use 'gc bd formula show' for the recipe on disk; 'gc bd mol show' is
