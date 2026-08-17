@@ -884,6 +884,10 @@ PY
             fail "$(basename "$guard") must not read the convoy straight from \$GC_BEAD_ID; it is not always exported"
         grep -F 'gc.root_bead_id' "$guard" >/dev/null ||
             fail "$(basename "$guard") must recover the convoy from the step bead's molecule root"
+        grep -F -- '--status=open,in_progress' "$guard" >/dev/null ||
+            fail "$(basename "$guard") must query the held step bead with --status=open,in_progress"
+        ! grep -F -- '--status=in_progress ' "$guard" >/dev/null ||
+            fail "$(basename "$guard") queries a claimed step bead, which is stored open, not in_progress"
         ! grep -F '[ "$WORK_STATUS" != "in_progress" ]' "$guard" >/dev/null ||
             fail "$(basename "$guard") must not treat an unassigned work bead as already submitted"
         grep -F '[ "$WORK_STATUS" = "closed" ]' "$guard" >/dev/null ||
