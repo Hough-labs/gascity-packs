@@ -617,6 +617,20 @@ def formula_nodes(data: dict) -> list[dict]:
     return nodes
 
 
+def worker_run_targets(data: dict) -> dict[str, str]:
+    """Map step id -> gc.run_target for the steps a worker actually claims.
+
+    Latch steps (scope bodies, cleanups) are closed by the orchestrator and
+    declare no run target, so they are absent from the result rather than
+    raising.
+    """
+    return {
+        step["id"]: step["metadata"]["gc.run_target"]
+        for step in data.get("steps", [])
+        if "gc.run_target" in step.get("metadata", {})
+    }
+
+
 def node_description(root: pathlib.Path, node: dict) -> str:
     description_file = node.get("description_file")
     if description_file:
@@ -2625,8 +2639,11 @@ class FormulaAssetTests(unittest.TestCase):
                 issue_adapter = resolve_formula_from_dirs(formula_dirs, "github-issue-fix")
                 self.assertFalse(pr_adapter["target_required"])
                 self.assertFalse(issue_adapter["target_required"])
-                pr_routes = {step["id"]: step["metadata"]["gc.run_target"] for step in pr_adapter["steps"]}
-                issue_routes = {step["id"]: step["metadata"]["gc.run_target"] for step in issue_adapter["steps"]}
+                # Scope bodies and other latch steps are closed by the
+                # orchestrator, not claimed by a worker, so they carry no run
+                # target. Only worker steps are routed.
+                pr_routes = worker_run_targets(pr_adapter)
+                issue_routes = worker_run_targets(issue_adapter)
                 self.assertEqual(pr_routes["run-review"], "gc.run-operator")
                 self.assertEqual(issue_routes["build"], "gc.run-operator")
 
@@ -3634,6 +3651,34 @@ class FormulaAssetTests(unittest.TestCase):
             (root / "assets/scripts/workflow_outcome.py").exists(),
             "run-review references workflow_outcome.py; the script must ship with the pack",
         )
+
+    def test_github_pr_review_scopes_comment_steps_so_a_failed_review_aborts(self) -> None:
+        """A failed run-review must stop the adapter, not merely mark it failed.
+
+        `needs` is a readiness edge: without abort_scope, render-comment and
+        post-comment become Ready as soon as run-review CLOSES, whatever its
+        outcome, and the adapter posts a verdict for a review that failed.
+        """
+        root = pathlib.Path(__file__).resolve().parents[1]
+        data = tomllib.loads((root / "formulas" / "github-pr-review.formula.toml").read_text(encoding="utf-8"))
+        steps = {step["id"]: step for step in data["steps"]}
+
+        body = steps["review-scope"]
+        self.assertEqual(body["metadata"]["gc.kind"], "scope")
+        self.assertEqual(body["metadata"]["gc.scope_role"], "body")
+        self.assertNotIn("gc.run_target", body["metadata"], "a scope body is a latch, not worker work")
+
+        for step_id in ("run-review", "render-comment", "human-gate-comment", "post-comment"):
+            with self.subTest(step=step_id):
+                metadata = steps[step_id]["metadata"]
+                self.assertEqual(metadata["gc.scope_ref"], "review-scope")
+                self.assertEqual(metadata["gc.scope_role"], "member")
+                self.assertEqual(metadata["gc.on_fail"], "abort_scope")
+
+        # finalize records why an aborted run failed, so it hangs off the body
+        # and is deliberately not a member — a member would be skipped.
+        self.assertEqual(steps["finalize"]["needs"], ["review-scope"])
+        self.assertNotIn("gc.scope_ref", steps["finalize"]["metadata"])
 
     def test_github_issue_fix_uses_implementation_plan_artifact_contract(self) -> None:
         root = pathlib.Path(__file__).resolve().parents[1]

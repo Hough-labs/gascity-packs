@@ -68,37 +68,59 @@ needs = ["snapshot"]
 metadata = { "gc.run_target" = "gc.run-operator" }
 description_file = "../assets/workflows/github-pr-review/reuse-current-head.md"
 
+# The four review/comment steps are scope members with `gc.on_fail =
+# "abort_scope"`. `needs` alone is a READINESS edge, not an OUTCOME edge: a
+# run-review that closes gc.outcome=fail still lets render/gate/post become
+# Ready, so the adapter would post a verdict for a review that never succeeded.
+# abort_scope is the mechanism graph.v2 already ships for this
+# (formula-spec-v2 section 3.5) — when a member fails the orchestrator skips
+# the remaining OPEN members and closes the scope body gc.outcome=fail.
 [[steps]]
 id = "run-review"
 title = "Run generic review"
 needs = ["reuse-current-head"]
-metadata = { "gc.run_target" = "gc.run-operator" }
+metadata = { "gc.run_target" = "gc.run-operator", "gc.scope_ref" = "review-scope", "gc.scope_role" = "member", "gc.on_fail" = "abort_scope" }
 description_file = "../assets/workflows/github-pr-review/run-review.md"
 
 [[steps]]
 id = "render-comment"
 title = "Render sticky PR comment"
 needs = ["run-review"]
-metadata = { "gc.run_target" = "gc.run-operator" }
+metadata = { "gc.run_target" = "gc.run-operator", "gc.scope_ref" = "review-scope", "gc.scope_role" = "member", "gc.on_fail" = "abort_scope" }
 description_file = "../assets/workflows/github-pr-review/render-comment.md"
 
 [[steps]]
 id = "human-gate-comment"
 title = "Gate PR review comment"
 needs = ["render-comment"]
-metadata = { "gc.run_target" = "gc.run-operator" }
+metadata = { "gc.run_target" = "gc.run-operator", "gc.scope_ref" = "review-scope", "gc.scope_role" = "member", "gc.on_fail" = "abort_scope" }
 description_file = "../assets/workflows/github-pr-review/human-gate-comment.md"
 
 [[steps]]
 id = "post-comment"
 title = "Create or update sticky PR comment"
 needs = ["render-comment", "human-gate-comment"]
-metadata = { "gc.run_target" = "gc.run-operator" }
+metadata = { "gc.run_target" = "gc.run-operator", "gc.scope_ref" = "review-scope", "gc.scope_role" = "member", "gc.on_fail" = "abort_scope" }
 description_file = "../assets/workflows/github-pr-review/post-comment.md"
 
+# The scope body. `needs = ["post-comment"]` follows the spec's own example,
+# where the body depends on its members so it closes after them and aggregates
+# their result.
+[[steps]]
+id = "review-scope"
+title = "PR review scope"
+needs = ["post-comment"]
+metadata = { "gc.kind" = "scope", "gc.scope_name" = "pr-review", "gc.scope_role" = "body" }
+description_file = "../assets/workflows/github-pr-review/review-scope.md"
+
+# finalize hangs off the scope body rather than post-comment so it records run
+# metadata for an ABORTED run too — the body closes either way, so this stays
+# Ready-able and the diagnostics it writes survive the failure path. It is
+# deliberately NOT a scope member: making it one would skip the very step whose
+# job is to record why the run failed.
 [[steps]]
 id = "finalize"
 title = "Finalize PR review result"
-needs = ["post-comment"]
+needs = ["review-scope"]
 metadata = { "gc.run_target" = "gc.run-operator" }
 description_file = "../assets/workflows/github-pr-review/finalize.md"
