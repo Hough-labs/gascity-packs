@@ -425,8 +425,124 @@ test_dolt_push_outage_detection_is_wired() {
         fail "deacon patrol must not take over dolt-remotes-patrol"
 }
 
+test_submit_and_exit_cannot_be_replayed() {
+    local formula prompt fragment submit_block
+    formula="$GASTOWN/formulas/mol-polecat-work.toml"
+    prompt="$GASTOWN/agents/polecat/prompt.template.md"
+    fragment="$GASTOWN/template-fragments/approval-fallacy.template.md"
+
+    parse_toml "$formula"
+
+    submit_block=$(python3 - "$formula" <<'PY'
+import sys
+import tomllib
+
+data = tomllib.load(open(sys.argv[1], "rb"))
+step = next(s for s in data["steps"] if s["id"] == "submit-and-exit")
+print(step["description"])
+PY
+)
+
+    # gcp-rz8a: the step ended at drain-ack without closing its own step bead.
+    # The molecule carries gc.session_affinity=require, so the pool respawned the
+    # same named session and `gc hook --claim` handed it the completed step
+    # again. Closing the step bead is what makes the step run once.
+    [[ "$submit_block" == *'--metadata-field gc.step_ref=mol-polecat-work.submit-and-exit'* ]] ||
+        fail "submit-and-exit must resolve its own step bead by step_ref, not guess at an id"
+    [[ "$submit_block" == *'gc bd close "$STEP_BEAD_ID"'* ]] ||
+        fail "submit-and-exit must close its own step bead so the pool cannot re-claim a completed submit"
+    [[ "$submit_block" != *'gc bd close "$GC_BEAD_ID"'* ]] ||
+        fail "for a polecat \$GC_BEAD_ID is the convoy, not this step; closing it closes live work"
+    [[ "$submit_block" != *'gc bd close "$WORK_BEAD_ID"'* ]] ||
+        fail "the polecat never closes the work bead; only the refinery does"
+
+    # The close has to happen BEFORE the drain, or the reconciler kills the
+    # session first and the step bead is left open exactly as before.
+    python3 - "$formula" <<'PY' || fail "submit-and-exit must close its step bead before draining"
+import sys
+import tomllib
+
+data = tomllib.load(open(sys.argv[1], "rb"))
+step = next(s for s in data["steps"] if s["id"] == "submit-and-exit")
+tail = step["description"]
+tail = tail[tail.index("**10."):]
+if tail.index('gc bd close "$STEP_BEAD_ID"') >= tail.index("gc runtime drain-ack"):
+    raise SystemExit(1)
+PY
+
+    # A halt that reached the step's contracted end must close the step bead
+    # too; a FAILED push must not, because the handoff never happened and the
+    # next session has to re-claim and retry it.
+    python3 - "$formula" <<'PY' || fail "auto_push=false must close the step bead; push failures must leave it open"
+import sys
+import tomllib
+
+data = tomllib.load(open(sys.argv[1], "rb"))
+step = next(s for s in data["steps"] if s["id"] == "submit-and-exit")
+text = step["description"]
+halt = text[text.index("auto_push=false: halting at branch-ready"):]
+halt = halt[: halt.index("git push origin HEAD")]
+if 'gc bd close "$STEP_BEAD_ID"' not in halt:
+    raise SystemExit(1)
+failed = text[text.index("PUSH FAILED (exit $PUSH_EXIT)"):]
+failed = failed[: failed.index("**6.")]
+if 'gc bd close "$STEP_BEAD_ID"' in failed:
+    raise SystemExit(1)
+PY
+
+    # gcp-rz8a's severity line: a replayed step 8 clears gc.routed_to="human",
+    # which is how a bead the refinery parked on an armed require_merge_approval
+    # gate gets pulled back out of an operator escalation. The guard must be
+    # read and acted on BEFORE the update that clears the routing.
+    [[ "$submit_block" == *'[ "$ROUTED_TO" = "human" ]'* ]] ||
+        fail "the refinery handoff must refuse to run when gc.routed_to is human"
+    python3 - "$formula" <<'PY' || fail "the human-routing guard must precede the update that clears gc.routed_to"
+import sys
+import tomllib
+
+data = tomllib.load(open(sys.argv[1], "rb"))
+step = next(s for s in data["steps"] if s["id"] == "submit-and-exit")
+reassign = step["description"]
+reassign = reassign[reassign.index("**8. Reassign to refinery"):]
+if reassign.index('[ "$ROUTED_TO" = "human" ]') >= reassign.index('--set-metadata gc.routed_to=""'):
+    raise SystemExit(1)
+PY
+
+    # Second brake: an idempotence guard that bails out before any bead write.
+    [[ "$submit_block" == *"ALREADY_SUBMITTED"* ]] ||
+        fail "submit-and-exit must detect a completed handoff before re-writing bead state"
+    python3 - "$formula" <<'PY' || fail "the already-submitted guard must run before the first bead write"
+import sys
+import tomllib
+
+data = tomllib.load(open(sys.argv[1], "rb"))
+step = next(s for s in data["steps"] if s["id"] == "submit-and-exit")
+text = step["description"]
+if text.index("ALREADY_SUBMITTED") >= text.index("gc bd update"):
+    raise SystemExit(1)
+PY
+
+    # The prompt-side guard could not run at all in the observed session:
+    # $GC_BEAD_ID was empty, so it never resolved a work bead. Both copies must
+    # recover the convoy, and both must key on POSITIVE evidence — a molecule's
+    # work bead is never assigned to the polecat session, so "not in_progress
+    # for me" reports already-submitted on work that was never submitted.
+    local guard
+    for guard in "$prompt" "$fragment"; do
+        grep -F 'CONVOY_ID="${GC_BEAD_ID:-}"' "$guard" >/dev/null ||
+            fail "$(basename "$guard") must not read the convoy straight from \$GC_BEAD_ID; it is not always exported"
+        grep -F 'gc.root_bead_id' "$guard" >/dev/null ||
+            fail "$(basename "$guard") must recover the convoy from the step bead's molecule root"
+        ! grep -F '[ "$WORK_STATUS" != "in_progress" ]' "$guard" >/dev/null ||
+            fail "$(basename "$guard") must not treat an unassigned work bead as already submitted"
+        grep -F '[ "$WORK_STATUS" = "closed" ]' "$guard" >/dev/null ||
+            fail "$(basename "$guard") must require positive evidence (closed, or handed to another assignee)"
+    done
+}
+
 test_dog_assets_are_pack_local
 test_retired_dog_formulas_are_not_reintroduced
+test_submit_and_exit_cannot_be_replayed
 test_post_merge_worktree_teardown_has_an_owner
 test_dolt_push_outage_detection_is_wired
 test_shutdown_dance_contracts_are_executable

@@ -17,9 +17,12 @@ merge review.
 The polecat sets `metadata.branch` and `metadata.target` on the work bead
 and reassigns it to the refinery. The refinery merges and closes.
 
-**NEVER CLOSE BEADS.** You must not run `gc bd close` or set status=closed.
-Even if you believe the code is already merged, reassign to refinery —
-only the refinery verifies merges and closes beads.
+**NEVER CLOSE THE WORK BEAD.** You must not run `gc bd close` or set
+status=closed on it. Even if you believe the code is already merged, reassign
+to refinery — only the refinery verifies merges and closes beads. The single
+exception is your own formula step beads, which you close as you finish each
+step; `submit-and-exit` closes its own step bead before draining, because a
+step bead left open is re-claimed by the next session the pool spawns.
 `{{base_branch}}` may come from the work bead's own `metadata.target` or
 be inherited from a parent convoy with `metadata.target` set.
 
@@ -313,18 +316,75 @@ needs = ["self-review"]
 description = """
 Hand off your work and self-clean. You cease to exist after this step.
 
-**1. Branch-shape gate (fails closed — non-negotiable).**
-
-Before anything else, verify you are on a per-bead branch. The refinery
-merges the branch recorded in your bead's `metadata.branch`, which must
-follow the `polecat/<bead-id>` convention; if you push from a different
-branch (your agent home branch, a stray local checkout, etc.), the
-handoff contract is broken and the bead is permanently stranded as
-"assigned to refinery, no merge target". See gastownhall/gascity#2082.
+**1. Resolve the work bead and this step's own bead.**
 
 ```bash
 CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
 WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
+STEP_SESSION="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
+STEP_BEAD_ID=$(gc bd list --assignee="$STEP_SESSION" --status=in_progress \
+  --metadata-field gc.step_ref=mol-polecat-work.submit-and-exit \
+  --include-infra --limit=0 --json 2>/dev/null | jq -r '.[0].id // empty')
+if [ -z "$STEP_BEAD_ID" ]; then
+    echo "WARN could not resolve this step's own bead; step 10 cannot close it."
+    echo "WARN an open submit-and-exit step bead is re-claimed by the next session the pool spawns."
+fi
+```
+
+`STEP_BEAD_ID` is closed in step 10, before the drain. That close is the
+whole reason this step can be trusted to run once: the molecule carries
+`gc.session_affinity=require`, so a step bead left open keeps the pool
+respawning the same named session, whose `gc hook --claim --json` hands it this
+already-completed step with no context that the work is done (gcp-rz8a). Never
+substitute `$GC_BEAD_ID` here — for a polecat that is the convoy the molecule
+was poured on, not this step, and closing it would close work that is still
+live.
+
+**2. Already-submitted guard (idempotent re-entry).**
+
+A re-entered submit-and-exit must not re-write bead state. Step 8 sets the
+assignee and clears `gc.routed_to`; run a second time on a bead the refinery
+has since parked, it silently pulls that bead back out of an escalation. Bail
+out before touching anything when all three marks of a completed handoff are
+present — target recorded, branch on origin at this commit, and the bead handed
+to somebody who is not this session:
+
+```bash
+SUBMITTED_JSON=$(gc bd show "$WORK_BEAD_ID" --json)
+SUBMITTED_TARGET=$(printf '%s' "$SUBMITTED_JSON" | jq -r '.[0].metadata.target // empty')
+SUBMITTED_BRANCH=$(printf '%s' "$SUBMITTED_JSON" | jq -r '.[0].metadata.branch // empty')
+SUBMITTED_ASSIGNEE=$(printf '%s' "$SUBMITTED_JSON" | jq -r '.[0].assignee // empty')
+SUBMITTED_REMOTE=""
+if [ -n "$SUBMITTED_BRANCH" ]; then
+    SUBMITTED_REMOTE=$(git ls-remote origin "refs/heads/$SUBMITTED_BRANCH" 2>/dev/null | awk '{print $1}')
+fi
+if [ -n "$SUBMITTED_TARGET" ] && [ -n "$SUBMITTED_REMOTE" ] &&
+   [ "$SUBMITTED_REMOTE" = "$(git rev-parse HEAD)" ] &&
+   [ -n "$SUBMITTED_ASSIGNEE" ] && [ "$SUBMITTED_ASSIGNEE" != "$STEP_SESSION" ]; then
+    echo "ALREADY_SUBMITTED $WORK_BEAD_ID target=$SUBMITTED_TARGET branch=$SUBMITTED_BRANCH assignee=$SUBMITTED_ASSIGNEE"
+    echo "Handoff already completed. Closing this step bead and draining without re-writing bead state."
+    [ -n "$STEP_BEAD_ID" ] && gc bd close "$STEP_BEAD_ID" --reason "submit-and-exit: already submitted; no bead state re-written"
+    gc runtime drain-ack
+    exit 0
+fi
+```
+
+All three marks are required together on purpose. `metadata.target` alone
+proves nothing — a caller may set it before dispatch to choose the base branch
+— and an unassigned bead with the branch on origin is the shape a witness
+salvage push leaves behind (gcp-7bo9), which is not a handoff this step
+performed.
+
+**3. Branch-shape gate (fails closed — non-negotiable).**
+
+Verify you are on a per-bead branch. The refinery merges the branch recorded
+in your bead's `metadata.branch`, which must follow the `polecat/<bead-id>`
+convention; if you push from a different branch (your agent home branch, a
+stray local checkout, etc.), the handoff contract is broken and the bead is
+permanently stranded as "assigned to refinery, no merge target". See
+gastownhall/gascity#2082.
+
+```bash
 CURRENT_BRANCH=$(git branch --show-current)
 EXPECTED_BRANCH="polecat/$WORK_BEAD_ID"
 if [ "$CURRENT_BRANCH" != "$EXPECTED_BRANCH" ]; then
@@ -357,7 +417,7 @@ if [ "$METADATA_BRANCH" != "$EXPECTED_BRANCH" ]; then
 fi
 ```
 
-**2. Final clean-state verification (safeguard):**
+**4. Final clean-state verification (safeguard):**
 ```bash
 git status --porcelain
 ```
@@ -373,7 +433,7 @@ BODY
 This is a belt-and-suspenders check — self-review should have caught this,
 but we never push with untracked work left behind.
 
-**3. Push your branch:**
+**5. Push your branch:**
 ```bash
 AUTO_PUSH=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata | if has("auto_push") then (.auto_push | tostring) else "" end')
 if [ "$AUTO_PUSH" = "false" ]; then
@@ -387,6 +447,7 @@ if [ "$AUTO_PUSH" = "false" ]; then
     --set-metadata halt_reason=auto_push_false \
     --set-metadata gc.routed_to="" \
     --notes "Branch ready: auto_push=false (no push, no refinery handoff)"
+  [ -n "$STEP_BEAD_ID" ] && gc bd close "$STEP_BEAD_ID" --reason "submit-and-exit: halted at branch-ready (auto_push=false)"
   gc runtime drain-ack
   exit 0
 fi
@@ -421,14 +482,19 @@ if [ "$REMOTE_REF" != "$LOCAL_HEAD" ]; then
 fi
 ```
 
-**4. Clean up local branch (prevent stale branch accumulation):**
+The `auto_push=false` halt closes this step bead because the step reached its
+contracted end; the push-failure paths deliberately do not. A failed push means
+the handoff never happened, so the step bead must stay open for the next
+session to re-claim and retry.
+
+**6. Clean up local branch (prevent stale branch accumulation):**
 ```bash
 BRANCH=$(git branch --show-current)
 git checkout --detach                 # Detach so we can delete the branch
 git branch -D "$BRANCH"              # Branch is pushed; refinery owns it now
 ```
 
-**5. Update metadata on the work bead:**
+**7. Update metadata on the work bead:**
 ```bash
 gc bd update "$WORK_BEAD_ID" \
   --set-metadata target={{base_branch}} \
@@ -440,9 +506,28 @@ provided by the caller, `metadata.existing_pr` is preserved for refinery
 validation. The refinery records canonical `pr_url` only after verifying
 the PR is open and matches the branch, base, and origin repository.
 
-**6. Reassign to refinery:**
+**8. Reassign to refinery:**
 ```bash
 REFINERY_TARGET="${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery"
+# NEVER clear gc.routed_to when it reads `human`. That value is an operator
+# escalation — the refinery writes it when it REFUSES to land a bead, typically
+# on an armed require_merge_approval gate. Reassigning to the refinery there
+# does not resume the work, it silently undoes the one control that makes
+# reviewed merges real (gcp-rz8a). The branch is already pushed and recorded, so
+# halting here loses nothing: the human owns the next move.
+ROUTED_TO=$(gc bd show "$WORK_BEAD_ID" --json 2>/dev/null | jq -r '.[0].metadata."gc.routed_to" // empty')
+if [ "$ROUTED_TO" = "human" ]; then
+    echo "HANDOFF HALTED: $WORK_BEAD_ID is routed to human — an operator escalation."
+    echo "Branch is pushed and metadata.target is set; leaving assignee and gc.routed_to untouched."
+    gc bd note "$WORK_BEAD_ID" --stdin <<'HUMAN_HALT'
+Polecat submit-and-exit halted at the refinery handoff: gc.routed_to=human.
+Branch is pushed and metadata.target is recorded. Assignee and routing left as
+the escalation set them; a human decides whether this goes to the refinery.
+HUMAN_HALT
+    [ -n "$STEP_BEAD_ID" ] && gc bd close "$STEP_BEAD_ID" --reason "submit-and-exit: halted at refinery handoff (gc.routed_to=human)"
+    gc runtime drain-ack
+    exit 0
+fi
 gc bd update "$WORK_BEAD_ID" --status=open --assignee="$REFINERY_TARGET" --set-metadata gc.routed_to=""
 # The handoff is the assignee write; `--status=open` is bookkeeping that has
 # been observed not to stick (gcp-s14g). Read it back and correct it once, so
@@ -475,27 +560,39 @@ merge, and close the bead. If there's a conflict, the refinery puts the
 bead back in the pool with `rejection_reason` metadata — a new polecat
 picks it up and resumes from the existing branch.
 
-**7. Signal refinery to check for work immediately (belt-and-suspenders):**
+**9. Signal refinery to check for work immediately (belt-and-suspenders):**
 ```bash
 REFINERY_TARGET="${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery"
 gc session wake "$REFINERY_TARGET" || true
 gc session nudge "$REFINERY_TARGET" "Run 'gc prime' to check merge queue and begin processing." || true
 ```
 
-The `gc bd update` in step 6 generates a `bead.updated` event the refinery's
+The `gc bd update` in step 8 generates a `bead.updated` event the refinery's
 event-watch will see, but that can take up to `event_timeout` seconds. Wake
 starts a stopped on_demand session; nudge leaves a visible prompt for a running
 one as soon as it is ready for input. Failure is non-fatal: the refinery finds
 the work on its next poll.
 
-**8. Signal reconciler and exit.**
+**10. Close this step bead, then signal the reconciler and exit.**
 ```bash
+if [ -n "$STEP_BEAD_ID" ]; then
+    gc bd close "$STEP_BEAD_ID" --reason "submit-and-exit: branch pushed, work bead handed to the refinery"
+else
+    echo "WARN this step's own bead was never resolved and stays open; the next session the pool spawns will re-claim a completed submit-and-exit."
+fi
 gc runtime drain-ack
 exit
 ```
+
+Closing the step bead is not bookkeeping — it is what makes this step run once.
+The molecule carries `gc.session_affinity=require`, so an open step bead keeps
+the pool respawning this named session onto work that is already done, and the
+guard in step 2 is the only thing standing between that respawn and a second
+pass over the work bead's assignee and routing (gcp-rz8a). Close the step bead
+you resolved in step 1 — never the work bead, and never `$GC_BEAD_ID`.
 
 `gc runtime drain-ack` tells the reconciler to kill this session. The
 reconciler only restarts you if the pool check command finds more work.
 You are GONE. Done means gone. There is no idle state.
 
-**Exit criteria:** Branch pushed, metadata set, bead reassigned, refinery signaled, drain acknowledged, session exited."""
+**Exit criteria:** Branch pushed, metadata set, bead reassigned, refinery signaled, this step's bead closed, drain acknowledged, session exited."""
