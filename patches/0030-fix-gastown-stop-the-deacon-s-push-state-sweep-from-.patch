@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 14 Aug 2026 22:49:08 -0400
-Subject: [PATCH 30/35] fix(gastown): stop the deacon's push-state sweep from
+Subject: [PATCH 30/36] fix(gastown): stop the deacon's push-state sweep from
  gating session start (gcp-oo0v)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

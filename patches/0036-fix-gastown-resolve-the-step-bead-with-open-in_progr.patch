@@ -1,0 +1,148 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Mon, 17 Aug 2026 09:21:04 -0400
+Subject: [PATCH 36/36] fix(gastown): resolve the step bead with
+ open,in_progress (gcp-rz8a)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Self-review found the step-bead close was inert. A claimed step bead carries
+the session's assignee but is still stored `open` — verified live on gcp-vgmf,
+assignee gastown__polecat-gc-ow42y, status open. Every query added by this
+branch asked for `--status=in_progress` alone, so:
+
+  - submit-and-exit's STEP_BEAD_ID came back empty at all three call sites,
+    step 10 printed its WARN, and the step bead stayed open — the respawn loop
+    the branch exists to close;
+  - the prompt/fragment guard's convoy recovery resolved no root bead, so
+    CONVOY_ID stayed empty and the guard still could not run.
+
+Widen all five queries to `--status=open,in_progress`, record why at each site,
+and add contract assertions that fail on the `in_progress`-only form.
+---
+ gastown/agents/polecat/prompt.template.md           |  7 +++++--
+ gastown/formulas/mol-polecat-work.toml              | 13 ++++++++++---
+ .../template-fragments/approval-fallacy.template.md |  7 +++++--
+ gastown/tests/test_gastown_pack_assets.sh           | 13 +++++++++++++
+ 4 files changed, 33 insertions(+), 7 deletions(-)
+
+diff --git a/gastown/agents/polecat/prompt.template.md b/gastown/agents/polecat/prompt.template.md
+index a7a3bb6..8874904 100644
+--- a/gastown/agents/polecat/prompt.template.md
++++ b/gastown/agents/polecat/prompt.template.md
+@@ -398,10 +398,13 @@ handed to somebody else — means submit-and-exit already ran. Otherwise run it:
+ EXPECTED_ASSIGNEE="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
+ # `$GC_BEAD_ID` is not always exported — it was empty in gcp-rz8a's session, so
+ # this guard could not run at all. Recover the convoy from the molecule root of
+-# the step bead this session is holding rather than skipping the check.
++# the step bead this session is holding rather than skipping the check. The
++# status filter is `open,in_progress`: a claimed step bead carries this
++# session's assignee but is still stored `open`, so `in_progress` alone matches
++# nothing and the recovery silently yields no convoy.
+ CONVOY_ID="${GC_BEAD_ID:-}"
+ if [ -z "$CONVOY_ID" ]; then
+-  ROOT_BEAD_ID=$(gc bd list --assignee="$EXPECTED_ASSIGNEE" --status=in_progress \
++  ROOT_BEAD_ID=$(gc bd list --assignee="$EXPECTED_ASSIGNEE" --status=open,in_progress \
+     --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null |
+     jq -r '[.[] | .metadata."gc.root_bead_id" // empty] | .[0] // empty' 2>/dev/null)
+   if [ -n "$ROOT_BEAD_ID" ]; then
+diff --git a/gastown/formulas/mol-polecat-work.toml b/gastown/formulas/mol-polecat-work.toml
+index 93b26d8..121f199 100644
+--- a/gastown/formulas/mol-polecat-work.toml
++++ b/gastown/formulas/mol-polecat-work.toml
+@@ -322,7 +322,7 @@ Hand off your work and self-clean. You cease to exist after this step.
+ CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
+ WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
+ STEP_SESSION="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
+-STEP_BEAD_ID=$(gc bd list --assignee="$STEP_SESSION" --status=in_progress \
++STEP_BEAD_ID=$(gc bd list --assignee="$STEP_SESSION" --status=open,in_progress \
+   --metadata-field gc.step_ref=mol-polecat-work.submit-and-exit \
+   --include-infra --limit=0 --json 2>/dev/null | jq -r '.[0].id // empty')
+ if [ -z "$STEP_BEAD_ID" ]; then
+@@ -344,6 +344,13 @@ Steps 2 and 10 re-derive both ids instead of inheriting them. Run each fenced
+ block in its own shell and an inherited variable is empty, which for those two
+ blocks degrades exactly into the failure this step is fixing.
+ 
++The status filter must be `open,in_progress`, never `in_progress` alone. A
++claimed step bead carries this session's assignee but is still stored `open` —
++observed on gcp-vgmf, assignee `gastown__polecat-gc-ow42y`, status `open`. Ask
++for `in_progress` and the query returns nothing, `STEP_BEAD_ID` is empty, and
++step 10 prints its WARN and leaves the step bead open — the exact respawn loop
++this step exists to close.
++
+ **2. Already-submitted guard (idempotent re-entry).**
+ 
+ A re-entered submit-and-exit must not re-write bead state. Step 8 sets the
+@@ -360,7 +367,7 @@ to somebody who is not this session:
+ CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
+ WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
+ STEP_SESSION="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
+-STEP_BEAD_ID=$(gc bd list --assignee="$STEP_SESSION" --status=in_progress \
++STEP_BEAD_ID=$(gc bd list --assignee="$STEP_SESSION" --status=open,in_progress \
+   --metadata-field gc.step_ref=mol-polecat-work.submit-and-exit \
+   --include-infra --limit=0 --json 2>/dev/null | jq -r '.[0].id // empty')
+ SUBMITTED_JSON=$(gc bd show "$WORK_BEAD_ID" --json)
+@@ -593,7 +600,7 @@ if [ -z "${STEP_BEAD_ID:-}" ]; then
+     # block run in a fresh shell inherits nothing and an unresolved id here is
+     # exactly the open step bead this whole change exists to prevent.
+     STEP_SESSION="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
+-    STEP_BEAD_ID=$(gc bd list --assignee="$STEP_SESSION" --status=in_progress \
++    STEP_BEAD_ID=$(gc bd list --assignee="$STEP_SESSION" --status=open,in_progress \
+       --metadata-field gc.step_ref=mol-polecat-work.submit-and-exit \
+       --include-infra --limit=0 --json 2>/dev/null | jq -r '.[0].id // empty')
+ fi
+diff --git a/gastown/template-fragments/approval-fallacy.template.md b/gastown/template-fragments/approval-fallacy.template.md
+index ec850bc..a12b458 100644
+--- a/gastown/template-fragments/approval-fallacy.template.md
++++ b/gastown/template-fragments/approval-fallacy.template.md
+@@ -36,10 +36,13 @@ means submit-and-exit already reassigned it. Otherwise run it:
+ EXPECTED_ASSIGNEE="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
+ # `$GC_BEAD_ID` is not always exported — it was empty in gcp-rz8a's session, so
+ # this guard could not run at all. Recover the convoy from the molecule root of
+-# the step bead this session is holding rather than skipping the check.
++# the step bead this session is holding rather than skipping the check. The
++# status filter is `open,in_progress`: a claimed step bead carries this
++# session's assignee but is still stored `open`, so `in_progress` alone matches
++# nothing and the recovery silently yields no convoy.
+ CONVOY_ID="${GC_BEAD_ID:-}"
+ if [ -z "$CONVOY_ID" ]; then
+-  ROOT_BEAD_ID=$(gc bd list --assignee="$EXPECTED_ASSIGNEE" --status=in_progress \
++  ROOT_BEAD_ID=$(gc bd list --assignee="$EXPECTED_ASSIGNEE" --status=open,in_progress \
+     --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null |
+     jq -r '[.[] | .metadata."gc.root_bead_id" // empty] | .[0] // empty' 2>/dev/null)
+   if [ -n "$ROOT_BEAD_ID" ]; then
+diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
+index 04f4732..c6fe61a 100755
+--- a/gastown/tests/test_gastown_pack_assets.sh
++++ b/gastown/tests/test_gastown_pack_assets.sh
+@@ -456,6 +456,15 @@ PY
+     [[ "$submit_block" != *'gc bd close "$WORK_BEAD_ID"'* ]] ||
+         fail "the polecat never closes the work bead; only the refinery does"
+ 
++    # A claimed step bead carries the session's assignee but is still stored
++    # `open` (observed on gcp-vgmf). A query for `in_progress` alone matches
++    # nothing, so STEP_BEAD_ID comes back empty and the close never happens —
++    # the fix reads as applied while the respawn loop stays wide open.
++    [[ "$submit_block" == *'--status=open,in_progress'* ]] ||
++        fail "submit-and-exit must resolve its step bead with --status=open,in_progress"
++    [[ "$submit_block" != *'--status=in_progress '* ]] ||
++        fail "a claimed step bead is stored open; --status=in_progress alone resolves nothing"
++
+     # An agent may run each fenced block in its own shell, so the two blocks
+     # that decide whether bead state gets re-written must derive their own ids
+     # rather than inherit them and silently degrade to "nothing to close".
+@@ -552,6 +561,10 @@ PY
+             fail "$(basename "$guard") must not read the convoy straight from \$GC_BEAD_ID; it is not always exported"
+         grep -F 'gc.root_bead_id' "$guard" >/dev/null ||
+             fail "$(basename "$guard") must recover the convoy from the step bead's molecule root"
++        grep -F -- '--status=open,in_progress' "$guard" >/dev/null ||
++            fail "$(basename "$guard") must query the held step bead with --status=open,in_progress"
++        ! grep -F -- '--status=in_progress ' "$guard" >/dev/null ||
++            fail "$(basename "$guard") queries a claimed step bead, which is stored open, not in_progress"
+         ! grep -F '[ "$WORK_STATUS" != "in_progress" ]' "$guard" >/dev/null ||
+             fail "$(basename "$guard") must not treat an unassigned work bead as already submitted"
+         grep -F '[ "$WORK_STATUS" = "closed" ]' "$guard" >/dev/null ||
+-- 
+2.50.1 (Apple Git-155)
+
