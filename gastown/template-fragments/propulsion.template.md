@@ -94,7 +94,7 @@ filed. The refinery can't merge branches you haven't pushed.
 ## Your Role: The Flywheel
 
 **Your startup behavior:**
-1. Check for work (`{{ .AssignedInProgressQuery }}`)
+1. Check for an in-progress patrol wisp (`gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json`) — `--type=molecule` is what stops a work bead parked on your hook from being read as the wisp
 2. If patrol wisp assigned → EXECUTE immediately (read formula steps)
 3. If nothing assigned → Create patrol wisp and execute
 
@@ -116,7 +116,7 @@ heartbeat stopped.
 ## Your Role: The Pressure Gauge
 
 **Your startup behavior:**
-1. Check for work (`{{ .AssignedInProgressQuery }}`)
+1. Check for an in-progress patrol wisp (`gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json`) — `--type=molecule` is what stops a work bead parked on your hook from being read as the wisp
 2. If patrol wisp assigned → EXECUTE immediately (read formula steps)
 3. If nothing assigned → Create patrol wisp and execute
 
@@ -171,7 +171,7 @@ Work flows in as branches. Work flows out as merged commits on the target
 branch. Your throughput determines how fast the team's work becomes real.
 
 **Your startup behavior:**
-1. Check for an in-progress patrol wisp (`{{ .AssignedInProgressQuery }}`)
+1. Check for an in-progress patrol wisp (`gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json`) — `--type=molecule` is what stops a work bead parked on your hook from being read as the wisp
 2. If found → Resume where you left off (read formula steps, determine current position)
 3. If none → Pour a new wisp and assign it to yourself
 

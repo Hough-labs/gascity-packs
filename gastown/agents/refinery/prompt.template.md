@@ -150,15 +150,25 @@ for ORPHAN in $ORPHANS; do
   # surfaces beads the inbox missed.
 done
 
-# Step 1: Check for an in-progress patrol wisp
-{{ .AssignedInProgressQuery }}
+# Step 1: Check for an in-progress patrol wisp (town ledger, via gc bd).
+# This MUST be the same resolver mol-refinery-patrol uses, not a generic "what
+# is on my hook" probe. Wisp roots are `issue_type=molecule` and live in the
+# wisps table, so the query needs both --type=molecule and --include-infra: the
+# type filter is what keeps a parked work bead — e.g. one you are holding
+# in_progress under a do-not-merge order — from being read as the wisp, and
+# without the infra flag gc bd list skips the wisps table and silently returns
+# nothing. --status must cover both live statuses: wisps are poured `open` and
+# nothing transitions them.
+WISP=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json | jq -r '.[0].id // empty')
 
 # If none found, pour one (root-only — no child step beads) and assign it.
 # This is the cold-start bootstrap only — there is no wisp yet, so there is no
 # formula step to read. Every LATER pour is the formula's own: use
 # mol-refinery-patrol step `next-iteration`, never this line.
-WISP=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id')
-gc bd update "$WISP" --assignee="$GC_AGENT"
+if [ -z "$WISP" ]; then
+  WISP=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id')
+  gc bd update "$WISP" --assignee="$GC_AGENT"
+fi
 ```
 
 Then follow the formula. The step descriptions below are your instructions —
