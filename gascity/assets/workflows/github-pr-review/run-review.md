@@ -40,6 +40,7 @@ without it. If workflow root metadata already carries
 launched the child — resume that id instead of slinging a second review.
 
 ```bash
+ROOT_BEAD_ID="<root-bead-id>"   # gc.root_bead_id from this step's metadata
 REVIEW_LAUNCH_JSON="$(gc sling gc.run-operator {{code_review_formula}} --formula --json \
   --var context_path="{{context_path}}" \
   --var subject_path="$SUBJECT_PATH" \
@@ -48,7 +49,7 @@ REVIEW_LAUNCH_JSON="$(gc sling gc.run-operator {{code_review_formula}} --formula
   --var review_mode="{{review_mode}}")"
 REVIEW_WORKFLOW_ID="$(printf '%s' "$REVIEW_LAUNCH_JSON" | jq -r '.workflow_id // .molecule_id // empty')"
 [ -n "$REVIEW_WORKFLOW_ID" ] || { echo "sling returned no workflow root id" >&2; exit 1; }
-gc bd update <root-bead-id> --set-metadata gc.github.review_workflow_id="$REVIEW_WORKFLOW_ID"
+gc bd update "$ROOT_BEAD_ID" --set-metadata gc.github.review_workflow_id="$REVIEW_WORKFLOW_ID"
 ```
 
 If the selected formula does not declare the mode vars, omit the two mode
