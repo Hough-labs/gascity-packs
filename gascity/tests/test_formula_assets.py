@@ -3680,6 +3680,13 @@ class FormulaAssetTests(unittest.TestCase):
         self.assertEqual(steps["finalize"]["needs"], ["review-scope"])
         self.assertNotIn("gc.scope_ref", steps["finalize"]["metadata"])
 
+        # Running on the abort path only helps if finalize knows it can, and
+        # knows not to fabricate the fields that path legitimately lacks.
+        finalize = node_description(root, steps["finalize"])
+        for fragment in ("ABORTED", "gc.github.review_child_outcome", "backfill"):
+            with self.subTest(step="finalize", fragment=fragment):
+                self.assertIn(fragment, finalize)
+
     def test_github_issue_fix_uses_implementation_plan_artifact_contract(self) -> None:
         root = pathlib.Path(__file__).resolve().parents[1]
         text = effective_formula_text(root, "github-issue-fix")
