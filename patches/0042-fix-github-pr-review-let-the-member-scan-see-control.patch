@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sun, 16 Aug 2026 22:13:38 -0400
+Subject: [PATCH 42/42] fix(github-pr-review): let the member scan see control
+ beads (gcp-m7dn)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Self-review catch, found by probing the live store rather than the fixtures.
+
+workflow_outcome.py's member cross-check ran a plain `gc bd list
+--metadata-field gc.root_bead_id=...`, which hides infra, template and gate
+beads by default. Those hidden classes are precisely where a graph.v2 workflow
+records a failure — the check, scope-check and gate control beads — so the scan
+was blind to the beads a fail-closed reader most needs. The primary signal (the
+root's own gc.outcome) was unaffected, but the backstop was weaker than it read.
+
+Pass --include-templates --include-infra --include-gates. On a workflow with no
+control beads the flags are a no-op (verified: same 7 members with and without
+them on gcp-yxau), so this only widens what the scan can see.
+
+Live verification against the real store, which also confirms the whole premise
+of this branch:
+
+  root-outcome gcp-yxau  -> {"outcome":"pass",...}      exit 0
+      a completed graph.v2 workflow root really does carry the engine-computed
+      gc.outcome this gate reads.
+  root-outcome gcp-9wz   -> {"outcome":"unknown",...}   exit 1
+      a root that closed with NO gc.outcome reads as not-passed rather than
+      passing by default.
+  root-outcome gcp-m7dn  -> {"outcome":"incomplete",...} exit 1
+      a still-open root is never mistaken for a terminated one.
+---
+ gascity/assets/scripts/workflow_outcome.py | 7 +++++++
+ gascity/tests/test_workflow_outcome.py     | 4 ++++
+ 2 files changed, 11 insertions(+)
+
+diff --git a/gascity/assets/scripts/workflow_outcome.py b/gascity/assets/scripts/workflow_outcome.py
+index a51002f..bdaf78d 100755
+--- a/gascity/assets/scripts/workflow_outcome.py
++++ b/gascity/assets/scripts/workflow_outcome.py
+@@ -137,6 +137,10 @@ def load_root(runner: Runner, root_bead_id: str) -> dict[str, Any]:
+ 
+ 
+ def load_members(runner: Runner, root_bead_id: str) -> list[dict[str, Any]]:
++    # The include-* flags matter: a workflow's failure is often recorded on a
++    # check/scope-check/gate control bead, and `gc bd list` hides those classes
++    # by default. Scanning without them would silently skip exactly the beads a
++    # fail-closed reader needs to see.
+     beads = parse_bead_list(
+         runner(
+             [
+@@ -147,6 +151,9 @@ def load_members(runner: Runner, root_bead_id: str) -> list[dict[str, Any]]:
+                 "--json",
+                 "--limit",
+                 "0",
++                "--include-templates",
++                "--include-infra",
++                "--include-gates",
+                 "--metadata-field",
+                 f"{ROOT_BEAD_ID_KEY}={root_bead_id}",
+             ]
+diff --git a/gascity/tests/test_workflow_outcome.py b/gascity/tests/test_workflow_outcome.py
+index 65ee8cf..fbb65c7 100644
+--- a/gascity/tests/test_workflow_outcome.py
++++ b/gascity/tests/test_workflow_outcome.py
+@@ -170,6 +170,10 @@ class ResolveWorkflowOutcomeTest(unittest.TestCase):
+         list_cmd = next(cmd for cmd in runner.calls if cmd[:3] == ["gc", "bd", "list"])
+         self.assertIn("--all", list_cmd)
+         self.assertIn(f"gc.root_bead_id={ROOT_ID}", list_cmd)
++        # Control beads (check, scope-check, gates) are where a workflow's
++        # failure gets recorded, and gc bd list hides them by default.
++        for flag in ("--include-templates", "--include-infra", "--include-gates"):
++            self.assertIn(flag, list_cmd)
+ 
+ 
+ class ReviewGateTest(unittest.TestCase):
+-- 
+2.50.1 (Apple Git-155)
+
