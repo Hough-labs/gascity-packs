@@ -340,6 +340,10 @@ substitute `$GC_BEAD_ID` here — for a polecat that is the convoy the molecule
 was poured on, not this step, and closing it would close work that is still
 live.
 
+Steps 2 and 10 re-derive both ids instead of inheriting them. Run each fenced
+block in its own shell and an inherited variable is empty, which for those two
+blocks degrades exactly into the failure this step is fixing.
+
 **2. Already-submitted guard (idempotent re-entry).**
 
 A re-entered submit-and-exit must not re-write bead state. Step 8 sets the
@@ -350,6 +354,15 @@ present — target recorded, branch on origin at this commit, and the bead hande
 to somebody who is not this session:
 
 ```bash
+# Re-derived rather than inherited: run each block in its own shell and the
+# guard silently degrades to "no evidence" — which is the wrong direction for
+# the one check standing between a respawn and a second pass over bead state.
+CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
+WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
+STEP_SESSION="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
+STEP_BEAD_ID=$(gc bd list --assignee="$STEP_SESSION" --status=in_progress \
+  --metadata-field gc.step_ref=mol-polecat-work.submit-and-exit \
+  --include-infra --limit=0 --json 2>/dev/null | jq -r '.[0].id // empty')
 SUBMITTED_JSON=$(gc bd show "$WORK_BEAD_ID" --json)
 SUBMITTED_TARGET=$(printf '%s' "$SUBMITTED_JSON" | jq -r '.[0].metadata.target // empty')
 SUBMITTED_BRANCH=$(printf '%s' "$SUBMITTED_JSON" | jq -r '.[0].metadata.branch // empty')
@@ -575,6 +588,15 @@ the work on its next poll.
 
 **10. Close this step bead, then signal the reconciler and exit.**
 ```bash
+if [ -z "${STEP_BEAD_ID:-}" ]; then
+    # Step 1 resolved this already; re-resolve rather than trust it, because a
+    # block run in a fresh shell inherits nothing and an unresolved id here is
+    # exactly the open step bead this whole change exists to prevent.
+    STEP_SESSION="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
+    STEP_BEAD_ID=$(gc bd list --assignee="$STEP_SESSION" --status=in_progress \
+      --metadata-field gc.step_ref=mol-polecat-work.submit-and-exit \
+      --include-infra --limit=0 --json 2>/dev/null | jq -r '.[0].id // empty')
+fi
 if [ -n "$STEP_BEAD_ID" ]; then
     gc bd close "$STEP_BEAD_ID" --reason "submit-and-exit: branch pushed, work bead handed to the refinery"
 else

@@ -456,6 +456,25 @@ PY
     [[ "$submit_block" != *'gc bd close "$WORK_BEAD_ID"'* ]] ||
         fail "the polecat never closes the work bead; only the refinery does"
 
+    # An agent may run each fenced block in its own shell, so the two blocks
+    # that decide whether bead state gets re-written must derive their own ids
+    # rather than inherit them and silently degrade to "nothing to close".
+    python3 - "$formula" <<'PY' || fail "the guard and the close must re-derive their ids, not inherit them"
+import sys
+import tomllib
+
+data = tomllib.load(open(sys.argv[1], "rb"))
+step = next(s for s in data["steps"] if s["id"] == "submit-and-exit")
+text = step["description"]
+guard = text[text.index("**2. Already-submitted guard"): text.index("**3. Branch-shape gate")]
+close = text[text.index("**10."):]
+for block in (guard, close):
+    if "--metadata-field gc.step_ref=mol-polecat-work.submit-and-exit" not in block:
+        raise SystemExit(1)
+if "gc convoy status" not in guard:
+    raise SystemExit(1)
+PY
+
     # The close has to happen BEFORE the drain, or the reconciler kills the
     # session first and the step bead is left open exactly as before.
     python3 - "$formula" <<'PY' || fail "submit-and-exit must close its step bead before draining"
