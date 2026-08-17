@@ -398,10 +398,13 @@ handed to somebody else — means submit-and-exit already ran. Otherwise run it:
 EXPECTED_ASSIGNEE="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
 # `$GC_BEAD_ID` is not always exported — it was empty in gcp-rz8a's session, so
 # this guard could not run at all. Recover the convoy from the molecule root of
-# the step bead this session is holding rather than skipping the check.
+# the step bead this session is holding rather than skipping the check. The
+# status filter is `open,in_progress`: a claimed step bead carries this
+# session's assignee but is still stored `open`, so `in_progress` alone matches
+# nothing and the recovery silently yields no convoy.
 CONVOY_ID="${GC_BEAD_ID:-}"
 if [ -z "$CONVOY_ID" ]; then
-  ROOT_BEAD_ID=$(gc bd list --assignee="$EXPECTED_ASSIGNEE" --status=in_progress \
+  ROOT_BEAD_ID=$(gc bd list --assignee="$EXPECTED_ASSIGNEE" --status=open,in_progress \
     --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null |
     jq -r '[.[] | .metadata."gc.root_bead_id" // empty] | .[0] // empty' 2>/dev/null)
   if [ -n "$ROOT_BEAD_ID" ]; then

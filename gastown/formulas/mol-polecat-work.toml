@@ -322,7 +322,7 @@ Hand off your work and self-clean. You cease to exist after this step.
 CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
 WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
 STEP_SESSION="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
-STEP_BEAD_ID=$(gc bd list --assignee="$STEP_SESSION" --status=in_progress \
+STEP_BEAD_ID=$(gc bd list --assignee="$STEP_SESSION" --status=open,in_progress \
   --metadata-field gc.step_ref=mol-polecat-work.submit-and-exit \
   --include-infra --limit=0 --json 2>/dev/null | jq -r '.[0].id // empty')
 if [ -z "$STEP_BEAD_ID" ]; then
@@ -344,6 +344,13 @@ Steps 2 and 10 re-derive both ids instead of inheriting them. Run each fenced
 block in its own shell and an inherited variable is empty, which for those two
 blocks degrades exactly into the failure this step is fixing.
 
+The status filter must be `open,in_progress`, never `in_progress` alone. A
+claimed step bead carries this session's assignee but is still stored `open` —
+observed on gcp-vgmf, assignee `gastown__polecat-gc-ow42y`, status `open`. Ask
+for `in_progress` and the query returns nothing, `STEP_BEAD_ID` is empty, and
+step 10 prints its WARN and leaves the step bead open — the exact respawn loop
+this step exists to close.
+
 **2. Already-submitted guard (idempotent re-entry).**
 
 A re-entered submit-and-exit must not re-write bead state. Step 8 sets the
@@ -360,7 +367,7 @@ to somebody who is not this session:
 CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
 WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
 STEP_SESSION="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
-STEP_BEAD_ID=$(gc bd list --assignee="$STEP_SESSION" --status=in_progress \
+STEP_BEAD_ID=$(gc bd list --assignee="$STEP_SESSION" --status=open,in_progress \
   --metadata-field gc.step_ref=mol-polecat-work.submit-and-exit \
   --include-infra --limit=0 --json 2>/dev/null | jq -r '.[0].id // empty')
 SUBMITTED_JSON=$(gc bd show "$WORK_BEAD_ID" --json)
@@ -593,7 +600,7 @@ if [ -z "${STEP_BEAD_ID:-}" ]; then
     # block run in a fresh shell inherits nothing and an unresolved id here is
     # exactly the open step bead this whole change exists to prevent.
     STEP_SESSION="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
-    STEP_BEAD_ID=$(gc bd list --assignee="$STEP_SESSION" --status=in_progress \
+    STEP_BEAD_ID=$(gc bd list --assignee="$STEP_SESSION" --status=open,in_progress \
       --metadata-field gc.step_ref=mol-polecat-work.submit-and-exit \
       --include-infra --limit=0 --json 2>/dev/null | jq -r '.[0].id // empty')
 fi

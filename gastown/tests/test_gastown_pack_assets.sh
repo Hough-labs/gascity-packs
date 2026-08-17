@@ -456,6 +456,15 @@ PY
     [[ "$submit_block" != *'gc bd close "$WORK_BEAD_ID"'* ]] ||
         fail "the polecat never closes the work bead; only the refinery does"
 
+    # A claimed step bead carries the session's assignee but is still stored
+    # `open` (observed on gcp-vgmf). A query for `in_progress` alone matches
+    # nothing, so STEP_BEAD_ID comes back empty and the close never happens —
+    # the fix reads as applied while the respawn loop stays wide open.
+    [[ "$submit_block" == *'--status=open,in_progress'* ]] ||
+        fail "submit-and-exit must resolve its step bead with --status=open,in_progress"
+    [[ "$submit_block" != *'--status=in_progress '* ]] ||
+        fail "a claimed step bead is stored open; --status=in_progress alone resolves nothing"
+
     # An agent may run each fenced block in its own shell, so the two blocks
     # that decide whether bead state gets re-written must derive their own ids
     # rather than inherit them and silently degrade to "nothing to close".
@@ -552,6 +561,10 @@ PY
             fail "$(basename "$guard") must not read the convoy straight from \$GC_BEAD_ID; it is not always exported"
         grep -F 'gc.root_bead_id' "$guard" >/dev/null ||
             fail "$(basename "$guard") must recover the convoy from the step bead's molecule root"
+        grep -F -- '--status=open,in_progress' "$guard" >/dev/null ||
+            fail "$(basename "$guard") must query the held step bead with --status=open,in_progress"
+        ! grep -F -- '--status=in_progress ' "$guard" >/dev/null ||
+            fail "$(basename "$guard") queries a claimed step bead, which is stored open, not in_progress"
         ! grep -F '[ "$WORK_STATUS" != "in_progress" ]' "$guard" >/dev/null ||
             fail "$(basename "$guard") must not treat an unassigned work bead as already submitted"
         grep -F '[ "$WORK_STATUS" = "closed" ]' "$guard" >/dev/null ||
