@@ -1,0 +1,371 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Mon, 17 Aug 2026 08:45:16 -0400
+Subject: [PATCH 34/34] fix(gastown): stop a parked work bead shadowing the
+ patrol wisp at startup (gcp-tl8)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The refinery and deacon Startup Step 1 blocks were captioned "check for an
+in-progress patrol wisp" but ran `{{ .AssignedInProgressQuery }}` — gc's generic
+"what is in_progress on my hook" expansion, which filters on status and assignee
+only and truncates at `--limit=1`. It answers a different question than the
+caption asks: it returns the first in-progress bead of *any* type assigned to the
+agent, and that single row is all the agent sees.
+
+Observed live on the gascity-packs refinery: work bead gcp-xbl is held
+in_progress under a standing do-not-merge order, so the shipped probe returned
+that bug rather than `gcp-wisp-jv2`, the real `mol-refinery-patrol` wisp. Two
+failures follow. The agent "resumes" formula steps against a bead that carries no
+formula, and because it believes it already holds a wisp it never pours one — so
+the patrol silently stops advancing. When the parked bead is blocked by design
+the condition is permanent, not transient.
+
+gcp-xbl and gcp-ah8h fixed the sibling `--type=molecule` queries (adding
+`--include-infra`, widening `--status`). Neither touches this one: there is no
+`--type` filter here to repair, because the line is a gc-provided expansion with
+no type filter at all. Replaced at both sites with the same resolver the witness
+prompt and the patrol formulas already use —
+`--status=open,in_progress --type=molecule --include-infra --limit=0` — where
+`--type=molecule` is what structurally prevents a work bead from being read as
+the wisp, and `--limit=0` stops the truncation that hid the real wisp below the
+cut. The three patrol-role blocks in propulsion.template.md carried the same
+mislabelled query in prose and are updated to match; the mayor, crew and dog
+blocks in that file keep the generic query, which asks it the question it does
+answer.
+
+Two incidental corrections in the deacon block, both required for the fix to
+hold rather than cleanup: the cold-start pour is now guarded by `if [ -z "$WISP" ]`
+(it previously ran unconditionally, so every restart poured a duplicate), and it
+assigns with `$GC_AGENT` instead of `$GC_ALIAS` so the pour and the probe agree
+on one identity. The refinery prompt already documents why: `$GC_ALIAS` can be
+empty or stale, which is how a refinery once self-polled for 13h42m with seven
+queued beads.
+
+Guarded in tests/test_wisp_molecule_queries.py, which gcp-xbl added but which
+asserted only on lines that already had a `--type` flag — the shape here has none,
+so it is guarded structurally instead: patrol-role prompt assets must not reach
+for the generic hook query at all. Scoping propulsion.template.md needs
+per-`{{ define }}` attribution, and the block scanner depth-counts
+`if`/`range`/`with`/`block` alongside `define` so a nested action cannot end a
+role block early and silently drop every line after it. Both facets have negative
+tests.
+
+Validated: tests/test_wisp_molecule_queries.py 7 passed; go vet, go build,
+go test -race, golangci-lint (0 issues) and validate_registry.py all clean.
+tests/test_no_bare_bd_commands.py::test_shipped_pack_assets_route_beads_commands_through_gc
+fails on this branch and equally on a stashed-clean checkout of the same base —
+pre-existing, untouched by this diff, filed separately.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ gastown/agents/deacon/prompt.template.md      |  33 ++--
+ gastown/agents/refinery/prompt.template.md    |  18 +-
+ .../template-fragments/propulsion.template.md |   6 +-
+ tests/test_wisp_molecule_queries.py           | 159 ++++++++++++++++++
+ 4 files changed, 197 insertions(+), 19 deletions(-)
+
+diff --git a/gastown/agents/deacon/prompt.template.md b/gastown/agents/deacon/prompt.template.md
+index d2622cc..41f24d7 100644
+--- a/gastown/agents/deacon/prompt.template.md
++++ b/gastown/agents/deacon/prompt.template.md
+@@ -54,18 +54,27 @@ Your formula: `mol-deacon-patrol`
+ > **The Universal Propulsion Principle: If you find something on your hook, YOU RUN IT.**
+ 
+ ```bash
+-# Step 1: Check for assigned work
+-{{ .AssignedInProgressQuery }}
+-
+-# Step 2: Nothing? Check mail for attached work
+-gc mail inbox
+-
+-# Step 3: Still nothing? Create patrol wisp (root-only — no child step beads).
+-# Cold-start bootstrap only — no wisp exists yet, so there is no formula step
+-# to read. Every later pour is the formula's own: mol-deacon-patrol step
+-# `next-iteration`, never this line.
+-NEW_WISP=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id')
+-gc bd update "$NEW_WISP" --assignee="$GC_ALIAS"
++# Step 1: Check for an in-progress patrol wisp (town ledger, via gc bd).
++# This MUST be the same resolver mol-deacon-patrol uses, not a generic "what is
++# on my hook" probe. Wisp roots are `issue_type=molecule` and live in the wisps
++# table, so the query needs both --type=molecule and --include-infra: the type
++# filter is what keeps a work bead parked in_progress on your hook from being
++# read as the wisp, and without the infra flag gc bd list skips the wisps table
++# and silently returns nothing. --status must cover both live statuses: wisps
++# are poured `open` and nothing transitions them.
++WISP=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json | jq -r '.[0].id // empty')
++
++if [ -z "$WISP" ]; then
++  # Step 2: Nothing? Check mail for attached work
++  gc mail inbox
++
++  # Step 3: Still nothing? Create patrol wisp (root-only — no child step beads).
++  # Cold-start bootstrap only — no wisp exists yet, so there is no formula step
++  # to read. Every later pour is the formula's own: mol-deacon-patrol step
++  # `next-iteration`, never this line.
++  WISP=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id')
++  gc bd update "$WISP" --assignee="$GC_AGENT"
++fi
+ 
+ # Step 4: Read the formula recipe — these are the steps to execute
+ # (Use 'gc bd formula show' for the recipe on disk; 'gc bd mol show' is
+diff --git a/gastown/agents/refinery/prompt.template.md b/gastown/agents/refinery/prompt.template.md
+index c98e639..08131e9 100644
+--- a/gastown/agents/refinery/prompt.template.md
++++ b/gastown/agents/refinery/prompt.template.md
+@@ -150,15 +150,25 @@ for ORPHAN in $ORPHANS; do
+   # surfaces beads the inbox missed.
+ done
+ 
+-# Step 1: Check for an in-progress patrol wisp
+-{{ .AssignedInProgressQuery }}
++# Step 1: Check for an in-progress patrol wisp (town ledger, via gc bd).
++# This MUST be the same resolver mol-refinery-patrol uses, not a generic "what
++# is on my hook" probe. Wisp roots are `issue_type=molecule` and live in the
++# wisps table, so the query needs both --type=molecule and --include-infra: the
++# type filter is what keeps a parked work bead — e.g. one you are holding
++# in_progress under a do-not-merge order — from being read as the wisp, and
++# without the infra flag gc bd list skips the wisps table and silently returns
++# nothing. --status must cover both live statuses: wisps are poured `open` and
++# nothing transitions them.
++WISP=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json | jq -r '.[0].id // empty')
+ 
+ # If none found, pour one (root-only — no child step beads) and assign it.
+ # This is the cold-start bootstrap only — there is no wisp yet, so there is no
+ # formula step to read. Every LATER pour is the formula's own: use
+ # mol-refinery-patrol step `next-iteration`, never this line.
+-WISP=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id')
+-gc bd update "$WISP" --assignee="$GC_AGENT"
++if [ -z "$WISP" ]; then
++  WISP=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id')
++  gc bd update "$WISP" --assignee="$GC_AGENT"
++fi
+ ```
+ 
+ Then follow the formula. The step descriptions below are your instructions —
+diff --git a/gastown/template-fragments/propulsion.template.md b/gastown/template-fragments/propulsion.template.md
+index 439a356..a60c8aa 100644
+--- a/gastown/template-fragments/propulsion.template.md
++++ b/gastown/template-fragments/propulsion.template.md
+@@ -94,7 +94,7 @@ filed. The refinery can't merge branches you haven't pushed.
+ ## Your Role: The Flywheel
+ 
+ **Your startup behavior:**
+-1. Check for work (`{{ .AssignedInProgressQuery }}`)
++1. Check for an in-progress patrol wisp (`gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json`) — `--type=molecule` is what stops a work bead parked on your hook from being read as the wisp
+ 2. If patrol wisp assigned → EXECUTE immediately (read formula steps)
+ 3. If nothing assigned → Create patrol wisp and execute
+ 
+@@ -116,7 +116,7 @@ heartbeat stopped.
+ ## Your Role: The Pressure Gauge
+ 
+ **Your startup behavior:**
+-1. Check for work (`{{ .AssignedInProgressQuery }}`)
++1. Check for an in-progress patrol wisp (`gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json`) — `--type=molecule` is what stops a work bead parked on your hook from being read as the wisp
+ 2. If patrol wisp assigned → EXECUTE immediately (read formula steps)
+ 3. If nothing assigned → Create patrol wisp and execute
+ 
+@@ -171,7 +171,7 @@ Work flows in as branches. Work flows out as merged commits on the target
+ branch. Your throughput determines how fast the team's work becomes real.
+ 
+ **Your startup behavior:**
+-1. Check for an in-progress patrol wisp (`{{ .AssignedInProgressQuery }}`)
++1. Check for an in-progress patrol wisp (`gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json`) — `--type=molecule` is what stops a work bead parked on your hook from being read as the wisp
+ 2. If found → Resume where you left off (read formula steps, determine current position)
+ 3. If none → Pour a new wisp and assign it to yourself
+ 
+diff --git a/tests/test_wisp_molecule_queries.py b/tests/test_wisp_molecule_queries.py
+index d317d44..77d3ad9 100644
+--- a/tests/test_wisp_molecule_queries.py
++++ b/tests/test_wisp_molecule_queries.py
+@@ -21,6 +21,18 @@ executed lands in its own surplus set, and the loop stops advancing — again wi
+ every command exiting 0. gcp-xbl fixed `--include-infra` at every site and left
+ this facet unfixed at every site, which is precisely why the manual re-grep it
+ relied on is replaced here by a test.
++
++The third facet (gcp-tl8) is the query that has no `--type` to fix in the first
++place. The patrol roles' Startup Step 1 was captioned "check for an in-progress
++patrol wisp" but ran `{{ .AssignedInProgressQuery }}` — a gc-provided expansion
++that lists in-progress beads by assignee, with no type filter at all and a
++`--limit=1` truncation. It returns the first in-progress bead of ANY type on the
++agent's hook, and that one row is all the agent sees. A
++refinery holding a work bead in_progress under a do-not-merge order therefore
++resumed that work bead as its patrol wisp on every restart, with the real wisp
++sorted below the cut and invisible. The two guards above cannot catch it (no
++`--type=molecule` on the line to inspect), so it is guarded structurally
++instead: patrol-role wisp probes must not use the generic hook query at all.
+ """
+ 
+ from __future__ import annotations
+@@ -50,6 +62,34 @@ LIMIT_FLAG = re.compile(r"--limit[= ](\d+)")
+ # them before checking so a flag on the continuation line still counts.
+ LINE_CONTINUATION = re.compile(r"\\\r?\n[ \t]*")
+ 
++# The gc-provided expansion of "what is in_progress on my hook". It is correct
++# for roles whose hook carries work beads (mayor, crew, polecat, dog) and wrong
++# for the patrol roles, whose hook carries a wisp: it has no --type filter, so
++# it cannot tell the two apart.
++GENERIC_HOOK_QUERY = "{{ .AssignedInProgressQuery }}"
++
++# The roles whose startup probe is resolving a patrol wisp, and whose prompt
++# assets therefore must not reach for the generic hook query.
++PATROL_ROLES = ("witness", "refinery", "deacon")
++PATROL_ROLE_PROMPTS = tuple(
++    Path("gastown/agents") / role / "prompt.template.md" for role in PATROL_ROLES
++)
++PROPULSION_FRAGMENT = Path("gastown/template-fragments/propulsion.template.md")
++PATROL_PROPULSION_BLOCKS = tuple(f"propulsion-{role}" for role in PATROL_ROLES)
++
++# `{{ define "name" }}` … `{{ end }}` — propulsion.template.md ships one block
++# per role, so the per-role blocks have to be split out before checking: the
++# non-patrol blocks in the same file use the generic query legitimately.
++# `{{ if }}` / `{{ range }}` / `{{ with }}` / `{{ block }}` close with their own
++# `{{ end }}`, so the block scan has to count them alongside `{{ define }}` —
++# otherwise a nested action ends the enclosing define early and every line after
++# it is attributed to no role and silently skipped.
++TEMPLATE_ACTION = re.compile(
++    r'{{-?\s*(?:define\s+"(?P<define>[^"]+)"'
++    r"|(?P<open>if|range|with|block)\b"
++    r"|(?P<end>end)\s*-?}})"
++)
++
+ 
+ def tracked_files() -> list[Path]:
+     result = subprocess.run(
+@@ -128,6 +168,64 @@ def live_wisp_status_violations(path: Path, text: str) -> list[str]:
+     return violations
+ 
+ 
++def _template_block_names(lines: list[str]) -> list[str | None]:
++    """Name the enclosing `{{ define }}` block for each line, or None outside one.
++
++    Depth-counted rather than paired to the next `{{ end }}`: a `{{ if }}` inside
++    a define closes with its own `{{ end }}`, and a naive pairing would end the
++    block there and stop attributing the rest of it to the role.
++    """
++    names: list[str | None] = []
++    stack: list[str | None] = []
++    for line in lines:
++        actions = list(TEMPLATE_ACTION.finditer(line))
++        opened = next((m.group("define") for m in actions if m.group("define")), None)
++        names.append(opened or next((name for name in reversed(stack) if name), None))
++        for match in actions:
++            if match.group("end"):
++                if stack:
++                    stack.pop()
++            else:
++                stack.append(match.group("define"))
++    return names
++
++
++def generic_hook_query_violations(path: Path, text: str) -> list[str]:
++    """Flag patrol-role wisp probes that resolve the wisp with the generic query.
++
++    `{{ .AssignedInProgressQuery }}` filters on status and assignee only, and
++    truncates at `--limit=1`. Used where the answer must be a patrol wisp, it
++    returns whichever in-progress bead sorts first on the agent's hook — a work
++    bead parked in_progress shadows the wisp completely, and the agent resumes it
++    as though it carried the patrol formula (gcp-tl8).
++
++    Only the patrol roles are constrained. Mayor, crew, polecat, and dog ask this
++    query the question it actually answers ("what work is on my hook?"), so their
++    use of it is correct and stays untouched.
++    """
++    violations = []
++    relative = path.relative_to(REPO_ROOT) if path.is_absolute() else path
++    if relative not in PATROL_ROLE_PROMPTS and relative != PROPULSION_FRAGMENT:
++        return violations
++
++    lines = text.splitlines()
++    blocks = (
++        _template_block_names(lines)
++        if relative == PROPULSION_FRAGMENT
++        else [None] * len(lines)
++    )
++    for index, line in enumerate(lines):
++        if GENERIC_HOOK_QUERY not in line:
++            continue
++        if relative == PROPULSION_FRAGMENT and blocks[index] not in PATROL_PROPULSION_BLOCKS:
++            continue
++        violations.append(
++            f"{relative}:{index + 1}: patrol wisp probe must filter --type=molecule, "
++            f"not the generic hook query: {line.strip()}"
++        )
++    return violations
++
++
+ def test_shipped_molecule_queries_include_infra() -> None:
+     violations = []
+     for path in tracked_files():
+@@ -162,6 +260,67 @@ def test_shipped_live_wisp_queries_cover_open_and_in_progress() -> None:
+     )
+ 
+ 
++def test_patrol_startup_probes_do_not_use_the_generic_hook_query() -> None:
++    violations = []
++    for path in tracked_files():
++        if path.resolve() == THIS_FILE:
++            continue
++        try:
++            text = path.read_text(encoding="utf-8")
++        except UnicodeDecodeError:
++            continue
++        violations.extend(generic_hook_query_violations(path, text))
++
++    assert not violations, (
++        "patrol startup probes that resume a parked work bead as the wisp:\n"
++        + "\n".join(violations)
++    )
++
++
++def test_generic_hook_query_detector_flags_the_gcp_tl8_shape() -> None:
++    broken = f"# Step 1: Check for an in-progress patrol wisp\n{GENERIC_HOOK_QUERY}\n"
++    fixed = (
++        "# Step 1: Check for an in-progress patrol wisp\n"
++        'WISP=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress '
++        "--type=molecule --include-infra --limit=0 --json | jq -r '.[0].id // empty')\n"
++    )
++
++    for role_prompt in PATROL_ROLE_PROMPTS:
++        assert generic_hook_query_violations(role_prompt, broken)
++        assert not generic_hook_query_violations(role_prompt, fixed)
++
++    # A role whose hook genuinely carries work beads asks this query the question
++    # it answers, so its prompt is not scanned at all.
++    assert not generic_hook_query_violations(
++        Path("gastown/agents/polecat/prompt.template.md"), broken
++    )
++
++
++def test_generic_hook_query_detector_scopes_propulsion_by_role_block() -> None:
++    fragment = (
++        '{{ define "propulsion-crew" }}\n'
++        f"1. Check for work (`{GENERIC_HOOK_QUERY}`)\n"
++        "{{ end }}\n"
++        '{{ define "propulsion-refinery" }}\n'
++        f"1. Check for an in-progress patrol wisp (`{GENERIC_HOOK_QUERY}`)\n"
++        "{{ end }}\n"
++    )
++
++    violations = generic_hook_query_violations(PROPULSION_FRAGMENT, fragment)
++    assert len(violations) == 1, violations
++    assert ":5:" in violations[0]  # the refinery block, not the crew block
++
++    # An `{{ if }}` nested in a role block must not end the block early, or every
++    # line after it would be attributed to no role and silently skipped.
++    nested = (
++        '{{ define "propulsion-witness" }}\n'
++        "{{ if .Something }}context{{ end }}\n"
++        f"1. Check for work (`{GENERIC_HOOK_QUERY}`)\n"
++        "{{ end }}\n"
++    )
++    assert generic_hook_query_violations(PROPULSION_FRAGMENT, nested)
++
++
+ def test_live_wisp_detector_flags_the_gcp_ah8h_shape() -> None:
+     fixture = Path("fixture.txt")
+     broken = (
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 13 Aug 2026 17:31:55 -0400
-Subject: [PATCH 22/33] feat(deacon): detect Dolt auto-push outages via
+Subject: [PATCH 22/34] feat(deacon): detect Dolt auto-push outages via
  push-state divergence (gcp-qhx1)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
