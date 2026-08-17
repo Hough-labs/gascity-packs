@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sun, 16 Aug 2026 22:19:20 -0400
+Subject: [PATCH 43/43] fix(github-pr-review): teach finalize how to record an
+ aborted run (gcp-m7dn)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Moving finalize onto the scope body means it now runs on a path it was never
+written for. Before the abort_scope wiring, finalize could only be reached
+through a completed post-comment, so its instruction to record "rendered comment
+path, GitHub comment id/url, mapped outcome" always had values to read. On an
+aborted run those fields are legitimately absent — nothing was rendered, nothing
+was posted, no verdict was mapped — and prose that lists them unconditionally
+invites the same failure this branch exists to close: an operator facing an
+unsatisfiable instruction either blocks or fabricates a value that makes the
+record look complete.
+
+Name the abort path explicitly, tell finalize to record the absent fields as
+absent along with gc.github.review_child_outcome and the diagnostics the scope
+body propagated, and forbid backfilling or carrying a value forward from an
+earlier head SHA.
+
+Also pin its close semantics, which are non-obvious: finalize closes
+gc.outcome=pass on an aborted run, because its own job — writing the record —
+succeeded. The failed scope member is what makes the workflow root resolve to
+fail (resolveFinalizeOutcome aggregates the finalizer's blockers, and
+review-scope is one of them). finalize closing fail would be reserved for a
+record it genuinely could not write.
+
+Extends the scope-wiring test with the finalize abort-path assertions.
+---
+ .../assets/workflows/github-pr-review/finalize.md | 15 +++++++++++++++
+ gascity/tests/test_formula_assets.py              |  7 +++++++
+ 2 files changed, 22 insertions(+)
+
+diff --git a/gascity/assets/workflows/github-pr-review/finalize.md b/gascity/assets/workflows/github-pr-review/finalize.md
+index 4a202c5..5624e61 100644
+--- a/gascity/assets/workflows/github-pr-review/finalize.md
++++ b/gascity/assets/workflows/github-pr-review/finalize.md
+@@ -4,3 +4,18 @@ id, head SHA, review subject path, review report path, rendered comment path,
+ GitHub comment id/url, mapped outcome, launch input URL {{github_pr_url}},
+ artifact root {{artifact_root}}, context path {{context_path}}, post mode
+ {{post_mode}}, and whether this run reused prior head-SHA output.
++
++This step hangs off the `review-scope` body, not off `post-comment`, so it also
++runs when the scope ABORTED — a review workflow that did not succeed, or a human
++gate that rejected the comment. On that path the fields above are legitimately
++absent: there is no rendered comment, no GitHub comment id, and no mapped
++outcome, because nothing was posted. Record them as absent and record why,
++reading `gc.github.review_child_outcome` and the scope body's propagated
++diagnostics. Do NOT invent, backfill, or carry forward a value from an earlier
++head SHA to make the record look complete — the whole point of the abort is that
++this run produced no verdict.
++
++Close this step `gc.outcome=pass` whenever it successfully recorded the result,
++including for an aborted run: this step's own job is to write the record, and
++the failed scope member is what makes the workflow root resolve to fail. Close
++`gc.outcome=fail` only when the record itself could not be written.
+diff --git a/gascity/tests/test_formula_assets.py b/gascity/tests/test_formula_assets.py
+index 6b813e9..b966d43 100755
+--- a/gascity/tests/test_formula_assets.py
++++ b/gascity/tests/test_formula_assets.py
+@@ -3680,6 +3680,13 @@ class FormulaAssetTests(unittest.TestCase):
+         self.assertEqual(steps["finalize"]["needs"], ["review-scope"])
+         self.assertNotIn("gc.scope_ref", steps["finalize"]["metadata"])
+ 
++        # Running on the abort path only helps if finalize knows it can, and
++        # knows not to fabricate the fields that path legitimately lacks.
++        finalize = node_description(root, steps["finalize"])
++        for fragment in ("ABORTED", "gc.github.review_child_outcome", "backfill"):
++            with self.subTest(step="finalize", fragment=fragment):
++                self.assertIn(fragment, finalize)
++
+     def test_github_issue_fix_uses_implementation_plan_artifact_contract(self) -> None:
+         root = pathlib.Path(__file__).resolve().parents[1]
+         text = effective_formula_text(root, "github-issue-fix")
+-- 
+2.50.1 (Apple Git-155)
+
