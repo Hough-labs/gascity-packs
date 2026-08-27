@@ -28,9 +28,12 @@ monitors the WORK layer:
 2. **Per-bead worktree teardown** — reap polecat worktrees whose bead has
    closed. The witness owns BOTH ends of the worktree lifecycle: the crash
    path (orphan recovery) and the happy path (post-merge teardown).
-3. **Refinery queue health** — work beads assigned to refinery, staleness.
-4. **Polecat health** — detect stuck polecats, file warrants for dog pool.
-5. **Help mail** — triage HELP/escalation requests from polecats.
+3. **Polecat home audit** — the OTHER worktree a polecat has. A home has no
+   bead, so the two duties above — and every other guard on the rig — are
+   structurally blind to it (gcp-actg); only a roster-vs-disk diff finds one.
+4. **Refinery queue health** — work beads assigned to refinery, staleness.
+5. **Polecat health** — detect stuck polecats, file warrants for dog pool.
+6. **Help mail** — triage HELP/escalation requests from polecats.
 
 Gate checks and convoy/swarm completion are town-wide concerns handled by
 the deacon, not the per-rig witness.
@@ -590,6 +593,124 @@ Partial cleanup is by design: the work is idempotent, the next cycle resumes
 it, and a witness that starts is worth more than a rig reaped in one pass.
 
 **Exit criteria:** Reaper log reviewed and any non-routine event acted on.
+Continue to `audit-polecat-homes` — do NOT exit the wisp here. The
+`next-iteration` step is the only place that pours the next wisp and burns
+this one."""
+
+[[steps]]
+id = "audit-polecat-homes"
+title = "Audit polecat agent-home worktrees"
+needs = ["reap-merged-worktrees"]
+description = """
+The two steps above cover the per-bead worktree at
+`<polecat-home>/worktrees/<bead-id>` — the crash path and the happy path.
+This step covers the OTHER worktree a polecat has: its persistent agent
+home at `<city>/.gc/worktrees/<rig>/polecats/<agent>`.
+
+**Why it needs a step of its own.** A per-bead worktree is found through
+its bead. A home has NO bead, so every guard the rig owns is structurally
+blind to it (gcp-actg, reported by the gascity witness as gascity-o963):
+
+| Guard | Key | Sees a home? |
+|---|---|---|
+| `polecat-worktree-reap.sh` | path must have a `worktrees/` parent | No — excluded by construction, correctly |
+| `recover-orphaned-beads` | a bead whose `metadata.work_dir` leads there | No — there is no bead |
+| the `work_dir` scan | same key | No — same blindness |
+
+Only a roster-vs-disk diff can see a home, and until this step nothing
+performed one. So `assets/scripts/polecat-home-audit.sh` issues zero
+`gc bd` calls: candidates come from `git worktree list`, ownership from
+`gc session list`. **Do not "improve" it by looking up a bead** — bead
+keying is the shared root of this whole family of blind spots
+(gascity-18kz, gcp-4k6o), and a home's bead lookup can only ever come back
+empty and be misread as "nothing owns it".
+
+**Why it is a formula step and NOT a `pre_start`.** `pre_start` is bounded
+by `[session] setup_timeout` (10s) and SIGKILLed on overrun, which fails
+the whole session start; six of those in an hour latch the supervisor
+circuit breaker and the rig loses its witness (gcp-ntbf, and gcp-oo0v on
+the deacon). The witness already spends most of that budget on the reaper.
+A periodic sweep belongs in a patrol cycle. Do not move it.
+
+**Step 1: Run the sweep.**
+
+Pack assets install into a content-hashed cache directory this step cannot
+name, so resolve the script from this formula's OWN resolved source path:
+it ships beside this formula in the same pack tree, making that the one
+candidate guaranteed present whenever the formula is and version-coherent
+with it. `gc formula list --json` reports that path for every formula gc
+can see, SHA-pinned packs included.
+
+```bash
+CITY="${GC_CITY:-${GC_CITY_PATH:-}}"
+if [ -n "$CITY" ]; then
+    FORMULA_JSON=$(gc formula list --city "$CITY" --json 2>/dev/null)
+else
+    FORMULA_JSON=$(gc formula list --json 2>/dev/null)
+fi
+FORMULA_SRC=$(printf '%s' "$FORMULA_JSON" \
+    | jq -r '.formulas[]? | select(.name == "mol-witness-patrol") | .source // empty' 2>/dev/null \
+    | head -1)
+AUDIT=""
+if [ -n "$FORMULA_SRC" ]; then
+    # <pack>/formulas/mol-witness-patrol.toml -> <pack>/assets/scripts/<sweep>
+    AUDIT="$(dirname "$(dirname "$FORMULA_SRC")")/assets/scripts/polecat-home-audit.sh"
+fi
+# GC_PACK_DIR is exported only when gc invokes a pack command, so it is a
+# fallback and never the primary — depending on it alone is what made the
+# refinery's approval gate permanently unresolvable (gcp-amo).
+if [ ! -x "$AUDIT" ] && [ -n "${GC_PACK_DIR:-}" ]; then
+    AUDIT="$GC_PACK_DIR/assets/scripts/polecat-home-audit.sh"
+fi
+if [ -x "$AUDIT" ]; then
+    "$AUDIT" "$GC_RIG_ROOT" --rig "$GC_RIG"
+else
+    # A sweep that cannot be resolved is itself the finding. Nothing else in
+    # this city watches polecat homes, so say it loudly rather than logging a
+    # silent OK — that silence is the exact failure mode this step exists to
+    # break.
+    echo "polecat-home-audit: sweep not runnable (resolved '$AUDIT'); home worktrees are UNWATCHED this cycle — report it"
+fi
+```
+
+**STAGED ROLLOUT — it is in dry-run today.** Real removal is opt-in
+(`--no-dry-run`) and the invocation above does not pass it, so the sweep
+logs what it WOULD remove and removes nothing. That matches the per-bead
+reaper and the city's posture for the native gascity reaper. Review the
+logged `home_removal_pending` set across several cycles, confirm no live
+home ever appears in it, then add `--no-dry-run` above.
+
+**Step 2: Read the verdicts.** One JSON line per decision, appended to
+`$GC_CITY/.gc/runtime/logs/polecat-home-audit.log`:
+
+```bash
+tail -n 50 "${LOG_DIR:-$GC_CITY/.gc/runtime/logs}/polecat-home-audit.log" | jq -c '{ts,event,agent,reason,detail}'
+```
+
+| Event | Meaning | Action |
+|---|---|---|
+| `home_removal_pending` | Passed every gate; dry-run, so NOT removed | Routine while the rollout is staged — this is the would-remove set to review |
+| `home_removed` | Removed. Routine, and only once `--no-dry-run` is wired | Log only. `worktree-setup.sh` recreates the home when the slot next spawns |
+| `home_removal_failed` | The directory survived removal | Investigate permissions or mounts, mail the mayor — same as `worktree_reap_failed` above |
+| `home_children_kept` | The home holds per-bead worktrees, so removing it would take them too | None — expected. The reaper clears children first; the home becomes eligible on a later cycle |
+| `home_dirty_kept` | Uncommitted work in a home nothing owns | **This is the failure this step exists to prevent.** A respawned namepool slot inherits it and fails submit-and-exit's clean-state check (gascity-vst). Salvage or clear it by hand |
+| `home_unpublished_commits_kept` | Commits reaching no remote, often on a detached HEAD | Investigate by hand. Whether they are superseded takes a CONTENT check at origin — a rebase/squash-merging refinery rewrites hashes, so `git merge-base --is-ancestor` lies here. The sweep deliberately does not guess |
+| `home_owner_unconfirmed` | The roster parsed but this home's liveness query did not answer | Nothing was removed. If it repeats, the roster shape has drifted |
+| `home_roster_unreadable` | `gc session list` failed, timed out, or answered in an unrecognised shape. Nothing was examined | `roster_read_timed_out` → the budget is the suspect first; the detail names the seconds it got. `roster_read_failed`/`roster_unparseable` implicate the roster — check `gc doctor` |
+| `home_status_unreadable` / `home_commits_unreadable` | `git status` / `git rev-list` actually ran in the home and did not answer. `reason` separates `*_timed_out` from `*_failed` | Timed out → budget first. Failed → that checkout is broken or moved; inspect by hand |
+| `home_worktree_list_failed` | `git worktree list` ran and did not answer | Timed out → budget first. Failed → the rig checkout itself is unhealthy |
+| `home_budget_truncated` | A check was NEVER ATTEMPTED — the budget was already spent when it came due. Nothing external failed | Not an outage; do not chase the named subsystem. Read it as "this cycle was too short" |
+| `home_budget_exhausted` | The run hit its wall clock and stopped at the top of the loop | Routine on a rig with many homes; the rest are deferred to the next cycle |
+
+A home occupied by a live polecat is logged as NOTHING — that is the
+healthy state of every working rig, and a line per agent per cycle would
+bury the findings above.
+
+**A `home_dirty_kept` or `home_unpublished_commits_kept` that repeats
+across cycles is a lost-work signal, not routine housekeeping.** Mail the
+mayor, exactly as for `worktree_dirty_kept` in the previous step.
+
+**Exit criteria:** Sweep run, log reviewed, any non-routine event acted on.
 Continue to `check-refinery` — do NOT exit the wisp here. The
 `next-iteration` step is the only place that pours the next wisp and burns
 this one."""
@@ -597,7 +718,7 @@ this one."""
 [[steps]]
 id = "check-refinery"
 title = "Check refinery queue health"
-needs = ["reap-merged-worktrees"]
+needs = ["audit-polecat-homes"]
 description = """
 Ensure the refinery is processing work and the queue is healthy.
 

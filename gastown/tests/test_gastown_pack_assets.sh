@@ -366,6 +366,108 @@ PY
     done < <(grep -oE 'record worktree_[a-z_]+' "$reaper" | awk '{print $2}' | sort -u)
 }
 
+test_polecat_home_teardown_has_an_owner() {
+    # gcp-actg: a polecat's per-bead worktrees have an owner (the step above);
+    # its persistent agent HOME had none. A home carries no bead, so every
+    # guard on the rig — all of them bead-keyed — is structurally blind to it,
+    # and the blindness is invisible in each guard's own diff. This test is the
+    # inventory that says the roster-keyed sweep exists and stays wired.
+    local audit="$GASTOWN/assets/scripts/polecat-home-audit.sh"
+    local witness_cfg="$GASTOWN/agents/witness/agent.toml"
+    local witness_prompt="$GASTOWN/agents/witness/prompt.template.md"
+    local patrol="$GASTOWN/formulas/mol-witness-patrol.toml"
+
+    [[ -f "$audit" ]] || fail "missing polecat agent-home audit sweep"
+    [[ -x "$audit" ]] || fail "home audit sweep must be executable"
+    parse_toml "$witness_cfg" "$patrol"
+
+    # It is a patrol step, NOT a pre_start, and must not drift back. pre_start
+    # is bounded by [session] setup_timeout (10s) and SIGKILLed on overrun; the
+    # witness already spends most of that on the reaper, and an overrun fails
+    # the session start and eventually latches the circuit breaker (gcp-ntbf,
+    # gcp-oo0v). The pack-wide inventory in test_agent_pre_start_budget.sh is
+    # the other half of this guard.
+    ! grep -F 'polecat-home-audit.sh' "$witness_cfg" >/dev/null ||
+        fail "the home audit must not be wired as a witness pre_start; it belongs in the patrol cycle"
+
+    grep -F 'id = "audit-polecat-homes"' "$patrol" >/dev/null ||
+        fail "witness patrol should own a polecat home audit step"
+    grep -F 'needs = ["audit-polecat-homes"]' "$patrol" >/dev/null ||
+        fail "the home audit step must be wired into the patrol chain, not orphaned"
+    grep -F 'Audit polecat agent-home worktrees no live session owns' "$witness_prompt" >/dev/null ||
+        fail "witness prompt should list the home audit as a duty"
+
+    # A formula step cannot name the content-hashed pack cache, so it resolves
+    # the sweep from the formula's own resolved source path — the one candidate
+    # guaranteed present and version-coherent with the formula.
+    grep -F 'gc formula list' "$patrol" >/dev/null ||
+        fail "home audit step must resolve the sweep from the formula's own source path"
+    grep -F 'assets/scripts/polecat-home-audit.sh' "$patrol" >/dev/null ||
+        fail "home audit step must actually run the sweep"
+    grep -F 'UNWATCHED this cycle' "$patrol" >/dev/null ||
+        fail "an unresolvable sweep must be reported as a finding, not a silent OK"
+
+    # THE POINT OF THE BEAD: ownership comes from the session roster and from
+    # nothing in the bead store. A home HAS no bead, so a bead lookup can only
+    # come back empty and be misread as "nothing owns it" — the shared root of
+    # this family of blind spots (gascity-18kz, gcp-4k6o). Comments are dropped
+    # so the header may say what the script does not do.
+    local bead_reads
+    bead_reads=$(grep -nE '(^|[^[:alnum:]_-])gc[[:space:]]+bd([[:space:]]|$)' "$audit" |
+        grep -vE '^[0-9]+:[[:space:]]*#' || true)
+    [[ -z "$bead_reads" ]] ||
+        fail "home audit must not read the bead store: ${bead_reads//$'\n'/ | }"
+    grep -F 'gc session list --state=all --json' "$audit" >/dev/null ||
+        fail "home audit must key ownership on the session roster"
+
+    # The gates are the safety contract; losing any one turns housekeeping into
+    # data loss.
+    grep -F '[ "$(basename "$(dirname "$wt")")" = "polecats" ]' "$audit" >/dev/null ||
+        fail "home audit must restrict candidates to polecat agent homes"
+    grep -F 'record home_children_kept' "$audit" >/dev/null ||
+        fail "home audit must defer a home that still hosts per-bead worktrees; a LIVE polecat from another slot can be working inside a dead home's subtree (gcp-actg)"
+    grep -F 'git -C "$WT" status --porcelain' "$audit" >/dev/null ||
+        fail "home audit must refuse to remove a home with uncommitted work"
+    grep -F 'git -C "$WT" rev-list --count HEAD --not --remotes' "$audit" >/dev/null ||
+        fail "home audit must refuse to remove a home holding commits that reach no remote; unlike a per-bead worktree there is no closed bead to prove the work landed"
+
+    # Fail closed on the roster, the same rule the reaper's gate 4 carries: a
+    # confirmation read that fails is not proof of absence, and reading it as
+    # an empty roster clears every home on the rig at once.
+    ! grep -F '{"sessions":[]}' "$audit" >/dev/null ||
+        fail "home audit must not fall back to an empty session roster; that makes the ownership gate fail open"
+    grep -F 'ROSTER_STATE="unconfirmed"' "$audit" >/dev/null ||
+        fail "home audit must seed the roster state to unconfirmed and promote it only on a clean read"
+    grep -F 'record home_roster_unreadable' "$audit" >/dev/null ||
+        fail "home audit must report and stop when the roster cannot be read"
+
+    # Staged rollout: dry run is the default and the patrol wiring must not opt
+    # in, so real removal cannot begin on a pin bump alone.
+    grep -x -F 'DRY_RUN=1' "$audit" >/dev/null ||
+        fail "home audit must default to dry run"
+    grep -F -- '--no-dry-run) DRY_RUN=0 ;;' "$audit" >/dev/null ||
+        fail "home audit must make real removal opt-in behind --no-dry-run"
+    ! grep -F -- '"$AUDIT" "$GC_RIG_ROOT" --rig "$GC_RIG" --no-dry-run' "$patrol" >/dev/null ||
+        fail "the patrol invocation must not enable live removal while the rollout is staged"
+
+    # The sweep cleans up around the canonical checkout; it must never write
+    # into it.
+    ! grep -F 'LOG_DIR="$RIG_ROOT' "$audit" >/dev/null ||
+        fail "home audit must not default its log inside the rig repo"
+
+    # The log is forensics, so a line must carry the time of ITS OWN event.
+    grep -F -e '--arg ts "$(date -u' "$audit" >/dev/null ||
+        fail "home audit must stamp each log line when the event happens, not once at the start of the run"
+
+    # And the witness must be able to explain every line it can be handed.
+    local ev
+    while IFS= read -r ev; do
+        [[ -n "$ev" ]] || continue
+        grep -F "\`$ev\`" "$patrol" >/dev/null ||
+            fail "home audit event $ev has no entry in the mol-witness-patrol log-review table"
+    done < <(grep -oE 'record home_[a-z_]+' "$audit" | awk '{print $2}' | sort -u)
+}
+
 test_dolt_push_outage_detection_is_wired() {
     local check="$GASTOWN/assets/scripts/dolt-push-state-check.sh"
     local deacon_cfg="$GASTOWN/agents/deacon/agent.toml"
@@ -576,6 +678,7 @@ test_dog_assets_are_pack_local
 test_retired_dog_formulas_are_not_reintroduced
 test_submit_and_exit_cannot_be_replayed
 test_post_merge_worktree_teardown_has_an_owner
+test_polecat_home_teardown_has_an_owner
 test_dolt_push_outage_detection_is_wired
 test_shutdown_dance_contracts_are_executable
 test_shutdown_dance_lifecycle_and_audit_contracts

@@ -17,6 +17,8 @@
 Your job:
 - Recover orphaned beads (agents that won't spawn anymore)
 - Reap per-bead polecat worktrees once their bead closes
+- Audit polecat agent-home worktrees no live session owns (a home has no
+  bead, so nothing keyed on one can see it)
 - Monitor refinery queue health
 - Detect stuck polecats (alive but not progressing)
 - Triage help requests from polecats
