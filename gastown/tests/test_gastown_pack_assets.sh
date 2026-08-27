@@ -700,12 +700,15 @@ test_prime_prompts_are_city_generic_and_compact() {
         fail "operational awareness must fail closed when endpoint discovery fails"
     grep -F 'run_bounded() {' "$awareness" >/dev/null ||
         fail "operational awareness should define a portable diagnostic timeout helper"
-    grep -F 'run_bounded 5 gc dolt sql' "$awareness" >/dev/null ||
-        fail "operational awareness should bound the process-list diagnostic"
+    # Steps 1 and 4 dial the resolved endpoint directly, not through `gc`:
+    # gc's own startup (measured 5-23s here, gascity-8tvt) cannot fit a bound
+    # small enough to tell a wedged server from a slow CLI (gcp-02bn).
+    grep -F 'run_bounded 10 dolt --host "$DOLT_HOST" --port "$DOLT_PORT"' "$awareness" >/dev/null ||
+        fail "operational awareness should bound the process-list diagnostic at the resolved endpoint"
     grep -F 'run_bounded 60 gc dolt health --json' "$awareness" >/dev/null ||
         fail "operational awareness should bound the health diagnostic"
-    grep -F 'run_bounded 10 gc dolt status' "$awareness" >/dev/null ||
-        fail "operational awareness should bound the status diagnostic"
+    [[ "$(grep -c -F 'run_bounded 10 dolt --host "$DOLT_HOST" --port "$DOLT_PORT"' "$awareness")" -ge 2 ]] ||
+        fail "operational awareness should bound the reachability diagnostic at the resolved endpoint"
     grep -F 'python3 - "$bound_seconds" "$@"' "$awareness" >/dev/null ||
         fail "operational awareness should use the portable Python timeout fallback"
     grep -F 'process.wait(timeout=2)' "$awareness" >/dev/null ||
@@ -727,7 +730,7 @@ test_prime_prompts_are_city_generic_and_compact() {
     helper="$(sed -n '/^run_bounded() {$/,/^}$/p' "$awareness")"
     [[ -n "$helper" ]] ||
         fail "run_bounded helper not found between 'run_bounded() {' and its closing brace"
-    [[ "$helper" != *'run_bounded 5 gc dolt sql'* ]] ||
+    [[ "$helper" != *'SHOW FULL PROCESSLIST'* ]] ||
         fail "run_bounded helper extraction overshot its closing brace anchor"
 
     helper_rc=0
