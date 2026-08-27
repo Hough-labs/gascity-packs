@@ -1,0 +1,1681 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 27 Aug 2026 16:15:30 -0400
+Subject: [PATCH 44/45] fix(gastown): give polecat agent-home worktrees a
+ teardown owner (gcp-actg)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A polecat has two kinds of worktree. The per-bead one at
+<home>/worktrees/<bead-id> is found through its bead, and
+polecat-worktree-reap.sh reaps it once that bead closes. The persistent
+agent HOME at <city>/.gc/worktrees/<rig>/polecats/<agent> has no bead at
+all — so every guard the rig owns, all of them bead-keyed, is
+structurally blind to it: the reaper excludes homes by construction (its
+gate 1 requires a `worktrees/` parent segment), and recover-orphaned-beads
+and the work_dir scan both key on a bead whose metadata.work_dir leads to
+the worktree. Only a roster-vs-disk diff can see a home, and no step
+prescribed one. Reported by the gascity witness as gascity-o963 and
+verified by the mayor before filing; the same blindness had already
+produced gascity-vst on the nux home.
+
+Nothing was at risk in either instance, but home paths are deterministic
+per namepool slot: respawn the slot and the new polecat inherits somebody
+else's abandoned checkout, and a non-empty `git status --porcelain` is
+exactly what fails submit-and-exit's clean-state check.
+
+This adds assets/scripts/polecat-home-audit.sh, a sweep that issues ZERO
+`gc bd` calls — candidates come from `git worktree list`, ownership from
+`gc session list` — and wires it as the new `audit-polecat-homes` step in
+mol-witness-patrol. Bead keying is the shared root of this whole family
+(gascity-18kz, gcp-4k6o), so a bead lookup here would rebuild the bug;
+test_gastown_pack_assets.sh now asserts the script contains none.
+
+Four gates, all of which must hold before a home is removed: the path is
+`.../polecats/<agent>`; no live session matches the home (on its own
+work_dir, or on `<rig>/<agent>` derived from the path); the home hosts no
+per-bead child worktrees; and the checkout is clean with nothing
+unpublished. The child gate is THE TRAP the bead warns about — when this
+was filed, gascity/gastown.rictus was alive and working inside the DEAD
+gascity/gastown.furiosa home's subtree, so a naive "home + no session ->
+remove" sweep deletes a live polecat's working tree. Any child at all
+defers the home, because resolving a child's owner means reading its
+bead. Unlike the per-bead reaper this DOES gate on unpublished commits:
+that reaper can skip the check because a closed bead is the refinery's
+own proof the work landed, and a home has no bead to close — the furiosa
+home sat on a detached HEAD holding two commits that belonged to no
+branch, and establishing they were superseded took reading content at
+origin, which a sweep must not attempt. Those are reported, never
+removed. An unreadable session roster ends the run with nothing removed:
+reading a failed confirmation as an empty roster is how a sweep concludes
+nobody owns anything and clears every home on the rig.
+
+It is a patrol step and NOT a pre_start, deliberately. pre_start is
+bounded by [session] setup_timeout and SIGKILLed on overrun, which fails
+the whole session start and latches the supervisor circuit breaker after
+six failures (gcp-ntbf on the witness, gcp-oo0v on the deacon); the
+witness already spends most of that budget on the reaper. It resolves
+itself from the formula's own source path, the way mol-deacon-patrol's
+detector does. Real removal stays opt-in behind --no-dry-run, matching
+the per-bead reaper and the city's posture for the native gascity reaper,
+and the patrol invocation does not pass it.
+
+Validation: gastown/tests/test_polecat_home_audit.sh, 11 cases covering
+the trap, both ownership keys, the unpublished/detached-HEAD report, the
+zero-bead-reads assertion, roster fail-closed, budget truncation, and the
+ran-vs-never-ran distinction in the log. All gastown shell tests pass,
+plus a dry run against the live gascity-packs rig: 4 homes, correctly
+skipping the live occupant and two dirty ones.
+
+Follow-up: two pre-existing test failures on this tree
+(tests/test_no_bare_bd_commands.py and gascity test_formula_assets.py)
+reproduce unchanged at the fork point ef98960 and are untouched here.
+---
+ gastown/agents/witness/prompt.template.md    |   2 +
+ gastown/assets/scripts/polecat-home-audit.sh | 639 ++++++++++++++++++
+ gastown/formulas/mol-witness-patrol.toml     | 129 +++-
+ gastown/tests/test_gastown_pack_assets.sh    | 103 +++
+ gastown/tests/test_polecat_home_audit.sh     | 656 +++++++++++++++++++
+ 5 files changed, 1525 insertions(+), 4 deletions(-)
+ create mode 100755 gastown/assets/scripts/polecat-home-audit.sh
+ create mode 100755 gastown/tests/test_polecat_home_audit.sh
+
+diff --git a/gastown/agents/witness/prompt.template.md b/gastown/agents/witness/prompt.template.md
+index 3a61292..e4bca78 100644
+--- a/gastown/agents/witness/prompt.template.md
++++ b/gastown/agents/witness/prompt.template.md
+@@ -17,6 +17,8 @@
+ Your job:
+ - Recover orphaned beads (agents that won't spawn anymore)
+ - Reap per-bead polecat worktrees once their bead closes
++- Audit polecat agent-home worktrees no live session owns (a home has no
++  bead, so nothing keyed on one can see it)
+ - Monitor refinery queue health
+ - Detect stuck polecats (alive but not progressing)
+ - Triage help requests from polecats
+diff --git a/gastown/assets/scripts/polecat-home-audit.sh b/gastown/assets/scripts/polecat-home-audit.sh
+new file mode 100755
+index 0000000..3af363d
+--- /dev/null
++++ b/gastown/assets/scripts/polecat-home-audit.sh
+@@ -0,0 +1,639 @@
++#!/usr/bin/env bash
++# polecat-home-audit.sh — find polecat AGENT-HOME worktrees no live session owns.
++#
++# The blind spot this closes (gcp-actg, reported as gascity-o963):
++#   A polecat has TWO kinds of worktree. The per-bead one at
++#   <home>/worktrees/<bead-id> is found through its bead, and
++#   polecat-worktree-reap.sh reaps it once that bead closes. The persistent
++#   agent HOME at <city>/.gc/worktrees/<rig>/polecats/<agent> has no bead at
++#   all — so every existing guard, all of which key on a bead, is structurally
++#   blind to it:
++#     - polecat-worktree-reap.sh    excludes homes by construction (its gate 1
++#                                   requires a `worktrees/` parent segment).
++#     - recover-orphaned-beads      keys on a bead whose metadata.work_dir
++#                                   leads to the worktree.
++#     - the work_dir scan           same key, same blindness.
++#   Only a roster-vs-disk diff can see a home, and nothing performed one.
++#
++# Why it matters even though a stranded home loses nothing: home paths are
++# deterministic per namepool slot. Respawn the same slot and the new polecat
++# inherits somebody else's abandoned checkout — and a non-empty
++# `git status --porcelain` is exactly what fails submit-and-exit's clean-state
++# check. Two instances so far, in two different homes (gascity-vst on nux, and
++# the gascity furiosa home this bead was filed from: 61 dirty paths, detached
++# HEAD, no session in any state).
++#
++# Deliberately keyed on NOTHING from the bead store. This script issues zero
++# `gc bd` calls: the candidate set comes from `git worktree list`, and
++# ownership from the session roster. Keying a home guard on bead fields is the
++# shared root of this whole family of blind spots (gascity-18kz, gcp-4k6o), so
++# reintroducing it here would rebuild the bug the script exists to fix.
++#
++# THE TRAP — a home with no session is NOT automatically disposable:
++#   When this was filed, `gascity/gastown.rictus` was alive and working inside
++#   the DEAD `gascity/gastown.furiosa` home's subtree, at
++#   .../polecats/gastown.furiosa/worktrees/gascity-g7nf. A naive
++#   "home + no session -> remove" sweep deletes a live polecat's working tree
++#   out from under it. So a home with ANY per-bead child on disk is deferred,
++#   whoever owns that child. Resolving each child's owner would mean reading
++#   the child's bead — the exact bead-keying this script refuses — and the
++#   conservative rule needs no such read: children belong to
++#   polecat-worktree-reap.sh, and once it has cleared them the home becomes
++#   eligible on a later cycle. Deferring costs a cycle; guessing costs a
++#   working tree.
++#
++# Gates — ALL must hold before a home is removed:
++#   1. Path shape is a polecat agent home: .../polecats/<agent>, i.e. the
++#      parent directory is literally `polecats`. That excludes the per-bead
++#      worktrees (parent `worktrees`), the rig root, and every non-polecat
++#      agent's worktree. The candidate sets of this script and the per-bead
++#      reaper are disjoint by construction.
++#   2. The session roster holds no LIVE session for this home — matched on the
++#      session's own `work_dir`, and on `<rig>/<agent>` derived from the path.
++#      The roster is the only ownership key here, so a read that fails, times
++#      out or does not parse ends the whole run with nothing removed: an
++#      unreadable roster is not an empty one, and reading it as empty is how a
++#      sweep concludes that nobody owns anything and clears every home on the
++#      rig. That is mol-witness-patrol's absent-confirm discipline (gcp-g98) —
++#      a confirmation read that fails is not proof of absence.
++#   3. The home holds no per-bead child worktrees — THE TRAP above.
++#   4. `git status --porcelain` is empty AND `git rev-list HEAD --not --remotes`
++#      is empty. Unlike the per-bead reaper, this script DOES gate on
++#      unpublished commits: that reaper can skip the check because a closed
++#      bead is the refinery's own proof the work landed, and a home has no bead
++#      to close. The furiosa home was on a DETACHED HEAD holding two commits
++#      that belonged to no branch; establishing they were superseded took
++#      reading content at origin, which a sweep must not attempt on its own.
++#      So unbranched commits are REPORTED, never silently removed.
++#
++# Staged rollout: REAL REMOVAL IS OPT-IN, matching the per-bead reaper and the
++# city's posture for the native gascity reaper. Without --no-dry-run this
++# reports what it WOULD remove and removes nothing. Flip it only after the
++# logged would-remove set has been reviewed across several patrol cycles.
++#
++# NOT a pre_start, and it must not become one. It is invoked from
++# mol-witness-patrol's `audit-polecat-homes` step. `pre_start` is bounded by
++# [session] setup_timeout (10s) and SIGKILLed on overrun, which fails the whole
++# session start and, after six failures in an hour, latches the supervisor
++# circuit breaker so the agent never returns (gcp-ntbf on the witness,
++# gcp-oo0v on the deacon). The witness already spends most of that budget on
++# polecat-worktree-reap.sh. A periodic sweep belongs in a patrol cycle, which
++# is also where it gets a budget generous enough to walk every home in one go.
++# It still enforces its own wall clock: a patrol step that hangs stalls a
++# patrol, and partial work here is free because the sweep is idempotent.
++#
++# Output: one JSON line per decision appended to LOG_FILE, plus a human
++# summary on stdout. Same log schema as polecat-worktree-reap.log — `ts` is
++# stamped at the event, `run_started` groups lines into cycles,
++# `budget_remaining` shows whether a decision was the clock's, and `reason` is
++# the machine-readable WHY, separating "the command ran and failed" from "the
++# command never ran".
++#
++# Env / args:
++#   $1 | GC_RIG_ROOT   rig repo root (default: `git rev-parse --show-toplevel`)
++#   --rig <name>       rig name, recorded on every log line. Defaults to $GC_RIG.
++#   LOG_DIR            where to write the log. Defaults to the city runtime log
++#                      directory; NEVER defaults inside the rig repo, which
++#                      would litter the canonical checkout with untracked files.
++#   --dry-run          report what would be removed, remove nothing (the default)
++#   --no-dry-run       opt in to real removal
++#   --budget <secs> | GC_HOME_AUDIT_BUDGET_SECONDS
++#                      wall-clock budget for the whole run (default 20s).
++#
++# Usage:
++#   GC_RIG=helm polecat-home-audit.sh                       # report only
++#   polecat-home-audit.sh /path/to/rig --rig helm --no-dry-run
++
++set -euo pipefail
++
++# Dry run is the default; real removal must be asked for. See the staged
++# rollout note in the header.
++DRY_RUN=1
++RIG_ROOT=""
++RIG_NAME="${GC_RIG:-}"
++# A patrol step, not a pre_start, so this is not held to setup_timeout — but a
++# sweep that can hang stalls a patrol cycle, so it still spends one wall clock.
++BUDGET_SECONDS="${GC_HOME_AUDIT_BUDGET_SECONDS:-20}"
++
++while [ "$#" -gt 0 ]; do
++    case "$1" in
++        --dry-run) DRY_RUN=1 ;;
++        --no-dry-run) DRY_RUN=0 ;;
++        --rig)
++            shift
++            [ "$#" -gt 0 ] || { echo "polecat-home-audit: --rig needs a value" >&2; exit 2; }
++            RIG_NAME="$1"
++            ;;
++        --budget)
++            shift
++            [ "$#" -gt 0 ] || { echo "polecat-home-audit: --budget needs a value" >&2; exit 2; }
++            BUDGET_SECONDS="$1"
++            ;;
++        -*) echo "polecat-home-audit: unknown flag $1" >&2; exit 2 ;;
++        *) RIG_ROOT="$1" ;;
++    esac
++    shift
++done
++
++case "$BUDGET_SECONDS" in
++    '' | *[!0-9]* | 0)
++        echo "polecat-home-audit: budget must be a positive whole number of seconds" >&2
++        exit 2
++        ;;
++esac
++
++if [ -z "$RIG_ROOT" ]; then
++    RIG_ROOT="${GC_RIG_ROOT:-}"
++fi
++if [ -z "$RIG_ROOT" ]; then
++    RIG_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
++fi
++if [ -z "$RIG_ROOT" ] || [ ! -d "$RIG_ROOT" ]; then
++    echo "polecat-home-audit: rig root not found (pass it as \$1 or set GC_RIG_ROOT)" >&2
++    exit 2
++fi
++
++# Log destination, in descending order of confidence. The rig repo is
++# deliberately absent from this list: a sweep that cleans up around the
++# canonical checkout must never leave untracked files inside it.
++if [ -n "${LOG_DIR:-}" ]; then
++    :
++elif [ -n "${GC_CITY_RUNTIME_DIR:-}" ]; then
++    LOG_DIR="$GC_CITY_RUNTIME_DIR/logs"
++elif [ -n "${GC_CITY:-}" ]; then
++    LOG_DIR="$GC_CITY/.gc/runtime/logs"
++else
++    LOG_DIR="${TMPDIR:-/tmp}/gc-polecat-home-audit"
++fi
++LOG_FILE="$LOG_DIR/polecat-home-audit.log"
++# Housekeeping must never take a patrol down with it: every failure below
++# degrades to a clean exit 0.
++if ! mkdir -p "$LOG_DIR" 2>/dev/null || ! touch "$LOG_FILE" 2>/dev/null; then
++    echo "polecat-home-audit: cannot write $LOG_FILE; skipping this run" >&2
++    exit 0
++fi
++
++RUN_STARTED=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
++START_EPOCH=$(date +%s)
++
++# Seconds left in this run's budget, floored at 0. Every external command is
++# bounded by this, so no single hung call can outlive the budget either.
++budget_left() {
++    local left=$((BUDGET_SECONDS - ($(date +%s) - START_EPOCH)))
++    if [ "$left" -lt 0 ]; then
++        left=0
++    fi
++    printf '%s\n' "$left"
++}
++
++TIMEOUT_BIN=""
++if command -v timeout >/dev/null 2>&1; then
++    TIMEOUT_BIN=timeout
++elif command -v gtimeout >/dev/null 2>&1; then
++    TIMEOUT_BIN=gtimeout
++fi
++
++# run_bounded <seconds> <cmd...> — run a command under a hard time limit,
++# returning 124 if it does not finish in time (matching timeout(1)).
++#
++# The fallback matters: coreutils `timeout` is not on a stock macOS, and it
++# actually kills rather than merely giving up on waiting.
++#
++# NOTE FOR CALLERS: a 124 from here means one of two very different things —
++# the command ran and overran, or the budget was already spent so it NEVER RAN.
++# Pass the limit you gave and the code you got to classify_outcome and report
++# what it says. Do not describe a 124 as a failure of the command.
++run_bounded() {
++    local limit="$1"
++    shift
++    if [ "$limit" -le 0 ]; then
++        return 124
++    fi
++    if [ -n "$TIMEOUT_BIN" ]; then
++        local rc=0
++        "$TIMEOUT_BIN" "$limit" "$@" || rc=$?
++        return "$rc"
++    fi
++    local pid waited=0 rc=0
++    "$@" &
++    pid=$!
++    while kill -0 "$pid" 2>/dev/null; do
++        if [ "$waited" -ge "$limit" ]; then
++            kill -TERM "$pid" 2>/dev/null || true
++            sleep 1
++            kill -KILL "$pid" 2>/dev/null || true
++            wait "$pid" 2>/dev/null || true
++            return 124
++        fi
++        sleep 1
++        waited=$((waited + 1))
++    done
++    wait "$pid" || rc=$?
++    return "$rc"
++}
++
++# classify_outcome <limit-given> <exit-code> — name what actually happened to a
++# bounded call: `skipped` (the budget was already spent, so the command never
++# ran), `timeout` (it ran and was killed at the limit), `failed` (it ran and
++# exited non-zero), `ok`.
++#
++# The limit is an argument rather than global state because several call sites
++# capture stdout in a command substitution, and anything run_bounded set about
++# itself would die with that subshell.
++classify_outcome() {
++    if [ "$1" -le 0 ]; then
++        printf 'skipped\n'
++    elif [ "$2" -eq 124 ]; then
++        printf 'timeout\n'
++    elif [ "$2" -ne 0 ]; then
++        printf 'failed\n'
++    else
++        printf 'ok\n'
++    fi
++}
++
++record() {
++    # record <event> <agent> <worktree> <detail> [reason]
++    #
++    # `ts` is stamped HERE, at the moment of the event, not at the run's start:
++    # a log where every line carries the start stamp cannot show that a cycle
++    # spent its whole budget, or in what order. `budget_remaining` is read at
++    # record time, so a line reporting 0 is self-evidently the clock's doing.
++    #
++    # The subject of a line is the AGENT whose home it is, not a bead — this
++    # script never learns a bead id, and inventing one would misdirect anybody
++    # who grepped the log for it.
++    jq -cn \
++        --arg ts "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
++        --arg run_started "$RUN_STARTED" \
++        --arg event "$1" \
++        --arg rig "$RIG_NAME" \
++        --arg agent "$2" \
++        --arg worktree "$3" \
++        --arg detail "$4" \
++        --arg reason "${5:-}" \
++        --argjson budget_remaining "$(budget_left)" \
++        --argjson dry_run "$DRY_RUN" \
++        '{ts:$ts, run_started:$run_started, event:$event, rig:$rig, agent:$agent,
++          worktree:$worktree, detail:$detail, reason:$reason,
++          budget_remaining:$budget_remaining, dry_run:($dry_run == 1)}' \
++        >>"$LOG_FILE"
++    echo "$1 $2 $3${4:+ ($4)}"
++}
++
++# Clear metadata for worktrees already removed from disk so the candidate list
++# reflects reality rather than stale administrative entries.
++run_bounded "$(budget_left)" git -C "$RIG_ROOT" worktree prune >/dev/null 2>&1 || true
++
++WT_LIST_LIMIT=$(budget_left)
++WT_LIST_RC=0
++WT_LIST=$(run_bounded "$WT_LIST_LIMIT" git -C "$RIG_ROOT" worktree list --porcelain 2>/dev/null) || WT_LIST_RC=$?
++WT_LIST_OUTCOME=$(classify_outcome "$WT_LIST_LIMIT" "$WT_LIST_RC")
++if [ "$WT_LIST_OUTCOME" != ok ]; then
++    # "no polecat homes under $RIG_ROOT" is a claim about the rig. A run that
++    # never got the list is not entitled to make it.
++    case "$WT_LIST_OUTCOME" in
++        skipped)
++            record home_budget_truncated "" "" \
++                "the ${BUDGET_SECONDS}s budget was spent before the worktree list was read; no candidate was enumerated" \
++                budget_spent_before_worktree_list
++            echo "polecat-home-audit: budget spent before enumerating worktrees; examined=0 (log: $LOG_FILE)"
++            ;;
++        timeout)
++            record home_worktree_list_failed "" "" \
++                "git worktree list did not answer within the ${WT_LIST_LIMIT}s left of the ${BUDGET_SECONDS}s budget" \
++                worktree_list_timed_out
++            echo "polecat-home-audit: worktree list did not answer within ${WT_LIST_LIMIT}s; examined=0 (log: $LOG_FILE)"
++            ;;
++        *)
++            record home_worktree_list_failed "" "" \
++                "git worktree list exited $WT_LIST_RC in $RIG_ROOT" \
++                worktree_list_failed
++            echo "polecat-home-audit: worktree list failed (exit $WT_LIST_RC); examined=0 (log: $LOG_FILE)"
++            ;;
++    esac
++    exit 0
++fi
++
++CANDIDATES=$(printf '%s\n' "$WT_LIST" \
++    | sed -n 's/^worktree //p' \
++    | while IFS= read -r wt; do
++        # Gate 1: polecat AGENT HOME shape. The parent directory must be
++        # literally `polecats`, which admits `.../polecats/<agent>` and nothing
++        # else — not the per-bead worktrees one level deeper (parent
++        # `worktrees`, and polecat-worktree-reap.sh's business), not the rig
++        # root, not another agent's worktree.
++        case "$wt" in
++            */polecats/*) ;;
++            *) continue ;;
++        esac
++        [ "$(basename "$(dirname "$wt")")" = "polecats" ] || continue
++        printf '%s\n' "$wt"
++    done || true)
++
++if [ -z "$CANDIDATES" ]; then
++    echo "polecat-home-audit: no polecat agent homes under $RIG_ROOT"
++    exit 0
++fi
++
++TOTAL=$(printf '%s\n' "$CANDIDATES" | grep -c . || true)
++
++SESSIONS_FILE=$(mktemp)
++trap 'rm -f "$SESSIONS_FILE"' EXIT
++
++# The session roster is the ONLY ownership key here, so it is fetched up front
++# rather than lazily: unlike the per-bead reaper, which can decide most
++# candidates on bead status alone, every candidate in this sweep needs it.
++#
++# A roster read that FAILS is not proof the owning session is gone. The state
++# starts at `unconfirmed` and is promoted only on a read that exited 0, wrote a
++# non-empty file, AND parsed as the expected shape; every failure path then
++# falls through to skip-this-home with no route to a removal. That is
++# mol-witness-patrol's absent-confirm discipline (gcp-g98): a confirmation read
++# that fails is not proof of absence.
++ROSTER_STATE="unconfirmed"
++ROSTER_REASON="roster_read_failed"
++
++ROSTER_LIMIT=$(budget_left)
++ROSTER_RC=0
++run_bounded "$ROSTER_LIMIT" gc session list --state=all --json >"$SESSIONS_FILE" 2>/dev/null || ROSTER_RC=$?
++case "$(classify_outcome "$ROSTER_LIMIT" "$ROSTER_RC")" in
++    skipped) ROSTER_REASON="budget_spent_before_roster_read" ;;
++    timeout) ROSTER_REASON="roster_read_timed_out" ;;
++    failed) ROSTER_REASON="roster_read_failed" ;;
++    *)
++        # `gc session list --json` returns an OBJECT ({sessions:[...]}), not a
++        # top-level array, and its fields are lowercase snake_case — the same
++        # schema facts mol-witness-patrol's liveness map depends on.
++        if [ -s "$SESSIONS_FILE" ] && jq -e '(.sessions | type) == "array"' "$SESSIONS_FILE" >/dev/null 2>&1; then
++            ROSTER_STATE="readable"
++            ROSTER_REASON=""
++        else
++            ROSTER_REASON="roster_unparseable"
++        fi
++        ;;
++esac
++
++if [ "$ROSTER_STATE" != readable ]; then
++    # The roster is the ONLY ownership key here, so a run without it cannot
++    # decide a single candidate — the same shape the per-bead reaper takes when
++    # its one bulk bead read comes back unusable. Report it once, at run level,
++    # and stop: a per-candidate line would repeat one fact $TOTAL times and
++    # still say nothing more. Reported, never inferred — an unreadable roster
++    # is not an empty one, and treating it as empty is how a sweep concludes
++    # that nobody owns anything and removes every home on the rig.
++    case "$ROSTER_REASON" in
++        budget_spent_before_roster_read)
++            record home_budget_truncated "" "" \
++                "the ${BUDGET_SECONDS}s budget was spent before the session roster was read; 0 of $TOTAL candidate(s) examined, $TOTAL deferred" \
++                "$ROSTER_REASON"
++            echo "polecat-home-audit: budget spent before the roster read; examined=0 deferred=$TOTAL of $TOTAL (log: $LOG_FILE)"
++            ;;
++        roster_read_timed_out)
++            record home_roster_unreadable "" "" \
++                "gc session list did not answer within the ${ROSTER_LIMIT}s left of the ${BUDGET_SECONDS}s budget; a read cut short is not proof of absence" \
++                "$ROSTER_REASON"
++            echo "polecat-home-audit: roster read timed out after ${ROSTER_LIMIT}s of the ${BUDGET_SECONDS}s budget; examined=0 of $TOTAL (log: $LOG_FILE)"
++            ;;
++        *)
++            record home_roster_unreadable "" "" \
++                "session roster unreadable ($ROSTER_REASON); a failed read is not proof of absence" \
++                "$ROSTER_REASON"
++            echo "polecat-home-audit: roster unreadable ($ROSTER_REASON); examined=0 of $TOTAL (log: $LOG_FILE)"
++            ;;
++    esac
++    exit 0
++fi
++
++# Prints the liveness verdict for a home:
++#   live        — a session that is not closed occupies this home
++#   absent      — the roster was read and holds no live occupant
++#   unconfirmed — this home's query did not answer; NOT proof of absence
++#
++# Two keys, because either alone has a hole. `work_dir` is the session's own
++# statement of which directory it occupies and is exact — the live roster
++# records `/…/.gc/worktrees/<rig>/polecats/<agent>` verbatim. The
++# `<rig>/<agent>` name derived from the path covers a session recorded with a
++# different work_dir shape (a resumed session, a provider that rewrote it).
++# Matching either way is deliberately generous: an extra match defers a home,
++# and deferring is the safe direction.
++session_state() {
++    local home="$1" name="$2" verdict
++    if ! verdict=$(jq -r --arg home "$home" --arg name "$name" '
++        (.sessions // [])
++        | map(select(.closed != true))
++        | map(select(
++            ((.work_dir // "") == $home)
++            or ((.name // "") == $name) or ((.alias // "") == $name)
++            or ((.agent_name // "") == $name) or ((.title // "") == $name)))
++        | if length > 0 then "live" else "absent" end
++    ' "$SESSIONS_FILE" 2>/dev/null); then
++        printf 'unconfirmed\n'
++        return
++    fi
++    case "$verdict" in
++        live | absent) printf '%s\n' "$verdict" ;;
++        *) printf 'unconfirmed\n' ;;
++    esac
++}
++
++REMOVED=0
++SKIPPED=0
++EXAMINED=0
++BUDGET_SPENT=0
++# Set when a home was skipped because a check was never attempted — the run's
++# own clock, not the subsystem the skipped check would have talked to.
++TRUNCATED=0
++
++while IFS= read -r WT; do
++    [ -n "$WT" ] || continue
++
++    # Yield rather than stall the patrol. What is left unexamined stays a
++    # candidate for the next cycle; the sweep is idempotent.
++    if [ "$(budget_left)" -le 0 ]; then
++        BUDGET_SPENT=1
++        record home_budget_exhausted "" "" \
++            "${BUDGET_SECONDS}s budget spent after $EXAMINED of $TOTAL candidate(s): removed=$REMOVED skipped=$SKIPPED deferred=$((TOTAL - EXAMINED))" \
++            budget_exhausted
++        break
++    fi
++    EXAMINED=$((EXAMINED + 1))
++
++    # .../worktrees/<rig>/polecats/<agent> — the agent is the leaf and the rig
++    # segment is two levels up. Derived from the path rather than from $RIG_NAME
++    # so the roster key is the one the session actually records, which is the
++    # city's rig name even when this run was given a different --rig label.
++    AGENT=$(basename "$WT")
++    RIG_SEGMENT=$(basename "$(dirname "$(dirname "$WT")")")
++    ROSTER_NAME="$RIG_SEGMENT/$AGENT"
++
++    # Gate 2: a live session owns its home. Nothing else about it matters, and
++    # nothing is logged — a polecat occupying its own home is the ordinary
++    # state of a healthy rig, so a line per live agent per cycle would bury the
++    # findings this log exists for.
++    case "$(session_state "$WT" "$ROSTER_NAME")" in
++        live)
++            SKIPPED=$((SKIPPED + 1))
++            continue
++            ;;
++        unconfirmed)
++            # The roster parsed, so this is a query that did not answer for
++            # this one home. Unreachable in practice, and kept anyway: the
++            # alternative to a skip here is treating a broken query as proof
++            # that nobody owns the home.
++            record home_owner_unconfirmed "$AGENT" "$WT" \
++                "the session roster parsed but the liveness query for this home did not answer; not proof of absence" \
++                roster_query_failed
++            SKIPPED=$((SKIPPED + 1))
++            continue
++            ;;
++    esac
++
++    # Gate 3: THE TRAP. A home whose subtree holds per-bead worktrees is not
++    # disposable no matter who owns the home itself — when this was filed, a
++    # LIVE polecat from another namepool slot was working inside a dead home's
++    # `worktrees/`. Any child at all defers, because establishing that a child
++    # is dead means reading its bead, and bead-keyed guards are what this
++    # script exists to stop relying on. The per-bead reaper owns children; once
++    # it has cleared them the home becomes eligible.
++    CHILD_COUNT=0
++    if [ -d "$WT/worktrees" ]; then
++        for child in "$WT"/worktrees/*; do
++            [ -e "$child" ] || continue
++            CHILD_COUNT=$((CHILD_COUNT + 1))
++        done
++    fi
++    if [ "$CHILD_COUNT" -gt 0 ]; then
++        record home_children_kept "$AGENT" "$WT" \
++            "$CHILD_COUNT per-bead worktree(s) live under this home; teardown of the home would take them with it" \
++            has_child_worktrees
++        SKIPPED=$((SKIPPED + 1))
++        continue
++    fi
++
++    # Gate 4a: never discard uncommitted work. Ignored files are build
++    # artifacts and are excluded by `git status --porcelain`; untracked
++    # non-ignored files are reported and block removal so the witness can
++    # salvage them. This is the check a respawned namepool slot fails on.
++    STATUS_LIMIT=$(budget_left)
++    STATUS_RC=0
++    DIRTY=$(run_bounded "$STATUS_LIMIT" git -C "$WT" status --porcelain 2>/dev/null) || STATUS_RC=$?
++    STATUS_OUTCOME=$(classify_outcome "$STATUS_LIMIT" "$STATUS_RC")
++    if [ "$STATUS_OUTCOME" != ok ]; then
++        # A worktree git cannot read is not one to delete on a guess — and
++        # neither is one git was never asked about. Different incidents,
++        # different owners, so different events.
++        case "$STATUS_OUTCOME" in
++            skipped)
++                TRUNCATED=1
++                record home_budget_truncated "$AGENT" "$WT" \
++                    "the ${BUDGET_SECONDS}s budget was spent before git status ran; the home was never inspected, at candidate $EXAMINED of $TOTAL" \
++                    budget_spent_before_git_status
++                ;;
++            timeout)
++                record home_status_unreadable "$AGENT" "$WT" \
++                    "git status did not answer within the ${STATUS_LIMIT}s left of the ${BUDGET_SECONDS}s budget" \
++                    git_status_timed_out
++                ;;
++            *)
++                record home_status_unreadable "$AGENT" "$WT" \
++                    "git status exited $STATUS_RC in the home worktree" \
++                    git_status_failed
++                ;;
++        esac
++        SKIPPED=$((SKIPPED + 1))
++        continue
++    fi
++    if [ -n "$DIRTY" ]; then
++        record home_dirty_kept "$AGENT" "$WT" \
++            "$(printf '%s\n' "$DIRTY" | wc -l | tr -d ' ') uncommitted path(s)" \
++            uncommitted_work
++        SKIPPED=$((SKIPPED + 1))
++        continue
++    fi
++
++    # Gate 4b: commits reachable from HEAD but from no remote-tracking ref.
++    # The per-bead reaper deliberately does NOT make this check, because a
++    # rebase-merging refinery rewrites hashes and a closed bead is its own
++    # proof the work landed. A home has no bead, so nothing else here can say
++    # the commits are safe — and the furiosa home was on a detached HEAD
++    # holding two of them. Establishing they were superseded took reading
++    # content at origin, which a sweep must not attempt on its own, so this
++    # reports and defers to the witness.
++    #
++    # A rig with stale remote-tracking refs over-reports, which defers a home.
++    # That is the safe direction and needs no fetch — a sweep that reached the
++    # network would be an unbounded call in a bounded step.
++    HEAD_REF=$(git -C "$WT" symbolic-ref -q --short HEAD 2>/dev/null || true)
++    UNPUSHED_LIMIT=$(budget_left)
++    UNPUSHED_RC=0
++    UNPUSHED=$(run_bounded "$UNPUSHED_LIMIT" git -C "$WT" rev-list --count HEAD --not --remotes 2>/dev/null) || UNPUSHED_RC=$?
++    UNPUSHED_OUTCOME=$(classify_outcome "$UNPUSHED_LIMIT" "$UNPUSHED_RC")
++    if [ "$UNPUSHED_OUTCOME" != ok ]; then
++        case "$UNPUSHED_OUTCOME" in
++            skipped)
++                TRUNCATED=1
++                record home_budget_truncated "$AGENT" "$WT" \
++                    "the ${BUDGET_SECONDS}s budget was spent before the unpublished-commit check ran, at candidate $EXAMINED of $TOTAL" \
++                    budget_spent_before_commit_check
++                ;;
++            timeout)
++                record home_commits_unreadable "$AGENT" "$WT" \
++                    "git rev-list did not answer within the ${UNPUSHED_LIMIT}s left of the ${BUDGET_SECONDS}s budget" \
++                    rev_list_timed_out
++                ;;
++            *)
++                record home_commits_unreadable "$AGENT" "$WT" \
++                    "git rev-list exited $UNPUSHED_RC in the home worktree" \
++                    rev_list_failed
++                ;;
++        esac
++        SKIPPED=$((SKIPPED + 1))
++        continue
++    fi
++    if [ "${UNPUSHED:-0}" != 0 ]; then
++        record home_unpublished_commits_kept "$AGENT" "$WT" \
++            "$UNPUSHED commit(s) on ${HEAD_REF:-a detached HEAD} reach no remote; whether they are superseded needs a content check at origin, which this sweep does not make" \
++            unpublished_commits
++        SKIPPED=$((SKIPPED + 1))
++        continue
++    fi
++
++    if [ "$DRY_RUN" -eq 1 ]; then
++        record home_removal_pending "$AGENT" "$WT" "dry run"
++        REMOVED=$((REMOVED + 1))
++        continue
++    fi
++
++    if ! run_bounded "$(budget_left)" git -C "$RIG_ROOT" worktree remove --force "$WT" >/dev/null 2>&1; then
++        # Fallback for a worktree git refuses to administer (moved, partially
++        # deleted). Removing the directory then pruning restores consistency.
++        rm -rf "$WT"
++    fi
++    run_bounded "$(budget_left)" git -C "$RIG_ROOT" worktree prune >/dev/null 2>&1 || true
++
++    if [ -e "$WT" ]; then
++        record home_removal_failed "$AGENT" "$WT" "directory still present after removal"
++        SKIPPED=$((SKIPPED + 1))
++        continue
++    fi
++
++    record home_removed "$AGENT" "$WT" "no live session, no child worktrees, nothing unpublished"
++    REMOVED=$((REMOVED + 1))
++done <<EOF
++$CANDIDATES
++EOF
++
++# The stdout summary is what a patrol reads first, so it must not imply a clean
++# cycle when the clock cut one short — including when the truncation landed on
++# the LAST candidate and the loop head therefore never fired.
++BUDGET_NOTE=""
++if [ "$BUDGET_SPENT" -eq 1 ] || [ "$TRUNCATED" -eq 1 ]; then
++    BUDGET_NOTE=" — budget spent: examined=$EXAMINED of $TOTAL, $((TOTAL - EXAMINED)) candidate(s) deferred to the next cycle"
++fi
++
++if [ "$DRY_RUN" -eq 1 ]; then
++    echo "polecat-home-audit: would remove=$REMOVED skipped=$SKIPPED of $TOTAL (dry run — nothing removed; pass --no-dry-run to remove; log: $LOG_FILE)$BUDGET_NOTE"
++else
++    echo "polecat-home-audit: removed=$REMOVED skipped=$SKIPPED of $TOTAL (log: $LOG_FILE)$BUDGET_NOTE"
++fi
+diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
+index 728752f..3909595 100644
+--- a/gastown/formulas/mol-witness-patrol.toml
++++ b/gastown/formulas/mol-witness-patrol.toml
+@@ -28,9 +28,12 @@ monitors the WORK layer:
+ 2. **Per-bead worktree teardown** — reap polecat worktrees whose bead has
+    closed. The witness owns BOTH ends of the worktree lifecycle: the crash
+    path (orphan recovery) and the happy path (post-merge teardown).
+-3. **Refinery queue health** — work beads assigned to refinery, staleness.
+-4. **Polecat health** — detect stuck polecats, file warrants for dog pool.
+-5. **Help mail** — triage HELP/escalation requests from polecats.
++3. **Polecat home audit** — the OTHER worktree a polecat has. A home has no
++   bead, so the two duties above — and every other guard on the rig — are
++   structurally blind to it (gcp-actg); only a roster-vs-disk diff finds one.
++4. **Refinery queue health** — work beads assigned to refinery, staleness.
++5. **Polecat health** — detect stuck polecats, file warrants for dog pool.
++6. **Help mail** — triage HELP/escalation requests from polecats.
+ 
+ Gate checks and convoy/swarm completion are town-wide concerns handled by
+ the deacon, not the per-rig witness.
+@@ -590,6 +593,124 @@ Partial cleanup is by design: the work is idempotent, the next cycle resumes
+ it, and a witness that starts is worth more than a rig reaped in one pass.
+ 
+ **Exit criteria:** Reaper log reviewed and any non-routine event acted on.
++Continue to `audit-polecat-homes` — do NOT exit the wisp here. The
++`next-iteration` step is the only place that pours the next wisp and burns
++this one."""
++
++[[steps]]
++id = "audit-polecat-homes"
++title = "Audit polecat agent-home worktrees"
++needs = ["reap-merged-worktrees"]
++description = """
++The two steps above cover the per-bead worktree at
++`<polecat-home>/worktrees/<bead-id>` — the crash path and the happy path.
++This step covers the OTHER worktree a polecat has: its persistent agent
++home at `<city>/.gc/worktrees/<rig>/polecats/<agent>`.
++
++**Why it needs a step of its own.** A per-bead worktree is found through
++its bead. A home has NO bead, so every guard the rig owns is structurally
++blind to it (gcp-actg, reported by the gascity witness as gascity-o963):
++
++| Guard | Key | Sees a home? |
++|---|---|---|
++| `polecat-worktree-reap.sh` | path must have a `worktrees/` parent | No — excluded by construction, correctly |
++| `recover-orphaned-beads` | a bead whose `metadata.work_dir` leads there | No — there is no bead |
++| the `work_dir` scan | same key | No — same blindness |
++
++Only a roster-vs-disk diff can see a home, and until this step nothing
++performed one. So `assets/scripts/polecat-home-audit.sh` issues zero
++`gc bd` calls: candidates come from `git worktree list`, ownership from
++`gc session list`. **Do not "improve" it by looking up a bead** — bead
++keying is the shared root of this whole family of blind spots
++(gascity-18kz, gcp-4k6o), and a home's bead lookup can only ever come back
++empty and be misread as "nothing owns it".
++
++**Why it is a formula step and NOT a `pre_start`.** `pre_start` is bounded
++by `[session] setup_timeout` (10s) and SIGKILLed on overrun, which fails
++the whole session start; six of those in an hour latch the supervisor
++circuit breaker and the rig loses its witness (gcp-ntbf, and gcp-oo0v on
++the deacon). The witness already spends most of that budget on the reaper.
++A periodic sweep belongs in a patrol cycle. Do not move it.
++
++**Step 1: Run the sweep.**
++
++Pack assets install into a content-hashed cache directory this step cannot
++name, so resolve the script from this formula's OWN resolved source path:
++it ships beside this formula in the same pack tree, making that the one
++candidate guaranteed present whenever the formula is and version-coherent
++with it. `gc formula list --json` reports that path for every formula gc
++can see, SHA-pinned packs included.
++
++```bash
++CITY="${GC_CITY:-${GC_CITY_PATH:-}}"
++if [ -n "$CITY" ]; then
++    FORMULA_JSON=$(gc formula list --city "$CITY" --json 2>/dev/null)
++else
++    FORMULA_JSON=$(gc formula list --json 2>/dev/null)
++fi
++FORMULA_SRC=$(printf '%s' "$FORMULA_JSON" \
++    | jq -r '.formulas[]? | select(.name == "mol-witness-patrol") | .source // empty' 2>/dev/null \
++    | head -1)
++AUDIT=""
++if [ -n "$FORMULA_SRC" ]; then
++    # <pack>/formulas/mol-witness-patrol.toml -> <pack>/assets/scripts/<sweep>
++    AUDIT="$(dirname "$(dirname "$FORMULA_SRC")")/assets/scripts/polecat-home-audit.sh"
++fi
++# GC_PACK_DIR is exported only when gc invokes a pack command, so it is a
++# fallback and never the primary — depending on it alone is what made the
++# refinery's approval gate permanently unresolvable (gcp-amo).
++if [ ! -x "$AUDIT" ] && [ -n "${GC_PACK_DIR:-}" ]; then
++    AUDIT="$GC_PACK_DIR/assets/scripts/polecat-home-audit.sh"
++fi
++if [ -x "$AUDIT" ]; then
++    "$AUDIT" "$GC_RIG_ROOT" --rig "$GC_RIG"
++else
++    # A sweep that cannot be resolved is itself the finding. Nothing else in
++    # this city watches polecat homes, so say it loudly rather than logging a
++    # silent OK — that silence is the exact failure mode this step exists to
++    # break.
++    echo "polecat-home-audit: sweep not runnable (resolved '$AUDIT'); home worktrees are UNWATCHED this cycle — report it"
++fi
++```
++
++**STAGED ROLLOUT — it is in dry-run today.** Real removal is opt-in
++(`--no-dry-run`) and the invocation above does not pass it, so the sweep
++logs what it WOULD remove and removes nothing. That matches the per-bead
++reaper and the city's posture for the native gascity reaper. Review the
++logged `home_removal_pending` set across several cycles, confirm no live
++home ever appears in it, then add `--no-dry-run` above.
++
++**Step 2: Read the verdicts.** One JSON line per decision, appended to
++`$GC_CITY/.gc/runtime/logs/polecat-home-audit.log`:
++
++```bash
++tail -n 50 "${LOG_DIR:-$GC_CITY/.gc/runtime/logs}/polecat-home-audit.log" | jq -c '{ts,event,agent,reason,detail}'
++```
++
++| Event | Meaning | Action |
++|---|---|---|
++| `home_removal_pending` | Passed every gate; dry-run, so NOT removed | Routine while the rollout is staged — this is the would-remove set to review |
++| `home_removed` | Removed. Routine, and only once `--no-dry-run` is wired | Log only. `worktree-setup.sh` recreates the home when the slot next spawns |
++| `home_removal_failed` | The directory survived removal | Investigate permissions or mounts, mail the mayor — same as `worktree_reap_failed` above |
++| `home_children_kept` | The home holds per-bead worktrees, so removing it would take them too | None — expected. The reaper clears children first; the home becomes eligible on a later cycle |
++| `home_dirty_kept` | Uncommitted work in a home nothing owns | **This is the failure this step exists to prevent.** A respawned namepool slot inherits it and fails submit-and-exit's clean-state check (gascity-vst). Salvage or clear it by hand |
++| `home_unpublished_commits_kept` | Commits reaching no remote, often on a detached HEAD | Investigate by hand. Whether they are superseded takes a CONTENT check at origin — a rebase/squash-merging refinery rewrites hashes, so `git merge-base --is-ancestor` lies here. The sweep deliberately does not guess |
++| `home_owner_unconfirmed` | The roster parsed but this home's liveness query did not answer | Nothing was removed. If it repeats, the roster shape has drifted |
++| `home_roster_unreadable` | `gc session list` failed, timed out, or answered in an unrecognised shape. Nothing was examined | `roster_read_timed_out` → the budget is the suspect first; the detail names the seconds it got. `roster_read_failed`/`roster_unparseable` implicate the roster — check `gc doctor` |
++| `home_status_unreadable` / `home_commits_unreadable` | `git status` / `git rev-list` actually ran in the home and did not answer. `reason` separates `*_timed_out` from `*_failed` | Timed out → budget first. Failed → that checkout is broken or moved; inspect by hand |
++| `home_worktree_list_failed` | `git worktree list` ran and did not answer | Timed out → budget first. Failed → the rig checkout itself is unhealthy |
++| `home_budget_truncated` | A check was NEVER ATTEMPTED — the budget was already spent when it came due. Nothing external failed | Not an outage; do not chase the named subsystem. Read it as "this cycle was too short" |
++| `home_budget_exhausted` | The run hit its wall clock and stopped at the top of the loop | Routine on a rig with many homes; the rest are deferred to the next cycle |
++
++A home occupied by a live polecat is logged as NOTHING — that is the
++healthy state of every working rig, and a line per agent per cycle would
++bury the findings above.
++
++**A `home_dirty_kept` or `home_unpublished_commits_kept` that repeats
++across cycles is a lost-work signal, not routine housekeeping.** Mail the
++mayor, exactly as for `worktree_dirty_kept` in the previous step.
++
++**Exit criteria:** Sweep run, log reviewed, any non-routine event acted on.
+ Continue to `check-refinery` — do NOT exit the wisp here. The
+ `next-iteration` step is the only place that pours the next wisp and burns
+ this one."""
+@@ -597,7 +718,7 @@ this one."""
+ [[steps]]
+ id = "check-refinery"
+ title = "Check refinery queue health"
+-needs = ["reap-merged-worktrees"]
++needs = ["audit-polecat-homes"]
+ description = """
+ Ensure the refinery is processing work and the queue is healthy.
+ 
+diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
+index c6fe61a..a5ef5b0 100755
+--- a/gastown/tests/test_gastown_pack_assets.sh
++++ b/gastown/tests/test_gastown_pack_assets.sh
+@@ -366,6 +366,108 @@ PY
+     done < <(grep -oE 'record worktree_[a-z_]+' "$reaper" | awk '{print $2}' | sort -u)
+ }
+ 
++test_polecat_home_teardown_has_an_owner() {
++    # gcp-actg: a polecat's per-bead worktrees have an owner (the step above);
++    # its persistent agent HOME had none. A home carries no bead, so every
++    # guard on the rig — all of them bead-keyed — is structurally blind to it,
++    # and the blindness is invisible in each guard's own diff. This test is the
++    # inventory that says the roster-keyed sweep exists and stays wired.
++    local audit="$GASTOWN/assets/scripts/polecat-home-audit.sh"
++    local witness_cfg="$GASTOWN/agents/witness/agent.toml"
++    local witness_prompt="$GASTOWN/agents/witness/prompt.template.md"
++    local patrol="$GASTOWN/formulas/mol-witness-patrol.toml"
++
++    [[ -f "$audit" ]] || fail "missing polecat agent-home audit sweep"
++    [[ -x "$audit" ]] || fail "home audit sweep must be executable"
++    parse_toml "$witness_cfg" "$patrol"
++
++    # It is a patrol step, NOT a pre_start, and must not drift back. pre_start
++    # is bounded by [session] setup_timeout (10s) and SIGKILLed on overrun; the
++    # witness already spends most of that on the reaper, and an overrun fails
++    # the session start and eventually latches the circuit breaker (gcp-ntbf,
++    # gcp-oo0v). The pack-wide inventory in test_agent_pre_start_budget.sh is
++    # the other half of this guard.
++    ! grep -F 'polecat-home-audit.sh' "$witness_cfg" >/dev/null ||
++        fail "the home audit must not be wired as a witness pre_start; it belongs in the patrol cycle"
++
++    grep -F 'id = "audit-polecat-homes"' "$patrol" >/dev/null ||
++        fail "witness patrol should own a polecat home audit step"
++    grep -F 'needs = ["audit-polecat-homes"]' "$patrol" >/dev/null ||
++        fail "the home audit step must be wired into the patrol chain, not orphaned"
++    grep -F 'Audit polecat agent-home worktrees no live session owns' "$witness_prompt" >/dev/null ||
++        fail "witness prompt should list the home audit as a duty"
++
++    # A formula step cannot name the content-hashed pack cache, so it resolves
++    # the sweep from the formula's own resolved source path — the one candidate
++    # guaranteed present and version-coherent with the formula.
++    grep -F 'gc formula list' "$patrol" >/dev/null ||
++        fail "home audit step must resolve the sweep from the formula's own source path"
++    grep -F 'assets/scripts/polecat-home-audit.sh' "$patrol" >/dev/null ||
++        fail "home audit step must actually run the sweep"
++    grep -F 'UNWATCHED this cycle' "$patrol" >/dev/null ||
++        fail "an unresolvable sweep must be reported as a finding, not a silent OK"
++
++    # THE POINT OF THE BEAD: ownership comes from the session roster and from
++    # nothing in the bead store. A home HAS no bead, so a bead lookup can only
++    # come back empty and be misread as "nothing owns it" — the shared root of
++    # this family of blind spots (gascity-18kz, gcp-4k6o). Comments are dropped
++    # so the header may say what the script does not do.
++    local bead_reads
++    bead_reads=$(grep -nE '(^|[^[:alnum:]_-])gc[[:space:]]+bd([[:space:]]|$)' "$audit" |
++        grep -vE '^[0-9]+:[[:space:]]*#' || true)
++    [[ -z "$bead_reads" ]] ||
++        fail "home audit must not read the bead store: ${bead_reads//$'\n'/ | }"
++    grep -F 'gc session list --state=all --json' "$audit" >/dev/null ||
++        fail "home audit must key ownership on the session roster"
++
++    # The gates are the safety contract; losing any one turns housekeeping into
++    # data loss.
++    grep -F '[ "$(basename "$(dirname "$wt")")" = "polecats" ]' "$audit" >/dev/null ||
++        fail "home audit must restrict candidates to polecat agent homes"
++    grep -F 'record home_children_kept' "$audit" >/dev/null ||
++        fail "home audit must defer a home that still hosts per-bead worktrees; a LIVE polecat from another slot can be working inside a dead home's subtree (gcp-actg)"
++    grep -F 'git -C "$WT" status --porcelain' "$audit" >/dev/null ||
++        fail "home audit must refuse to remove a home with uncommitted work"
++    grep -F 'git -C "$WT" rev-list --count HEAD --not --remotes' "$audit" >/dev/null ||
++        fail "home audit must refuse to remove a home holding commits that reach no remote; unlike a per-bead worktree there is no closed bead to prove the work landed"
++
++    # Fail closed on the roster, the same rule the reaper's gate 4 carries: a
++    # confirmation read that fails is not proof of absence, and reading it as
++    # an empty roster clears every home on the rig at once.
++    ! grep -F '{"sessions":[]}' "$audit" >/dev/null ||
++        fail "home audit must not fall back to an empty session roster; that makes the ownership gate fail open"
++    grep -F 'ROSTER_STATE="unconfirmed"' "$audit" >/dev/null ||
++        fail "home audit must seed the roster state to unconfirmed and promote it only on a clean read"
++    grep -F 'record home_roster_unreadable' "$audit" >/dev/null ||
++        fail "home audit must report and stop when the roster cannot be read"
++
++    # Staged rollout: dry run is the default and the patrol wiring must not opt
++    # in, so real removal cannot begin on a pin bump alone.
++    grep -x -F 'DRY_RUN=1' "$audit" >/dev/null ||
++        fail "home audit must default to dry run"
++    grep -F -- '--no-dry-run) DRY_RUN=0 ;;' "$audit" >/dev/null ||
++        fail "home audit must make real removal opt-in behind --no-dry-run"
++    ! grep -F -- '"$AUDIT" "$GC_RIG_ROOT" --rig "$GC_RIG" --no-dry-run' "$patrol" >/dev/null ||
++        fail "the patrol invocation must not enable live removal while the rollout is staged"
++
++    # The sweep cleans up around the canonical checkout; it must never write
++    # into it.
++    ! grep -F 'LOG_DIR="$RIG_ROOT' "$audit" >/dev/null ||
++        fail "home audit must not default its log inside the rig repo"
++
++    # The log is forensics, so a line must carry the time of ITS OWN event.
++    grep -F -e '--arg ts "$(date -u' "$audit" >/dev/null ||
++        fail "home audit must stamp each log line when the event happens, not once at the start of the run"
++
++    # And the witness must be able to explain every line it can be handed.
++    local ev
++    while IFS= read -r ev; do
++        [[ -n "$ev" ]] || continue
++        grep -F "\`$ev\`" "$patrol" >/dev/null ||
++            fail "home audit event $ev has no entry in the mol-witness-patrol log-review table"
++    done < <(grep -oE 'record home_[a-z_]+' "$audit" | awk '{print $2}' | sort -u)
++}
++
+ test_dolt_push_outage_detection_is_wired() {
+     local check="$GASTOWN/assets/scripts/dolt-push-state-check.sh"
+     local deacon_cfg="$GASTOWN/agents/deacon/agent.toml"
+@@ -576,6 +678,7 @@ test_dog_assets_are_pack_local
+ test_retired_dog_formulas_are_not_reintroduced
+ test_submit_and_exit_cannot_be_replayed
+ test_post_merge_worktree_teardown_has_an_owner
++test_polecat_home_teardown_has_an_owner
+ test_dolt_push_outage_detection_is_wired
+ test_shutdown_dance_contracts_are_executable
+ test_shutdown_dance_lifecycle_and_audit_contracts
+diff --git a/gastown/tests/test_polecat_home_audit.sh b/gastown/tests/test_polecat_home_audit.sh
+new file mode 100755
+index 0000000..91789b4
+--- /dev/null
++++ b/gastown/tests/test_polecat_home_audit.sh
+@@ -0,0 +1,656 @@
++#!/usr/bin/env bash
++# Guards polecat-home-audit.sh — the roster-keyed sweep for polecat AGENT-HOME
++# worktrees, the one shape every bead-keyed guard is structurally blind to
++# (gcp-actg).
++#
++# The test that matters most here is the TRAP: when this was filed, a live
++# polecat from one namepool slot was working inside a DEAD polecat's home
++# subtree. A "home + no session -> remove" sweep deletes that live working tree.
++# `test_a_home_with_child_worktrees_is_never_removed` is that case; do not
++# relax it into a bead lookup, because bead-keying is the blindness this whole
++# script exists to stop relying on.
++set -euo pipefail
++
++ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
++SCRIPT="$ROOT/gastown/assets/scripts/polecat-home-audit.sh"
++
++fail() {
++    echo "FAIL: $*" >&2
++    exit 1
++}
++
++# macOS `mktemp -d` hands back a path under /var, which is a symlink to
++# /private/var — and `git worktree list` reports the RESOLVED form. Tests that
++# compare a worktree path against one the test itself composed (the work_dir
++# ownership key) would then fail on the symlink rather than on the behaviour.
++# Canonicalise once, here, so every test reasons about the same path git does.
++make_tmp() {
++    local d
++    d=$(mktemp -d)
++    (cd "$d" && pwd -P)
++}
++
++write_gc_stub() {
++    # Serves the ONE read this script performs. It must never grow a `bd` arm:
++    # if a change makes the script read beads, the assertion in
++    # test_the_sweep_reads_no_beads catches it here.
++    #
++    # Test hooks:
++    #   GC_SESSION_DELAY seconds to stall the roster read (budget tests)
++    #   GC_SESSION_FAIL  non-empty: the roster read exits 1
++    #   GC_CALLS         append the first argv word per call, so a test can
++    #                    assert which gc subcommands were used
++    local bin="$1"
++    mkdir -p "$bin"
++    cat >"$bin/gc" <<'SH'
++#!/usr/bin/env sh
++if [ -n "${GC_CALLS:-}" ]; then printf '%s\n' "$1" >>"$GC_CALLS"; fi
++case "$1" in
++    session)
++        if [ -n "${GC_SESSION_DELAY:-}" ]; then sleep "$GC_SESSION_DELAY"; fi
++        if [ -n "${GC_SESSION_FAIL:-}" ]; then
++            echo "simulated roster failure" >&2
++            exit 1
++        fi
++        cat "$GC_SESSIONS_JSON"
++        ;;
++    *)
++        printf '[]'
++        ;;
++esac
++SH
++    chmod +x "$bin/gc"
++}
++
++write_git_stub() {
++    # Wraps the real git so this script's OWN git calls can be made slow or
++    # made to fail — the only way to drive the not-attempted / timed-out /
++    # failed classification from outside, and that three-way distinction is
++    # exactly what the log schema promises a reader.
++    #
++    # Test hooks:
++    #   GIT_PRUNE_DELAY     seconds to stall `git ... worktree prune`
++    #   GIT_STATUS_DELAY    seconds to stall `git ... status`
++    #   GIT_STATUS_FAIL     non-empty: `git ... status` exits 128
++    #   GIT_REVLIST_FAIL    non-empty: `git ... rev-list` exits 128
++    local bin="$1" real
++    real=$(command -v git)
++    mkdir -p "$bin"
++    cat >"$bin/git" <<SH
++#!/usr/bin/env sh
++case " \$* " in
++    *" worktree prune "*)
++        if [ -n "\${GIT_PRUNE_DELAY:-}" ]; then sleep "\$GIT_PRUNE_DELAY"; fi
++        ;;
++    *" status "*)
++        if [ -n "\${GIT_STATUS_DELAY:-}" ]; then sleep "\$GIT_STATUS_DELAY"; fi
++        if [ -n "\${GIT_STATUS_FAIL:-}" ]; then
++            echo "fatal: simulated git status failure" >&2
++            exit 128
++        fi
++        ;;
++    *" rev-list "*)
++        if [ -n "\${GIT_REVLIST_FAIL:-}" ]; then
++            echo "fatal: simulated rev-list failure" >&2
++            exit 128
++        fi
++        ;;
++esac
++exec "$real" "\$@"
++SH
++    chmod +x "$bin/git"
++}
++
++# reason_for <log> <event> — the `reason` field of the last line carrying <event>.
++reason_for() {
++    jq -r --arg e "$2" 'select(.event == $e) | .reason' "$1" | tail -n 1
++}
++
++# detail_for <log> <event> — the `detail` field of the last line carrying <event>.
++detail_for() {
++    jq -r --arg e "$2" 'select(.event == $e) | .detail' "$1" | tail -n 1
++}
++
++# A rig repo plus a bare "origin" it can publish to, so the unpublished-commit
++# gate has a real remote-tracking ref to reason about rather than the
++# everything-is-unpublished degenerate case a remoteless repo produces.
++setup_rig() {
++    local rig="$1" origin="$2"
++    git init -q --bare "$origin"
++    mkdir -p "$rig"
++    git -C "$rig" init -q
++    git -C "$rig" config user.email home@test
++    git -C "$rig" config user.name home
++    echo seed >"$rig/seed.txt"
++    git -C "$rig" add seed.txt
++    git -C "$rig" commit -qm seed
++    git -C "$rig" remote add origin "$origin"
++    git -C "$rig" push -q origin HEAD:refs/heads/main
++    git -C "$rig" fetch -q origin
++}
++
++# add_home <rig> <homes-root> <agent> — a polecat agent home, checked out at a
++# commit the remote already has so it is disposable by default. Individual
++# tests then dirty exactly the one property they are about.
++add_home() {
++    git -C "$1" worktree add -q "$2/$3" --detach origin/main
++}
++
++test_removes_only_unowned_childless_clean_published_homes() {
++    local tmp rig origin bin homes sessions logdir log
++    tmp=$(make_tmp)
++    rig="$tmp/rig"
++    origin="$tmp/origin.git"
++    bin="$tmp/bin"
++    homes="$tmp/city/.gc/worktrees/rig/polecats"
++    sessions="$tmp/sessions.json"
++    logdir="$tmp/logs"
++    mkdir -p "$logdir"
++
++    setup_rig "$rig" "$origin"
++    write_gc_stub "$bin"
++
++    add_home "$rig" "$homes" dead      # every gate passes — the only removal
++    add_home "$rig" "$homes" live      # a running session owns it
++    add_home "$rig" "$homes" dirty     # uncommitted work on disk
++    add_home "$rig" "$homes" unpushed  # commits that reach no remote
++    add_home "$rig" "$homes" parent    # holds a per-bead child — THE TRAP
++
++    echo scratch >"$homes/dirty/seed.txt"
++
++    git -C "$homes/unpushed" commit -q --allow-empty -m "work that never left"
++
++    # A per-bead worktree under the `parent` home. Its own owner is irrelevant:
++    # removing the home takes the child with it either way.
++    git -C "$rig" worktree add -q "$homes/parent/worktrees/wt-child" --detach origin/main
++
++    # The refinery's worktree sits beside the polecats tree, not inside it.
++    # Nothing about it is a polecat home and the sweep must not claim it.
++    git -C "$rig" worktree add -q "$tmp/city/.gc/worktrees/rig/refinery" --detach origin/main
++
++    cat >"$sessions" <<'JSON'
++{"sessions":[
++  {"id":"gc-live","name":"rig/live","alias":"rig/live","agent_name":"rig/live","state":"active","closed":false},
++  {"id":"gc-gone","name":"rig/dead","alias":"rig/dead","agent_name":"rig/dead","state":"closed","closed":true}
++]}
++JSON
++
++    GC_RIG=rig LOG_DIR="$logdir" GC_SESSIONS_JSON="$sessions" PATH="$bin:$PATH" \
++        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out.txt" 2>&1 ||
++        fail "audit exited non-zero: $(cat "$tmp/out.txt")"
++
++    [[ ! -e "$homes/dead" ]] ||
++        fail "an unowned, childless, clean, fully-published home was not removed"
++    [[ -e "$homes/live/seed.txt" ]] ||
++        fail "a home owned by a live session was removed out from under it"
++    [[ -e "$homes/dirty/seed.txt" ]] ||
++        fail "a home with uncommitted work was removed; work would be lost"
++    [[ -e "$homes/unpushed/seed.txt" ]] ||
++        fail "a home holding commits that reach no remote was removed"
++    [[ -e "$homes/parent/worktrees/wt-child/seed.txt" ]] ||
++        fail "THE TRAP: a live polecat's per-bead worktree was deleted with its host home"
++    [[ -e "$tmp/city/.gc/worktrees/rig/refinery/seed.txt" ]] ||
++        fail "a non-polecat agent worktree was removed; only polecat homes are candidates"
++    [[ -e "$rig/seed.txt" ]] ||
++        fail "the rig root worktree was touched"
++
++    log="$logdir/polecat-home-audit.log"
++    [[ -f "$log" ]] || fail "audit wrote no log"
++    grep -F '"event":"home_removed"' "$log" >/dev/null ||
++        fail "the removal was not recorded in the log"
++    grep -F '"agent":"dead"' "$log" >/dev/null ||
++        fail "the removed home's agent was not named in the log"
++    grep -F '"event":"home_dirty_kept"' "$log" >/dev/null ||
++        fail "a dirty home kept was not reported for salvage"
++    grep -F '"event":"home_unpublished_commits_kept"' "$log" >/dev/null ||
++        fail "a home holding unpublished commits was not reported"
++    grep -F '"event":"home_children_kept"' "$log" >/dev/null ||
++        fail "a home deferred for its child worktrees was not reported"
++    ! grep -F '"agent":"live"' "$log" >/dev/null ||
++        fail "a live polecat in its own home is the healthy case and must not be logged as an incident"
++
++    # Git's administrative view must agree with the filesystem.
++    ! git -C "$rig" worktree list --porcelain | grep -F "$homes/dead" >/dev/null ||
++        fail "the removed home is still registered with git"
++
++    rm -rf "$tmp"
++}
++
++test_a_home_with_child_worktrees_is_never_removed() {
++    # THE TRAP, isolated. gcp-actg was filed while gascity/gastown.rictus was
++    # alive inside the dead gascity/gastown.furiosa home's subtree. The home
++    # passes every other gate here — no session, clean, nothing unpublished —
++    # and must STILL be deferred, on the child alone.
++    local tmp rig origin bin homes sessions logdir log
++    tmp=$(make_tmp)
++    rig="$tmp/rig"
++    origin="$tmp/origin.git"
++    bin="$tmp/bin"
++    homes="$tmp/city/.gc/worktrees/rig/polecats"
++    sessions="$tmp/sessions.json"
++    logdir="$tmp/logs"
++    mkdir -p "$logdir"
++
++    setup_rig "$rig" "$origin"
++    write_gc_stub "$bin"
++    add_home "$rig" "$homes" furiosa
++    git -C "$rig" worktree add -q "$homes/furiosa/worktrees/rig-g7nf" --detach origin/main
++
++    # The roster knows a live rictus, but rictus's OWN work_dir is its OWN
++    # home — nothing in the roster associates it with the furiosa subtree it is
++    # actually working in. That is precisely why the guard cannot be a liveness
++    # lookup on the home's owner, and must be the child's mere existence.
++    cat >"$sessions" <<'JSON'
++{"sessions":[
++  {"id":"gc-rictus","name":"rig/rictus","alias":"rig/rictus","agent_name":"rig/rictus","state":"active","closed":false}
++]}
++JSON
++
++    GC_RIG=rig LOG_DIR="$logdir" GC_SESSIONS_JSON="$sessions" PATH="$bin:$PATH" \
++        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out.txt" 2>&1 ||
++        fail "audit exited non-zero: $(cat "$tmp/out.txt")"
++
++    [[ -e "$homes/furiosa/worktrees/rig-g7nf/seed.txt" ]] ||
++        fail "THE TRAP: a live polecat's working tree was deleted with the dead home hosting it"
++    [[ -e "$homes/furiosa" ]] ||
++        fail "a home hosting per-bead worktrees was removed"
++
++    log="$logdir/polecat-home-audit.log"
++    [[ "$(reason_for "$log" home_children_kept)" == "has_child_worktrees" ]] ||
++        fail "the child-worktree deferral was not reported as one"
++
++    rm -rf "$tmp"
++}
++
++test_the_home_is_matched_by_its_own_work_dir_too() {
++    # A session whose name does not follow <rig>/<agent> still states which
++    # directory it occupies. Ownership must be honoured on that key alone, or a
++    # renamed or resumed agent loses its home mid-session.
++    local tmp rig origin bin homes sessions logdir
++    tmp=$(make_tmp)
++    rig="$tmp/rig"
++    origin="$tmp/origin.git"
++    bin="$tmp/bin"
++    homes="$tmp/city/.gc/worktrees/rig/polecats"
++    sessions="$tmp/sessions.json"
++    logdir="$tmp/logs"
++    mkdir -p "$logdir"
++
++    setup_rig "$rig" "$origin"
++    write_gc_stub "$bin"
++    add_home "$rig" "$homes" nux
++
++    cat >"$sessions" <<JSON
++{"sessions":[
++  {"id":"gc-odd","name":"something-else-entirely","state":"active","closed":false,
++   "work_dir":"$homes/nux"}
++]}
++JSON
++
++    GC_RIG=rig LOG_DIR="$logdir" GC_SESSIONS_JSON="$sessions" PATH="$bin:$PATH" \
++        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out.txt" 2>&1 ||
++        fail "audit exited non-zero: $(cat "$tmp/out.txt")"
++
++    [[ -e "$homes/nux/seed.txt" ]] ||
++        fail "a home was removed from under a live session that named it as its work_dir"
++
++    rm -rf "$tmp"
++}
++
++test_real_removal_is_opt_in() {
++    # Staged rollout, same posture as polecat-worktree-reap.sh and the native
++    # gascity reaper: the patrol step passes no --no-dry-run. If this
++    # regresses, home removal goes live on the first pin bump with no
++    # observation window.
++    local tmp rig origin bin homes sessions logdir log
++    tmp=$(make_tmp)
++    rig="$tmp/rig"
++    origin="$tmp/origin.git"
++    bin="$tmp/bin"
++    homes="$tmp/city/.gc/worktrees/rig/polecats"
++    sessions="$tmp/sessions.json"
++    logdir="$tmp/logs"
++    mkdir -p "$logdir"
++
++    setup_rig "$rig" "$origin"
++    write_gc_stub "$bin"
++    add_home "$rig" "$homes" dead
++    echo '{"sessions":[]}' >"$sessions"
++
++    GC_RIG=rig LOG_DIR="$logdir" GC_SESSIONS_JSON="$sessions" PATH="$bin:$PATH" \
++        bash "$SCRIPT" "$rig" >"$tmp/out.txt" 2>&1 ||
++        fail "audit exited non-zero: $(cat "$tmp/out.txt")"
++
++    [[ -e "$homes/dead/seed.txt" ]] ||
++        fail "the bare invocation removed a home; real removal must be opt-in"
++    grep -F 'dry run' "$tmp/out.txt" >/dev/null ||
++        fail "the default run did not say it was a dry run: $(cat "$tmp/out.txt")"
++
++    log="$logdir/polecat-home-audit.log"
++    grep -F '"event":"home_removal_pending"' "$log" >/dev/null ||
++        fail "the would-remove set was not logged for review"
++    grep -F '"dry_run":true' "$log" >/dev/null ||
++        fail "log lines do not record that the run was a dry run"
++
++    # Idempotent: a second dry run reaches the same verdict and still removes
++    # nothing, so a patrol can run it every cycle.
++    GC_RIG=rig LOG_DIR="$logdir" GC_SESSIONS_JSON="$sessions" PATH="$bin:$PATH" \
++        bash "$SCRIPT" "$rig" >"$tmp/again.txt" 2>&1 ||
++        fail "second dry run exited non-zero: $(cat "$tmp/again.txt")"
++    [[ -e "$homes/dead/seed.txt" ]] || fail "the second dry run removed a home"
++    [[ "$(tail -n 1 "$tmp/out.txt")" == "$(tail -n 1 "$tmp/again.txt")" ]] ||
++        fail "dry runs are not idempotent: '$(tail -n 1 "$tmp/out.txt")' vs '$(tail -n 1 "$tmp/again.txt")'"
++
++    rm -rf "$tmp"
++}
++
++test_an_unreadable_session_roster_removes_nothing() {
++    # The absent-confirm rule (gcp-g98): a confirmation read that FAILS is not
++    # proof of absence. Without this the first Dolt or supervisor hiccup turns
++    # the whole sweep into "no session owns anything, remove everything".
++    local tmp rig origin bin homes sessions logdir log
++    tmp=$(make_tmp)
++    rig="$tmp/rig"
++    origin="$tmp/origin.git"
++    bin="$tmp/bin"
++    homes="$tmp/city/.gc/worktrees/rig/polecats"
++    sessions="$tmp/sessions.json"
++    logdir="$tmp/logs"
++    mkdir -p "$logdir"
++
++    setup_rig "$rig" "$origin"
++    write_gc_stub "$bin"
++    add_home "$rig" "$homes" dead
++    echo '{"sessions":[]}' >"$sessions"
++    log="$logdir/polecat-home-audit.log"
++
++    # Case 1: the roster read errors.
++    GC_RIG=rig LOG_DIR="$logdir" GC_SESSIONS_JSON="$sessions" GC_SESSION_FAIL=1 \
++        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/failed.txt" 2>&1 ||
++        fail "audit exited non-zero on a failing roster read: $(cat "$tmp/failed.txt")"
++    [[ -e "$homes/dead/seed.txt" ]] ||
++        fail "a home was removed while the session roster was unreadable"
++    [[ "$(reason_for "$log" home_roster_unreadable)" == "roster_read_failed" ]] ||
++        fail "a failed roster read was not reported as one"
++
++    # Case 2: the roster answers with a shape we do not recognise. Same
++    # verdict — an unparseable answer is not an empty roster.
++    rm -f "$log"
++    printf '[]' >"$sessions"
++    GC_RIG=rig LOG_DIR="$logdir" GC_SESSIONS_JSON="$sessions" PATH="$bin:$PATH" \
++        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/shape.txt" 2>&1 ||
++        fail "audit exited non-zero on an unparseable roster: $(cat "$tmp/shape.txt")"
++    [[ -e "$homes/dead/seed.txt" ]] ||
++        fail "a home was removed on a roster whose shape was not understood"
++    [[ "$(reason_for "$log" home_roster_unreadable)" == "roster_unparseable" ]] ||
++        fail "an unparseable roster was not distinguished from a failed read"
++
++    rm -rf "$tmp"
++}
++
++test_unpublished_commits_are_reported_not_removed() {
++    # The furiosa case verbatim: a home on a DETACHED HEAD carrying commits
++    # that belong to no branch. Whether they are superseded took reading
++    # content at origin — a check a sweep must not make — so the only correct
++    # action is to report and defer. The detail must say "detached HEAD",
++    # because that is the fact that tells a reader why the commits are hard to
++    # find at all.
++    local tmp rig origin bin homes sessions logdir log
++    tmp=$(make_tmp)
++    rig="$tmp/rig"
++    origin="$tmp/origin.git"
++    bin="$tmp/bin"
++    homes="$tmp/city/.gc/worktrees/rig/polecats"
++    sessions="$tmp/sessions.json"
++    logdir="$tmp/logs"
++    mkdir -p "$logdir"
++
++    setup_rig "$rig" "$origin"
++    write_gc_stub "$bin"
++    add_home "$rig" "$homes" furiosa
++    git -C "$homes/furiosa" commit -q --allow-empty -m "belongs to no branch"
++    echo '{"sessions":[]}' >"$sessions"
++
++    GC_RIG=rig LOG_DIR="$logdir" GC_SESSIONS_JSON="$sessions" PATH="$bin:$PATH" \
++        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out.txt" 2>&1 ||
++        fail "audit exited non-zero: $(cat "$tmp/out.txt")"
++
++    [[ -e "$homes/furiosa/seed.txt" ]] ||
++        fail "a home holding unbranched commits was removed rather than reported"
++
++    log="$logdir/polecat-home-audit.log"
++    [[ "$(reason_for "$log" home_unpublished_commits_kept)" == "unpublished_commits" ]] ||
++        fail "unpublished commits were not reported with a machine-readable reason"
++    [[ "$(detail_for "$log" home_unpublished_commits_kept)" == *"detached HEAD"* ]] ||
++        fail "the report does not say the commits sit on a detached HEAD: $(detail_for "$log" home_unpublished_commits_kept)"
++
++    rm -rf "$tmp"
++}
++
++test_the_sweep_reads_no_beads() {
++    # Keying a home guard on bead fields is the shared root of this family of
++    # blind spots (gascity-18kz, gcp-4k6o, gcp-actg): a home HAS no bead, so a
++    # bead lookup can only ever come back empty and be misread as "nothing to
++    # own". A `gc bd` call appearing here means the fix has been undone.
++    local tmp rig origin bin homes sessions logdir calls
++    tmp=$(make_tmp)
++    rig="$tmp/rig"
++    origin="$tmp/origin.git"
++    bin="$tmp/bin"
++    homes="$tmp/city/.gc/worktrees/rig/polecats"
++    sessions="$tmp/sessions.json"
++    logdir="$tmp/logs"
++    calls="$tmp/calls.txt"
++    mkdir -p "$logdir"
++
++    setup_rig "$rig" "$origin"
++    write_gc_stub "$bin"
++    add_home "$rig" "$homes" dead
++    add_home "$rig" "$homes" other
++    echo '{"sessions":[]}' >"$sessions"
++
++    GC_RIG=rig LOG_DIR="$logdir" GC_SESSIONS_JSON="$sessions" GC_CALLS="$calls" \
++        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out.txt" 2>&1 ||
++        fail "audit exited non-zero: $(cat "$tmp/out.txt")"
++
++    ! grep -qx bd "$calls" ||
++        fail "the home sweep read the bead store; ownership must come from the session roster alone"
++    [[ "$(grep -cx session "$calls")" == "1" ]] ||
++        fail "the session roster was read $(grep -cx session "$calls") times; it must be fetched once per run"
++
++    rm -rf "$tmp"
++}
++
++test_budget_expiry_defers_rather_than_hangs() {
++    # A patrol step that never returns stalls the patrol. The sweep spends one
++    # shared wall clock and reports what it did not reach, rather than running
++    # until something else kills it.
++    local tmp rig origin bin homes sessions logdir log started ended
++    tmp=$(make_tmp)
++    rig="$tmp/rig"
++    origin="$tmp/origin.git"
++    bin="$tmp/bin"
++    homes="$tmp/city/.gc/worktrees/rig/polecats"
++    sessions="$tmp/sessions.json"
++    logdir="$tmp/logs"
++    mkdir -p "$logdir"
++
++    setup_rig "$rig" "$origin"
++    write_gc_stub "$bin"
++    write_git_stub "$bin"
++    add_home "$rig" "$homes" one
++    add_home "$rig" "$homes" two
++    echo '{"sessions":[]}' >"$sessions"
++
++    started=$(date +%s)
++    GC_RIG=rig LOG_DIR="$logdir" GC_SESSIONS_JSON="$sessions" \
++        GIT_STATUS_DELAY=30 GC_HOME_AUDIT_BUDGET_SECONDS=4 PATH="$bin:$PATH" \
++        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out.txt" 2>&1 ||
++        fail "audit exited non-zero when its budget expired: $(cat "$tmp/out.txt")"
++    ended=$(date +%s)
++
++    (( ended - started < 25 )) ||
++        fail "the audit ran $((ended - started))s on a 4s budget; the bound is not enforced"
++    [[ -e "$homes/one/seed.txt" && -e "$homes/two/seed.txt" ]] ||
++        fail "a home was removed without its status ever being read"
++    grep -F 'budget spent' "$tmp/out.txt" >/dev/null ||
++        fail "a truncated cycle reported as a clean one: $(cat "$tmp/out.txt")"
++
++    log="$logdir/polecat-home-audit.log"
++    grep -F '"event":"home_status_unreadable"' "$log" >/dev/null ||
++        fail "the home whose git status was cut short was not reported"
++    [[ "$(reason_for "$log" home_status_unreadable)" == "git_status_timed_out" ]] ||
++        fail "a git status cut short by the budget was reported as a failure of the checkout"
++
++    rm -rf "$tmp"
++}
++
++test_a_check_that_never_ran_is_not_reported_as_a_failure() {
++    # `home_budget_truncated` is the never-attempted case and names nothing
++    # external; every other event means a command actually ran. Blurring the
++    # two is what sent readers at a healthy Dolt server twice in one night
++    # (gcp-mqu9, in the sibling reaper) — the same distinction has to hold here.
++    local tmp rig origin bin homes sessions logdir log
++    tmp=$(make_tmp)
++    rig="$tmp/rig"
++    origin="$tmp/origin.git"
++    bin="$tmp/bin"
++    homes="$tmp/city/.gc/worktrees/rig/polecats"
++    sessions="$tmp/sessions.json"
++    logdir="$tmp/logs"
++    mkdir -p "$logdir"
++
++    setup_rig "$rig" "$origin"
++    write_gc_stub "$bin"
++    write_git_stub "$bin"
++    add_home "$rig" "$homes" one
++    echo '{"sessions":[]}' >"$sessions"
++    log="$logdir/polecat-home-audit.log"
++
++    # Case 1: the roster read RAN and was cut off at the budget. The reason
++    # must name the read, and the detail must point at the seconds it was
++    # given — otherwise a short budget reads as a broken supervisor.
++    GC_RIG=rig LOG_DIR="$logdir" GC_SESSIONS_JSON="$sessions" \
++        GC_SESSION_DELAY=20 GC_HOME_AUDIT_BUDGET_SECONDS=3 PATH="$bin:$PATH" \
++        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/slow.txt" 2>&1 ||
++        fail "audit exited non-zero on a slow roster read: $(cat "$tmp/slow.txt")"
++
++    [[ -e "$homes/one/seed.txt" ]] ||
++        fail "a home was removed after a roster read that never completed"
++    [[ "$(reason_for "$log" home_roster_unreadable)" == "roster_read_timed_out" ]] ||
++        fail "a roster read cut short by the budget was not named as such"
++    [[ "$(detail_for "$log" home_roster_unreadable)" == *"budget"* ]] ||
++        fail "the roster timeout does not point at the budget it hit: $(detail_for "$log" home_roster_unreadable)"
++
++    # Case 2: the budget was already gone when the worktree list came due, so
++    # NOTHING was enumerated. Nothing external failed here, and the log must
++    # not imply that git or the roster did — it is the clock's line alone.
++    rm -f "$log"
++    GC_RIG=rig LOG_DIR="$logdir" GC_SESSIONS_JSON="$sessions" \
++        GIT_PRUNE_DELAY=20 GC_HOME_AUDIT_BUDGET_SECONDS=3 PATH="$bin:$PATH" \
++        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/starved.txt" 2>&1 ||
++        fail "audit exited non-zero when its budget was spent up front: $(cat "$tmp/starved.txt")"
++
++    [[ -e "$homes/one/seed.txt" ]] || fail "a home was removed without being enumerated"
++    [[ "$(reason_for "$log" home_budget_truncated)" == "budget_spent_before_worktree_list" ]] ||
++        fail "a check that never ran was not reported as never having run"
++    ! grep -F '"event":"home_roster_unreadable"' "$log" >/dev/null ||
++        fail "a run that never asked the roster anything blamed the roster"
++    ! grep -F '"event":"home_worktree_list_failed"' "$log" >/dev/null ||
++        fail "a worktree list that was never attempted was reported as a failure of git"
++
++    rm -rf "$tmp"
++}
++
++test_git_failures_are_distinguished_from_a_short_budget() {
++    # Same honesty rule on the other two git calls: a checkout git could not
++    # read is a real incident with a real owner, and must not wear the same
++    # reason as a clock that ran out.
++    local tmp rig origin bin homes sessions logdir log
++    tmp=$(make_tmp)
++    rig="$tmp/rig"
++    origin="$tmp/origin.git"
++    bin="$tmp/bin"
++    homes="$tmp/city/.gc/worktrees/rig/polecats"
++    sessions="$tmp/sessions.json"
++    logdir="$tmp/logs"
++    mkdir -p "$logdir"
++
++    setup_rig "$rig" "$origin"
++    write_gc_stub "$bin"
++    write_git_stub "$bin"
++    add_home "$rig" "$homes" one
++    echo '{"sessions":[]}' >"$sessions"
++    log="$logdir/polecat-home-audit.log"
++
++    GC_RIG=rig LOG_DIR="$logdir" GC_SESSIONS_JSON="$sessions" GIT_STATUS_FAIL=1 \
++        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/status.txt" 2>&1 ||
++        fail "audit exited non-zero on a failing git status: $(cat "$tmp/status.txt")"
++    [[ "$(reason_for "$log" home_status_unreadable)" == "git_status_failed" ]] ||
++        fail "a genuine git status failure was not reported as one"
++    [[ "$(detail_for "$log" home_status_unreadable)" == *"exited 128"* ]] ||
++        fail "the git status failure does not name the exit code"
++    [[ -e "$homes/one/seed.txt" ]] || fail "a home whose git status failed was removed"
++
++    rm -f "$log"
++    GC_RIG=rig LOG_DIR="$logdir" GC_SESSIONS_JSON="$sessions" GIT_REVLIST_FAIL=1 \
++        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/revlist.txt" 2>&1 ||
++        fail "audit exited non-zero on a failing rev-list: $(cat "$tmp/revlist.txt")"
++    [[ "$(reason_for "$log" home_commits_unreadable)" == "rev_list_failed" ]] ||
++        fail "a genuine rev-list failure was not reported as one"
++    [[ -e "$homes/one/seed.txt" ]] ||
++        fail "a home was removed without ever establishing its commits were published"
++
++    rm -rf "$tmp"
++}
++
++test_every_line_is_stamped_at_the_event_not_at_the_run() {
++    # A log where every line carries the run's start stamp cannot show that a
++    # cycle spent its whole budget, or in what order decisions fell.
++    local tmp rig origin bin homes sessions logdir log stamps
++    tmp=$(make_tmp)
++    rig="$tmp/rig"
++    origin="$tmp/origin.git"
++    bin="$tmp/bin"
++    homes="$tmp/city/.gc/worktrees/rig/polecats"
++    sessions="$tmp/sessions.json"
++    logdir="$tmp/logs"
++    mkdir -p "$logdir"
++
++    setup_rig "$rig" "$origin"
++    write_gc_stub "$bin"
++    write_git_stub "$bin"
++    add_home "$rig" "$homes" one
++    add_home "$rig" "$homes" two
++    echo scratch >"$homes/one/seed.txt"
++    echo scratch >"$homes/two/seed.txt"
++    echo '{"sessions":[]}' >"$sessions"
++
++    GC_RIG=rig LOG_DIR="$logdir" GC_SESSIONS_JSON="$sessions" \
++        GIT_STATUS_DELAY=2 GC_HOME_AUDIT_BUDGET_SECONDS=20 PATH="$bin:$PATH" \
++        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out.txt" 2>&1 ||
++        fail "audit exited non-zero: $(cat "$tmp/out.txt")"
++
++    log="$logdir/polecat-home-audit.log"
++    stamps=$(jq -r 'select(.event == "home_dirty_kept") | .ts' "$log" | sort -u | wc -l | tr -d ' ')
++    [[ "$stamps" -gt 1 ]] ||
++        fail "two decisions seconds apart share one timestamp; ts is the run's start, not the event's"
++    jq -e 'select(.event == "home_dirty_kept") | .run_started != null and .run_started != ""' "$log" >/dev/null ||
++        fail "lines carry no run_started, so they cannot be grouped into cycles"
++
++    rm -rf "$tmp"
++}
++
++test_removes_only_unowned_childless_clean_published_homes
++test_a_home_with_child_worktrees_is_never_removed
++test_the_home_is_matched_by_its_own_work_dir_too
++test_real_removal_is_opt_in
++test_an_unreadable_session_roster_removes_nothing
++test_unpublished_commits_are_reported_not_removed
++test_the_sweep_reads_no_beads
++test_budget_expiry_defers_rather_than_hangs
++test_a_check_that_never_ran_is_not_reported_as_a_failure
++test_git_failures_are_distinguished_from_a_short_budget
++test_every_line_is_stamped_at_the_event_not_at_the_run
++
++echo "polecat home audit tests passed"
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 27 Aug 2026 16:42:34 -0400
+Subject: [PATCH 45/45] test(gastown): keep the home-audit no-bead assertion
+ off the bare-bd guard (gcp-actg)
+
+The new no-bead assertion wrote its grep pattern positionally, which put the
+literal `bd` directly against the file argument. tests/test_no_bare_bd_commands.py
+reads that pair as a dynamic beads subcommand and flagged the line, adding a
+sixth violation to a guard that already fails with five on integration.
+
+Pass the pattern via `-e ... --` instead. Match semantics are unchanged: `-x`
+still anchors the whole line, so a recorded `bd` call is caught and `bdshow` is
+not.
+---
+ gastown/tests/test_polecat_home_audit.sh | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/gastown/tests/test_polecat_home_audit.sh b/gastown/tests/test_polecat_home_audit.sh
+index 91789b4..dc6ff41 100755
+--- a/gastown/tests/test_polecat_home_audit.sh
++++ b/gastown/tests/test_polecat_home_audit.sh
+@@ -453,7 +453,11 @@ test_the_sweep_reads_no_beads() {
+         PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out.txt" 2>&1 ||
+         fail "audit exited non-zero: $(cat "$tmp/out.txt")"
+ 
+-    ! grep -qx bd "$calls" ||
++    # Pass the pattern via `-e ... --`, not as a bare positional. Written
++    # positionally, the pattern sits directly against the file argument and the
++    # no-bare-bd guard (tests/test_no_bare_bd_commands.py) reads that pair as a
++    # dynamic beads subcommand and flags the line. Keep the `-e` form.
++    ! grep -qx -e bd -- "$calls" ||
+         fail "the home sweep read the bead store; ownership must come from the session roster alone"
+     [[ "$(grep -cx session "$calls")" == "1" ]] ||
+         fail "the session roster was read $(grep -cx session "$calls") times; it must be fetched once per run"
+-- 
+2.50.1 (Apple Git-155)
+
