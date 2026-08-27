@@ -98,70 +98,126 @@ Two distinct servers, one of them holding exactly one rig's beads, is a normal
 topology — not a symptom.
 
 If you detect Dolt trouble (commands hang/timeout, "connection refused",
-"database not found", query latency > 5s, unexpected empty results):
+"database not found", query latency > 5s **measured straight at the resolved
+endpoint**, unexpected empty results):
+
+**Latency measured through `gc` is not a measurement of Dolt.** `gc` pays
+seconds of fixed startup before any subcommand reaches a server, so a slow
+`gc dolt ...` or `gc bd ...` is weak evidence about the data plane. Time the
+endpoint itself (step 1 below) before you conclude anything about the server —
+and never open an incident on the strength of a `gc` invocation feeling slow.
 
 **BEFORE restarting Dolt, collect non-fatal diagnostics.** Dolt hangs
 are hard to reproduce. A blind restart destroys the evidence. Always resolve
 the endpoint first (above), then:
 
 ```bash
-# Every command in this bundle targets the MANAGED city server. If the
-# scope you are investigating is `explicit`, capture this anyway (it rules
-# the managed server in or out) but do NOT read it as evidence about that
-# scope's beads — step 5 below is the one that dials external endpoints.
+# Every SQL / reachability probe below dials the endpoint resolved in step 0,
+# so the bundle covers an `explicit` external server too. Step 3
+# (`gc dolt health`) is the one exception — it is a managed-server-only view,
+# so read it as evidence about the managed server and nothing else. Step 5 is
+# the probe that walks every rig's own endpoint.
 #
-# Group all five captures under one timestamp so the bundle is easy
-# to attach to the escalation note. Each timed step writes via
-# redirect (not `tee`) so timeout's exit 124 propagates to `||` and
-# the agent gets an explicit "diagnostic timed out" signal — POSIX
-# pipelines mask the upstream exit code via tee.
+# Group all captures under one timestamp so the bundle is easy to attach to
+# the escalation note. Each timed step writes via redirect (not `tee`) so
+# timeout's exit 124 propagates to `||` and the agent gets an explicit
+# "diagnostic timed out" signal — POSIX pipelines mask the upstream exit
+# code via tee.
+#
+# Every budget below is a measured number, not a guess. A budget exists only
+# to stop a wedged server from blocking the diagnostic, so each sits well
+# above the measured worst case — a step that times out is a real finding,
+# never an artifact of the tool's own startup cost.
 ts=$(date +%s)
+
+# 0. Resolve the endpoint for the scope you are investigating and probe THAT
+#    server — this is the resolution the endpoint-origin table above
+#    describes, applied rather than assumed. Run from the rig (or city)
+#    directory whose beads you are chasing.
+CFG=.beads/config.yaml
+ORIGIN=$(grep -E '^[[:space:]]*gc\.endpoint_origin:' "$CFG" | head -1 | sed 's/.*: *//')
+if [ "$ORIGIN" = "explicit" ]; then
+  DOLT_HOST=$(grep -E '^[[:space:]]*dolt\.host:' "$CFG" | head -1 | sed 's/.*: *//')
+  DOLT_PORT=$(grep -E '^[[:space:]]*dolt\.port:' "$CFG" | head -1 | sed 's/.*: *//')
+else
+  DOLT_HOST=127.0.0.1
+  DOLT_PORT=$(jq -r '.port' {{ .CityRoot }}/.gc/runtime/packs/dolt/dolt-state.json)
+fi
+echo "probing ${ORIGIN:-unknown} endpoint ${DOLT_HOST}:${DOLT_PORT}"
+# Dolt 2.x has no `sql-client` subcommand: the connection flags are GLOBAL and
+# go BEFORE `sql`. `--no-tls` is required — the managed server serves no TLS
+# and the client otherwise dies in the handshake. Override DOLT_USER /
+# DOLT_PASSWORD for an external endpoint that has real credentials.
 
 # 1. Capture live process state via SQL (non-fatal — Dolt keeps running).
 #    SHOW FULL PROCESSLIST lists active connections, the query each is
-#    running, and time-in-state. Bound the call so a wedged server can't
-#    block the diagnostic itself.
-timeout 5 gc dolt sql -q "SHOW FULL PROCESSLIST" \
+#    running, and time-in-state. Straight at the endpoint it costs 0.10-0.31s
+#    (measured, load ~20-37), so a 10s wall is ~30x headroom: if this one
+#    fires, the server genuinely is not answering.
+timeout 10 dolt --host "$DOLT_HOST" --port "$DOLT_PORT" \
+      --user "${DOLT_USER:-root}" --password "${DOLT_PASSWORD:-}" --no-tls \
+      sql -q "SHOW FULL PROCESSLIST" \
     > /tmp/dolt-hang-$ts-procs.log 2>&1 \
   || echo "(step 1 timed out or failed — see procs.log for partial output)"
 cat /tmp/dolt-hang-$ts-procs.log
 
 # 2. Capture recent server log (timestamps, slow queries, prior crashes).
-#    `gc dolt logs` is a `tail` against an on-disk file — does not
-#    touch the live server, so no outer timeout is needed. Use the
-#    redirect form for the same reason as the other steps: a missing
-#    log file should surface as a "diagnostic failed" signal, not be
-#    masked by the `tee` exit code.
+#    `gc dolt logs` is a `tail` against an on-disk file — it never touches the
+#    live server, so it needs no wall (measured 2.1-5.9s, essentially all of
+#    it gc startup). Use the redirect form for the same reason as the other
+#    steps: a missing log file should surface as a "diagnostic failed" signal,
+#    not be masked by the `tee` exit code.
 gc dolt logs -n 500 \
     > /tmp/dolt-hang-$ts-logs.log 2>&1 \
   || echo "(step 2 failed — see logs.log; the dolt log file may be missing)"
 cat /tmp/dolt-hang-$ts-logs.log
 
-# 3. Capture the structured health snapshot. `gc dolt health` bounds
-#    each per-database SQL probe internally with `run_bounded 5`, but
-#    worst-case wall time is roughly 5s + 5s × N_databases. 60s covers
-#    cities up to ~10 databases at the limit; if the timeout fires,
-#    treat it as evidence the data plane is wedged and escalate.
+# 3. Capture the structured health snapshot — the one managed-server view with
+#    no direct-SQL equivalent, since it knows which databases the city expects.
+#    Measured 8.2-24.3s on a 6-database city at load ~20-37 (it bounds each
+#    per-database probe internally with `run_bounded 5`, then pays gc's startup
+#    on top). 60s is ~2.5x that worst case; if it fires, treat it as evidence
+#    the data plane is wedged and escalate.
 timeout 60 gc dolt health --json \
     > /tmp/dolt-hang-$ts-health.json 2>&1 \
   || echo "(step 3 timed out or failed — see health.json for partial output)"
 cat /tmp/dolt-hang-$ts-health.json
 
-# 4. Capture reachability + PID for the escalation note. Bound the
-#    call: `gc dolt status` probes /dev/tcp, which can stall on a
-#    server that accepts connections but never speaks MySQL.
-timeout 10 gc dolt status \
-    > /tmp/dolt-hang-$ts-status.log 2>&1 \
-  || echo "(step 4 timed out or failed — see status.log for partial output)"
+# 4. Reachability + PID for the escalation note. This used to be
+#    `timeout 10 gc dolt status`, which could never pass: `gc dolt status`
+#    measured 5.1-8.0s idle and ~23s at load 30-50, so a bounded call could not
+#    tell "server wedged" from "gc slow to start". Both facts are reachable
+#    without gc — reachability is the resolved endpoint answering a trivial
+#    query (0.10-0.31s measured, same 10s wall as step 1), and the managed
+#    server's PID is already sitting in dolt-state.json. NOTE: that PID file
+#    describes the MANAGED server only; an `explicit` external endpoint is not
+#    gc-supervised and has no PID to report here.
+{
+  echo "endpoint: ${ORIGIN:-unknown} ${DOLT_HOST}:${DOLT_PORT}"
+  timeout 10 dolt --host "$DOLT_HOST" --port "$DOLT_PORT" \
+        --user "${DOLT_USER:-root}" --password "${DOLT_PASSWORD:-}" --no-tls \
+        sql -q "SELECT VERSION() AS server_version, NOW() AS server_time" \
+    || echo "(step 4 reachability probe timed out or failed)"
+  echo "--- managed server supervisor state (dolt-state.json) ---"
+  cat {{ .CityRoot }}/.gc/runtime/packs/dolt/dolt-state.json
+} > /tmp/dolt-hang-$ts-status.log 2>&1
 cat /tmp/dolt-hang-$ts-status.log
 
-# 5. Probe every rig's OWN endpoint, including externally-pinned ones the
-#    four steps above structurally cannot reach. gc doctor walks every rig
-#    and is slow — budget minutes, and treat a timeout here as a finding,
-#    not as permission to skip the step.
-timeout 600 gc doctor --json \
-    > /tmp/dolt-hang-$ts-doctor.json 2>&1 \
-  || echo "(step 5 timed out or failed — see doctor.json for partial output)"
+# 5. Probe every rig's OWN endpoint, including externally-pinned ones the steps
+#    above only cover when you happen to be standing in that rig. gc doctor
+#    walks every rig and is slow — measured 96s on this city, and it grows with
+#    rig count, so 600s is ~6x headroom. Treat a timeout here as a finding, not
+#    as permission to skip the step.
+timeout 600 gc doctor --json > /tmp/dolt-hang-$ts-doctor.json 2>&1
+rc=$?
+#    Unlike the steps above, non-zero here is the NORMAL case: gc doctor exits
+#    1 whenever it has findings. Separate that from a real timeout, or the
+#    failure branch cries wolf on every healthy run.
+if [ "$rc" -eq 124 ]; then
+  echo "(step 5 TIMED OUT after 600s — that is itself a finding; see doctor.json)"
+elif [ "$rc" -ne 0 ]; then
+  echo "(step 5 exit $rc — gc doctor exits non-zero when it HAS findings; read doctor.json)"
+fi
 jq -r '.. | objects | select((.name? // "") | test("dolt-server"))
        | "\(.name) | \(.status) | \(.message)"' \
     /tmp/dolt-hang-$ts-doctor.json 2>/dev/null \
