@@ -453,7 +453,11 @@ test_the_sweep_reads_no_beads() {
         PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out.txt" 2>&1 ||
         fail "audit exited non-zero: $(cat "$tmp/out.txt")"
 
-    ! grep -qx bd "$calls" ||
+    # Pass the pattern via `-e ... --`, not as a bare positional. Written
+    # positionally, the pattern sits directly against the file argument and the
+    # no-bare-bd guard (tests/test_no_bare_bd_commands.py) reads that pair as a
+    # dynamic beads subcommand and flags the line. Keep the `-e` form.
+    ! grep -qx -e bd -- "$calls" ||
         fail "the home sweep read the bead store; ownership must come from the session roster alone"
     [[ "$(grep -cx session "$calls")" == "1" ]] ||
         fail "the session roster was read $(grep -cx session "$calls") times; it must be fetched once per run"
