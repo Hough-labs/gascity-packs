@@ -1,0 +1,32 @@
+# gauntlet-tdd — the gauntlet RED-to-GREEN contract loop as a pack.
+#
+# Distributes the TDD cycle a careful contributor runs by hand against the
+# gauntlet CLI — scaffold a contract from a bead's acceptance criteria,
+# observe RED, implement, observe GREEN — so any city that imports this pack
+# gets the same discipline as platform-native formulas and commands.
+#
+# v0.1.0 ships ONE formula:
+#   - mol-tdd-red-green   bead -> scaffold -> RED -> implement -> GREEN
+#
+# It has a wrapper `tdd` command (`tdd red-green`).
+#
+# The loop is pinned to the BATS lane. `gauntlet scaffold --from-bead` emits a
+# `.bats` skeleton, and a bead-scoped `gauntlet run local` dispatches by file
+# extension, so a `.bats` covering file never reaches the hurl runner. No step
+# passes `--contracts=hurl`; see README.md, "Why the lane is pinned".
+#
+# The red gate is `gauntlet lint`, NEVER `gauntlet run local`. Freshly
+# scaffolded stubs are skip-guarded, so `run local` exits 0 on a new scaffold
+# and using it to prove red would assert green on an empty contract.
+#
+# Usage in your city's pack.toml:
+#   [imports.gauntlet-tdd]
+#   source = "../packs/gauntlet-tdd"
+#
+# Drive the loop for a bead:
+#   gc gauntlet-tdd tdd red-green gaunt-8ibp --rig gauntlet
+
+[pack]
+name = "gauntlet-tdd"
+version = "0.1.0"
+schema = 2
