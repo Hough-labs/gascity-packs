@@ -1,0 +1,361 @@
+description = """
+The gauntlet RED-to-GREEN contract loop, driven from a single bead.
+
+Takes a bead id, scaffolds a contract from that bead's acceptance criteria,
+proves the contract RED, routes the implementation to the rig's implementer,
+and proves the contract GREEN. The bead's acceptance criteria are the
+contract; the loop refuses to advance on an assertion it cannot see fail.
+
+A coding agent (polecat or equivalent) follows the steps in order. The
+molecule root bead IS the control bead — run state is recorded in its notes
+via `gc bd update <root-id> --notes "<key>: <value>"`.
+
+## Contract
+
+1. Caller slings with `--var contract_bead=<bead-id>`
+2. Agent works through 5 sequential steps
+3. Report written to `.gc/gauntlet-tdd/loops/<bead-id>.md`
+4. Root-bead notes record `contract_path:`, `red_findings:`, `report_path:`
+5. Chain ends either GREEN, or halted with `halt_reason:` recorded
+
+## Variables
+
+| Variable | Source | Description |
+|----------|--------|-------------|
+| contract_bead | caller | Bead whose acceptance criteria seed the contract (required) |
+| implementer_target | caller | Role the implement step is routed to (default: `gastown.polecat`) |
+| contracts_dir | caller | Contracts directory override; empty means `<repo-root>/.gauntlet` |
+
+## The red gate is `gauntlet lint`, never `gauntlet run local`
+
+`gauntlet scaffold --from-bead` emits skip-guarded stubs. A skip is not a
+failure, so `gauntlet run local` exits 0 on a freshly scaffolded contract —
+measured, not assumed: on the gaunt-8ibp smoke a three-stub scaffold gave
+`GAUNTLET_SUMMARY ... pass=0 fail=0 skipped=3` and exit 0, while
+`gauntlet lint` on the same tree exited 1 with three `todo_skip` findings.
+Using `run local` to prove red would therefore assert GREEN on an empty
+contract and wave the whole loop through. `gauntlet lint` sees through the
+skip guard; it is the only red gate this formula uses.
+
+## The lane is pinned to bats
+
+`gauntlet scaffold --from-bead` emits a `.bats` skeleton, and a bead-scoped
+`gauntlet run local` dispatches by FILE EXTENSION (inferTool), not by a lane
+flag. Every run in this formula passes `--contracts=bats` explicitly so the
+pin is enforced rather than incidental. No step names the hurl lane at all.
+
+## Failure Modes
+
+| Situation | Action |
+|-----------|--------|
+| Repo is not a git checkout | Record halt_reason, close root bead |
+| `gauntlet` not on PATH | Record halt_reason, close root bead |
+| Bead has no acceptance criteria | Record halt_reason, close root bead |
+| Scaffold emits no `.bats` file | Record halt_reason, close root bead |
+| `gauntlet lint` reports clean on a fresh scaffold | Halt — the contract is not red, so nothing would be proven |
+| Implementation cannot reach GREEN | Record halt_reason with the failing run output, close root bead |"""
+formula = "mol-tdd-red-green"
+version = 1
+contract = "graph.v2"
+
+[vars]
+[vars.contract_bead]
+description = "Bead id whose acceptance criteria seed the contract (e.g. \\\"gaunt-8ibp\\\"). Named contract_bead, not bead_id: `bead_id`, `issue` and `convoy_id` are reserved graph.v2 runtime vars."
+required = true
+
+[vars.implementer_target]
+description = "Role the implement step is routed to. Must be a role the consuming rig actually imports — see README.md, \\\"Single-implementer rigs\\\"."
+default = "gastown.polecat"
+
+[vars.contracts_dir]
+description = "Contracts directory override, passed through as --contracts-dir. Empty means gauntlet's default of <repo-root>/.gauntlet."
+default = ""
+
+[[steps]]
+id = "intake"
+title = "Preflight the loop for {{contract_bead}}"
+description = """
+Establish that the loop can run at all before anything is written. Every
+check below halts the chain rather than proceeding on a guess — a loop that
+scaffolds into the wrong tree, or against a bead with no acceptance criteria,
+produces a contract that cannot mean anything.
+
+```bash
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
+
+halt() {
+    gc bd update "$ROOT_ID" --notes "halt_reason: $1"
+    echo "[tdd-red-green] HALT: $1" >&2
+    gc bd close "$ROOT_ID" --reason "$1"
+    exit 1
+}
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || halt "not a git checkout"
+cd "$REPO_ROOT"
+
+command -v gauntlet >/dev/null 2>&1 || halt "gauntlet CLI not on PATH"
+```
+
+The bead's acceptance criteria ARE the contract. A bead with none scaffolds
+to nothing, so read it before scaffolding rather than discovering the empty
+skeleton two steps later:
+
+```bash
+ACCEPTANCE=$(gc bd show "{{contract_bead}}" --json | jq -r '.[0].acceptance_criteria // ""')
+[ -n "$ACCEPTANCE" ] || halt "{{contract_bead}} has no acceptance criteria to scaffold from"
+```
+
+Resolve the contracts directory once, and reuse `$CONTRACTS_FLAG` verbatim in
+every later gauntlet invocation so all four steps address the same tree:
+
+```bash
+CONTRACTS_FLAG=""
+if [ -n "{{contracts_dir}}" ]; then
+    CONTRACTS_FLAG="--contracts-dir {{contracts_dir}}"
+fi
+
+gc bd update "$ROOT_ID" --notes "contract_bead: {{contract_bead}}
+repo_root: $REPO_ROOT
+contracts_flag: ${CONTRACTS_FLAG:-<default .gauntlet>}
+lane: bats
+status: in_progress"
+```
+
+**Note on bead resolution.** `gauntlet scaffold --from-bead` resolves the bead
+through the `bd` CLI itself, using the store that the CWD resolves to. Inside a
+rig worktree that is the rig's own store and no action is needed. If the
+scaffold reports "no issue found" for a bead you can read with `gc bd show`,
+an inherited `BEADS_DIR` is pointing the CLI at a different store — that is
+the failure, not a missing bead.
+
+**Exit criteria:** In repo root, `gauntlet` present, `{{contract_bead}}`
+readable with non-empty acceptance criteria, `$CONTRACTS_FLAG` resolved.
+"""
+
+[[steps]]
+id = "scaffold"
+title = "Scaffold the contract from {{contract_bead}}'s acceptance criteria"
+needs = ["intake"]
+description = """
+Emit the contract skeleton. This writes a `.bats` file under the contracts
+directory, one `@test` stub per testable assertion in the bead's acceptance
+criteria, each stub skip-guarded and tagged `red-by-design`.
+
+```bash
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
+gauntlet scaffold --from-bead "{{contract_bead}}" 2>&1 | tee /tmp/tdd-scaffold-$$.log
+```
+
+The command prints the path of each file it wrote, prefixed by its lane:
+
+    bats: /path/to/.gauntlet/<name>.bats
+    scaffold --from-bead <id>: wrote 1 file(s), skipped 0, 3 @test stub(s) (tier=B)
+
+Capture that path and assert the artifact is `.bats`. The extension is not
+cosmetic: a bead-scoped `gauntlet run local` picks its runner from the file
+extension, so the `.bats` suffix is exactly what keeps this loop on the bats
+lane and off the hurl runner.
+
+```bash
+CONTRACT_PATH=$(sed -n 's/^bats: //p' /tmp/tdd-scaffold-$$.log | head -1)
+if [ -z "$CONTRACT_PATH" ] || [ "${CONTRACT_PATH##*.}" != "bats" ]; then
+    gc bd update "$ROOT_ID" --notes "halt_reason: scaffold emitted no .bats contract"
+    gc bd close "$ROOT_ID" --reason "scaffold emitted no .bats contract"
+    exit 1
+fi
+gc bd update "$ROOT_ID" --notes "contract_path: $CONTRACT_PATH"
+```
+
+If scaffold reports `skipped 1` and wrote nothing, a contract for this bead
+already exists. That is a resume, not a failure: keep the existing file and
+carry on to the red gate, which will tell you whether it still has unproven
+stubs in it.
+
+**Exit criteria:** A `.bats` contract exists covering `{{contract_bead}}`, and
+its path is recorded on the root bead as `contract_path:`.
+"""
+
+[[steps]]
+id = "assert-red"
+title = "Prove the contract RED"
+needs = ["scaffold"]
+description = """
+**This step uses `gauntlet lint`. It must never use `gauntlet run local`.**
+
+Scaffolded stubs are skip-guarded, and a skipped test is not a failed test —
+`gauntlet run local` exits 0 on a fresh scaffold. Proving red with a green
+exit code is not a weaker gate, it is an inverted one: it certifies an empty
+contract and every later step inherits the lie. `gauntlet lint` reads through
+the skip guard and reports each residual placeholder as a `todo_skip`
+finding, which is what "red" means here.
+
+```bash
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
+
+set +e
+gauntlet lint $CONTRACTS_FLAG --json > /tmp/tdd-lint-red-$$.json 2>/tmp/tdd-lint-red-$$.err
+LINT_STATUS=$?
+set -e
+```
+
+A non-zero exit with at least one finding is RED, and the loop proceeds. A
+clean exit means there is nothing to prove — either the scaffold produced no
+stubs, or the contract was already implemented — and the loop halts rather
+than declaring victory over an assertion it never saw fail:
+
+```bash
+if [ "$LINT_STATUS" -eq 0 ]; then
+    gc bd update "$ROOT_ID" --notes "halt_reason: gauntlet lint reports clean on a fresh scaffold — no red to prove"
+    gc bd close "$ROOT_ID" --reason "contract is not red; nothing to prove"
+    exit 1
+fi
+
+RED_FINDINGS=$(sed -n 's/.*findings=\\([0-9][0-9]*\\).*/\\1/p' /tmp/tdd-lint-red-$$.err | tail -1)
+gc bd update "$ROOT_ID" --notes "red_findings: ${RED_FINDINGS:-unparsed}
+red_proven: yes"
+```
+
+Record the finding list in the run log — it is the to-do list the implement
+step works from, one entry per unproven assertion.
+
+**Exit criteria:** `gauntlet lint` exited non-zero, the finding count is
+recorded as `red_findings:` on the root bead, and `red_proven: yes` is set.
+"""
+
+[[steps]]
+id = "implement"
+title = "Implement until the contract holds"
+needs = ["assert-red"]
+metadata = { "gc.run_target" = "{{implementer_target}}" }
+description = """
+Routed to `{{implementer_target}}` — a gc-native dispatch, so the witness sees
+a real session and the refinery sees a real branch. `gauntlet loop --exec`
+would drive the same cycle as an opaque subprocess; that is the wrong
+orchestration model here, because a subprocess is invisible to both.
+
+Work from the red findings recorded by the previous step. For each stub in
+`$CONTRACT_PATH`:
+
+1. Read the acceptance line the stub was generated from — it is quoted in the
+   placeholder text.
+2. Replace the skip guard with a real assertion against real behaviour. A
+   stub rewritten to assert nothing passes, and passing is not the goal.
+3. Implement the production change that makes that assertion hold.
+
+Two rules that decide whether the loop meant anything:
+
+- **Never delete a stub to make the contract pass.** A deleted assertion is
+  an acceptance criterion silently dropped from the bead.
+- **Never leave the `red-by-design` file tag on a contract that now passes.**
+  `gauntlet bats untag-green` strips the tag from tests that have gone green;
+  run it rather than editing the tag by hand.
+
+Iterate locally against the bats lane until it holds:
+
+```bash
+gauntlet run local "{{contract_bead}}" $CONTRACTS_FLAG --contracts=bats
+```
+
+Commit the contract and the implementation together. The contract is part of
+the change, not a side artifact of it.
+
+**Exit criteria:** Every stub carries a real assertion, the implementation is
+committed, and a local bats-lane run passes.
+"""
+
+[[steps]]
+id = "assert-green"
+title = "Prove the contract GREEN and write the report"
+needs = ["implement"]
+description = """
+Two gates, both required. Lint proves no placeholder survived; the bead-scoped
+run proves the assertions actually pass. Either one alone is satisfiable by a
+contract that proves nothing — a file with every stub deleted lints clean, and
+a file with every stub still skipped runs green.
+
+```bash
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
+
+set +e
+gauntlet lint $CONTRACTS_FLAG > /tmp/tdd-lint-green-$$.log 2>&1
+LINT_STATUS=$?
+gauntlet run local "{{contract_bead}}" $CONTRACTS_FLAG --contracts=bats > /tmp/tdd-run-green-$$.log 2>&1
+RUN_STATUS=$?
+set -e
+
+if [ "$LINT_STATUS" -ne 0 ] || [ "$RUN_STATUS" -ne 0 ]; then
+    gc bd update "$ROOT_ID" --notes "halt_reason: green gate failed (lint=$LINT_STATUS run=$RUN_STATUS)"
+    cat /tmp/tdd-lint-green-$$.log /tmp/tdd-run-green-$$.log >&2
+    gc bd close "$ROOT_ID" --reason "green gate failed"
+    exit 1
+fi
+```
+
+A green bats-lane run prints a summary line naming the counts. `skipped` must
+be 0 — a run whose tests all skipped exits 0 and would otherwise read as a
+pass:
+
+    GAUNTLET_SUMMARY workflow=bats-tests total=3 pass=3 fail=0 ... skipped=0
+
+```bash
+SKIPPED=$(sed -n 's/.*GAUNTLET_SUMMARY.* skipped=\\([0-9][0-9]*\\).*/\\1/p' /tmp/tdd-run-green-$$.log | tail -1)
+if [ "${SKIPPED:-1}" -ne 0 ]; then
+    gc bd update "$ROOT_ID" --notes "halt_reason: green run reported skipped=${SKIPPED:-unparsed} — skips are not passes"
+    gc bd close "$ROOT_ID" --reason "green run still has skipped tests"
+    exit 1
+fi
+```
+
+Write the report:
+
+```bash
+mkdir -p .gc/gauntlet-tdd/loops
+REPORT_PATH=".gc/gauntlet-tdd/loops/{{contract_bead}}.md"
+```
+
+Use this structure:
+
+```markdown
+# RED-to-GREEN — {{contract_bead}}
+
+## Contract
+
+- **Bead**: {{contract_bead}}
+- **Contract file**: <contract_path>
+- **Lane**: bats
+
+## Acceptance criteria covered
+
+<one line per @test, naming the acceptance line it came from>
+
+## RED
+
+<gauntlet lint output at the red gate, with the finding count>
+
+## GREEN
+
+<GAUNTLET_SUMMARY line from the bead-scoped run>
+
+## Implementation
+
+<what changed, and which assertion each change makes hold>
+
+## Not covered
+
+<acceptance lines that produced no stub, and why — an empty section is a
+claim that the contract covers the bead whole>
+```
+
+Then finalize:
+
+```bash
+gc bd update "$ROOT_ID" --notes "report_path: $REPORT_PATH
+green_proven: yes
+status: complete"
+echo "[tdd-red-green] GREEN for {{contract_bead}}"
+echo "[tdd-red-green]   Report: $REPORT_PATH"
+```
+
+**Exit criteria:** Lint clean, bead-scoped bats run green with `skipped=0`,
+report written, root-bead notes finalized.
+"""
