@@ -57,6 +57,7 @@ fi
 WORK_BEAD_ID=""
 WORK_STATUS=""
 WORK_ASSIGNEE=""
+WORK_SESSION_TAG=""
 READ_OK=0
 READ_TRY=0
 while [ "$READ_TRY" -lt 3 ]; do
@@ -68,6 +69,7 @@ while [ "$READ_TRY" -lt 3 ]; do
     SHOW_CODE=$?
     WORK_STATUS=$(printf '%s' "$WORK_JSON" | jq -r '.[0].status // empty' 2>/dev/null)
     WORK_ASSIGNEE=$(printf '%s' "$WORK_JSON" | jq -r '.[0].assignee // empty' 2>/dev/null)
+    WORK_SESSION_TAG=$(printf '%s' "$WORK_JSON" | jq -r '.[0].metadata.polecat_session // empty' 2>/dev/null)
     if [ "$SHOW_CODE" -eq 0 ] && [ -n "$WORK_STATUS" ]; then
       READ_OK=1
       break
@@ -75,13 +77,17 @@ while [ "$READ_TRY" -lt 3 ]; do
   fi
   sleep 1
 done
-# Only POSITIVE evidence counts: the bead is closed, or it is assigned to
-# somebody who is not this session (the refinery). "Not in_progress for me" is
-# NOT evidence — a molecule's work bead is never assigned to the polecat
-# session in the first place, so that test reports already-submitted on work
-# that has not been submitted at all, and drains with the branch unpushed.
+# Only POSITIVE evidence counts: the bead is closed, or it is held by somebody
+# who is not a polecat — the refinery. "Not in_progress for me" is NOT evidence,
+# and neither is a bare "assigned to somebody else": mol-polecat-work's
+# workspace-setup claims the WORK bead for the session implementing it, and a
+# pool restart mints a NEW session identity, so a resumed molecule legitimately
+# finds the bead still held by its own PREVIOUS session — which
+# metadata.polecat_session names. Reading that as a handoff drains with the
+# branch unpushed, the exact failure this guard exists to prevent.
 if [ "$READ_OK" -eq 1 ] && { [ "$WORK_STATUS" = "closed" ] ||
-     { [ -n "$WORK_ASSIGNEE" ] && [ "$WORK_ASSIGNEE" != "$EXPECTED_ASSIGNEE" ]; }; }; then
+     { [ -n "$WORK_ASSIGNEE" ] && [ "$WORK_ASSIGNEE" != "$EXPECTED_ASSIGNEE" ] &&
+       [ "$WORK_ASSIGNEE" != "$WORK_SESSION_TAG" ]; }; }; then
   echo "ALREADY_SUBMITTED $WORK_BEAD_ID status=$WORK_STATUS assignee=$WORK_ASSIGNEE — draining."
   gc runtime drain-ack
   exit
