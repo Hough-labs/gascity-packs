@@ -8,7 +8,16 @@ contract; the loop refuses to advance on an assertion it cannot see fail.
 
 A coding agent (polecat or equivalent) follows the steps in order. The
 molecule root bead IS the control bead — run state is recorded in its notes
-via `gc bd update <root-id> --notes "<key>: <value>"`.
+via `gc bd update <root-id> --append-notes "<key>: <value>"`.
+
+**Every note write in this formula is `--append-notes`, never `--notes`.**
+`--notes` REPLACES the field. The `implement` step reads `contract_path:`
+back off the notes two steps after `scaffold` wrote it, so a replacing write
+anywhere in between erases the only record of which file the loop is working
+on — and `gc bd update` still exits 0, so the loss surfaces as an
+unexplained "no contract_path on the root bead" at the implement gate rather
+than at the write that caused it. Appending also keeps the witness's and
+refinery's own annotations on a shared bead.
 
 ## Contract
 
@@ -84,7 +93,7 @@ produces a contract that cannot mean anything.
 ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
 
 halt() {
-    gc bd update "$ROOT_ID" --notes "halt_reason: $1"
+    gc bd update "$ROOT_ID" --append-notes "halt_reason: $1"
     echo "[tdd-red-green] HALT: $1" >&2
     gc bd close "$ROOT_ID" --reason "$1"
     exit 1
@@ -120,7 +129,7 @@ if [ -n "$CONTRACTS_DIR" ]; then
     RUN_ARGS="--contracts-dir $CONTRACTS_DIR"
 fi
 
-gc bd update "$ROOT_ID" --notes "contract_bead: {{contract_bead}}
+gc bd update "$ROOT_ID" --append-notes "contract_bead: {{contract_bead}}
 repo_root: $REPO_ROOT
 contracts_dir: ${CONTRACTS_DIR:-<default .gauntlet>}
 lane: bats
@@ -175,11 +184,11 @@ lane and off the hurl runner.
 ```bash
 CONTRACT_PATH=$(sed -n 's/^bats: //p' /tmp/tdd-scaffold-$$.log | head -1)
 if [ -z "$CONTRACT_PATH" ] || [ "${CONTRACT_PATH##*.}" != "bats" ]; then
-    gc bd update "$ROOT_ID" --notes "halt_reason: scaffold emitted no .bats contract"
+    gc bd update "$ROOT_ID" --append-notes "halt_reason: scaffold emitted no .bats contract"
     gc bd close "$ROOT_ID" --reason "scaffold emitted no .bats contract"
     exit 1
 fi
-gc bd update "$ROOT_ID" --notes "contract_path: $CONTRACT_PATH"
+gc bd update "$ROOT_ID" --append-notes "contract_path: $CONTRACT_PATH"
 ```
 
 If scaffold reports `skipped 1` and wrote nothing, a contract for this bead
@@ -234,13 +243,13 @@ than declaring victory over an assertion it never saw fail:
 
 ```bash
 if [ "$LINT_STATUS" -eq 0 ]; then
-    gc bd update "$ROOT_ID" --notes "halt_reason: gauntlet lint reports clean on a fresh scaffold — no red to prove"
+    gc bd update "$ROOT_ID" --append-notes "halt_reason: gauntlet lint reports clean on a fresh scaffold — no red to prove"
     gc bd close "$ROOT_ID" --reason "contract is not red; nothing to prove"
     exit 1
 fi
 
 RED_FINDINGS=$(jq -r '.findings // [] | length' /tmp/tdd-lint-red-$$.json)
-gc bd update "$ROOT_ID" --notes "red_findings: ${RED_FINDINGS:-unparsed}
+gc bd update "$ROOT_ID" --append-notes "red_findings: ${RED_FINDINGS:-unparsed}
 red_proven: yes"
 ```
 
@@ -340,7 +349,7 @@ RUN_STATUS=$?
 set -e
 
 if [ "$LINT_STATUS" -ne 0 ] || [ "$RUN_STATUS" -ne 0 ]; then
-    gc bd update "$ROOT_ID" --notes "halt_reason: green gate failed (lint=$LINT_STATUS run=$RUN_STATUS)"
+    gc bd update "$ROOT_ID" --append-notes "halt_reason: green gate failed (lint=$LINT_STATUS run=$RUN_STATUS)"
     cat /tmp/tdd-lint-green-$$.log /tmp/tdd-run-green-$$.log >&2
     gc bd close "$ROOT_ID" --reason "green gate failed"
     exit 1
@@ -356,7 +365,7 @@ pass:
 ```bash
 SKIPPED=$(sed -n 's/.*GAUNTLET_SUMMARY.* skipped=\\([0-9][0-9]*\\).*/\\1/p' /tmp/tdd-run-green-$$.log | tail -1)
 if [ "${SKIPPED:-1}" -ne 0 ]; then
-    gc bd update "$ROOT_ID" --notes "halt_reason: green run reported skipped=${SKIPPED:-unparsed} — skips are not passes"
+    gc bd update "$ROOT_ID" --append-notes "halt_reason: green run reported skipped=${SKIPPED:-unparsed} — skips are not passes"
     gc bd close "$ROOT_ID" --reason "green run still has skipped tests"
     exit 1
 fi
@@ -405,7 +414,7 @@ claim that the contract covers the bead whole>
 Then finalize:
 
 ```bash
-gc bd update "$ROOT_ID" --notes "report_path: $REPORT_PATH
+gc bd update "$ROOT_ID" --append-notes "report_path: $REPORT_PATH
 green_proven: yes
 status: complete"
 echo "[tdd-red-green] GREEN for {{contract_bead}}"

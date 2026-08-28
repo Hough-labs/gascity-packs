@@ -347,6 +347,64 @@ class NoCrossStepShellStateTests(unittest.TestCase):
                         )
 
 
+class NoteWritesAppendTests(unittest.TestCase):
+    """Run state crosses steps through the root bead's notes, so it must append.
+
+    `gc bd update --notes` REPLACES the notes field; `--append-notes` is the
+    appending form. The formula records `contract_path:` in `scaffold` and
+    reads it back in `implement`, two steps later — so one replacing write in
+    `assert-red` erases the only record of which contract the loop is on. The
+    write still exits 0, so the loss surfaces as an unexplained "no
+    contract_path on the root bead" at the implement gate, far from its cause.
+
+    Appending is also what keeps a shared bead's other annotations (witness,
+    refinery) intact.
+    """
+
+    NOTES_FLAG = re.compile(r"(?<!-)(?<!append-)--notes\b")
+
+    def test_no_step_writes_notes_with_the_replacing_flag(self) -> None:
+        for path in formula_paths():
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
+            for step_id, body in step_bodies(data).items():
+                for line in shell_lines(body):
+                    if "bd update" not in line:
+                        continue
+                    with self.subTest(formula=path.name, step=step_id, line=line):
+                        self.assertIsNone(
+                            self.NOTES_FLAG.search(line),
+                            "use --append-notes; --notes replaces the field and "
+                            "drops run state a later step reads back",
+                        )
+
+    def test_contract_path_is_written_before_it_is_read_back(self) -> None:
+        """The cross-step handoff this pack depends on actually exists."""
+        for path in formula_paths():
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
+            bodies = step_bodies(data)
+            readers = [
+                step_id
+                for step_id, body in bodies.items()
+                if any("contract_path: //p" in line for line in shell_lines(body))
+            ]
+            if not readers:
+                continue
+            writers = [
+                step_id
+                for step_id, body in bodies.items()
+                if any(
+                    "--append-notes" in line and "contract_path:" in line
+                    for line in shell_lines(body)
+                )
+            ]
+            with self.subTest(formula=path.name):
+                self.assertTrue(
+                    writers,
+                    f"{readers} read contract_path back off the notes, but no step "
+                    "appends it there",
+                )
+
+
 class ConfigPurityTests(unittest.TestCase):
     """A published pack must be configuration-pure.
 
