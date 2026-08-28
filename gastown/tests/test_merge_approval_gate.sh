@@ -27,14 +27,14 @@ write_gc_stub() {
 # Only `gc bd show <id> --json` and `gc bd update <id> --set-metadata ...`
 # are exercised here.
 case "${1:-} ${2:-}" in
-    "bd show")
+    "bd show") # gc-bd-argv-tail: case label matching the fake gc's argv tail
         if [ -n "${STUB_BEAD_JSON:-}" ] && [ -f "$STUB_BEAD_JSON" ]; then
             cat "$STUB_BEAD_JSON"
             exit 0
         fi
         exit 1
         ;;
-    "bd update")
+    "bd update") # gc-bd-argv-tail: case label matching the fake gc's argv tail
         printf '%s\n' "$*" >>"${STUB_UPDATE_LOG:-/dev/null}"
         exit "${STUB_UPDATE_EXIT:-0}"
         ;;
@@ -160,7 +160,7 @@ test_producer_records_complete_signal() {
         fail "producer failed on a valid approval"
 
     [[ "$(wc -l <"$log")" -eq 1 ]] ||
-        fail "producer must write the whole signal in a single bd update"
+        fail "producer must write the whole signal in a single bd update" # gc-bd-argv-tail: failure message, not an invocation
     local line
     line=$(cat "$log")
     grep -F 'merge_approval.verdict=approved' <<<"$line" >/dev/null ||
