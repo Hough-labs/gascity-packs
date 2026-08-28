@@ -17,6 +17,30 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "scripts"))
 import github_intake_service as service
 
 
+# Agent sessions export a live GC_*/BEADS_* namespace that the code under test
+# reads -- GC_BIN in particular, via os.environ.get("GC_BIN", "gc") -- so a test
+# that inherits os.environ asserts against whatever the session happens to
+# export. Build the environment from an explicit allowlist instead of snapshot,
+# mutate and restore, which preserves the ambient namespace (gcp-9ur).
+ENV_ALLOWLIST = ("HOME", "LANG", "LC_ALL", "PATH", "TMPDIR")
+
+
+def isolated_environ(**overrides: str) -> dict[str, str]:
+    """Return a minimal environment: allowlisted names plus explicit overrides."""
+
+    env = {name: os.environ[name] for name in ENV_ALLOWLIST if name in os.environ}
+    env.update(overrides)
+    return env
+
+
+def isolate_environ(test: unittest.TestCase, **overrides: str) -> None:
+    """Replace os.environ with an isolated one for the duration of ``test``."""
+
+    patcher = mock.patch.dict(os.environ, isolated_environ(**overrides), clear=True)
+    patcher.start()
+    test.addCleanup(patcher.stop)
+
+
 class DummyWebhookHandler:
     def __init__(self, body: bytes, headers: dict[str, str]) -> None:
         self.headers = headers
@@ -40,12 +64,7 @@ class GitHubIntakeServiceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tempdir.cleanup)
-        self._old_environ = os.environ.copy()
-        os.environ["GC_CITY_ROOT"] = self.tempdir.name
-
-    def tearDown(self) -> None:
-        os.environ.clear()
-        os.environ.update(self._old_environ)
+        isolate_environ(self, GC_CITY_ROOT=self.tempdir.name)
 
     def test_fix_command_behavior(self) -> None:
         behavior = service.command_behavior("fix")
@@ -1590,14 +1609,7 @@ class PublishImportedIdentityTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tempdir.cleanup)
-        self._old_environ = os.environ.copy()
-        os.environ["GC_CITY_ROOT"] = self.tempdir.name
-        os.environ.pop("GITHUB_INTAKE_IDENTITY_PUBLISHER", None)
-        os.environ.pop("GITHUB_INTAKE_APP_IDENTITY", None)
-
-    def tearDown(self) -> None:
-        os.environ.clear()
-        os.environ.update(self._old_environ)
+        isolate_environ(self, GC_CITY_ROOT=self.tempdir.name)
 
     def test_publish_imported_identity_resolves_settings_from_workspace_env(self) -> None:
         config = {"app": {"app_id": "7", "private_key_pem": "PEM"}}
@@ -1674,12 +1686,7 @@ class RenderAdminHomeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tempdir.cleanup)
-        self._old_environ = os.environ.copy()
-        os.environ["GC_CITY_ROOT"] = self.tempdir.name
-
-    def tearDown(self) -> None:
-        os.environ.clear()
-        os.environ.update(self._old_environ)
+        isolate_environ(self, GC_CITY_ROOT=self.tempdir.name)
 
     def test_register_form_offers_organization_target(self) -> None:
         snapshot = {

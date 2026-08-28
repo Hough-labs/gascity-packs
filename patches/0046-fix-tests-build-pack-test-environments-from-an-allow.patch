@@ -1,0 +1,750 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 28 Aug 2026 14:22:34 -0400
+Subject: [PATCH 46/46] fix(tests): build pack test environments from an
+ allowlist (gcp-9ur)
+
+Seven tests in the pack suite passed on CI and failed for anyone running the
+suite from inside a gastown agent session. CI's runner exports none of the
+GC_*/BEADS_* namespace; every agent in this town does, and the affected tests
+inherited it. Six failures came from GC_BIN -- the code under test reads
+os.environ.get("GC_BIN", "gc") and the tests assert argv[0] == "gc", so an
+exported GC_BIN=/Users/.../gc made argv[0] an absolute path -- and one from
+GC_TEMPLATE, which leaked into the claim script's route computation and made it
+reject the fixture route. The cost was not the red tests: four beads (gcp-ks5,
+gcp-cvb, part of gcp-e6xv, plus a mayor consolidation pass) were filed against
+a defect that never existed on the branch.
+
+Two mechanisms produced it. The github and discord intake tests snapshot
+os.environ in setUp, add GC_CITY_ROOT and restore on teardown -- preserving the
+ambient namespace rather than clearing it -- and test_formula_assets.py built
+subprocess environments as {**os.environ, ...} at fourteen sites. Both now go
+through an isolated_environ() helper that starts from an explicit allowlist
+(HOME, LANG, LC_ALL, PATH, TMPDIR) and layers the variables a test actually
+means to set; the in-process cases apply it via mock.patch.dict(..., clear=True),
+the precedent this same file already used at two call sites. Production code is
+untouched on purpose -- honoring GC_BIN is correct behavior, and the defect is
+entirely in test isolation.
+
+The allowlist is deliberate rather than a pop-list of the two known-bad names,
+and this commit removes the three pop-lists that were already in the tree
+(GITHUB_INTAKE_* in one setUp, BEADS_ACTOR/GC_SESSION_*/GC_AGENT at two
+subprocess sites): popping fixes today's variables and leaves the class intact,
+so the next name an agent session gains recreates the bug. Each pack keeps its
+own copy of the helper because packs ship independently from this repo and must
+not import test infrastructure across pack boundaries.
+
+tests/test_env_hermeticity.py is the part that makes it stick. It runs the three
+affected modules twice as subprocesses -- once with a representative synthetic
+agent session injected, once with the namespace stripped -- and asserts the
+per-test outcomes are identical, so a new leak in any guarded module turns it
+red regardless of which variable causes it. Verified both directions in this
+session: red against the pre-fix tree, naming exactly the seven tests above, and
+green after. Directory-level coverage was considered and rejected -- discord/tests
+is 42s of unrelated socket tests, so the guard runs modules and costs ~35s.
+
+The guard confirms a divergence by re-running just the candidates before
+reporting. Two claim-command tests in test_formula_assets.py bound a subprocess
+at two seconds and time out under machine load; that flake is pre-existing
+(it reproduces on unmodified 3d92618) and is filed as gcp-eqh8, but without the
+confirm round it would surface here as a phantom isolation regression -- the
+same false signal this guard exists to prevent. Drop the confirm round when
+gcp-eqh8 lands.
+
+Verification: the full CI invocation over the eight test directories now reports
+the same result with and without GC_BIN/GC_TEMPLATE set, which is the property
+the bead asks for. The residual failures in both runs are test_no_bare_bd_commands
+(gcp-xk96, unmerged) and gcp-eqh8's load flake; neither is this change's.
+---
+ discord/tests/test_discord_intake_service.py |  31 ++-
+ gascity/tests/test_formula_assets.py         | 224 +++++++++----------
+ github/tests/test_github_intake_service.py   |  47 ++--
+ tests/test_env_hermeticity.py                | 210 +++++++++++++++++
+ 4 files changed, 373 insertions(+), 139 deletions(-)
+ create mode 100644 tests/test_env_hermeticity.py
+
+diff --git a/discord/tests/test_discord_intake_service.py b/discord/tests/test_discord_intake_service.py
+index 5fdd196..849c111 100755
+--- a/discord/tests/test_discord_intake_service.py
++++ b/discord/tests/test_discord_intake_service.py
+@@ -19,6 +19,30 @@ import discord_intake_common as common
+ import discord_intake_service as service
+ 
+ 
++# Agent sessions export a live GC_*/BEADS_* namespace that the code under test
++# reads -- GC_BIN in particular, via os.environ.get("GC_BIN", "gc") -- so a test
++# that inherits os.environ asserts against whatever the session happens to
++# export. Build the environment from an explicit allowlist instead of snapshot,
++# mutate and restore, which preserves the ambient namespace (gcp-9ur).
++ENV_ALLOWLIST = ("HOME", "LANG", "LC_ALL", "PATH", "TMPDIR")
++
++
++def isolated_environ(**overrides: str) -> dict[str, str]:
++    """Return a minimal environment: allowlisted names plus explicit overrides."""
++
++    env = {name: os.environ[name] for name in ENV_ALLOWLIST if name in os.environ}
++    env.update(overrides)
++    return env
++
++
++def isolate_environ(test: unittest.TestCase, **overrides: str) -> None:
++    """Replace os.environ with an isolated one for the duration of ``test``."""
++
++    patcher = mock.patch.dict(os.environ, isolated_environ(**overrides), clear=True)
++    patcher.start()
++    test.addCleanup(patcher.stop)
++
++
+ def unix_http_request(
+     socket_path: str,
+     method: str,
+@@ -56,15 +80,10 @@ class DiscordIntakeServiceTests(unittest.TestCase):
+     def setUp(self) -> None:
+         self.tempdir = tempfile.TemporaryDirectory()
+         self.addCleanup(self.tempdir.cleanup)
+-        self._old_environ = os.environ.copy()
+-        os.environ["GC_CITY_ROOT"] = self.tempdir.name
++        isolate_environ(self, GC_CITY_ROOT=self.tempdir.name)
+         service.LAST_REQUEST_PRUNE_AT = 0.0
+         service.LAST_REQUEST_RECOVERY_AT = 0.0
+ 
+-    def tearDown(self) -> None:
+-        os.environ.clear()
+-        os.environ.update(self._old_environ)
+-
+     def write_rig_route(self, rig: str) -> None:
+         beads_dir = pathlib.Path(self.tempdir.name, ".beads")
+         beads_dir.mkdir(parents=True, exist_ok=True)
+diff --git a/gascity/tests/test_formula_assets.py b/gascity/tests/test_formula_assets.py
+index b966d43..362e00d 100755
+--- a/gascity/tests/test_formula_assets.py
++++ b/gascity/tests/test_formula_assets.py
+@@ -10,6 +10,22 @@ import tomllib
+ import unittest
+ 
+ 
++# Formula command scripts read the GC_*/BEADS_* namespace that every agent
++# session exports, so a subprocess env built as {**os.environ, ...} makes these
++# tests assert against the session that happens to run them: GC_TEMPLATE leaks
++# into the claim script's route computation and it rejects the fixture route.
++# Build the child environment from an explicit allowlist instead (gcp-9ur).
++ENV_ALLOWLIST = ("HOME", "LANG", "LC_ALL", "PATH", "TMPDIR")
++
++
++def isolated_environ(**overrides: str) -> dict[str, str]:
++    """Return a minimal environment: allowlisted names plus explicit overrides."""
++
++    env = {name: os.environ[name] for name in ENV_ALLOWLIST if name in os.environ}
++    env.update(overrides)
++    return env
++
++
+ FORMULAS = {
+     "build-base",
+     "build-basic",
+@@ -771,14 +787,13 @@ class FormulaAssetTests(unittest.TestCase):
+                 encoding="utf-8",
+             )
+             fake_gc.chmod(0o755)
+-            env = {
+-                **os.environ,
+-                "BEADS_ACTOR": "worker",
+-                "GC_AGENT": "gc.implementation-worker",
+-                "GC_PACK_DIR": str(root),
+-                "GC_PACK_NAME": "gc",
+-                "PATH": f"{bin_dir}:/usr/bin:/bin",
+-            }
++            env = isolated_environ(
++                BEADS_ACTOR="worker",
++                GC_AGENT="gc.implementation-worker",
++                GC_PACK_DIR=str(root),
++                GC_PACK_NAME="gc",
++                PATH=f"{bin_dir}:/usr/bin:/bin",
++            )
+             result = subprocess.run([str(command)], capture_output=True, env=env, text=True)
+ 
+         self.assertEqual(result.returncode, 0, result.stderr)
+@@ -821,13 +836,12 @@ class FormulaAssetTests(unittest.TestCase):
+                 encoding="utf-8",
+             )
+             fake_gc.chmod(0o755)
+-            env = {
+-                **os.environ,
+-                "BEADS_ACTOR": "worker",
+-                "GC_PACK_DIR": str(root),
+-                "GC_PACK_NAME": "gc",
+-                "PATH": f"{bin_dir}:/usr/bin:/bin",
+-            }
++            env = isolated_environ(
++                BEADS_ACTOR="worker",
++                GC_PACK_DIR=str(root),
++                GC_PACK_NAME="gc",
++                PATH=f"{bin_dir}:/usr/bin:/bin",
++            )
+             result = subprocess.run([str(command)], capture_output=True, env=env, text=True)
+ 
+         self.assertEqual(result.returncode, 0, result.stderr)
+@@ -863,15 +877,14 @@ class FormulaAssetTests(unittest.TestCase):
+             fake_sleep = bin_dir / "sleep"
+             fake_sleep.write_text("#!/bin/sh\n/bin/sleep 0.05\n", encoding="utf-8")
+             fake_sleep.chmod(0o755)
+-            env = {
+-                **os.environ,
+-                "BEADS_ACTOR": "worker",
+-                "GC_AGENT": "gc.implementation-worker",
+-                "GC_PACK_DIR": str(root),
+-                "GC_PACK_NAME": "gc",
+-                "GC_TEST_CALLS": str(calls),
+-                "PATH": f"{bin_dir}:/usr/bin:/bin",
+-            }
++            env = isolated_environ(
++                BEADS_ACTOR="worker",
++                GC_AGENT="gc.implementation-worker",
++                GC_PACK_DIR=str(root),
++                GC_PACK_NAME="gc",
++                GC_TEST_CALLS=str(calls),
++                PATH=f"{bin_dir}:/usr/bin:/bin",
++            )
+             result = subprocess.run(
+                 [str(command)], capture_output=True, env=env, text=True, timeout=2
+             )
+@@ -901,15 +914,12 @@ class FormulaAssetTests(unittest.TestCase):
+                 encoding="utf-8",
+             )
+             fake_gc.chmod(0o755)
+-            env = {
+-                **os.environ,
+-                "GC_PACK_DIR": str(root),
+-                "GC_PACK_NAME": "gc",
+-                "GC_TEST_CALLS": str(calls),
+-                "PATH": f"{bin_dir}:/usr/bin:/bin",
+-            }
+-            for key in ("BEADS_ACTOR", "GC_SESSION_NAME", "GC_SESSION_ID", "GC_AGENT"):
+-                env.pop(key, None)
++            env = isolated_environ(
++                GC_PACK_DIR=str(root),
++                GC_PACK_NAME="gc",
++                GC_TEST_CALLS=str(calls),
++                PATH=f"{bin_dir}:/usr/bin:/bin",
++            )
+             result = subprocess.run([str(command)], capture_output=True, env=env, text=True)
+             call_lines = calls.read_text(encoding="utf-8").splitlines()
+ 
+@@ -935,14 +945,13 @@ class FormulaAssetTests(unittest.TestCase):
+                 encoding="utf-8",
+             )
+             fake_gc.chmod(0o755)
+-            env = {
+-                **os.environ,
+-                "BEADS_ACTOR": "worker",
+-                "GC_PACK_DIR": str(root),
+-                "GC_PACK_NAME": "gc",
+-                "GC_TEST_CALLS": str(calls),
+-                "PATH": str(bin_dir),
+-            }
++            env = isolated_environ(
++                BEADS_ACTOR="worker",
++                GC_PACK_DIR=str(root),
++                GC_PACK_NAME="gc",
++                GC_TEST_CALLS=str(calls),
++                PATH=str(bin_dir),
++            )
+             result = subprocess.run([str(command)], capture_output=True, env=env, text=True)
+             call_lines = calls.read_text(encoding="utf-8").splitlines()
+ 
+@@ -968,15 +977,12 @@ class FormulaAssetTests(unittest.TestCase):
+                 encoding="utf-8",
+             )
+             fake_gc.chmod(0o755)
+-            env = {
+-                **os.environ,
+-                "GC_PACK_DIR": str(root),
+-                "GC_PACK_NAME": "gc",
+-                "GC_TEST_CALLS": str(calls),
+-                "PATH": f"{bin_dir}:/usr/bin:/bin",
+-            }
+-            for key in ("BEADS_ACTOR", "GC_SESSION_NAME", "GC_SESSION_ID", "GC_AGENT"):
+-                env.pop(key, None)
++            env = isolated_environ(
++                GC_PACK_DIR=str(root),
++                GC_PACK_NAME="gc",
++                GC_TEST_CALLS=str(calls),
++                PATH=f"{bin_dir}:/usr/bin:/bin",
++            )
+             result = subprocess.run([str(command)], capture_output=True, env=env, text=True)
+             call_lines = calls.read_text(encoding="utf-8").splitlines()
+ 
+@@ -1006,15 +1012,14 @@ class FormulaAssetTests(unittest.TestCase):
+                 encoding="utf-8",
+             )
+             fake_gc.chmod(0o755)
+-            env = {
+-                **os.environ,
+-                "BEADS_ACTOR": "worker",
+-                "GC_AGENT": "gc.implementation-worker",
+-                "GC_PACK_DIR": str(root),
+-                "GC_PACK_NAME": "gc",
+-                "GC_TEST_CALLS": str(calls),
+-                "PATH": f"{bin_dir}:/usr/bin:/bin",
+-            }
++            env = isolated_environ(
++                BEADS_ACTOR="worker",
++                GC_AGENT="gc.implementation-worker",
++                GC_PACK_DIR=str(root),
++                GC_PACK_NAME="gc",
++                GC_TEST_CALLS=str(calls),
++                PATH=f"{bin_dir}:/usr/bin:/bin",
++            )
+             result = subprocess.run(
+                 [str(command)], capture_output=True, env=env, text=True, timeout=2
+             )
+@@ -1053,15 +1058,14 @@ class FormulaAssetTests(unittest.TestCase):
+             fake_sleep = bin_dir / "sleep"
+             fake_sleep.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+             fake_sleep.chmod(0o755)
+-            env = {
+-                **os.environ,
+-                "BEADS_ACTOR": "worker",
+-                "GC_AGENT": "gc.implementation-worker",
+-                "GC_PACK_DIR": str(root),
+-                "GC_PACK_NAME": "gc",
+-                "GC_TEST_CALLS": str(calls),
+-                "PATH": f"{bin_dir}:/usr/bin:/bin",
+-            }
++            env = isolated_environ(
++                BEADS_ACTOR="worker",
++                GC_AGENT="gc.implementation-worker",
++                GC_PACK_DIR=str(root),
++                GC_PACK_NAME="gc",
++                GC_TEST_CALLS=str(calls),
++                PATH=f"{bin_dir}:/usr/bin:/bin",
++            )
+             result = subprocess.run(
+                 [str(command)],
+                 capture_output=True,
+@@ -1112,15 +1116,14 @@ class FormulaAssetTests(unittest.TestCase):
+             fake_sleep = bin_dir / "sleep"
+             fake_sleep.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+             fake_sleep.chmod(0o755)
+-            env = {
+-                **os.environ,
+-                "BEADS_ACTOR": "worker",
+-                "GC_AGENT": "gc.implementation-worker",
+-                "GC_PACK_DIR": str(root),
+-                "GC_PACK_NAME": "gc",
+-                "GC_TEST_CALLS": str(calls),
+-                "PATH": f"{bin_dir}:/usr/bin:/bin",
+-            }
++            env = isolated_environ(
++                BEADS_ACTOR="worker",
++                GC_AGENT="gc.implementation-worker",
++                GC_PACK_DIR=str(root),
++                GC_PACK_NAME="gc",
++                GC_TEST_CALLS=str(calls),
++                PATH=f"{bin_dir}:/usr/bin:/bin",
++            )
+             result = subprocess.run(
+                 [str(command)], capture_output=True, env=env, text=True, timeout=2
+             )
+@@ -4065,13 +4068,12 @@ description = "Override sink that writes the base triage report contract."
+             )
+             fake_gc.chmod(0o755)
+ 
+-            env = {
+-                **os.environ,
+-                "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+-                "BD_SHOW_DIR": str(show_dir),
+-                "GC_BEAD_ID": bead_id,
++            env = isolated_environ(
++                PATH=f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
++                BD_SHOW_DIR=str(show_dir),
++                GC_BEAD_ID=bead_id,
+                 **(extra_env or {}),
+-            }
++            )
+             return subprocess.run(
+                 [str(script)],
+                 env=env,
+@@ -4123,16 +4125,15 @@ description = "Override sink that writes the base triage report contract."
+             )
+             fake_gc.chmod(0o755)
+ 
+-            env = {
+-                **os.environ,
+-                "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+-                "BD_SHOW_JSON": str(show_path),
+-                "BD_PARENT_SHOW_JSON": str(parent_show_path),
+-                "BD_LIST_JSON": str(list_path),
+-                "GC_BEAD_ID": "loop",
+-                "GC_ITERATION": "1",
++            env = isolated_environ(
++                PATH=f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
++                BD_SHOW_JSON=str(show_path),
++                BD_PARENT_SHOW_JSON=str(parent_show_path),
++                BD_LIST_JSON=str(list_path),
++                GC_BEAD_ID="loop",
++                GC_ITERATION="1",
+                 **(extra_env or {}),
+-            }
++            )
+             return subprocess.run(
+                 [str(script)],
+                 env=env,
+@@ -4632,13 +4633,12 @@ description = "Override sink that writes the base triage report contract."
+                 encoding="utf-8",
+             )
+ 
+-            env = {
+-                **os.environ,
+-                "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+-                "BD_SHOW_JSON": str(show_json),
+-                "BD_LIST_JSON": str(list_json),
+-                "GC_BEAD_ID": "loop",
+-            }
++            env = isolated_environ(
++                PATH=f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
++                BD_SHOW_JSON=str(show_json),
++                BD_LIST_JSON=str(list_json),
++                GC_BEAD_ID="loop",
++            )
+             result = subprocess.run(
+                 [str(script)],
+                 env=env,
+@@ -4728,13 +4728,12 @@ description = "Override sink that writes the base triage report contract."
+                 encoding="utf-8",
+             )
+ 
+-            env = {
+-                **os.environ,
+-                "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+-                "BD_SHOW_JSON": str(show_json),
+-                "BD_LIST_JSON": str(list_json),
+-                "GC_BEAD_ID": "loop-root",
+-            }
++            env = isolated_environ(
++                PATH=f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
++                BD_SHOW_JSON=str(show_json),
++                BD_LIST_JSON=str(list_json),
++                GC_BEAD_ID="loop-root",
++            )
+             result = subprocess.run(
+                 [str(script)],
+                 env=env,
+@@ -4804,13 +4803,12 @@ description = "Override sink that writes the base triage report contract."
+                 encoding="utf-8",
+             )
+ 
+-            env = {
+-                **os.environ,
+-                "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+-                "BD_SHOW_JSON": str(show_json),
+-                "BD_LIST_JSON": str(list_json),
+-                "GC_BEAD_ID": "design-approval-child",
+-            }
++            env = isolated_environ(
++                PATH=f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
++                BD_SHOW_JSON=str(show_json),
++                BD_LIST_JSON=str(list_json),
++                GC_BEAD_ID="design-approval-child",
++            )
+             result = subprocess.run(
+                 [str(script)],
+                 env=env,
+diff --git a/github/tests/test_github_intake_service.py b/github/tests/test_github_intake_service.py
+index 4066dbb..6343228 100755
+--- a/github/tests/test_github_intake_service.py
++++ b/github/tests/test_github_intake_service.py
+@@ -17,6 +17,30 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "scripts"))
+ import github_intake_service as service
+ 
+ 
++# Agent sessions export a live GC_*/BEADS_* namespace that the code under test
++# reads -- GC_BIN in particular, via os.environ.get("GC_BIN", "gc") -- so a test
++# that inherits os.environ asserts against whatever the session happens to
++# export. Build the environment from an explicit allowlist instead of snapshot,
++# mutate and restore, which preserves the ambient namespace (gcp-9ur).
++ENV_ALLOWLIST = ("HOME", "LANG", "LC_ALL", "PATH", "TMPDIR")
++
++
++def isolated_environ(**overrides: str) -> dict[str, str]:
++    """Return a minimal environment: allowlisted names plus explicit overrides."""
++
++    env = {name: os.environ[name] for name in ENV_ALLOWLIST if name in os.environ}
++    env.update(overrides)
++    return env
++
++
++def isolate_environ(test: unittest.TestCase, **overrides: str) -> None:
++    """Replace os.environ with an isolated one for the duration of ``test``."""
++
++    patcher = mock.patch.dict(os.environ, isolated_environ(**overrides), clear=True)
++    patcher.start()
++    test.addCleanup(patcher.stop)
++
++
+ class DummyWebhookHandler:
+     def __init__(self, body: bytes, headers: dict[str, str]) -> None:
+         self.headers = headers
+@@ -40,12 +64,7 @@ class GitHubIntakeServiceTests(unittest.TestCase):
+     def setUp(self) -> None:
+         self.tempdir = tempfile.TemporaryDirectory()
+         self.addCleanup(self.tempdir.cleanup)
+-        self._old_environ = os.environ.copy()
+-        os.environ["GC_CITY_ROOT"] = self.tempdir.name
+-
+-    def tearDown(self) -> None:
+-        os.environ.clear()
+-        os.environ.update(self._old_environ)
++        isolate_environ(self, GC_CITY_ROOT=self.tempdir.name)
+ 
+     def test_fix_command_behavior(self) -> None:
+         behavior = service.command_behavior("fix")
+@@ -1590,14 +1609,7 @@ class PublishImportedIdentityTests(unittest.TestCase):
+     def setUp(self) -> None:
+         self.tempdir = tempfile.TemporaryDirectory()
+         self.addCleanup(self.tempdir.cleanup)
+-        self._old_environ = os.environ.copy()
+-        os.environ["GC_CITY_ROOT"] = self.tempdir.name
+-        os.environ.pop("GITHUB_INTAKE_IDENTITY_PUBLISHER", None)
+-        os.environ.pop("GITHUB_INTAKE_APP_IDENTITY", None)
+-
+-    def tearDown(self) -> None:
+-        os.environ.clear()
+-        os.environ.update(self._old_environ)
++        isolate_environ(self, GC_CITY_ROOT=self.tempdir.name)
+ 
+     def test_publish_imported_identity_resolves_settings_from_workspace_env(self) -> None:
+         config = {"app": {"app_id": "7", "private_key_pem": "PEM"}}
+@@ -1674,12 +1686,7 @@ class RenderAdminHomeTests(unittest.TestCase):
+     def setUp(self) -> None:
+         self.tempdir = tempfile.TemporaryDirectory()
+         self.addCleanup(self.tempdir.cleanup)
+-        self._old_environ = os.environ.copy()
+-        os.environ["GC_CITY_ROOT"] = self.tempdir.name
+-
+-    def tearDown(self) -> None:
+-        os.environ.clear()
+-        os.environ.update(self._old_environ)
++        isolate_environ(self, GC_CITY_ROOT=self.tempdir.name)
+ 
+     def test_register_form_offers_organization_target(self) -> None:
+         snapshot = {
+diff --git a/tests/test_env_hermeticity.py b/tests/test_env_hermeticity.py
+new file mode 100644
+index 0000000..e584681
+--- /dev/null
++++ b/tests/test_env_hermeticity.py
+@@ -0,0 +1,210 @@
++"""Guard: the pack test suites must be insensitive to agent-session environment.
++
++Every gastown agent exports a live ``GC_*``/``BEADS_*`` namespace. Test modules
++that build a subprocess environment from ``{**os.environ, ...}`` -- or that
++snapshot, mutate and restore ``os.environ`` in ``setUp`` without clearing it --
++inherit that namespace, so the same tree passes on a CI runner (which sets none
++of it) and fails for every polecat running the suite as a local quality gate.
++
++That asymmetry is expensive precisely because it does not look like an
++environment bug: seven tests failed that way and four beads were filed against
++the phantom before the cause was found (gcp-9ur). Fixing the two variables that
++happened to surface it would leave the class intact, so this guard runs the
++affected modules twice as subprocesses -- once with a representative agent
++session injected, once with the namespace stripped -- and asserts the per-test
++outcomes are identical. Any new leak in a guarded module turns it red.
++"""
++
++from __future__ import annotations
++
++import os
++import pathlib
++import subprocess
++import sys
++import tempfile
++import unittest
++import xml.etree.ElementTree as ElementTree
++
++
++REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
++
++# Modules that drive scripts reading the GC_* namespace. Listing a module here
++# costs one extra run of it; leaving one out means its isolation is unguarded.
++GUARDED_MODULES = (
++    "gascity/tests/test_formula_assets.py",
++    "discord/tests/test_discord_intake_service.py",
++    "github/tests/test_github_intake_service.py",
++)
++
++AMBIENT_PREFIXES = ("GC_", "BEADS_")
++
++# A representative gastown agent session. Values are synthetic so the guard
++# behaves identically on a CI runner and inside a live session, and the set is
++# deliberately wider than the two names that produced the original failures --
++# GC_BIN (six of them) and GC_TEMPLATE (one) -- so it detects the class.
++AGENT_SESSION_ENV = {
++    "BEADS_ACTOR": "guard__polecat-gc-0000",
++    "BEADS_DIR": "/nonexistent/guard/.beads",
++    "BEADS_ROUTING_MODE": "off",
++    "GC_AGENT": "guard-rig/gastown.guard",
++    "GC_ALIAS": "guard-rig/gastown.guard",
++    "GC_BEADS": "bd",
++    "GC_BIN": "/nonexistent/guard/bin/gc",
++    "GC_CITY": "/nonexistent/guard/city",
++    "GC_DIR": "/nonexistent/guard/worktree",
++    "GC_HOME": "/nonexistent/guard/home",
++    "GC_PROVIDER": "claude",
++    "GC_RIG": "guard-rig",
++    "GC_SESSION_ID": "gc-0000",
++    "GC_SESSION_NAME": "guard__polecat-gc-0000",
++    "GC_TEMPLATE": "guard-rig/gastown.polecat",
++}
++
++
++def ambient_free_environ() -> dict[str, str]:
++    """This process's environment with the whole agent-session namespace removed."""
++
++    return {
++        key: value
++        for key, value in os.environ.items()
++        if not key.startswith(AMBIENT_PREFIXES)
++    }
++
++
++def outcome_of(testcase: ElementTree.Element) -> str:
++    """Map a JUnit ``testcase`` element to a single outcome word."""
++
++    for tag in ("error", "failure", "skipped"):
++        if testcase.find(tag) is not None:
++            return tag
++    return "passed"
++
++
++def run_guarded_modules(
++    env: dict[str, str], *, selector: str | None = None
++) -> dict[str, str]:
++    """Run the guarded modules under ``env`` and return {test id: outcome}."""
++
++    selection = ["-k", selector] if selector else []
++    with tempfile.TemporaryDirectory() as tmp:
++        report = pathlib.Path(tmp, "report.xml")
++        completed = subprocess.run(
++            [
++                sys.executable,
++                "-m",
++                "pytest",
++                *GUARDED_MODULES,
++                *selection,
++                "-q",
++                "--tb=no",
++                "-p",
++                "no:cacheprovider",
++                f"--junit-xml={report}",
++            ],
++            cwd=REPO_ROOT,
++            env=env,
++            capture_output=True,
++            text=True,
++            timeout=900,
++        )
++        if not report.is_file():
++            raise AssertionError(
++                "pytest produced no JUnit report; it likely failed to collect.\n"
++                f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
++            )
++        root = ElementTree.parse(report).getroot()
++
++    return {
++        f"{case.get('classname')}::{case.get('name')}": outcome_of(case)
++        for case in root.iter("testcase")
++    }
++
++
++def divergent_outcomes(
++    env: dict[str, str], *, selector: str | None = None
++) -> tuple[dict[str, str], dict[str, str], dict[str, tuple[str, str]]]:
++    """Compare a clean run against an agent-session run of the same selection."""
++
++    clean = run_guarded_modules(env, selector=selector)
++    with_session = run_guarded_modules(
++        {**env, **AGENT_SESSION_ENV}, selector=selector
++    )
++    divergent = {
++        test_id: (clean[test_id], with_session[test_id])
++        for test_id in clean.keys() & with_session.keys()
++        if clean[test_id] != with_session[test_id]
++    }
++    return clean, with_session, divergent
++
++
++def method_name(test_id: str) -> str:
++    """The bare method name from a ``classname::name`` JUnit id."""
++
++    return test_id.rpartition("::")[2]
++
++
++class EnvironmentHermeticityTests(unittest.TestCase):
++    maxDiff = None
++
++    def test_guarded_modules_ignore_agent_session_environment(self) -> None:
++        base = ambient_free_environ()
++
++        clean, with_session, divergent = divergent_outcomes(base)
++
++        self.assertTrue(clean, "the clean run collected no tests")
++        # Collection is settled before any test runs, so unlike an outcome this
++        # cannot be a load flake: a difference here means the environment
++        # decided which tests exist at all.
++        self.assertEqual(
++            sorted(clean),
++            sorted(with_session),
++            "the two runs collected different tests",
++        )
++
++        if divergent:
++            # Env sensitivity is deterministic; a couple of the guarded tests
++            # bound a subprocess at two seconds and time out when the machine is
++            # loaded -- and a whole-module run under this guard is exactly that.
++            # Re-run only the candidates, where they are not competing with 80
++            # other tests, and keep the ones that still diverge. Without this a
++            # load flake reports as an isolation regression, which is the same
++            # false signal this guard exists to prevent.
++            confirmable = sorted(
++                {
++                    name
++                    for name in map(method_name, divergent)
++                    if name.isidentifier()
++                }
++            )
++            unconfirmable = {
++                test_id: outcomes
++                for test_id, outcomes in divergent.items()
++                if not method_name(test_id).isidentifier()
++            }
++            reconfirmed: dict[str, tuple[str, str]] = {}
++            if confirmable:
++                _, _, reconfirmed = divergent_outcomes(
++                    base, selector=" or ".join(confirmable)
++                )
++            divergent = {
++                test_id: outcomes
++                for test_id, outcomes in divergent.items()
++                if test_id in reconfirmed
++            }
++            divergent.update(unconfirmable)
++
++        self.assertEqual(
++            divergent,
++            {},
++            "these tests changed outcome when an agent session's environment was "
++            "present, so they inherit os.environ instead of building an explicit "
++            "one (clean outcome, agent-session outcome shown):\n"
++            + "\n".join(
++                f"  {test_id}: {before} -> {after}"
++                for test_id, (before, after) in sorted(divergent.items())
++            ),
++        )
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.50.1 (Apple Git-155)
+

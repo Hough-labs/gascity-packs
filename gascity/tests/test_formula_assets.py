@@ -10,6 +10,22 @@ import tomllib
 import unittest
 
 
+# Formula command scripts read the GC_*/BEADS_* namespace that every agent
+# session exports, so a subprocess env built as {**os.environ, ...} makes these
+# tests assert against the session that happens to run them: GC_TEMPLATE leaks
+# into the claim script's route computation and it rejects the fixture route.
+# Build the child environment from an explicit allowlist instead (gcp-9ur).
+ENV_ALLOWLIST = ("HOME", "LANG", "LC_ALL", "PATH", "TMPDIR")
+
+
+def isolated_environ(**overrides: str) -> dict[str, str]:
+    """Return a minimal environment: allowlisted names plus explicit overrides."""
+
+    env = {name: os.environ[name] for name in ENV_ALLOWLIST if name in os.environ}
+    env.update(overrides)
+    return env
+
+
 FORMULAS = {
     "build-base",
     "build-basic",
@@ -771,14 +787,13 @@ class FormulaAssetTests(unittest.TestCase):
                 encoding="utf-8",
             )
             fake_gc.chmod(0o755)
-            env = {
-                **os.environ,
-                "BEADS_ACTOR": "worker",
-                "GC_AGENT": "gc.implementation-worker",
-                "GC_PACK_DIR": str(root),
-                "GC_PACK_NAME": "gc",
-                "PATH": f"{bin_dir}:/usr/bin:/bin",
-            }
+            env = isolated_environ(
+                BEADS_ACTOR="worker",
+                GC_AGENT="gc.implementation-worker",
+                GC_PACK_DIR=str(root),
+                GC_PACK_NAME="gc",
+                PATH=f"{bin_dir}:/usr/bin:/bin",
+            )
             result = subprocess.run([str(command)], capture_output=True, env=env, text=True)
 
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -821,13 +836,12 @@ class FormulaAssetTests(unittest.TestCase):
                 encoding="utf-8",
             )
             fake_gc.chmod(0o755)
-            env = {
-                **os.environ,
-                "BEADS_ACTOR": "worker",
-                "GC_PACK_DIR": str(root),
-                "GC_PACK_NAME": "gc",
-                "PATH": f"{bin_dir}:/usr/bin:/bin",
-            }
+            env = isolated_environ(
+                BEADS_ACTOR="worker",
+                GC_PACK_DIR=str(root),
+                GC_PACK_NAME="gc",
+                PATH=f"{bin_dir}:/usr/bin:/bin",
+            )
             result = subprocess.run([str(command)], capture_output=True, env=env, text=True)
 
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -863,15 +877,14 @@ class FormulaAssetTests(unittest.TestCase):
             fake_sleep = bin_dir / "sleep"
             fake_sleep.write_text("#!/bin/sh\n/bin/sleep 0.05\n", encoding="utf-8")
             fake_sleep.chmod(0o755)
-            env = {
-                **os.environ,
-                "BEADS_ACTOR": "worker",
-                "GC_AGENT": "gc.implementation-worker",
-                "GC_PACK_DIR": str(root),
-                "GC_PACK_NAME": "gc",
-                "GC_TEST_CALLS": str(calls),
-                "PATH": f"{bin_dir}:/usr/bin:/bin",
-            }
+            env = isolated_environ(
+                BEADS_ACTOR="worker",
+                GC_AGENT="gc.implementation-worker",
+                GC_PACK_DIR=str(root),
+                GC_PACK_NAME="gc",
+                GC_TEST_CALLS=str(calls),
+                PATH=f"{bin_dir}:/usr/bin:/bin",
+            )
             result = subprocess.run(
                 [str(command)], capture_output=True, env=env, text=True, timeout=2
             )
@@ -901,15 +914,12 @@ class FormulaAssetTests(unittest.TestCase):
                 encoding="utf-8",
             )
             fake_gc.chmod(0o755)
-            env = {
-                **os.environ,
-                "GC_PACK_DIR": str(root),
-                "GC_PACK_NAME": "gc",
-                "GC_TEST_CALLS": str(calls),
-                "PATH": f"{bin_dir}:/usr/bin:/bin",
-            }
-            for key in ("BEADS_ACTOR", "GC_SESSION_NAME", "GC_SESSION_ID", "GC_AGENT"):
-                env.pop(key, None)
+            env = isolated_environ(
+                GC_PACK_DIR=str(root),
+                GC_PACK_NAME="gc",
+                GC_TEST_CALLS=str(calls),
+                PATH=f"{bin_dir}:/usr/bin:/bin",
+            )
             result = subprocess.run([str(command)], capture_output=True, env=env, text=True)
             call_lines = calls.read_text(encoding="utf-8").splitlines()
 
@@ -935,14 +945,13 @@ class FormulaAssetTests(unittest.TestCase):
                 encoding="utf-8",
             )
             fake_gc.chmod(0o755)
-            env = {
-                **os.environ,
-                "BEADS_ACTOR": "worker",
-                "GC_PACK_DIR": str(root),
-                "GC_PACK_NAME": "gc",
-                "GC_TEST_CALLS": str(calls),
-                "PATH": str(bin_dir),
-            }
+            env = isolated_environ(
+                BEADS_ACTOR="worker",
+                GC_PACK_DIR=str(root),
+                GC_PACK_NAME="gc",
+                GC_TEST_CALLS=str(calls),
+                PATH=str(bin_dir),
+            )
             result = subprocess.run([str(command)], capture_output=True, env=env, text=True)
             call_lines = calls.read_text(encoding="utf-8").splitlines()
 
@@ -968,15 +977,12 @@ class FormulaAssetTests(unittest.TestCase):
                 encoding="utf-8",
             )
             fake_gc.chmod(0o755)
-            env = {
-                **os.environ,
-                "GC_PACK_DIR": str(root),
-                "GC_PACK_NAME": "gc",
-                "GC_TEST_CALLS": str(calls),
-                "PATH": f"{bin_dir}:/usr/bin:/bin",
-            }
-            for key in ("BEADS_ACTOR", "GC_SESSION_NAME", "GC_SESSION_ID", "GC_AGENT"):
-                env.pop(key, None)
+            env = isolated_environ(
+                GC_PACK_DIR=str(root),
+                GC_PACK_NAME="gc",
+                GC_TEST_CALLS=str(calls),
+                PATH=f"{bin_dir}:/usr/bin:/bin",
+            )
             result = subprocess.run([str(command)], capture_output=True, env=env, text=True)
             call_lines = calls.read_text(encoding="utf-8").splitlines()
 
@@ -1006,15 +1012,14 @@ class FormulaAssetTests(unittest.TestCase):
                 encoding="utf-8",
             )
             fake_gc.chmod(0o755)
-            env = {
-                **os.environ,
-                "BEADS_ACTOR": "worker",
-                "GC_AGENT": "gc.implementation-worker",
-                "GC_PACK_DIR": str(root),
-                "GC_PACK_NAME": "gc",
-                "GC_TEST_CALLS": str(calls),
-                "PATH": f"{bin_dir}:/usr/bin:/bin",
-            }
+            env = isolated_environ(
+                BEADS_ACTOR="worker",
+                GC_AGENT="gc.implementation-worker",
+                GC_PACK_DIR=str(root),
+                GC_PACK_NAME="gc",
+                GC_TEST_CALLS=str(calls),
+                PATH=f"{bin_dir}:/usr/bin:/bin",
+            )
             result = subprocess.run(
                 [str(command)], capture_output=True, env=env, text=True, timeout=2
             )
@@ -1053,15 +1058,14 @@ class FormulaAssetTests(unittest.TestCase):
             fake_sleep = bin_dir / "sleep"
             fake_sleep.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             fake_sleep.chmod(0o755)
-            env = {
-                **os.environ,
-                "BEADS_ACTOR": "worker",
-                "GC_AGENT": "gc.implementation-worker",
-                "GC_PACK_DIR": str(root),
-                "GC_PACK_NAME": "gc",
-                "GC_TEST_CALLS": str(calls),
-                "PATH": f"{bin_dir}:/usr/bin:/bin",
-            }
+            env = isolated_environ(
+                BEADS_ACTOR="worker",
+                GC_AGENT="gc.implementation-worker",
+                GC_PACK_DIR=str(root),
+                GC_PACK_NAME="gc",
+                GC_TEST_CALLS=str(calls),
+                PATH=f"{bin_dir}:/usr/bin:/bin",
+            )
             result = subprocess.run(
                 [str(command)],
                 capture_output=True,
@@ -1112,15 +1116,14 @@ class FormulaAssetTests(unittest.TestCase):
             fake_sleep = bin_dir / "sleep"
             fake_sleep.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             fake_sleep.chmod(0o755)
-            env = {
-                **os.environ,
-                "BEADS_ACTOR": "worker",
-                "GC_AGENT": "gc.implementation-worker",
-                "GC_PACK_DIR": str(root),
-                "GC_PACK_NAME": "gc",
-                "GC_TEST_CALLS": str(calls),
-                "PATH": f"{bin_dir}:/usr/bin:/bin",
-            }
+            env = isolated_environ(
+                BEADS_ACTOR="worker",
+                GC_AGENT="gc.implementation-worker",
+                GC_PACK_DIR=str(root),
+                GC_PACK_NAME="gc",
+                GC_TEST_CALLS=str(calls),
+                PATH=f"{bin_dir}:/usr/bin:/bin",
+            )
             result = subprocess.run(
                 [str(command)], capture_output=True, env=env, text=True, timeout=2
             )
@@ -4065,13 +4068,12 @@ description = "Override sink that writes the base triage report contract."
             )
             fake_gc.chmod(0o755)
 
-            env = {
-                **os.environ,
-                "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
-                "BD_SHOW_DIR": str(show_dir),
-                "GC_BEAD_ID": bead_id,
+            env = isolated_environ(
+                PATH=f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+                BD_SHOW_DIR=str(show_dir),
+                GC_BEAD_ID=bead_id,
                 **(extra_env or {}),
-            }
+            )
             return subprocess.run(
                 [str(script)],
                 env=env,
@@ -4123,16 +4125,15 @@ description = "Override sink that writes the base triage report contract."
             )
             fake_gc.chmod(0o755)
 
-            env = {
-                **os.environ,
-                "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
-                "BD_SHOW_JSON": str(show_path),
-                "BD_PARENT_SHOW_JSON": str(parent_show_path),
-                "BD_LIST_JSON": str(list_path),
-                "GC_BEAD_ID": "loop",
-                "GC_ITERATION": "1",
+            env = isolated_environ(
+                PATH=f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+                BD_SHOW_JSON=str(show_path),
+                BD_PARENT_SHOW_JSON=str(parent_show_path),
+                BD_LIST_JSON=str(list_path),
+                GC_BEAD_ID="loop",
+                GC_ITERATION="1",
                 **(extra_env or {}),
-            }
+            )
             return subprocess.run(
                 [str(script)],
                 env=env,
@@ -4632,13 +4633,12 @@ description = "Override sink that writes the base triage report contract."
                 encoding="utf-8",
             )
 
-            env = {
-                **os.environ,
-                "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
-                "BD_SHOW_JSON": str(show_json),
-                "BD_LIST_JSON": str(list_json),
-                "GC_BEAD_ID": "loop",
-            }
+            env = isolated_environ(
+                PATH=f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+                BD_SHOW_JSON=str(show_json),
+                BD_LIST_JSON=str(list_json),
+                GC_BEAD_ID="loop",
+            )
             result = subprocess.run(
                 [str(script)],
                 env=env,
@@ -4728,13 +4728,12 @@ description = "Override sink that writes the base triage report contract."
                 encoding="utf-8",
             )
 
-            env = {
-                **os.environ,
-                "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
-                "BD_SHOW_JSON": str(show_json),
-                "BD_LIST_JSON": str(list_json),
-                "GC_BEAD_ID": "loop-root",
-            }
+            env = isolated_environ(
+                PATH=f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+                BD_SHOW_JSON=str(show_json),
+                BD_LIST_JSON=str(list_json),
+                GC_BEAD_ID="loop-root",
+            )
             result = subprocess.run(
                 [str(script)],
                 env=env,
@@ -4804,13 +4803,12 @@ description = "Override sink that writes the base triage report contract."
                 encoding="utf-8",
             )
 
-            env = {
-                **os.environ,
-                "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
-                "BD_SHOW_JSON": str(show_json),
-                "BD_LIST_JSON": str(list_json),
-                "GC_BEAD_ID": "design-approval-child",
-            }
+            env = isolated_environ(
+                PATH=f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+                BD_SHOW_JSON=str(show_json),
+                BD_LIST_JSON=str(list_json),
+                GC_BEAD_ID="design-approval-child",
+            )
             result = subprocess.run(
                 [str(script)],
                 env=env,

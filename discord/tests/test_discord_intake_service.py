@@ -19,6 +19,30 @@ import discord_intake_common as common
 import discord_intake_service as service
 
 
+# Agent sessions export a live GC_*/BEADS_* namespace that the code under test
+# reads -- GC_BIN in particular, via os.environ.get("GC_BIN", "gc") -- so a test
+# that inherits os.environ asserts against whatever the session happens to
+# export. Build the environment from an explicit allowlist instead of snapshot,
+# mutate and restore, which preserves the ambient namespace (gcp-9ur).
+ENV_ALLOWLIST = ("HOME", "LANG", "LC_ALL", "PATH", "TMPDIR")
+
+
+def isolated_environ(**overrides: str) -> dict[str, str]:
+    """Return a minimal environment: allowlisted names plus explicit overrides."""
+
+    env = {name: os.environ[name] for name in ENV_ALLOWLIST if name in os.environ}
+    env.update(overrides)
+    return env
+
+
+def isolate_environ(test: unittest.TestCase, **overrides: str) -> None:
+    """Replace os.environ with an isolated one for the duration of ``test``."""
+
+    patcher = mock.patch.dict(os.environ, isolated_environ(**overrides), clear=True)
+    patcher.start()
+    test.addCleanup(patcher.stop)
+
+
 def unix_http_request(
     socket_path: str,
     method: str,
@@ -56,14 +80,9 @@ class DiscordIntakeServiceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tempdir.cleanup)
-        self._old_environ = os.environ.copy()
-        os.environ["GC_CITY_ROOT"] = self.tempdir.name
+        isolate_environ(self, GC_CITY_ROOT=self.tempdir.name)
         service.LAST_REQUEST_PRUNE_AT = 0.0
         service.LAST_REQUEST_RECOVERY_AT = 0.0
-
-    def tearDown(self) -> None:
-        os.environ.clear()
-        os.environ.update(self._old_environ)
 
     def write_rig_route(self, rig: str) -> None:
         beads_dir = pathlib.Path(self.tempdir.name, ".beads")
