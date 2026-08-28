@@ -407,8 +407,12 @@ def test_supported_pack_nightly_workflow_uses_manifold_shape_and_pack_matrix() -
     assert "model-smoke)" in workflow
     assert "superpowers|compound-engineering|gstack|bmad)" in workflow
     assert "max-parallel: 2" in workflow
-    assert "runs-on: blacksmith-2vcpu-ubuntu-2404" in workflow
-    assert "runs-on: blacksmith-32vcpu-ubuntu-2404" in workflow
+    # Upstream sizes these two jobs differently (2vcpu / 32vcpu). This fork runs
+    # them on anvil, which is a single repurposed box exposing one label rather
+    # than a sized fleet, so both jobs collapse onto `hough-labs-k3s`. Asserting
+    # the count keeps both jobs covered even though the label no longer
+    # distinguishes them.
+    assert workflow.count("runs-on: hough-labs-k3s") == 2
     assert "GATE_TIMEOUT: ${{ github.event.inputs.timeout || matrix.gate_timeout }}" in workflow
     assert '--timeout "$GATE_TIMEOUT"' in workflow
     assert 'DOLT_VERSION: "2.1.7"' in workflow
@@ -462,7 +466,7 @@ def test_dispatch_inference_workflow_is_manual_or_external_only() -> None:
     assert "\n  schedule:" not in workflow
     assert "\n  pull_request:" not in workflow
     assert "\n  push:" not in workflow
-    assert "runs-on: blacksmith-32vcpu-ubuntu-2404" in workflow
+    assert "runs-on: hough-labs-k3s" in workflow
     assert 'DOLT_VERSION: "2.1.7"' in workflow
     assert 'BD_VERSION: "v1.1.0"' in workflow
     assert 'go-version: "1.26.5"' in workflow
@@ -473,16 +477,50 @@ def test_dispatch_inference_workflow_is_manual_or_external_only() -> None:
     assert "ANTHROPIC_API_KEY:" not in workflow
 
 
-def test_ci_workflows_use_blacksmith_runner_labels() -> None:
-    expected = {
-        ".github/workflows/ci.yml": "runs-on: blacksmith-32vcpu-ubuntu-2404",
-        ".github/workflows/codeql.yml": "runs-on: blacksmith-32vcpu-ubuntu-2404",
-        ".github/workflows/pack-release-compatibility.yml": "runs-on: blacksmith-32vcpu-ubuntu-2404",
+def test_ci_workflows_use_self_hosted_runner_labels() -> None:
+    # Fork-local divergence: upstream runs every workflow on Blacksmith's hosted
+    # runners (a project sponsor -- the README badge asserted below is separate
+    # and stays). This fork runs its own pipeline on the self-hosted
+    # `hough-labs-k3s` label on anvil so it does not depend on metered cloud
+    # minutes.
+    #
+    # This matters most for the three scheduled workflows (codeql,
+    # pack-release-compatibility, supported-pack-nightly): once they are
+    # re-enabled, a stale cloud label would leave their crons firing at a runner
+    # that does not exist, piling up permanently-queued runs. So the gate is
+    # tree-wide rather than a per-file allowlist -- a new workflow added on a
+    # billed label fails here rather than at 3am.
+    expected_runs_on = {
+        ".github/workflows/ci.yml": 1,
+        ".github/workflows/codeql.yml": 1,
+        ".github/workflows/gascity-pack-inference.yml": 1,
+        ".github/workflows/pack-release-compatibility.yml": 1,
+        # Two jobs, upstream-sized 2vcpu and 32vcpu, both on the one label.
+        ".github/workflows/supported-pack-nightly.yml": 2,
     }
 
-    for relative_path, marker in expected.items():
+    workflow_dir = gascity_pack_inference_gate.REPO_ROOT / ".github" / "workflows"
+    for relative_path, job_count in expected_runs_on.items():
         workflow = (gascity_pack_inference_gate.REPO_ROOT / relative_path).read_text(encoding="utf-8")
-        assert marker in workflow
+        # Every `runs-on:` in the file is the self-hosted label -- no mixed targets.
+        assert workflow.count("runs-on:") == job_count, relative_path
+        assert workflow.count("runs-on: hough-labs-k3s") == job_count, relative_path
+
+    # Nothing anywhere in the workflow tree may target billed cloud compute or
+    # fall back to a GitHub-hosted image, including files not listed above.
+    # Both extensions are swept: Actions honours `.yaml` as well as `.yml`, and
+    # the whole point of this sweep is the workflow somebody adds later.
+    workflow_paths = sorted(
+        [*workflow_dir.glob("*.yml"), *workflow_dir.glob("*.yaml")]
+    )
+    assert workflow_paths, "no workflow files found -- the sweep below would vacuously pass"
+    for workflow_path in workflow_paths:
+        workflow = workflow_path.read_text(encoding="utf-8")
+        assert "blacksmith" not in workflow, workflow_path.name
+        for line in workflow.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("runs-on:"):
+                assert stripped == "runs-on: hough-labs-k3s", f"{workflow_path.name}: {stripped}"
 
 
 def test_readme_includes_blacksmith_sponsor_badge() -> None:

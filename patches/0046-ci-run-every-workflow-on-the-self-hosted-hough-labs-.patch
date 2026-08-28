@@ -1,0 +1,241 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 28 Aug 2026 14:08:56 -0400
+Subject: [PATCH 46/46] ci: run every workflow on the self-hosted
+ hough-labs-k3s runner (gcp-3d7n)
+
+All five workflow files targeted Blacksmith's hosted runners -- six `runs-on`
+lines of billed cloud compute (ci 1, codeql 1, gascity-pack-inference 1,
+pack-release-compatibility 1, supported-pack-nightly 2). The standing
+requirement is that this pipeline runs on the Overseer's own hardware on anvil,
+precisely so it does not depend on metered cloud minutes. `hough-labs-k3s` is
+the org-wide label for that runner, and gascity-packs was the sole repo still
+pointing elsewhere: gauntlet, pelican, mill, kindling and ember all target it
+across their ci/release/security workflows.
+
+The urgency is the three scheduled workflows. codeql, pack-release-compatibility
+and supported-pack-nightly are currently state=disabled_fork (GitHub disables
+crons on forks) and are slated to be re-enabled on anvil. Had they been armed
+while still carrying a cloud label, three crons would have begun firing at a
+runner that does not resolve, accumulating permanently-queued runs -- the
+failure was already demonstrated live by run 33199131342, which queued on
+["blacksmith-32vcpu-ubuntu-2404"] and had to be cancelled. Converting all five
+is therefore the precondition for arming the nightlies, not a tidy-up.
+
+The workflow diff is the six `runs-on` lines and nothing else: no job renamed,
+no step added, removed or reordered, and no `on:`/`branches:`/`schedule:` key
+touched (trigger scoping belongs to gcp-75ed, not here). Two judgement calls are
+recorded deliberately rather than assumed. First, supported-pack-nightly sizes
+its two jobs differently upstream (2vcpu and 32vcpu); anvil is a single
+repurposed box exposing one label, not a sized fleet, so both collapse onto
+`hough-labs-k3s` -- no size-suffixed label was invented, since that is the only
+label verified live in this org. Second, no toolchain bootstrap step was added
+anywhere, because none is needed: each workflow already drives
+`actions/setup-go` / `actions/setup-python` before any `go install` or
+`pip install`, which is exactly how the sibling repos run on this same label
+with no extra setup (pelican drives setup-python; mill, kindling and gauntlet
+drive setup-go).
+
+The label swap regressed a test, which is the non-obvious part of this commit.
+`tests/test_gascity_pack_inference_gate.py` pinned the blacksmith labels in
+three places. That gate is upstream-correct -- upstream runs on Blacksmith
+deliberately, as a project sponsor -- but fork-wrong, so it is updated rather
+than deleted, and deliberately strengthened rather than merely inverted. It now
+asserts per file that every `runs-on:` is the self-hosted label with no mixed
+targets, then sweeps the whole workflow directory so that any file, including
+one added later, fails here if it carries `blacksmith` or a GitHub-hosted
+fallback. That converts a per-file allowlist into a real drift guard, so the
+next billed-label workflow is caught in review rather than at 3am. The
+README/Blacksmith sponsor-badge test is untouched: sponsorship is a separate
+matter from where jobs execute. The gate is renamed to
+test_ci_workflows_use_self_hosted_runner_labels; the old name had no other
+references.
+
+Validation: all five workflows re-parse as YAML; `git diff origin/integration --
+.github/` is exactly the six runs-on lines; post-change per-file `runs-on`
+counts are 1,1,1,1,2, all `hough-labs-k3s`, and `grep -r blacksmith .github/` is
+empty. `make check-patches` exits 0. Full pack pytest suite 813 passed / 3
+failed, and those 3 (test_no_bare_bd_commands, two test_formula_assets claim
+cases) fail identically on unmodified origin/integration -- confirmed in a
+scratch worktree, so they are pre-existing and unrelated. Also green: go vet,
+go build, go test -race, and validate_registry.py --require-git.
+
+One assumption stays unverified by design, per the bead's caveat: whether the
+org runner group admits this fork needs admin:org to read. If the first run
+after gcp-399 sits queued on "waiting for a runner", the fix is a runner-group
+access change, NOT a revert to a cloud label -- that would silently reintroduce
+the billed-minutes dependency this commit removes. Sibling defects gcp-399 (CI
+never registers on this fork) and gcp-75ed (ci.yml scoped `branches: [main]`)
+remain open and are not folded in here.
+---
+ .github/workflows/ci.yml                      |  2 +-
+ .github/workflows/codeql.yml                  |  2 +-
+ .github/workflows/gascity-pack-inference.yml  |  2 +-
+ .../workflows/pack-release-compatibility.yml  |  2 +-
+ .github/workflows/supported-pack-nightly.yml  |  4 +-
+ tests/test_gascity_pack_inference_gate.py     | 58 +++++++++++++++----
+ 6 files changed, 54 insertions(+), 16 deletions(-)
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 56a3c9f..382d94a 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -12,7 +12,7 @@ permissions:
+ jobs:
+   check:
+     name: Check
+-    runs-on: blacksmith-32vcpu-ubuntu-2404
++    runs-on: hough-labs-k3s
+     steps:
+       - name: Check out repository
+         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+diff --git a/.github/workflows/codeql.yml b/.github/workflows/codeql.yml
+index 1bcc512..1475e91 100644
+--- a/.github/workflows/codeql.yml
++++ b/.github/workflows/codeql.yml
+@@ -16,7 +16,7 @@ permissions:
+ jobs:
+   analyze:
+     name: Analyze (${{ matrix.language }})
+-    runs-on: blacksmith-32vcpu-ubuntu-2404
++    runs-on: hough-labs-k3s
+     strategy:
+       fail-fast: false
+       matrix:
+diff --git a/.github/workflows/gascity-pack-inference.yml b/.github/workflows/gascity-pack-inference.yml
+index f3d761c..c80d0cc 100644
+--- a/.github/workflows/gascity-pack-inference.yml
++++ b/.github/workflows/gascity-pack-inference.yml
+@@ -73,7 +73,7 @@ env:
+ jobs:
+   supported-pack-formulas:
+     name: supported pack formula inference gates
+-    runs-on: blacksmith-32vcpu-ubuntu-2404
++    runs-on: hough-labs-k3s
+     timeout-minutes: 360
+ 
+     steps:
+diff --git a/.github/workflows/pack-release-compatibility.yml b/.github/workflows/pack-release-compatibility.yml
+index b45c75b..cd29f63 100644
+--- a/.github/workflows/pack-release-compatibility.yml
++++ b/.github/workflows/pack-release-compatibility.yml
+@@ -53,7 +53,7 @@ permissions:
+ jobs:
+   latest-pack-releases:
+     name: Latest pack releases
+-    runs-on: blacksmith-32vcpu-ubuntu-2404
++    runs-on: hough-labs-k3s
+     timeout-minutes: 30
+ 
+     steps:
+diff --git a/.github/workflows/supported-pack-nightly.yml b/.github/workflows/supported-pack-nightly.yml
+index 50fc692..db7e496 100644
+--- a/.github/workflows/supported-pack-nightly.yml
++++ b/.github/workflows/supported-pack-nightly.yml
+@@ -57,7 +57,7 @@ env:
+ jobs:
+   static-contracts:
+     name: static pack flow contracts
+-    runs-on: blacksmith-2vcpu-ubuntu-2404
++    runs-on: hough-labs-k3s
+     timeout-minutes: 15
+     steps:
+       - name: Check out gascity-packs
+@@ -80,7 +80,7 @@ jobs:
+   inference:
+     name: ${{ matrix.pack }} / ${{ matrix.gate }}
+     needs: static-contracts
+-    runs-on: blacksmith-32vcpu-ubuntu-2404
++    runs-on: hough-labs-k3s
+     timeout-minutes: ${{ matrix.timeout_minutes }}
+     strategy:
+       fail-fast: false
+diff --git a/tests/test_gascity_pack_inference_gate.py b/tests/test_gascity_pack_inference_gate.py
+index 6ed5cc6..3448ddc 100644
+--- a/tests/test_gascity_pack_inference_gate.py
++++ b/tests/test_gascity_pack_inference_gate.py
+@@ -407,8 +407,12 @@ def test_supported_pack_nightly_workflow_uses_manifold_shape_and_pack_matrix() -
+     assert "model-smoke)" in workflow
+     assert "superpowers|compound-engineering|gstack|bmad)" in workflow
+     assert "max-parallel: 2" in workflow
+-    assert "runs-on: blacksmith-2vcpu-ubuntu-2404" in workflow
+-    assert "runs-on: blacksmith-32vcpu-ubuntu-2404" in workflow
++    # Upstream sizes these two jobs differently (2vcpu / 32vcpu). This fork runs
++    # them on anvil, which is a single repurposed box exposing one label rather
++    # than a sized fleet, so both jobs collapse onto `hough-labs-k3s`. Asserting
++    # the count keeps both jobs covered even though the label no longer
++    # distinguishes them.
++    assert workflow.count("runs-on: hough-labs-k3s") == 2
+     assert "GATE_TIMEOUT: ${{ github.event.inputs.timeout || matrix.gate_timeout }}" in workflow
+     assert '--timeout "$GATE_TIMEOUT"' in workflow
+     assert 'DOLT_VERSION: "2.1.7"' in workflow
+@@ -462,7 +466,7 @@ def test_dispatch_inference_workflow_is_manual_or_external_only() -> None:
+     assert "\n  schedule:" not in workflow
+     assert "\n  pull_request:" not in workflow
+     assert "\n  push:" not in workflow
+-    assert "runs-on: blacksmith-32vcpu-ubuntu-2404" in workflow
++    assert "runs-on: hough-labs-k3s" in workflow
+     assert 'DOLT_VERSION: "2.1.7"' in workflow
+     assert 'BD_VERSION: "v1.1.0"' in workflow
+     assert 'go-version: "1.26.5"' in workflow
+@@ -473,16 +477,50 @@ def test_dispatch_inference_workflow_is_manual_or_external_only() -> None:
+     assert "ANTHROPIC_API_KEY:" not in workflow
+ 
+ 
+-def test_ci_workflows_use_blacksmith_runner_labels() -> None:
+-    expected = {
+-        ".github/workflows/ci.yml": "runs-on: blacksmith-32vcpu-ubuntu-2404",
+-        ".github/workflows/codeql.yml": "runs-on: blacksmith-32vcpu-ubuntu-2404",
+-        ".github/workflows/pack-release-compatibility.yml": "runs-on: blacksmith-32vcpu-ubuntu-2404",
++def test_ci_workflows_use_self_hosted_runner_labels() -> None:
++    # Fork-local divergence: upstream runs every workflow on Blacksmith's hosted
++    # runners (a project sponsor -- the README badge asserted below is separate
++    # and stays). This fork runs its own pipeline on the self-hosted
++    # `hough-labs-k3s` label on anvil so it does not depend on metered cloud
++    # minutes.
++    #
++    # This matters most for the three scheduled workflows (codeql,
++    # pack-release-compatibility, supported-pack-nightly): once they are
++    # re-enabled, a stale cloud label would leave their crons firing at a runner
++    # that does not exist, piling up permanently-queued runs. So the gate is
++    # tree-wide rather than a per-file allowlist -- a new workflow added on a
++    # billed label fails here rather than at 3am.
++    expected_runs_on = {
++        ".github/workflows/ci.yml": 1,
++        ".github/workflows/codeql.yml": 1,
++        ".github/workflows/gascity-pack-inference.yml": 1,
++        ".github/workflows/pack-release-compatibility.yml": 1,
++        # Two jobs, upstream-sized 2vcpu and 32vcpu, both on the one label.
++        ".github/workflows/supported-pack-nightly.yml": 2,
+     }
+ 
+-    for relative_path, marker in expected.items():
++    workflow_dir = gascity_pack_inference_gate.REPO_ROOT / ".github" / "workflows"
++    for relative_path, job_count in expected_runs_on.items():
+         workflow = (gascity_pack_inference_gate.REPO_ROOT / relative_path).read_text(encoding="utf-8")
+-        assert marker in workflow
++        # Every `runs-on:` in the file is the self-hosted label -- no mixed targets.
++        assert workflow.count("runs-on:") == job_count, relative_path
++        assert workflow.count("runs-on: hough-labs-k3s") == job_count, relative_path
++
++    # Nothing anywhere in the workflow tree may target billed cloud compute or
++    # fall back to a GitHub-hosted image, including files not listed above.
++    # Both extensions are swept: Actions honours `.yaml` as well as `.yml`, and
++    # the whole point of this sweep is the workflow somebody adds later.
++    workflow_paths = sorted(
++        [*workflow_dir.glob("*.yml"), *workflow_dir.glob("*.yaml")]
++    )
++    assert workflow_paths, "no workflow files found -- the sweep below would vacuously pass"
++    for workflow_path in workflow_paths:
++        workflow = workflow_path.read_text(encoding="utf-8")
++        assert "blacksmith" not in workflow, workflow_path.name
++        for line in workflow.splitlines():
++            stripped = line.strip()
++            if stripped.startswith("runs-on:"):
++                assert stripped == "runs-on: hough-labs-k3s", f"{workflow_path.name}: {stripped}"
+ 
+ 
+ def test_readme_includes_blacksmith_sponsor_badge() -> None:
+-- 
+2.50.1 (Apple Git-155)
+

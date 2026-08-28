@@ -73,7 +73,7 @@ env:
 jobs:
   supported-pack-formulas:
     name: supported pack formula inference gates
-    runs-on: blacksmith-32vcpu-ubuntu-2404
+    runs-on: hough-labs-k3s
     timeout-minutes: 360
 
     steps:
