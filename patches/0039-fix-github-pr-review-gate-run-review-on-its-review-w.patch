@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 16 Aug 2026 21:51:09 -0400
-Subject: [PATCH 39/47] fix(github-pr-review): gate run-review on its review
+Subject: [PATCH 39/48] fix(github-pr-review): gate run-review on its review
  workflow's outcome (gcp-m7dn)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
