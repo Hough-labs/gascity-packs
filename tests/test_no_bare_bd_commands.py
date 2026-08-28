@@ -149,11 +149,32 @@ BARE_BD_SERIALIZED_ARGV = re.compile(
 # post-image of that same content is scanned directly.
 DERIVED_PREFIXES = ("patches/",)
 GC_BD_ARGV_TAIL_MARKER = "gc-bd-argv-tail"
-GC_BD_ARGV_TAIL_FIXTURE = Path("tests/test_gascity_pack_inference_gate.py")
-GC_BD_ARGV_TAIL_LINES = {
-    '*"bd show fi-root --json"*) # gc-bd-argv-tail: fake gc receives the wrapper\'s argv tail',
-    '*"bd list --json --limit 1000"*) # gc-bd-argv-tail: fake gc receives the wrapper\'s argv tail',
-    'assert "bd show fi-root --json" in args_path.read_text(encoding="utf-8")  # gc-bd-argv-tail',
+# Lines that name a `bd` subcommand as DATA rather than invoking one: a fake
+# `gc`'s case labels matching the wrapper's argv tail, an assertion on the tail
+# it recorded, a failure message, and prose describing what a stub models.
+# Every entry stays triple-locked -- an exact tracked path, the literal marker
+# on the line, and an exact-line match -- so editing an exempted line re-fires
+# the guard and a human re-confirms the line is still data. That is deliberate:
+# excluding a content class instead (comments, quoted strings) would blind the
+# guard to genuine invocation sites such as `eval "bd show ..."`.
+GC_BD_ARGV_TAIL_ALLOWLIST: dict[Path, set[str]] = {
+    Path("tests/test_gascity_pack_inference_gate.py"): {
+        '*"bd show fi-root --json"*) # gc-bd-argv-tail: fake gc receives the wrapper\'s argv tail',
+        '*"bd list --json --limit 1000"*) # gc-bd-argv-tail: fake gc receives the wrapper\'s argv tail',
+        'assert "bd show fi-root --json" in args_path.read_text(encoding="utf-8")  # gc-bd-argv-tail',
+    },
+    Path("gastown/tests/test_merge_approval_gate.sh"): {
+        '"bd show") # gc-bd-argv-tail: case label matching the fake gc\'s argv tail',
+        '"bd update") # gc-bd-argv-tail: case label matching the fake gc\'s argv tail',
+        'fail "producer must write the whole signal in a single bd update"'
+        " # gc-bd-argv-tail: failure message, not an invocation",
+    },
+    Path("gastown/tests/test_refinery_find_work.sh"): {
+        "# Stub `gc` implementing just enough of `bd list` to answer the shipped"
+        " query. # gc-bd-argv-tail: prose, not an invocation",
+        "# `bd list` hides closed issues unless asked."
+        " # gc-bd-argv-tail: prose, not an invocation",
+    },
 }
 
 
@@ -214,10 +235,11 @@ def gc_routes_bd(line: str, bd_start: int) -> bool:
 
 
 def intentional_gc_bd_argv_tail(relative: Path, line: str) -> bool:
+    allowed = GC_BD_ARGV_TAIL_ALLOWLIST.get(relative)
     return (
-        relative == GC_BD_ARGV_TAIL_FIXTURE
+        allowed is not None
         and GC_BD_ARGV_TAIL_MARKER in line
-        and line.strip() in GC_BD_ARGV_TAIL_LINES
+        and line.strip() in allowed
     )
 
 

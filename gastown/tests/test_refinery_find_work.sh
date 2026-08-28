@@ -60,10 +60,11 @@ with open(out, "w") as handle:
 PY
 }
 
-# Stub `gc` implementing just enough of `bd list` to answer the shipped query:
-# assignee equality, a comma-separated status filter, --has-metadata-key,
-# --exclude-type, and --limit. Anything else is an error, so a query that grows
-# a flag this stub does not model fails loudly instead of passing vacuously.
+# Stub `gc` implementing just enough of `bd list` to answer the shipped query. # gc-bd-argv-tail: prose, not an invocation
+# It models assignee equality, a comma-separated status filter,
+# --has-metadata-key, --exclude-type, and --limit. Anything else is an error, so
+# a query that grows a flag this stub does not model fails loudly instead of
+# passing vacuously.
 write_gc_stub() {
     local dir="$1"
     cat >"$dir/gc" <<'STUB'
@@ -110,8 +111,9 @@ for arg in args:
     else:
         sys.exit(f"stub gc bd list: unmodelled flag {arg!r}")
 
-# `bd list` hides closed issues unless asked; the stub mirrors that so a query
-# cannot appear to work by sweeping closed beads back into the queue.
+# `bd list` hides closed issues unless asked. # gc-bd-argv-tail: prose, not an invocation
+# The stub mirrors that so a query cannot appear to work by sweeping closed
+# beads back into the queue.
 matched = [
     bead
     for bead in beads

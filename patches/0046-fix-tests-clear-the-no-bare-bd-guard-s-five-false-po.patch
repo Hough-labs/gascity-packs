@@ -1,0 +1,174 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 28 Aug 2026 13:49:00 -0400
+Subject: [PATCH 46/46] fix(tests): clear the no-bare-bd guard's five false
+ positives (gcp-xk96)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`tests/test_no_bare_bd_commands.py::test_shipped_pack_assets_route_beads_commands_through_gc`
+has been red on `integration` with five violations, all false positives on
+test-harness code that names a `bd` subcommand as data rather than invoking one:
+two `case` labels in a fake `gc` matching the wrapper's argv tail, one failure
+message, and two prose comments describing what a stub models. A guard that is
+permanently red can no longer fail usefully — a genuine bare-`bd` regression
+would land inside an already-failing assertion and go unnoticed. The guard's
+entire value is being green.
+
+This extends the detector's EXISTING marker-based allowlist rather than teaching
+the scanner to skip a content class. `GC_BD_ARGV_TAIL_FIXTURE` +
+`GC_BD_ARGV_TAIL_LINES` (a single pinned path and its line set) generalize into
+`GC_BD_ARGV_TAIL_ALLOWLIST`, a path -> exact-lines map, and each of the five
+sites gains a trailing `# gc-bd-argv-tail: <why>` marker. All three of the
+original locks survive: an exact tracked path, the literal marker on the line,
+and an exact-line match. Editing an exempted line therefore re-fires the guard
+and forces a human to re-confirm the line is still data — that re-confirmation
+is a feature, not a cost.
+
+The rejected alternative was narrowing `bare_bd_violations` to ignore comments
+and quoted strings. It does not even cover all five (the failure message is a
+string literal), and excluding bare `bd` inside double quotes would blind the
+guard to `eval "bd show ..."`, heredocs, and every other quoted command string.
+Skipping `*/tests/*` wholesale is worse: test files are shipped pack assets. The
+marker comments are purely additive, so the stubs' argv-matching behavior is
+untouched (gcp-e6xv's "do not rewrite the stubs to satisfy a scanner" is
+honored).
+
+Validation: `python3 -m pytest tests/test_no_bare_bd_commands.py -q` now exits 0
+(was 1 failed with exactly these five). The full CI invocation
+`env -u GC_BIN -u GC_TEMPLATE python3 -m pytest tests contributing/tests
+gascity/tests discord/tests github/tests slack-full/tests slack-channel/tests
+pr-pipeline/tests -q` is green at 816 passed / 7 skipped (was 815 passed,
+1 failed). Negative control: appending an unmarked `bd show zzz-1 --json` to
+either shell file still fails the guard naming that line, proving neither file
+is blanket-exempt. Both `bash gastown/tests/test_merge_approval_gate.sh` and
+`bash gastown/tests/test_refinery_find_work.sh` still pass, and `go test .`
+(root embed) is ok.
+---
+ gastown/tests/test_merge_approval_gate.sh |  6 ++--
+ gastown/tests/test_refinery_find_work.sh  | 14 +++++----
+ tests/test_no_bare_bd_commands.py         | 36 ++++++++++++++++++-----
+ 3 files changed, 40 insertions(+), 16 deletions(-)
+
+diff --git a/gastown/tests/test_merge_approval_gate.sh b/gastown/tests/test_merge_approval_gate.sh
+index 1cec0c9..99734bb 100755
+--- a/gastown/tests/test_merge_approval_gate.sh
++++ b/gastown/tests/test_merge_approval_gate.sh
+@@ -27,14 +27,14 @@ write_gc_stub() {
+ # Only `gc bd show <id> --json` and `gc bd update <id> --set-metadata ...`
+ # are exercised here.
+ case "${1:-} ${2:-}" in
+-    "bd show")
++    "bd show") # gc-bd-argv-tail: case label matching the fake gc's argv tail
+         if [ -n "${STUB_BEAD_JSON:-}" ] && [ -f "$STUB_BEAD_JSON" ]; then
+             cat "$STUB_BEAD_JSON"
+             exit 0
+         fi
+         exit 1
+         ;;
+-    "bd update")
++    "bd update") # gc-bd-argv-tail: case label matching the fake gc's argv tail
+         printf '%s\n' "$*" >>"${STUB_UPDATE_LOG:-/dev/null}"
+         exit "${STUB_UPDATE_EXIT:-0}"
+         ;;
+@@ -160,7 +160,7 @@ test_producer_records_complete_signal() {
+         fail "producer failed on a valid approval"
+ 
+     [[ "$(wc -l <"$log")" -eq 1 ]] ||
+-        fail "producer must write the whole signal in a single bd update"
++        fail "producer must write the whole signal in a single bd update" # gc-bd-argv-tail: failure message, not an invocation
+     local line
+     line=$(cat "$log")
+     grep -F 'merge_approval.verdict=approved' <<<"$line" >/dev/null ||
+diff --git a/gastown/tests/test_refinery_find_work.sh b/gastown/tests/test_refinery_find_work.sh
+index 880dbac..81684e1 100755
+--- a/gastown/tests/test_refinery_find_work.sh
++++ b/gastown/tests/test_refinery_find_work.sh
+@@ -60,10 +60,11 @@ with open(out, "w") as handle:
+ PY
+ }
+ 
+-# Stub `gc` implementing just enough of `bd list` to answer the shipped query:
+-# assignee equality, a comma-separated status filter, --has-metadata-key,
+-# --exclude-type, and --limit. Anything else is an error, so a query that grows
+-# a flag this stub does not model fails loudly instead of passing vacuously.
++# Stub `gc` implementing just enough of `bd list` to answer the shipped query. # gc-bd-argv-tail: prose, not an invocation
++# It models assignee equality, a comma-separated status filter,
++# --has-metadata-key, --exclude-type, and --limit. Anything else is an error, so
++# a query that grows a flag this stub does not model fails loudly instead of
++# passing vacuously.
+ write_gc_stub() {
+     local dir="$1"
+     cat >"$dir/gc" <<'STUB'
+@@ -110,8 +111,9 @@ for arg in args:
+     else:
+         sys.exit(f"stub gc bd list: unmodelled flag {arg!r}")
+ 
+-# `bd list` hides closed issues unless asked; the stub mirrors that so a query
+-# cannot appear to work by sweeping closed beads back into the queue.
++# `bd list` hides closed issues unless asked. # gc-bd-argv-tail: prose, not an invocation
++# The stub mirrors that so a query cannot appear to work by sweeping closed
++# beads back into the queue.
+ matched = [
+     bead
+     for bead in beads
+diff --git a/tests/test_no_bare_bd_commands.py b/tests/test_no_bare_bd_commands.py
+index d6d4783..28b2dff 100644
+--- a/tests/test_no_bare_bd_commands.py
++++ b/tests/test_no_bare_bd_commands.py
+@@ -149,11 +149,32 @@ BARE_BD_SERIALIZED_ARGV = re.compile(
+ # post-image of that same content is scanned directly.
+ DERIVED_PREFIXES = ("patches/",)
+ GC_BD_ARGV_TAIL_MARKER = "gc-bd-argv-tail"
+-GC_BD_ARGV_TAIL_FIXTURE = Path("tests/test_gascity_pack_inference_gate.py")
+-GC_BD_ARGV_TAIL_LINES = {
+-    '*"bd show fi-root --json"*) # gc-bd-argv-tail: fake gc receives the wrapper\'s argv tail',
+-    '*"bd list --json --limit 1000"*) # gc-bd-argv-tail: fake gc receives the wrapper\'s argv tail',
+-    'assert "bd show fi-root --json" in args_path.read_text(encoding="utf-8")  # gc-bd-argv-tail',
++# Lines that name a `bd` subcommand as DATA rather than invoking one: a fake
++# `gc`'s case labels matching the wrapper's argv tail, an assertion on the tail
++# it recorded, a failure message, and prose describing what a stub models.
++# Every entry stays triple-locked -- an exact tracked path, the literal marker
++# on the line, and an exact-line match -- so editing an exempted line re-fires
++# the guard and a human re-confirms the line is still data. That is deliberate:
++# excluding a content class instead (comments, quoted strings) would blind the
++# guard to genuine invocation sites such as `eval "bd show ..."`.
++GC_BD_ARGV_TAIL_ALLOWLIST: dict[Path, set[str]] = {
++    Path("tests/test_gascity_pack_inference_gate.py"): {
++        '*"bd show fi-root --json"*) # gc-bd-argv-tail: fake gc receives the wrapper\'s argv tail',
++        '*"bd list --json --limit 1000"*) # gc-bd-argv-tail: fake gc receives the wrapper\'s argv tail',
++        'assert "bd show fi-root --json" in args_path.read_text(encoding="utf-8")  # gc-bd-argv-tail',
++    },
++    Path("gastown/tests/test_merge_approval_gate.sh"): {
++        '"bd show") # gc-bd-argv-tail: case label matching the fake gc\'s argv tail',
++        '"bd update") # gc-bd-argv-tail: case label matching the fake gc\'s argv tail',
++        'fail "producer must write the whole signal in a single bd update"'
++        " # gc-bd-argv-tail: failure message, not an invocation",
++    },
++    Path("gastown/tests/test_refinery_find_work.sh"): {
++        "# Stub `gc` implementing just enough of `bd list` to answer the shipped"
++        " query. # gc-bd-argv-tail: prose, not an invocation",
++        "# `bd list` hides closed issues unless asked."
++        " # gc-bd-argv-tail: prose, not an invocation",
++    },
+ }
+ 
+ 
+@@ -214,10 +235,11 @@ def gc_routes_bd(line: str, bd_start: int) -> bool:
+ 
+ 
+ def intentional_gc_bd_argv_tail(relative: Path, line: str) -> bool:
++    allowed = GC_BD_ARGV_TAIL_ALLOWLIST.get(relative)
+     return (
+-        relative == GC_BD_ARGV_TAIL_FIXTURE
++        allowed is not None
+         and GC_BD_ARGV_TAIL_MARKER in line
+-        and line.strip() in GC_BD_ARGV_TAIL_LINES
++        and line.strip() in allowed
+     )
+ 
+ 
+-- 
+2.50.1 (Apple Git-155)
+
