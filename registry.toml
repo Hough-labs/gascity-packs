@@ -368,3 +368,15 @@ schema = 1
     commit = "510a4e22a34d325063fe24f77038c004221b7e7e"
     hash = "sha256:e4d85af1e0e202e30785ac33ac12c83f26dba1cc61de22573d3ac5f8ea9e80de"
     description = "First release under the new name; the pack was renamed from contributing. Carries everything since contributing 0.2.1: the mol-contributing-* formula set, renamed lifecycle skills with an orchestrated umbrella, default-branch resolution from the local ref, and bead commands routed through gc. Imports must switch from //contributing to //contributing-to-gascity."
+[[pack]]
+  name = "gauntlet-tdd"
+  description = "The gauntlet RED-to-GREEN contract loop as a pack: scaffold a .bats contract from a bead's acceptance criteria, prove it red with gauntlet lint, route implementation to the rig's implementer, prove it green with a bead-scoped run (mol-tdd-red-green)."
+  source = "https://github.com/gastownhall/gascity-packs/tree/main/gauntlet-tdd"
+  source_kind = "git"
+
+  [[pack.release]]
+    version = "0.1.0"
+    ref = "main"
+    commit = "c84a27ba9bc290f67cbf24ba86e663e7268d6798"
+    hash = "sha256:3e93803831adc79d19da3d9bb06e9bc23518d1013ab1432da81a4d18b40de7ff"
+    description = "Initial gauntlet-tdd release: the RED-to-GREEN contract loop as one formula (mol-tdd-red-green) plus a wrapper command, pinned to the bats lane with gauntlet lint as the red gate."
