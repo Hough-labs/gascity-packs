@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 13 Aug 2026 13:07:46 -0400
-Subject: [PATCH 21/46] fix(deacon): make the queue-starvation-check able to
+Subject: [PATCH 21/47] fix(deacon): make the queue-starvation-check able to
  see a queue (gcp-wzhy)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

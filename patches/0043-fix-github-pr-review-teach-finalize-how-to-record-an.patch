@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 16 Aug 2026 22:19:20 -0400
-Subject: [PATCH 43/46] fix(github-pr-review): teach finalize how to record an
+Subject: [PATCH 43/47] fix(github-pr-review): teach finalize how to record an
  aborted run (gcp-m7dn)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
