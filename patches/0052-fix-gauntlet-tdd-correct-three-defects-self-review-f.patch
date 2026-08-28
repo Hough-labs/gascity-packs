@@ -1,0 +1,351 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 28 Aug 2026 18:10:55 -0400
+Subject: [PATCH 52/59] fix(gauntlet-tdd): correct three defects self-review
+ found in the loop (gcp-dnxq)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Three bugs, all of the same family: each is silent at the default and only
+bites a caller who sets `contracts_dir`, which is exactly the caller no test
+run exercises unless it is written to.
+
+1. `gauntlet lint` was passed `--contracts-dir <path>`. It does not take that
+   flag — verified against the CLI, not the help text: `lint: unknown flag:
+   --contracts-dir`. `gauntlet lint [path]` takes a POSITIONAL path while
+   `gauntlet run local` takes the flag, so the two spellings are derived
+   separately now (LINT_ARGS / RUN_ARGS) from one `contracts_dir` value.
+
+2. The red gate parsed its finding count out of stderr. `gauntlet lint --json`
+   writes the whole report to STDOUT and leaves stderr empty, so the parse
+   always yielded nothing and `red_findings:` was recorded as `unparsed` on
+   every run. Now `jq -r '.findings // [] | length'` against the JSON, with
+   the real shape documented in the step (`findings` is null when clean, an
+   array of {path,line,kind,message} when not).
+
+3. `$CONTRACTS_FLAG` and `$CONTRACT_PATH` were set in one step and read in
+   later ones. A formula step is a separate agent turn and the routed
+   `implement` step is a separate SESSION, so neither survives. The failure is
+   not a crash: an empty `$LINT_ARGS` reads as "gauntlet's default .gauntlet",
+   so the later gates would address a different tree than the one scaffolded
+   into and still report success. Values that must cross a boundary now go
+   through the root bead's notes (`implement` reads `contract_path:` back);
+   everything else is re-derived from the `{{contracts_dir}}` token, which
+   does render in every step.
+
+Two new guards so none of it recurs, both mutation-checked:
+
+- CliSurfaceTests: no `gauntlet lint` invocation may pass `--contracts-dir`.
+- NoCrossStepShellStateTests: every `$VAR` a step reads must be assigned in
+  that same step's shell blocks (ambient GC_*/BEADS_*/HOME-style names
+  excepted). Deleting the green gate's own derivation turns it red.
+
+The shell-block extractor now strips trailing `#` comments before scanning,
+outside double-quoted spans. Without that, the explanatory
+`# gauntlet run local --contracts-dir <path>` comment beside RUN_ARGS read as
+an unpinned `run local` invocation and tripped the lane-pin guard — a comment
+naming a command is documentation, not a run.
+
+Verified by executing the corrected snippets against the real CLI with
+`contracts_dir` set — the case that was broken: red gate exit 1 with
+RED_FINDINGS=1 and the finding rendered; green gate lint=0 run=0 SKIPPED=0
+with `total=3 pass=3 fail=0`. Suite: 19 passed, 41 subtests.
+---
+ gauntlet-tdd/README.md                        |  9 ++
+ .../formulas/mol-tdd-red-green.formula.toml   | 82 ++++++++++++++---
+ .../tests/test_gauntlet_tdd_formulas.py       | 91 ++++++++++++++++++-
+ 3 files changed, 168 insertions(+), 14 deletions(-)
+
+diff --git a/gauntlet-tdd/README.md b/gauntlet-tdd/README.md
+index 32e0c69..515bdbc 100644
+--- a/gauntlet-tdd/README.md
++++ b/gauntlet-tdd/README.md
+@@ -64,6 +64,15 @@ The formula assumes these verbs, all of which are dispatched in
+ | prove GREEN | `gauntlet run local <bead-id> [--contracts-dir <path>] --contracts=bats` |
+ | drop the red-by-design tag | `gauntlet bats untag-green` |
+ 
++**The two commands spell the contracts directory differently.** `gauntlet
++lint` takes a positional path and rejects the flag form outright —
++`lint: unknown flag: --contracts-dir` — while `gauntlet run local` takes
++`--contracts-dir <path>`. The formula derives both spellings from the single
++`contracts_dir` var, and the test suite asserts no lint invocation is given
++the flag. Worth knowing because the failure is invisible at the default: with
++`contracts_dir` unset, both forms collapse to `.gauntlet` and the mistake
++never shows.
++
+ Verified against gauntlet at commit `201c94f` — `git describe --tags` reports
+ **`v0.1.0-454-g201c94f`**. The CLI has no `--version` flag and no `version`
+ subcommand, so `git describe` in the gauntlet checkout is the version marker
+diff --git a/gauntlet-tdd/formulas/mol-tdd-red-green.formula.toml b/gauntlet-tdd/formulas/mol-tdd-red-green.formula.toml
+index 99922a2..3e6c189 100644
+--- a/gauntlet-tdd/formulas/mol-tdd-red-green.formula.toml
++++ b/gauntlet-tdd/formulas/mol-tdd-red-green.formula.toml
+@@ -105,22 +105,37 @@ ACCEPTANCE=$(gc bd show "{{contract_bead}}" --json | jq -r '.[0].acceptance_crit
+ [ -n "$ACCEPTANCE" ] || halt "{{contract_bead}} has no acceptance criteria to scaffold from"
+ ```
+ 
+-Resolve the contracts directory once, and reuse `$CONTRACTS_FLAG` verbatim in
+-every later gauntlet invocation so all four steps address the same tree:
++Resolve the contracts directory. **The two commands spell it differently** —
++`gauntlet lint` takes a POSITIONAL path and rejects `--contracts-dir` with
++`lint: unknown flag`, while `gauntlet run local` takes the flag. Passing the
++flag form to lint is not a loud failure you would notice: it aborts that one
++gate. Derive both spellings from the same value:
+ 
+ ```bash
+-CONTRACTS_FLAG=""
+-if [ -n "{{contracts_dir}}" ]; then
+-    CONTRACTS_FLAG="--contracts-dir {{contracts_dir}}"
++CONTRACTS_DIR="{{contracts_dir}}"
++LINT_ARGS=""                                    # gauntlet lint [path]
++RUN_ARGS=""                                     # gauntlet run local --contracts-dir <path>
++if [ -n "$CONTRACTS_DIR" ]; then
++    LINT_ARGS="$CONTRACTS_DIR"
++    RUN_ARGS="--contracts-dir $CONTRACTS_DIR"
+ fi
+ 
+ gc bd update "$ROOT_ID" --notes "contract_bead: {{contract_bead}}
+ repo_root: $REPO_ROOT
+-contracts_flag: ${CONTRACTS_FLAG:-<default .gauntlet>}
++contracts_dir: ${CONTRACTS_DIR:-<default .gauntlet>}
+ lane: bats
+ status: in_progress"
+ ```
+ 
++**Each step re-derives these three lines from `{{contracts_dir}}` itself.**
++Do not set them once here and expect them downstream: a formula step is a
++separate agent turn, and the routed `implement` step is a separate session
++entirely, so a shell variable set in this step is empty in the next one. An
++empty `$LINT_ARGS` silently means "gauntlet's default `.gauntlet`", so the
++later gates would address a different tree than the one scaffolded into and
++still report success. The template token renders in every step; the shell
++variable does not survive one.
++
+ **Note on bead resolution.** `gauntlet scaffold --from-bead` resolves the bead
+ through the `bd` CLI itself, using the store that the CWD resolves to. Inside a
+ rig worktree that is the rig's own store and no action is needed. If the
+@@ -129,7 +144,8 @@ an inherited `BEADS_DIR` is pointing the CLI at a different store — that is
+ the failure, not a missing bead.
+ 
+ **Exit criteria:** In repo root, `gauntlet` present, `{{contract_bead}}`
+-readable with non-empty acceptance criteria, `$CONTRACTS_FLAG` resolved.
++readable with non-empty acceptance criteria, contracts directory recorded on
++the root bead.
+ """
+ 
+ [[steps]]
+@@ -192,12 +208,25 @@ finding, which is what "red" means here.
+ ```bash
+ ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
+ 
++CONTRACTS_DIR="{{contracts_dir}}"
++LINT_ARGS=""
++[ -n "$CONTRACTS_DIR" ] && LINT_ARGS="$CONTRACTS_DIR"
++
+ set +e
+-gauntlet lint $CONTRACTS_FLAG --json > /tmp/tdd-lint-red-$$.json 2>/tmp/tdd-lint-red-$$.err
++gauntlet lint $LINT_ARGS --json > /tmp/tdd-lint-red-$$.json
+ LINT_STATUS=$?
+ set -e
+ ```
+ 
++`--json` writes the whole report to **stdout**, not stderr, and `findings` is
++`null` when clean and an array of `{path, line, kind, message}` when not:
++
++```json
++{ "scanned": 1, "clean": 0,
++  "findings": [ { "path": ".gauntlet/x.bats", "line": 5, "kind": "todo_skip",
++                  "message": "scaffold placeholder 'skip \"TODO\"' left in test" } ] }
++```
++
+ A non-zero exit with at least one finding is RED, and the loop proceeds. A
+ clean exit means there is nothing to prove — either the scaffold produced no
+ stubs, or the contract was already implemented — and the loop halts rather
+@@ -210,13 +239,17 @@ if [ "$LINT_STATUS" -eq 0 ]; then
+     exit 1
+ fi
+ 
+-RED_FINDINGS=$(sed -n 's/.*findings=\\([0-9][0-9]*\\).*/\\1/p' /tmp/tdd-lint-red-$$.err | tail -1)
++RED_FINDINGS=$(jq -r '.findings // [] | length' /tmp/tdd-lint-red-$$.json)
+ gc bd update "$ROOT_ID" --notes "red_findings: ${RED_FINDINGS:-unparsed}
+ red_proven: yes"
+ ```
+ 
+ Record the finding list in the run log — it is the to-do list the implement
+-step works from, one entry per unproven assertion.
++step works from, one entry per unproven assertion:
++
++```bash
++jq -r '.findings[] | "\\(.path):\\(.line)  \\(.kind)  \\(.message)"' /tmp/tdd-lint-red-$$.json
++```
+ 
+ **Exit criteria:** `gauntlet lint` exited non-zero, the finding count is
+ recorded as `red_findings:` on the root bead, and `red_proven: yes` is set.
+@@ -233,6 +266,21 @@ a real session and the refinery sees a real branch. `gauntlet loop --exec`
+ would drive the same cycle as an opaque subprocess; that is the wrong
+ orchestration model here, because a subprocess is invisible to both.
+ 
++This step runs in its own session, so nothing the earlier steps put in a
++shell variable is still set. Read the contract path back off the root bead,
++where the scaffold step recorded it, and re-derive the run flag:
++
++```bash
++ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
++CONTRACT_PATH=$(gc bd show "$ROOT_ID" --json |
++    jq -r '.[0].notes // ""' | sed -n 's/^contract_path: //p' | tail -1)
++[ -n "$CONTRACT_PATH" ] || { echo "no contract_path on the root bead" >&2; exit 1; }
++
++CONTRACTS_DIR="{{contracts_dir}}"
++RUN_ARGS=""
++[ -n "$CONTRACTS_DIR" ] && RUN_ARGS="--contracts-dir $CONTRACTS_DIR"
++```
++
+ Work from the red findings recorded by the previous step. For each stub in
+ `$CONTRACT_PATH`:
+ 
+@@ -253,7 +301,7 @@ Two rules that decide whether the loop meant anything:
+ Iterate locally against the bats lane until it holds:
+ 
+ ```bash
+-gauntlet run local "{{contract_bead}}" $CONTRACTS_FLAG --contracts=bats
++gauntlet run local "{{contract_bead}}" $RUN_ARGS --contracts=bats
+ ```
+ 
+ Commit the contract and the implementation together. The contract is part of
+@@ -276,10 +324,18 @@ a file with every stub still skipped runs green.
+ ```bash
+ ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
+ 
++CONTRACTS_DIR="{{contracts_dir}}"
++LINT_ARGS=""                                    # positional path
++RUN_ARGS=""                                     # --contracts-dir flag
++if [ -n "$CONTRACTS_DIR" ]; then
++    LINT_ARGS="$CONTRACTS_DIR"
++    RUN_ARGS="--contracts-dir $CONTRACTS_DIR"
++fi
++
+ set +e
+-gauntlet lint $CONTRACTS_FLAG > /tmp/tdd-lint-green-$$.log 2>&1
++gauntlet lint $LINT_ARGS > /tmp/tdd-lint-green-$$.log 2>&1
+ LINT_STATUS=$?
+-gauntlet run local "{{contract_bead}}" $CONTRACTS_FLAG --contracts=bats > /tmp/tdd-run-green-$$.log 2>&1
++gauntlet run local "{{contract_bead}}" $RUN_ARGS --contracts=bats > /tmp/tdd-run-green-$$.log 2>&1
+ RUN_STATUS=$?
+ set -e
+ 
+diff --git a/gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py b/gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py
+index 429e70a..b5e2634 100644
+--- a/gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py
++++ b/gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py
+@@ -70,10 +70,27 @@ def shell_lines(body: str) -> list[str]:
+             inside = stripped[3:].strip() == "bash" if not inside else False
+             continue
+         if inside:
+-            lines.append(raw)
++            lines.append(strip_comment(raw))
+     return lines
+ 
+ 
++def strip_comment(line: str) -> str:
++    """Drop a trailing `#` shell comment.
++
++    Without this, a comment that names a command reads as an invocation of it
++    — the `# gauntlet run local --contracts-dir <path>` note beside RUN_ARGS
++    is documentation, not a run. Only a `#` that opens a word and sits outside
++    a double-quoted span counts, so `"sha256:#..."`-style content is safe.
++    """
++    quoted = False
++    for index, char in enumerate(line):
++        if char == '"':
++            quoted = not quoted
++        elif char == "#" and not quoted and (index == 0 or line[index - 1] in " \t"):
++            return line[:index].rstrip()
++    return line
++
++
+ def shell_text(body: str) -> str:
+     return "\n".join(shell_lines(body))
+ 
+@@ -258,6 +275,78 @@ class LanePinnedToBatsTests(unittest.TestCase):
+         self.assertRegex(readme, r"\bgaunt-8ibp\b")
+ 
+ 
++class CliSurfaceTests(unittest.TestCase):
++    """The two gauntlet commands spell the contracts directory differently.
++
++    `gauntlet lint [path]` takes a POSITIONAL path and rejects the flag form
++    outright (`lint: unknown flag: --contracts-dir`); `gauntlet run local`
++    takes `--contracts-dir <path>`. Getting it backwards kills the red gate
++    for any caller who sets `contracts_dir` — and only for those callers, so
++    it survives every test run that leaves the var at its empty default.
++    """
++
++    def test_no_lint_invocation_passes_contracts_dir(self) -> None:
++        for path in formula_paths():
++            data = tomllib.loads(path.read_text(encoding="utf-8"))
++            for step_id, body in step_bodies(data).items():
++                for line in shell_lines(body):
++                    if "gauntlet lint" not in line:
++                        continue
++                    with self.subTest(formula=path.name, step=step_id):
++                        self.assertNotIn(
++                            "--contracts-dir",
++                            line,
++                            "gauntlet lint takes a positional path, not --contracts-dir",
++                        )
++
++
++class NoCrossStepShellStateTests(unittest.TestCase):
++    """A shell variable set in one step is empty in the next.
++
++    Each formula step is a separate agent turn, and a step carrying
++    `gc.run_target` is a separate session entirely, so nothing survives in the
++    shell between them. The dangerous case is not a crash: an unset
++    `$LINT_ARGS` reads as "gauntlet's default .gauntlet", so a later gate
++    silently addresses a different tree than the one scaffolded into and still
++    reports success. Values that must cross a step boundary go through the
++    root bead's notes; everything else is re-derived from a `{{var}}`, which
++    does render in every step.
++    """
++
++    # Set by the environment, not by the step.
++    AMBIENT = frozenset({"HOME", "PATH", "PWD", "TMPDIR", "USER", "SHELL", "IFS"})
++    AMBIENT_PREFIXES = ("GC_", "BEADS_", "BD_")
++
++    # An assignment opens a command: at a line start, or after a separator
++    # (`;`, `&&`, `||`, `then`, `do`). re.M matters — shell snippets are
++    # multi-line, and without it only the very first line would ever match,
++    # which reports every variable as cross-step.
++    ASSIGNED = re.compile(
++        r"(?:^|;|&&|\|\||\bthen\b|\bdo\b)[ \t]*([A-Z_][A-Z0-9_]*)=", re.M
++    )
++    USED = re.compile(r"\$\{?([A-Z_][A-Z0-9_]*)")
++
++    def _is_ambient(self, name: str) -> bool:
++        return name in self.AMBIENT or name.startswith(self.AMBIENT_PREFIXES)
++
++    def test_every_shell_var_a_step_reads_is_set_in_that_step(self) -> None:
++        for path in formula_paths():
++            data = tomllib.loads(path.read_text(encoding="utf-8"))
++            for step_id, body in step_bodies(data).items():
++                shell = shell_text(body)
++                assigned = set(self.ASSIGNED.findall(shell))
++                for name in sorted(set(self.USED.findall(shell))):
++                    if self._is_ambient(name):
++                        continue
++                    with self.subTest(formula=path.name, step=step_id, var=name):
++                        self.assertIn(
++                            name,
++                            assigned,
++                            f"${name} is read in step {step_id} but set in an earlier "
++                            "step — shell state does not cross a step boundary",
++                        )
++
++
+ class ConfigPurityTests(unittest.TestCase):
+     """A published pack must be configuration-pure.
+ 
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 28 Aug 2026 17:59:46 -0400
+Subject: [PATCH 51/59] feat(registry): publish gauntlet-tdd 0.1.0 (gcp-dnxq)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Second half of the two-commit publish sequence. validate_registry.py does not
+trust the hash in the file: it recomputes it from `git ls-tree` over the pack
+subtree at the named commit and fails when it cannot ("a hash that cannot be
+computed is an error, never a pass"). So the subtree has to exist in history
+before it can be pinned, which is why this is a separate commit and why
+`commit` names c84a27b — the commit that INTRODUCED the pack — rather than
+this one.
+
+The entry was produced by `make registry-publish PACK=gauntlet-tdd
+PACK_PATH=gauntlet-tdd VERSION=0.1.0 REGISTRY_COMMIT=c84a27b...`, but only
+the gauntlet-tdd block is kept. `gc pack release stamp` also rewrote all
+fifteen pre-existing [[pack]] entries to add `tier = "community"` and
+`publisher = "Unknown publisher"`; that churn is unrelated to this bead, no
+existing entry carries those keys, and validate_registry.py does not require
+them, so registry.toml was restored and the new entry appended by hand. The
+diff is additive: 13 insertions, 0 deletions.
+
+Validation:
+- `python3 validate_registry.py registry.toml` -> `registry.toml: ok`
+- `python3 validate_registry.py --require-git` (the CI form, which is what
+  actually recomputes the subtree hash) -> `registry.toml: ok`
+- tests/test_validate_registry.py + test_registry_release.py +
+  test_pack_release_compat.py -> 36 passed
+---
+ registry.toml | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/registry.toml b/registry.toml
+index 4f57c0a..255dfc7 100644
+--- a/registry.toml
++++ b/registry.toml
+@@ -313,3 +313,16 @@ schema = 1
+     commit = "636fdfaaf54195b293e8e56d5e9c30e4b8d5a9ef"
+     hash = "sha256:ba0428bf51627bf465a693f2426cf6be0cef70ae81b043fce3ce6761a4772290"
+     description = "First registry release of the superpowers build factory."
++
++[[pack]]
++  name = "gauntlet-tdd"
++  description = "The gauntlet RED-to-GREEN contract loop as a pack: scaffold a .bats contract from a bead's acceptance criteria, prove it red with gauntlet lint, route implementation to the rig's implementer, prove it green with a bead-scoped run (mol-tdd-red-green)."
++  source = "https://github.com/gastownhall/gascity-packs/tree/main/gauntlet-tdd"
++  source_kind = "git"
++
++  [[pack.release]]
++    version = "0.1.0"
++    ref = "main"
++    commit = "c84a27ba9bc290f67cbf24ba86e663e7268d6798"
++    hash = "sha256:3e93803831adc79d19da3d9bb06e9bc23518d1013ab1432da81a4d18b40de7ff"
++    description = "Initial gauntlet-tdd release: the RED-to-GREEN contract loop as one formula (mol-tdd-red-green) plus a wrapper command, pinned to the bats lane with gauntlet lint as the red gate."
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,209 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 28 Aug 2026 18:51:26 -0400
+Subject: [PATCH 54/59] fix(gauntlet-tdd): append run-state notes instead of
+ replacing them (gcp-dnxq)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`gc bd update --notes` REPLACES the notes field; `--append-notes` is the
+appending form. Every note write in mol-tdd-red-green used the replacing
+form, which broke the one cross-step handoff the loop depends on:
+
+  scaffold    --notes "contract_path: ..."      <- recorded
+  assert-red  --notes "red_findings: ...."      <- contract_path erased
+  implement   sed -n 's/^contract_path: //p'    <- empty, hard exit 1
+
+So every run of the formula would halt at the implement gate with "no
+contract_path on the root bead", after the red gate had already passed.
+The failure is silent at its cause — `gc bd update` exits 0 on the write
+that erased the value — and only surfaces two steps later, pointing at
+the reader rather than the writer.
+
+Switched all eight writes to --append-notes. That also stops the loop
+clobbering the witness's and refinery's own annotations on a shared bead,
+and the `implement` reader already takes `tail -1`, so repeated keys
+resolve to the latest write.
+
+Two regression guards in NoteWritesAppendTests, cycled red->green:
+- no `bd update` line in any step may use the replacing --notes flag
+  (a negative-lookbehind regex, so --append-notes does not self-match);
+- if any step reads contract_path back off the notes, some step must
+  append it there.
+
+Reintroducing the bug fails both; the fix passes both.
+---
+ .../formulas/mol-tdd-red-green.formula.toml   | 29 ++++++----
+ .../tests/test_gauntlet_tdd_formulas.py       | 58 +++++++++++++++++++
+ 2 files changed, 77 insertions(+), 10 deletions(-)
+
+diff --git a/gauntlet-tdd/formulas/mol-tdd-red-green.formula.toml b/gauntlet-tdd/formulas/mol-tdd-red-green.formula.toml
+index 3e6c189..2310883 100644
+--- a/gauntlet-tdd/formulas/mol-tdd-red-green.formula.toml
++++ b/gauntlet-tdd/formulas/mol-tdd-red-green.formula.toml
+@@ -8,7 +8,16 @@ contract; the loop refuses to advance on an assertion it cannot see fail.
+ 
+ A coding agent (polecat or equivalent) follows the steps in order. The
+ molecule root bead IS the control bead — run state is recorded in its notes
+-via `gc bd update <root-id> --notes "<key>: <value>"`.
++via `gc bd update <root-id> --append-notes "<key>: <value>"`.
++
++**Every note write in this formula is `--append-notes`, never `--notes`.**
++`--notes` REPLACES the field. The `implement` step reads `contract_path:`
++back off the notes two steps after `scaffold` wrote it, so a replacing write
++anywhere in between erases the only record of which file the loop is working
++on — and `gc bd update` still exits 0, so the loss surfaces as an
++unexplained "no contract_path on the root bead" at the implement gate rather
++than at the write that caused it. Appending also keeps the witness's and
++refinery's own annotations on a shared bead.
+ 
+ ## Contract
+ 
+@@ -84,7 +93,7 @@ produces a contract that cannot mean anything.
+ ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
+ 
+ halt() {
+-    gc bd update "$ROOT_ID" --notes "halt_reason: $1"
++    gc bd update "$ROOT_ID" --append-notes "halt_reason: $1"
+     echo "[tdd-red-green] HALT: $1" >&2
+     gc bd close "$ROOT_ID" --reason "$1"
+     exit 1
+@@ -120,7 +129,7 @@ if [ -n "$CONTRACTS_DIR" ]; then
+     RUN_ARGS="--contracts-dir $CONTRACTS_DIR"
+ fi
+ 
+-gc bd update "$ROOT_ID" --notes "contract_bead: {{contract_bead}}
++gc bd update "$ROOT_ID" --append-notes "contract_bead: {{contract_bead}}
+ repo_root: $REPO_ROOT
+ contracts_dir: ${CONTRACTS_DIR:-<default .gauntlet>}
+ lane: bats
+@@ -175,11 +184,11 @@ lane and off the hurl runner.
+ ```bash
+ CONTRACT_PATH=$(sed -n 's/^bats: //p' /tmp/tdd-scaffold-$$.log | head -1)
+ if [ -z "$CONTRACT_PATH" ] || [ "${CONTRACT_PATH##*.}" != "bats" ]; then
+-    gc bd update "$ROOT_ID" --notes "halt_reason: scaffold emitted no .bats contract"
++    gc bd update "$ROOT_ID" --append-notes "halt_reason: scaffold emitted no .bats contract"
+     gc bd close "$ROOT_ID" --reason "scaffold emitted no .bats contract"
+     exit 1
+ fi
+-gc bd update "$ROOT_ID" --notes "contract_path: $CONTRACT_PATH"
++gc bd update "$ROOT_ID" --append-notes "contract_path: $CONTRACT_PATH"
+ ```
+ 
+ If scaffold reports `skipped 1` and wrote nothing, a contract for this bead
+@@ -234,13 +243,13 @@ than declaring victory over an assertion it never saw fail:
+ 
+ ```bash
+ if [ "$LINT_STATUS" -eq 0 ]; then
+-    gc bd update "$ROOT_ID" --notes "halt_reason: gauntlet lint reports clean on a fresh scaffold — no red to prove"
++    gc bd update "$ROOT_ID" --append-notes "halt_reason: gauntlet lint reports clean on a fresh scaffold — no red to prove"
+     gc bd close "$ROOT_ID" --reason "contract is not red; nothing to prove"
+     exit 1
+ fi
+ 
+ RED_FINDINGS=$(jq -r '.findings // [] | length' /tmp/tdd-lint-red-$$.json)
+-gc bd update "$ROOT_ID" --notes "red_findings: ${RED_FINDINGS:-unparsed}
++gc bd update "$ROOT_ID" --append-notes "red_findings: ${RED_FINDINGS:-unparsed}
+ red_proven: yes"
+ ```
+ 
+@@ -340,7 +349,7 @@ RUN_STATUS=$?
+ set -e
+ 
+ if [ "$LINT_STATUS" -ne 0 ] || [ "$RUN_STATUS" -ne 0 ]; then
+-    gc bd update "$ROOT_ID" --notes "halt_reason: green gate failed (lint=$LINT_STATUS run=$RUN_STATUS)"
++    gc bd update "$ROOT_ID" --append-notes "halt_reason: green gate failed (lint=$LINT_STATUS run=$RUN_STATUS)"
+     cat /tmp/tdd-lint-green-$$.log /tmp/tdd-run-green-$$.log >&2
+     gc bd close "$ROOT_ID" --reason "green gate failed"
+     exit 1
+@@ -356,7 +365,7 @@ pass:
+ ```bash
+ SKIPPED=$(sed -n 's/.*GAUNTLET_SUMMARY.* skipped=\\([0-9][0-9]*\\).*/\\1/p' /tmp/tdd-run-green-$$.log | tail -1)
+ if [ "${SKIPPED:-1}" -ne 0 ]; then
+-    gc bd update "$ROOT_ID" --notes "halt_reason: green run reported skipped=${SKIPPED:-unparsed} — skips are not passes"
++    gc bd update "$ROOT_ID" --append-notes "halt_reason: green run reported skipped=${SKIPPED:-unparsed} — skips are not passes"
+     gc bd close "$ROOT_ID" --reason "green run still has skipped tests"
+     exit 1
+ fi
+@@ -405,7 +414,7 @@ claim that the contract covers the bead whole>
+ Then finalize:
+ 
+ ```bash
+-gc bd update "$ROOT_ID" --notes "report_path: $REPORT_PATH
++gc bd update "$ROOT_ID" --append-notes "report_path: $REPORT_PATH
+ green_proven: yes
+ status: complete"
+ echo "[tdd-red-green] GREEN for {{contract_bead}}"
+diff --git a/gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py b/gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py
+index b5e2634..886b5a1 100644
+--- a/gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py
++++ b/gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py
+@@ -347,6 +347,64 @@ class NoCrossStepShellStateTests(unittest.TestCase):
+                         )
+ 
+ 
++class NoteWritesAppendTests(unittest.TestCase):
++    """Run state crosses steps through the root bead's notes, so it must append.
++
++    `gc bd update --notes` REPLACES the notes field; `--append-notes` is the
++    appending form. The formula records `contract_path:` in `scaffold` and
++    reads it back in `implement`, two steps later — so one replacing write in
++    `assert-red` erases the only record of which contract the loop is on. The
++    write still exits 0, so the loss surfaces as an unexplained "no
++    contract_path on the root bead" at the implement gate, far from its cause.
++
++    Appending is also what keeps a shared bead's other annotations (witness,
++    refinery) intact.
++    """
++
++    NOTES_FLAG = re.compile(r"(?<!-)(?<!append-)--notes\b")
++
++    def test_no_step_writes_notes_with_the_replacing_flag(self) -> None:
++        for path in formula_paths():
++            data = tomllib.loads(path.read_text(encoding="utf-8"))
++            for step_id, body in step_bodies(data).items():
++                for line in shell_lines(body):
++                    if "bd update" not in line:
++                        continue
++                    with self.subTest(formula=path.name, step=step_id, line=line):
++                        self.assertIsNone(
++                            self.NOTES_FLAG.search(line),
++                            "use --append-notes; --notes replaces the field and "
++                            "drops run state a later step reads back",
++                        )
++
++    def test_contract_path_is_written_before_it_is_read_back(self) -> None:
++        """The cross-step handoff this pack depends on actually exists."""
++        for path in formula_paths():
++            data = tomllib.loads(path.read_text(encoding="utf-8"))
++            bodies = step_bodies(data)
++            readers = [
++                step_id
++                for step_id, body in bodies.items()
++                if any("contract_path: //p" in line for line in shell_lines(body))
++            ]
++            if not readers:
++                continue
++            writers = [
++                step_id
++                for step_id, body in bodies.items()
++                if any(
++                    "--append-notes" in line and "contract_path:" in line
++                    for line in shell_lines(body)
++                )
++            ]
++            with self.subTest(formula=path.name):
++                self.assertTrue(
++                    writers,
++                    f"{readers} read contract_path back off the notes, but no step "
++                    "appends it there",
++                )
++
++
+ class ConfigPurityTests(unittest.TestCase):
+     """A published pack must be configuration-pure.
+ 
+-- 
+2.50.1 (Apple Git-155)
+

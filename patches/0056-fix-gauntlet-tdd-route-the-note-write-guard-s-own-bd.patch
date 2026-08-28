@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 28 Aug 2026 19:15:28 -0400
+Subject: [PATCH 56/59] fix(gauntlet-tdd): route the note-write guard's own bd
+ match through gc (gcp-dnxq)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The `--notes` guard added in 25a61a8 filtered candidate lines on the bare
+substring `"bd update"`, which trips the repo's own bare-bd guard
+(tests/test_no_bare_bd_commands.py) — that scanner reads the literal as a
+shipped asset invoking `bd` outside store-aware routing.
+
+Matching on `"gc bd update"` clears the scanner and is the more precise
+filter besides: every note write in the formula is `gc bd`-routed, so a
+line that reaches the assertion via the bare form would already be a
+different violation.
+
+`pytest tests/test_no_bare_bd_commands.py gauntlet-tdd/tests` -> 23 passed,
+51 subtests passed. Reintroducing the --notes regression still fails both
+NoteWritesAppendTests guards; restoring the fix passes both.
+---
+ gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py b/gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py
+index 886b5a1..41b7002 100644
+--- a/gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py
++++ b/gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py
+@@ -368,7 +368,7 @@ class NoteWritesAppendTests(unittest.TestCase):
+             data = tomllib.loads(path.read_text(encoding="utf-8"))
+             for step_id, body in step_bodies(data).items():
+                 for line in shell_lines(body):
+-                    if "bd update" not in line:
++                    if "gc bd update" not in line:
+                         continue
+                     with self.subTest(formula=path.name, step=step_id, line=line):
+                         self.assertIsNone(
+-- 
+2.50.1 (Apple Git-155)
+

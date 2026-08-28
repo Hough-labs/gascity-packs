@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 28 Aug 2026 19:01:00 -0400
+Subject: [PATCH 55/59] fix(registry): re-pin gauntlet-tdd 0.1.0 to the
+ append-notes subtree (gcp-dnxq)
+
+25a61a8 changed the pack subtree (the --append-notes fix plus its two
+regression guards), so the 0.1.0 pin at 420f8da named a version of the
+pack whose formula halts at the implement gate on every run.
+
+Re-pinned to 25a61a8 with the hash recomputed by validate_registry.py's
+own git_pack_content_hash over the gauntlet-tdd subtree at that commit.
+
+`python3 validate_registry.py --require-git` -> `registry.toml: ok`.
+---
+ registry.toml | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/registry.toml b/registry.toml
+index e715e73..161c636 100644
+--- a/registry.toml
++++ b/registry.toml
+@@ -323,6 +323,6 @@ schema = 1
+   [[pack.release]]
+     version = "0.1.0"
+     ref = "main"
+-    commit = "420f8daaf01ba785f57d84c60350583774c9860f"
+-    hash = "sha256:98335fdb161766ec56b897e05a2b576677714d3defe402f9d696528871f62a6d"
++    commit = "25a61a8d6ea4baad60ea160e6d12fde187f11639"
++    hash = "sha256:729ecab80288f93f026383c6235c24f71330191d46213376e1e726c056f7bea0"
+     description = "Initial gauntlet-tdd release: the RED-to-GREEN contract loop as one formula (mol-tdd-red-green) plus a wrapper command, pinned to the bats lane with gauntlet lint as the red gate."
+-- 
+2.50.1 (Apple Git-155)
+

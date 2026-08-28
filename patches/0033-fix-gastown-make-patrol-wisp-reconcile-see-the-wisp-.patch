@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 16 Aug 2026 15:19:38 -0400
-Subject: [PATCH 33/49] fix(gastown): make patrol wisp reconcile see the wisp
+Subject: [PATCH 33/59] fix(gastown): make patrol wisp reconcile see the wisp
  it is running (gcp-ah8h)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

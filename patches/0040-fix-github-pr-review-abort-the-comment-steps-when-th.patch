@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 16 Aug 2026 21:56:39 -0400
-Subject: [PATCH 40/49] fix(github-pr-review): abort the comment steps when the
+Subject: [PATCH 40/59] fix(github-pr-review): abort the comment steps when the
  review scope fails (gcp-m7dn)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

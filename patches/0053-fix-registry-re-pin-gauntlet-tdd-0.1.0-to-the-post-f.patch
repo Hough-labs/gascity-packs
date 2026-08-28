@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 28 Aug 2026 18:15:51 -0400
+Subject: [PATCH 53/59] fix(registry): re-pin gauntlet-tdd 0.1.0 to the
+ post-fix pack subtree (gcp-dnxq)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The 0.1.0 release was stamped against c84a27b, the commit that introduced the
+pack. 420f8da then changed the pack subtree — the lint-flag, JSON-stream and
+cross-step-state fixes — so the pin still validated (the hash is recomputed at
+the named commit, and that commit's tree is unchanged) while naming a version
+of the pack with three known defects in it. A release that validates and ships
+the wrong bytes is worse than one that fails: nothing surfaces.
+
+Re-pinned to 420f8da with the hash recomputed by validate_registry.py's own
+`git_pack_content_hash` over the pack subtree at that commit, so the published
+0.1.0 is the content that was actually tested.
+
+`python3 validate_registry.py --require-git` -> `registry.toml: ok`.
+---
+ registry.toml | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/registry.toml b/registry.toml
+index 255dfc7..e715e73 100644
+--- a/registry.toml
++++ b/registry.toml
+@@ -323,6 +323,6 @@ schema = 1
+   [[pack.release]]
+     version = "0.1.0"
+     ref = "main"
+-    commit = "c84a27ba9bc290f67cbf24ba86e663e7268d6798"
+-    hash = "sha256:3e93803831adc79d19da3d9bb06e9bc23518d1013ab1432da81a4d18b40de7ff"
++    commit = "420f8daaf01ba785f57d84c60350583774c9860f"
++    hash = "sha256:98335fdb161766ec56b897e05a2b576677714d3defe402f9d696528871f62a6d"
+     description = "Initial gauntlet-tdd release: the RED-to-GREEN contract loop as one formula (mol-tdd-red-green) plus a wrapper command, pinned to the bats lane with gauntlet lint as the red gate."
+-- 
+2.50.1 (Apple Git-155)
+

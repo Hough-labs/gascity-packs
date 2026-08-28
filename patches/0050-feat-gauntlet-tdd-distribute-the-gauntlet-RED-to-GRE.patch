@@ -1,0 +1,1160 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 28 Aug 2026 17:50:52 -0400
+Subject: [PATCH 50/59] feat(gauntlet-tdd): distribute the gauntlet
+ RED-to-GREEN loop as a pack (gcp-dnxq)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+No pack in this repo shipped a TDD or contract-test workflow, so the gauntlet
+CLI's scaffold -> red -> implement -> green cycle was something each rig
+re-derived by hand. This packages it: one formula, mol-tdd-red-green, that
+takes a bead id, scaffolds a contract from that bead's acceptance criteria,
+proves the contract RED, routes implementation to the rig's implementer, and
+proves it GREEN.
+
+The design turns on one inversion that is easy to get backwards and silent
+when you do. `gauntlet scaffold --from-bead` emits skip-guarded stubs, and a
+skipped test is not a failed test, so `gauntlet run local` exits 0 on a
+brand-new scaffold. Measured on the gaunt-8ibp smoke, same tree, same moment:
+run local gave `pass=0 fail=0 skipped=3` and exit 0, while `gauntlet lint`
+gave exit 1 and three `todo_skip` findings. A formula that proved red with
+run local would therefore certify an EMPTY contract and wave every later step
+through — an inverted gate, not merely a weak one. So `gauntlet lint` is the
+red gate here, `run local` is the green gate, and the test suite asserts
+neither can drift into the other's job. The green gate additionally rejects
+`skipped != 0`, which is the same hole seen from the other side.
+
+The lane is pinned to bats. A bead-scoped run dispatches by file extension
+via inferTool, so a `.bats` covering file structurally never reaches the hurl
+runner — which is what keeps the gauntlet repo's two open hurl-corpus defects
+(gaunt-4bzz, gaunt-svhp) off this pack's path. Every run passes
+`--contracts=bats` explicitly and the suite asserts no step names the hurl
+lane, so that stays an enforced invariant rather than a property of today's
+scaffold output.
+
+Routing: only the implement step is routed, via
+`gc.run_target = "{{implementer_target}}"`, defaulting to `gastown.polecat`.
+`gc.run_target` reaches only roles the consuming rig actually imports, and the
+gauntlet rig imports gastown plus its own crew pack — the twelve winnow-only
+build-pack roles are unavailable there. Hence one routed step to one role
+every gastown-importing rig has, overridable with `--implementer`. The suite
+asserts every step target a formula names is documented in the README as a
+required import, so a new routed role cannot be added silently.
+
+`gauntlet loop --bead <id>` already runs this cycle in one process and is
+deliberately NOT wrapped: its `--exec` model drives implementation as an
+opaque subprocess, invisible to the witness and the refinery. The gc dispatch
+is the point. The README names it as the local single-process equivalent.
+
+Validation:
+- gauntlet-tdd/tests: 17 passed, 15 subtests. Mutation-checked, not just run —
+  swapping the red gate to run local, switching the green run to the hurl
+  lane, and pointing implementer_target at an undocumented role each turn the
+  suite red.
+- Full CI pytest path list (with gauntlet-tdd/tests appended): 832 passed,
+  7 skipped, 9447 subtests. Two gascity claim-command failures are
+  pre-existing — reproduced at the untouched merge-base bb1800f in a separate
+  worktree — and are filed as gcp-yafz.
+- `gc lint gauntlet-tdd`: ok.
+- `gc import check` against the documented stanza in a scratch city: exit 0,
+  "Import state OK", with `gc import list` resolving ../packs/gauntlet-tdd.
+- End-to-end smoke on the gauntlet rig, bead gaunt-8ibp, bats lane: scaffold
+  emitted a 3-stub .bats; lint exit 1 (findings=3); after implementation lint
+  exit 0 and a bead-scoped run gave total=3 pass=3 fail=0 skipped=0.
+
+ci.yml's pytest path list is explicit, not a glob, so `gauntlet-tdd/tests` is
+appended there in this commit — without it the suite would ship green locally
+and never run in CI.
+
+The registry entry follows in a separate commit: validate_registry.py
+recomputes each release hash from `git ls-tree` at the named commit, so the
+pack subtree has to exist in history before it can be pinned.
+---
+ .github/workflows/ci.yml                      |   2 +-
+ gauntlet-tdd/README.md                        | 195 ++++++++++
+ gauntlet-tdd/commands/tdd/red-green/help.md   |  60 +++
+ gauntlet-tdd/commands/tdd/red-green/run.sh    |  94 +++++
+ .../formulas/mol-tdd-red-green.formula.toml   | 361 ++++++++++++++++++
+ gauntlet-tdd/pack.toml                        |  32 ++
+ .../tests/test_gauntlet_tdd_formulas.py       | 277 ++++++++++++++
+ 7 files changed, 1020 insertions(+), 1 deletion(-)
+ create mode 100644 gauntlet-tdd/README.md
+ create mode 100644 gauntlet-tdd/commands/tdd/red-green/help.md
+ create mode 100755 gauntlet-tdd/commands/tdd/red-green/run.sh
+ create mode 100644 gauntlet-tdd/formulas/mol-tdd-red-green.formula.toml
+ create mode 100644 gauntlet-tdd/pack.toml
+ create mode 100644 gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index ebc8ff8..bc19095 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -41,7 +41,7 @@ jobs:
+         run: python3 validate_registry.py --require-git
+ 
+       - name: Run Python pack tests
+-        run: python3 -m pytest tests contributing/tests gascity/tests discord/tests github/tests slack-full/tests slack-channel/tests pr-pipeline/tests -q
++        run: python3 -m pytest tests contributing/tests gascity/tests discord/tests github/tests slack-full/tests slack-channel/tests pr-pipeline/tests gauntlet-tdd/tests -q
+ 
+       - name: Lint and exercise shared role prompt composition
+         run: |
+diff --git a/gauntlet-tdd/README.md b/gauntlet-tdd/README.md
+new file mode 100644
+index 0000000..32e0c69
+--- /dev/null
++++ b/gauntlet-tdd/README.md
+@@ -0,0 +1,195 @@
++# gauntlet-tdd
++
++The [gauntlet](https://github.com/Hough-labs/gauntlet) RED-to-GREEN contract
++loop distributed as a Gas City pack.
++
++Encodes the TDD cycle a careful contributor runs by hand — scaffold a contract
++from a bead's acceptance criteria, watch it fail, implement, watch it pass —
++so any city that imports this pack gets the same discipline as platform-native
++formulas and commands.
++
++## Status
++
++**v0.1.0** — initial release. Ships one formula with a matching wrapper
++command:
++
++| Formula | Command | Purpose |
++|---------|---------|---------|
++| `mol-tdd-red-green` | `gc <binding> tdd red-green <bead-id>` | Bead → scaffold → RED → implement → GREEN |
++
++The loop writes a `.bats` contract into the repository's contracts directory,
++a report to `.gc/gauntlet-tdd/loops/<bead-id>.md`, and whatever the
++implementation itself changes. It does not push or open PRs — that stays with
++the rig's own submit path.
++
++## Usage
++
++In your city's `pack.toml`:
++
++```toml
++[imports.gauntlet-tdd]
++source = "../packs/gauntlet-tdd"
++```
++
++Then, from inside a rig session:
++
++```
++gc gauntlet-tdd tdd red-green gaunt-8ibp
++```
++
++or explicitly:
++
++```
++gc gauntlet-tdd tdd red-green gaunt-8ibp --rig gauntlet
++```
++
++The equivalent direct sling, if you would rather skip the wrapper:
++
++```
++gc sling gauntlet/polecat mol-tdd-red-green --formula --var contract_bead=gaunt-8ibp
++```
++
++## Requirements
++
++### The gauntlet CLI
++
++The `gauntlet` binary must be on the agent's PATH inside the rig worktree.
++The formula assumes these verbs, all of which are dispatched in
++`cmd/gauntlet/main.go`:
++
++| Step | Verb |
++|---|---|
++| scaffold the contract | `gauntlet scaffold --from-bead <id>` |
++| prove RED | `gauntlet lint [path] [--json]` |
++| prove GREEN | `gauntlet run local <bead-id> [--contracts-dir <path>] --contracts=bats` |
++| drop the red-by-design tag | `gauntlet bats untag-green` |
++
++Verified against gauntlet at commit `201c94f` — `git describe --tags` reports
++**`v0.1.0-454-g201c94f`**. The CLI has no `--version` flag and no `version`
++subcommand, so `git describe` in the gauntlet checkout is the version marker
++to compare against.
++
++### Single-implementer rigs
++
++The `implement` step is the only routed step. It carries
++`gc.run_target = "{{implementer_target}}"`, which defaults to
++**`gastown.polecat`**.
++
++`gc.run_target` only reaches roles the *consuming rig* actually imports. The
++gauntlet rig imports `gastown` (giving `gastown.polecat` and
++`gastown.refinery`) and its own local crew pack; the twelve build-pack roles
++that `bmad`, `gstack` and friends fan out to — design-author, task-decomposer,
++implementation-reviewer and the rest — are winnow-only and are **not**
++reachable there.
++
++So this formula is deliberately built for a single-implementer rig: exactly
++one routed step, to one role, which every gastown-importing rig has. If your
++rig's implementer is a different role, name it rather than adding steps:
++
++```
++gc gauntlet-tdd tdd red-green gaunt-8ibp --rig gauntlet --implementer crew.valkyrie
++```
++
++**Required imports.** A consuming rig must import a pack providing the role
++named by `implementer_target`. With the default that is the `gastown` pack,
++and `gastown.polecat` is then the only step target this pack names. The test
++suite asserts that every step target the formulas name is documented here, so
++a new routed role cannot be added without landing in this section.
++
++### The bead is the contract
++
++`gauntlet scaffold --from-bead` reads the bead's **acceptance criteria** and
++emits one `@test` stub per testable assertion. A bead with empty acceptance
++criteria scaffolds to nothing, so the `intake` step halts on it rather than
++producing an empty contract two steps later.
++
++## Why the red gate is `gauntlet lint`
++
++Freshly scaffolded stubs are skip-guarded and tagged `red-by-design`. A
++skipped test is not a failed test, so **`gauntlet run local` exits 0 on a
++brand-new scaffold**. Measured on the smoke below, on the same tree:
++
++```
++$ gauntlet run local gaunt-8ibp --contracts=bats
++GAUNTLET_SUMMARY workflow=bats-tests total=3 pass=0 fail=0 red_expected=0 red_unexpected=0 regressions=0 skipped=3 duration=0
++$ echo $?
++0
++
++$ gauntlet lint
++.gauntlet/gauntlet-tdd-smoke.bats:7   todo_skip  scaffold placeholder 'skip "TODO"' left in test
++.gauntlet/gauntlet-tdd-smoke.bats:11  todo_skip  scaffold placeholder 'skip "TODO"' left in test
++.gauntlet/gauntlet-tdd-smoke.bats:15  todo_skip  scaffold placeholder 'skip "TODO"' left in test
++scanned=1  clean=0  findings=3
++$ echo $?
++1
++```
++
++Using `run local` as the red gate would therefore certify an empty contract
++and wave the whole loop through — an inverted gate, not a weaker one. The
++scaffold command says so itself on the way out: *"stubs are skip-guarded and
++lint-red; run `gauntlet lint` to observe red, then replace skip with real
++assertions."*
++
++`gauntlet lint` is the red gate. `gauntlet run local` is the green gate. The
++pack's test suite asserts that neither can drift into the other's job.
++
++## Why the lane is pinned to bats
++
++`gauntlet scaffold --from-bead` emits a `.bats` skeleton, and a bead-scoped
++`gauntlet run local` picks its runner by **file extension** (`inferTool`), not
++by a lane flag — `.bats` routes to the bats runner, `.hurl` to the hurl
++runner. A scaffolded bead's only covering file is therefore always `.bats`.
++
++Every run in this formula still passes `--contracts=bats` explicitly, and the
++test suite asserts that no step passes `--contracts=hurl`. That turns a
++property of the current scaffold output into an enforced invariant: the loop
++cannot drift onto the hurl lane, and the two open hurl-corpus defects in the
++gauntlet repo (`gaunt-4bzz`, `gaunt-svhp`) stay off this pack's path by
++construction rather than by luck.
++
++## Related: `gauntlet loop`
++
++`gauntlet loop --bead <id> [--exit-on-green] [--max-iter N] [--exec '<cmd>']`
++is a real command in the gauntlet CLI (dispatched at `cmd/gauntlet/main.go`)
++that runs this same RED-to-GREEN cycle in a single process. It appears in no
++help text and no docs, which is easy to miss.
++
++This pack deliberately does **not** wrap it. `loop`'s `--exec` model drives
++implementation as an opaque subprocess; this formula's implement step is a gc
++dispatch, so the witness sees a real session and the refinery sees a real
++branch. Different orchestration models — use `gauntlet loop` for a local
++single-process cycle, use this pack when the loop should be visible to the
++city.
++
++## End-to-end smoke
++
++Run against bead **`gaunt-8ibp`** ("gauntlet-tdd pack smoke: RED-to-GREEN on
++the bats lane") in the gauntlet rig, on the bats lane:
++
++| Stage | Command | Result |
++|---|---|---|
++| scaffold | `gauntlet scaffold --from-bead gaunt-8ibp` | wrote `.gauntlet/gauntlet-tdd-smoke.bats`, 3 `@test` stubs, tier=B |
++| RED | `gauntlet lint` | exit 1 — `scanned=1 clean=0 findings=3`, three `todo_skip` |
++| (control) | `gauntlet run local gaunt-8ibp --contracts=bats` | exit 0 on the *unimplemented* scaffold — why lint is the red gate |
++| implement | stubs replaced with real assertions | — |
++| GREEN | `gauntlet lint` | exit 0 — `scanned=1 clean=1 findings=0` |
++| GREEN | `gauntlet run local gaunt-8ibp --contracts=bats` | exit 0 — `total=3 pass=3 fail=0 skipped=0` |
++
++Note for anyone reproducing it outside a rig worktree: `scaffold --from-bead`
++resolves the bead through the `bd` CLI against whatever store the CWD resolves
++to, and an inherited `BEADS_DIR` from an agent session overrides that. If the
++scaffold reports "no issue found" for a bead `gc bd show` can read, that
++inherited variable is the cause, not a missing bead.
++
++## Tests
++
++```
++python3 -m pytest gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py -q
++```
++
++The suite is pack-local, mirroring `pr-pipeline/tests/`. It asserts the
++formulas parse, declare their required vars, name only documented step
++targets, keep the red gate on `gauntlet lint`, and keep the lane pinned to
++bats. `.github/workflows/ci.yml` names `gauntlet-tdd/tests` in its pytest path
++list — that list is explicit, not a glob, so a new pack's suite is invisible
++to CI until it is added there.
+diff --git a/gauntlet-tdd/commands/tdd/red-green/help.md b/gauntlet-tdd/commands/tdd/red-green/help.md
+new file mode 100644
+index 0000000..b5309d5
+--- /dev/null
++++ b/gauntlet-tdd/commands/tdd/red-green/help.md
+@@ -0,0 +1,60 @@
++Drive the gauntlet RED-to-GREEN contract loop for a bead — scaffold the
++contract from the bead's acceptance criteria, prove it red, implement, prove
++it green.
++
++This dispatches a coding agent to a rig with the `mol-tdd-red-green` formula.
++The agent scaffolds a `.bats` contract from `<bead-id>`'s acceptance criteria,
++proves it RED with `gauntlet lint`, implements until the assertions hold, and
++proves it GREEN with a bead-scoped `gauntlet run local --contracts=bats`. A
++report is saved to `.gc/gauntlet-tdd/loops/<bead-id>.md`.
++
++Usage:
++  gc <binding> tdd red-green <bead-id> [flags]
++
++Arguments:
++  <bead-id>              Bead whose acceptance criteria seed the contract.
++                         Must be a full id (`gaunt-8ibp`), not a fragment —
++                         `bd` fuzzy-matches partial ids onto the wrong bead.
++
++Flags:
++  --rig <name>           Rig to run the loop inside (defaults to $GC_RIG).
++  --agent <name>         Agent name to sling to (default: "polecat").
++                         Set this if your city's coding-worker pool uses a
++                         different name (e.g. "claude", "worker").
++  --implementer <role>   Role the implement step is routed to
++                         (default: "gastown.polecat"). Must be a role the
++                         consuming rig actually imports — `gc.run_target`
++                         reaches no further than the rig's own imports.
++  --contracts-dir <path> Contracts directory override. Default is the
++                         repository's own `.gauntlet/`.
++
++Examples:
++  # Inside a rig session (GC_RIG is set automatically):
++  gc <binding> tdd red-green gaunt-8ibp
++
++  # Explicitly target a rig:
++  gc <binding> tdd red-green gaunt-8ibp --rig gauntlet
++
++  # Route implementation to a rig-specific implementer role:
++  gc <binding> tdd red-green gaunt-8ibp --rig gauntlet --implementer crew.valkyrie
++
++Direct sling (skip this command):
++  gc sling gauntlet/polecat mol-tdd-red-green --formula --var contract_bead=gaunt-8ibp
++
++Requirements:
++  The `gauntlet` CLI must be on the agent's PATH inside the rig worktree, and
++  the bead must carry non-empty acceptance criteria — they are the contract.
++
++Output:
++  The contract is written under the repository's contracts directory as a
++  `.bats` file carrying `# covers: <bead-id>`. The report is written to
++  `<repo-root>/.gc/gauntlet-tdd/loops/<bead-id>.md`. The molecule's root bead
++  notes record `contract_path:`, `red_findings:` and `report_path:`, or
++  `halt_reason:` if a gate stopped the loop.
++
++Environment variables (set by gc):
++  GC_CITY_PATH      absolute city root
++  GC_PACK_DIR       absolute pack directory
++  GC_PACK_NAME      pack name ("gauntlet-tdd")
++  GC_CITY_NAME      city workspace name
++  GC_RIG            current rig name (when running inside a rig session)
+diff --git a/gauntlet-tdd/commands/tdd/red-green/run.sh b/gauntlet-tdd/commands/tdd/red-green/run.sh
+new file mode 100755
+index 0000000..196c403
+--- /dev/null
++++ b/gauntlet-tdd/commands/tdd/red-green/run.sh
+@@ -0,0 +1,94 @@
++#!/bin/sh
++# gc <binding> tdd red-green — sling a coding agent the mol-tdd-red-green formula.
++#
++# Usage:
++#   gc <binding> tdd red-green <bead-id> [--rig <name>] [--agent <name>]
++#                              [--implementer <role>] [--contracts-dir <path>]
++#
++# Environment (set by gc):
++#   GC_CITY_PATH   absolute city root
++#   GC_PACK_DIR    absolute pack directory
++#   GC_PACK_NAME   pack name ("gauntlet-tdd")
++#   GC_CITY_NAME   city workspace name
++#   GC_RIG         current rig (when running inside a rig session)
++
++set -eu
++
++if [ -z "${GC_PACK_DIR:-}" ]; then
++    echo "gc gauntlet-tdd tdd red-green: missing Gas City pack context" >&2
++    exit 1
++fi
++
++if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ] || [ -z "${1:-}" ]; then
++    cat "$GC_PACK_DIR/commands/tdd/red-green/help.md"
++    [ -z "${1:-}" ] && exit 2 || exit 0
++fi
++
++BEAD="$1"
++shift
++
++# A bead id, not a bare number: the formula scaffolds from that bead's
++# acceptance criteria, and `bd` fuzzy-matches a partial id onto whatever it
++# happens to resolve to. Require the `<prefix>-<suffix>` shape so a typo fails
++# here rather than scaffolding a contract from somebody else's bead.
++case "$BEAD" in
++    *-*) ;;
++    *)
++        echo "gc gauntlet-tdd tdd red-green: <bead-id> must look like <prefix>-<id> (got: $BEAD)" >&2
++        exit 2
++        ;;
++esac
++
++RIG=""
++AGENT="polecat"
++IMPLEMENTER=""
++CONTRACTS_DIR=""
++
++while [ $# -gt 0 ]; do
++    case "$1" in
++        --rig)              RIG="$2"; shift 2 ;;
++        --rig=*)            RIG="${1#--rig=}"; shift ;;
++        --agent)            AGENT="$2"; shift 2 ;;
++        --agent=*)          AGENT="${1#--agent=}"; shift ;;
++        --implementer)      IMPLEMENTER="$2"; shift 2 ;;
++        --implementer=*)    IMPLEMENTER="${1#--implementer=}"; shift ;;
++        --contracts-dir)    CONTRACTS_DIR="$2"; shift 2 ;;
++        --contracts-dir=*)  CONTRACTS_DIR="${1#--contracts-dir=}"; shift ;;
++        *)
++            echo "gc gauntlet-tdd tdd red-green: unknown argument: $1" >&2
++            exit 2
++            ;;
++    esac
++done
++
++if [ -z "$RIG" ]; then
++    RIG="${GC_RIG:-}"
++fi
++
++if [ -z "$RIG" ]; then
++    cat >&2 <<'USAGE'
++gc gauntlet-tdd tdd red-green: rig is required.
++
++Pass --rig <name> or run inside a rig session where GC_RIG is set.
++
++The loop needs to run inside a rig's git worktree: it scaffolds the contract
++into that repo's contracts directory and resolves the bead through the store
++the worktree points at. Pick the rig whose repository the bead describes.
++USAGE
++    exit 2
++fi
++
++if ! command -v gc >/dev/null 2>&1; then
++    echo "gc gauntlet-tdd tdd red-green: gc binary not in PATH" >&2
++    exit 1
++fi
++
++set -- gc sling "$RIG/$AGENT" mol-tdd-red-green --formula --var "contract_bead=$BEAD"
++if [ -n "$IMPLEMENTER" ]; then
++    set -- "$@" --var "implementer_target=$IMPLEMENTER"
++fi
++if [ -n "$CONTRACTS_DIR" ]; then
++    set -- "$@" --var "contracts_dir=$CONTRACTS_DIR"
++fi
++
++exec "$@"
+diff --git a/gauntlet-tdd/formulas/mol-tdd-red-green.formula.toml b/gauntlet-tdd/formulas/mol-tdd-red-green.formula.toml
+new file mode 100644
+index 0000000..99922a2
+--- /dev/null
++++ b/gauntlet-tdd/formulas/mol-tdd-red-green.formula.toml
+@@ -0,0 +1,361 @@
++description = """
++The gauntlet RED-to-GREEN contract loop, driven from a single bead.
++
++Takes a bead id, scaffolds a contract from that bead's acceptance criteria,
++proves the contract RED, routes the implementation to the rig's implementer,
++and proves the contract GREEN. The bead's acceptance criteria are the
++contract; the loop refuses to advance on an assertion it cannot see fail.
++
++A coding agent (polecat or equivalent) follows the steps in order. The
++molecule root bead IS the control bead — run state is recorded in its notes
++via `gc bd update <root-id> --notes "<key>: <value>"`.
++
++## Contract
++
++1. Caller slings with `--var contract_bead=<bead-id>`
++2. Agent works through 5 sequential steps
++3. Report written to `.gc/gauntlet-tdd/loops/<bead-id>.md`
++4. Root-bead notes record `contract_path:`, `red_findings:`, `report_path:`
++5. Chain ends either GREEN, or halted with `halt_reason:` recorded
++
++## Variables
++
++| Variable | Source | Description |
++|----------|--------|-------------|
++| contract_bead | caller | Bead whose acceptance criteria seed the contract (required) |
++| implementer_target | caller | Role the implement step is routed to (default: `gastown.polecat`) |
++| contracts_dir | caller | Contracts directory override; empty means `<repo-root>/.gauntlet` |
++
++## The red gate is `gauntlet lint`, never `gauntlet run local`
++
++`gauntlet scaffold --from-bead` emits skip-guarded stubs. A skip is not a
++failure, so `gauntlet run local` exits 0 on a freshly scaffolded contract —
++measured, not assumed: on the gaunt-8ibp smoke a three-stub scaffold gave
++`GAUNTLET_SUMMARY ... pass=0 fail=0 skipped=3` and exit 0, while
++`gauntlet lint` on the same tree exited 1 with three `todo_skip` findings.
++Using `run local` to prove red would therefore assert GREEN on an empty
++contract and wave the whole loop through. `gauntlet lint` sees through the
++skip guard; it is the only red gate this formula uses.
++
++## The lane is pinned to bats
++
++`gauntlet scaffold --from-bead` emits a `.bats` skeleton, and a bead-scoped
++`gauntlet run local` dispatches by FILE EXTENSION (inferTool), not by a lane
++flag. Every run in this formula passes `--contracts=bats` explicitly so the
++pin is enforced rather than incidental. No step names the hurl lane at all.
++
++## Failure Modes
++
++| Situation | Action |
++|-----------|--------|
++| Repo is not a git checkout | Record halt_reason, close root bead |
++| `gauntlet` not on PATH | Record halt_reason, close root bead |
++| Bead has no acceptance criteria | Record halt_reason, close root bead |
++| Scaffold emits no `.bats` file | Record halt_reason, close root bead |
++| `gauntlet lint` reports clean on a fresh scaffold | Halt — the contract is not red, so nothing would be proven |
++| Implementation cannot reach GREEN | Record halt_reason with the failing run output, close root bead |"""
++formula = "mol-tdd-red-green"
++version = 1
++contract = "graph.v2"
++
++[vars]
++[vars.contract_bead]
++description = "Bead id whose acceptance criteria seed the contract (e.g. \\\"gaunt-8ibp\\\"). Named contract_bead, not bead_id: `bead_id`, `issue` and `convoy_id` are reserved graph.v2 runtime vars."
++required = true
++
++[vars.implementer_target]
++description = "Role the implement step is routed to. Must be a role the consuming rig actually imports — see README.md, \\\"Single-implementer rigs\\\"."
++default = "gastown.polecat"
++
++[vars.contracts_dir]
++description = "Contracts directory override, passed through as --contracts-dir. Empty means gauntlet's default of <repo-root>/.gauntlet."
++default = ""
++
++[[steps]]
++id = "intake"
++title = "Preflight the loop for {{contract_bead}}"
++description = """
++Establish that the loop can run at all before anything is written. Every
++check below halts the chain rather than proceeding on a guess — a loop that
++scaffolds into the wrong tree, or against a bead with no acceptance criteria,
++produces a contract that cannot mean anything.
++
++```bash
++ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
++
++halt() {
++    gc bd update "$ROOT_ID" --notes "halt_reason: $1"
++    echo "[tdd-red-green] HALT: $1" >&2
++    gc bd close "$ROOT_ID" --reason "$1"
++    exit 1
++}
++
++REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || halt "not a git checkout"
++cd "$REPO_ROOT"
++
++command -v gauntlet >/dev/null 2>&1 || halt "gauntlet CLI not on PATH"
++```
++
++The bead's acceptance criteria ARE the contract. A bead with none scaffolds
++to nothing, so read it before scaffolding rather than discovering the empty
++skeleton two steps later:
++
++```bash
++ACCEPTANCE=$(gc bd show "{{contract_bead}}" --json | jq -r '.[0].acceptance_criteria // ""')
++[ -n "$ACCEPTANCE" ] || halt "{{contract_bead}} has no acceptance criteria to scaffold from"
++```
++
++Resolve the contracts directory once, and reuse `$CONTRACTS_FLAG` verbatim in
++every later gauntlet invocation so all four steps address the same tree:
++
++```bash
++CONTRACTS_FLAG=""
++if [ -n "{{contracts_dir}}" ]; then
++    CONTRACTS_FLAG="--contracts-dir {{contracts_dir}}"
++fi
++
++gc bd update "$ROOT_ID" --notes "contract_bead: {{contract_bead}}
++repo_root: $REPO_ROOT
++contracts_flag: ${CONTRACTS_FLAG:-<default .gauntlet>}
++lane: bats
++status: in_progress"
++```
++
++**Note on bead resolution.** `gauntlet scaffold --from-bead` resolves the bead
++through the `bd` CLI itself, using the store that the CWD resolves to. Inside a
++rig worktree that is the rig's own store and no action is needed. If the
++scaffold reports "no issue found" for a bead you can read with `gc bd show`,
++an inherited `BEADS_DIR` is pointing the CLI at a different store — that is
++the failure, not a missing bead.
++
++**Exit criteria:** In repo root, `gauntlet` present, `{{contract_bead}}`
++readable with non-empty acceptance criteria, `$CONTRACTS_FLAG` resolved.
++"""
++
++[[steps]]
++id = "scaffold"
++title = "Scaffold the contract from {{contract_bead}}'s acceptance criteria"
++needs = ["intake"]
++description = """
++Emit the contract skeleton. This writes a `.bats` file under the contracts
++directory, one `@test` stub per testable assertion in the bead's acceptance
++criteria, each stub skip-guarded and tagged `red-by-design`.
++
++```bash
++ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
++gauntlet scaffold --from-bead "{{contract_bead}}" 2>&1 | tee /tmp/tdd-scaffold-$$.log
++```
++
++The command prints the path of each file it wrote, prefixed by its lane:
++
++    bats: /path/to/.gauntlet/<name>.bats
++    scaffold --from-bead <id>: wrote 1 file(s), skipped 0, 3 @test stub(s) (tier=B)
++
++Capture that path and assert the artifact is `.bats`. The extension is not
++cosmetic: a bead-scoped `gauntlet run local` picks its runner from the file
++extension, so the `.bats` suffix is exactly what keeps this loop on the bats
++lane and off the hurl runner.
++
++```bash
++CONTRACT_PATH=$(sed -n 's/^bats: //p' /tmp/tdd-scaffold-$$.log | head -1)
++if [ -z "$CONTRACT_PATH" ] || [ "${CONTRACT_PATH##*.}" != "bats" ]; then
++    gc bd update "$ROOT_ID" --notes "halt_reason: scaffold emitted no .bats contract"
++    gc bd close "$ROOT_ID" --reason "scaffold emitted no .bats contract"
++    exit 1
++fi
++gc bd update "$ROOT_ID" --notes "contract_path: $CONTRACT_PATH"
++```
++
++If scaffold reports `skipped 1` and wrote nothing, a contract for this bead
++already exists. That is a resume, not a failure: keep the existing file and
++carry on to the red gate, which will tell you whether it still has unproven
++stubs in it.
++
++**Exit criteria:** A `.bats` contract exists covering `{{contract_bead}}`, and
++its path is recorded on the root bead as `contract_path:`.
++"""
++
++[[steps]]
++id = "assert-red"
++title = "Prove the contract RED"
++needs = ["scaffold"]
++description = """
++**This step uses `gauntlet lint`. It must never use `gauntlet run local`.**
++
++Scaffolded stubs are skip-guarded, and a skipped test is not a failed test —
++`gauntlet run local` exits 0 on a fresh scaffold. Proving red with a green
++exit code is not a weaker gate, it is an inverted one: it certifies an empty
++contract and every later step inherits the lie. `gauntlet lint` reads through
++the skip guard and reports each residual placeholder as a `todo_skip`
++finding, which is what "red" means here.
++
++```bash
++ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
++
++set +e
++gauntlet lint $CONTRACTS_FLAG --json > /tmp/tdd-lint-red-$$.json 2>/tmp/tdd-lint-red-$$.err
++LINT_STATUS=$?
++set -e
++```
++
++A non-zero exit with at least one finding is RED, and the loop proceeds. A
++clean exit means there is nothing to prove — either the scaffold produced no
++stubs, or the contract was already implemented — and the loop halts rather
++than declaring victory over an assertion it never saw fail:
++
++```bash
++if [ "$LINT_STATUS" -eq 0 ]; then
++    gc bd update "$ROOT_ID" --notes "halt_reason: gauntlet lint reports clean on a fresh scaffold — no red to prove"
++    gc bd close "$ROOT_ID" --reason "contract is not red; nothing to prove"
++    exit 1
++fi
++
++RED_FINDINGS=$(sed -n 's/.*findings=\\([0-9][0-9]*\\).*/\\1/p' /tmp/tdd-lint-red-$$.err | tail -1)
++gc bd update "$ROOT_ID" --notes "red_findings: ${RED_FINDINGS:-unparsed}
++red_proven: yes"
++```
++
++Record the finding list in the run log — it is the to-do list the implement
++step works from, one entry per unproven assertion.
++
++**Exit criteria:** `gauntlet lint` exited non-zero, the finding count is
++recorded as `red_findings:` on the root bead, and `red_proven: yes` is set.
++"""
++
++[[steps]]
++id = "implement"
++title = "Implement until the contract holds"
++needs = ["assert-red"]
++metadata = { "gc.run_target" = "{{implementer_target}}" }
++description = """
++Routed to `{{implementer_target}}` — a gc-native dispatch, so the witness sees
++a real session and the refinery sees a real branch. `gauntlet loop --exec`
++would drive the same cycle as an opaque subprocess; that is the wrong
++orchestration model here, because a subprocess is invisible to both.
++
++Work from the red findings recorded by the previous step. For each stub in
++`$CONTRACT_PATH`:
++
++1. Read the acceptance line the stub was generated from — it is quoted in the
++   placeholder text.
++2. Replace the skip guard with a real assertion against real behaviour. A
++   stub rewritten to assert nothing passes, and passing is not the goal.
++3. Implement the production change that makes that assertion hold.
++
++Two rules that decide whether the loop meant anything:
++
++- **Never delete a stub to make the contract pass.** A deleted assertion is
++  an acceptance criterion silently dropped from the bead.
++- **Never leave the `red-by-design` file tag on a contract that now passes.**
++  `gauntlet bats untag-green` strips the tag from tests that have gone green;
++  run it rather than editing the tag by hand.
++
++Iterate locally against the bats lane until it holds:
++
++```bash
++gauntlet run local "{{contract_bead}}" $CONTRACTS_FLAG --contracts=bats
++```
++
++Commit the contract and the implementation together. The contract is part of
++the change, not a side artifact of it.
++
++**Exit criteria:** Every stub carries a real assertion, the implementation is
++committed, and a local bats-lane run passes.
++"""
++
++[[steps]]
++id = "assert-green"
++title = "Prove the contract GREEN and write the report"
++needs = ["implement"]
++description = """
++Two gates, both required. Lint proves no placeholder survived; the bead-scoped
++run proves the assertions actually pass. Either one alone is satisfiable by a
++contract that proves nothing — a file with every stub deleted lints clean, and
++a file with every stub still skipped runs green.
++
++```bash
++ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
++
++set +e
++gauntlet lint $CONTRACTS_FLAG > /tmp/tdd-lint-green-$$.log 2>&1
++LINT_STATUS=$?
++gauntlet run local "{{contract_bead}}" $CONTRACTS_FLAG --contracts=bats > /tmp/tdd-run-green-$$.log 2>&1
++RUN_STATUS=$?
++set -e
++
++if [ "$LINT_STATUS" -ne 0 ] || [ "$RUN_STATUS" -ne 0 ]; then
++    gc bd update "$ROOT_ID" --notes "halt_reason: green gate failed (lint=$LINT_STATUS run=$RUN_STATUS)"
++    cat /tmp/tdd-lint-green-$$.log /tmp/tdd-run-green-$$.log >&2
++    gc bd close "$ROOT_ID" --reason "green gate failed"
++    exit 1
++fi
++```
++
++A green bats-lane run prints a summary line naming the counts. `skipped` must
++be 0 — a run whose tests all skipped exits 0 and would otherwise read as a
++pass:
++
++    GAUNTLET_SUMMARY workflow=bats-tests total=3 pass=3 fail=0 ... skipped=0
++
++```bash
++SKIPPED=$(sed -n 's/.*GAUNTLET_SUMMARY.* skipped=\\([0-9][0-9]*\\).*/\\1/p' /tmp/tdd-run-green-$$.log | tail -1)
++if [ "${SKIPPED:-1}" -ne 0 ]; then
++    gc bd update "$ROOT_ID" --notes "halt_reason: green run reported skipped=${SKIPPED:-unparsed} — skips are not passes"
++    gc bd close "$ROOT_ID" --reason "green run still has skipped tests"
++    exit 1
++fi
++```
++
++Write the report:
++
++```bash
++mkdir -p .gc/gauntlet-tdd/loops
++REPORT_PATH=".gc/gauntlet-tdd/loops/{{contract_bead}}.md"
++```
++
++Use this structure:
++
++```markdown
++# RED-to-GREEN — {{contract_bead}}
++
++## Contract
++
++- **Bead**: {{contract_bead}}
++- **Contract file**: <contract_path>
++- **Lane**: bats
++
++## Acceptance criteria covered
++
++<one line per @test, naming the acceptance line it came from>
++
++## RED
++
++<gauntlet lint output at the red gate, with the finding count>
++
++## GREEN
++
++<GAUNTLET_SUMMARY line from the bead-scoped run>
++
++## Implementation
++
++<what changed, and which assertion each change makes hold>
++
++## Not covered
++
++<acceptance lines that produced no stub, and why — an empty section is a
++claim that the contract covers the bead whole>
++```
++
++Then finalize:
++
++```bash
++gc bd update "$ROOT_ID" --notes "report_path: $REPORT_PATH
++green_proven: yes
++status: complete"
++echo "[tdd-red-green] GREEN for {{contract_bead}}"
++echo "[tdd-red-green]   Report: $REPORT_PATH"
++```
++
++**Exit criteria:** Lint clean, bead-scoped bats run green with `skipped=0`,
++report written, root-bead notes finalized.
++"""
+diff --git a/gauntlet-tdd/pack.toml b/gauntlet-tdd/pack.toml
+new file mode 100644
+index 0000000..d5b5a75
+--- /dev/null
++++ b/gauntlet-tdd/pack.toml
+@@ -0,0 +1,32 @@
++# gauntlet-tdd — the gauntlet RED-to-GREEN contract loop as a pack.
++#
++# Distributes the TDD cycle a careful contributor runs by hand against the
++# gauntlet CLI — scaffold a contract from a bead's acceptance criteria,
++# observe RED, implement, observe GREEN — so any city that imports this pack
++# gets the same discipline as platform-native formulas and commands.
++#
++# v0.1.0 ships ONE formula:
++#   - mol-tdd-red-green   bead -> scaffold -> RED -> implement -> GREEN
++#
++# It has a wrapper `tdd` command (`tdd red-green`).
++#
++# The loop is pinned to the BATS lane. `gauntlet scaffold --from-bead` emits a
++# `.bats` skeleton, and a bead-scoped `gauntlet run local` dispatches by file
++# extension, so a `.bats` covering file never reaches the hurl runner. No step
++# passes `--contracts=hurl`; see README.md, "Why the lane is pinned".
++#
++# The red gate is `gauntlet lint`, NEVER `gauntlet run local`. Freshly
++# scaffolded stubs are skip-guarded, so `run local` exits 0 on a new scaffold
++# and using it to prove red would assert green on an empty contract.
++#
++# Usage in your city's pack.toml:
++#   [imports.gauntlet-tdd]
++#   source = "../packs/gauntlet-tdd"
++#
++# Drive the loop for a bead:
++#   gc gauntlet-tdd tdd red-green gaunt-8ibp --rig gauntlet
++
++[pack]
++name = "gauntlet-tdd"
++version = "0.1.0"
++schema = 2
+diff --git a/gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py b/gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py
+new file mode 100644
+index 0000000..429e70a
+--- /dev/null
++++ b/gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py
+@@ -0,0 +1,277 @@
++"""Guards for the gauntlet-tdd pack's formulas.
++
++Two invariants carry the whole pack, and both are the kind that fail silently
++when they break:
++
++1. **The red gate is `gauntlet lint`, never `gauntlet run local`.** Freshly
++   scaffolded stubs are skip-guarded, so a bead-scoped `run local` exits 0 on
++   an empty contract (measured on the gaunt-8ibp smoke: `pass=0 fail=0
++   skipped=3`, exit 0, while `gauntlet lint` on the same tree exits 1 with
++   three findings). A formula that proved red with `run local` would certify
++   an empty contract and wave every later step through — an inverted gate, not
++   a weaker one, and one that reports success the whole way.
++
++2. **The lane is pinned to bats.** A bead-scoped run dispatches by file
++   extension via `inferTool`, so a `.bats` covering file never reaches the
++   hurl runner. That is what keeps the gauntlet repo's two open hurl-corpus
++   defects (gaunt-4bzz, gaunt-svhp) off this pack's path. Asserting it here
++   turns a property of today's scaffold output into an enforced invariant.
++
++Plus the drift guard AC1 asks for: every step target a formula names must be
++documented in the pack README as a required import, because `gc.run_target`
++reaches no further than the roles the consuming rig actually imports.
++"""
++
++from __future__ import annotations
++
++import pathlib
++import re
++import tomllib
++import unittest
++
++
++PACK_ROOT = pathlib.Path(__file__).resolve().parents[1]
++FORMULAS = PACK_ROOT / "formulas"
++README = PACK_ROOT / "README.md"
++
++# Reserved graph.v2 runtime vars. A formula that declares one of these has its
++# value clobbered by the runtime binding, silently. See
++# gascity/formulas/REQUIREMENTS.md.
++RESERVED_RUNTIME_VARS = frozenset({"issue", "bead_id", "convoy_id"})
++
++# `{{token}}` occurrences, used both to resolve templated run targets and to
++# catch a template token that names no declared var.
++TEMPLATE_TOKEN = re.compile(r"\{\{([a-z_][a-z0-9_]*)\}\}")
++
++
++def formula_paths() -> list[pathlib.Path]:
++    paths = sorted(FORMULAS.glob("*.formula.toml"))
++    assert paths, "no formulas found — the glob or the pack layout is wrong"
++    return paths
++
++
++def step_bodies(data: dict) -> dict[str, str]:
++    return {step["id"]: step.get("description", "") for step in data["steps"]}
++
++
++def shell_lines(body: str) -> list[str]:
++    """Lines inside ```bash fences — the parts a step actually executes.
++
++    An invocation check has to separate running a command from writing about
++    one, or the rationale prose that explains WHY `run local` is the wrong red
++    gate reads as a step invoking it. The repo's own drift guard draws the same
++    line (tests/test_prompt_formula_command_drift.py, fenced_blocks).
++    """
++    lines: list[str] = []
++    inside = False
++    for raw in body.split("\n"):
++        stripped = raw.strip()
++        if stripped.startswith("```"):
++            inside = stripped[3:].strip() == "bash" if not inside else False
++            continue
++        if inside:
++            lines.append(raw)
++    return lines
++
++
++def shell_text(body: str) -> str:
++    return "\n".join(shell_lines(body))
++
++
++class PackFormulaShapeTests(unittest.TestCase):
++    """Every formula in the pack parses and declares what it needs."""
++
++    def test_every_formula_parses_as_toml(self) -> None:
++        for path in formula_paths():
++            with self.subTest(formula=path.name):
++                data = tomllib.loads(path.read_text(encoding="utf-8"))
++                self.assertIn("formula", data)
++                self.assertIn("steps", data)
++                self.assertTrue(data["steps"], "a formula with no steps runs nothing")
++
++    def test_no_formula_declares_a_reserved_runtime_var(self) -> None:
++        for path in formula_paths():
++            data = tomllib.loads(path.read_text(encoding="utf-8"))
++            declared = set(data.get("vars", {}))
++            with self.subTest(formula=path.name):
++                self.assertEqual(
++                    declared & RESERVED_RUNTIME_VARS,
++                    set(),
++                    "reserved graph.v2 runtime vars are bound by the runtime and "
++                    "would clobber the declared value",
++                )
++
++    def test_every_template_token_names_a_declared_var(self) -> None:
++        # A typo'd `{{contact_bead}}` renders as empty string rather than
++        # failing, so the scaffold would run against no bead at all.
++        for path in formula_paths():
++            text = path.read_text(encoding="utf-8")
++            data = tomllib.loads(text)
++            declared = set(data.get("vars", {}))
++            with self.subTest(formula=path.name):
++                for token in sorted(set(TEMPLATE_TOKEN.findall(text))):
++                    self.assertIn(token, declared, f"{{{{{token}}}}} names no declared var")
++
++    def test_step_needs_resolve_to_real_steps(self) -> None:
++        for path in formula_paths():
++            data = tomllib.loads(path.read_text(encoding="utf-8"))
++            ids = {step["id"] for step in data["steps"]}
++            with self.subTest(formula=path.name):
++                for step in data["steps"]:
++                    for need in step.get("needs", []):
++                        self.assertIn(need, ids, f"step {step['id']} needs unknown {need}")
++
++
++class StepTargetsAreDocumentedTests(unittest.TestCase):
++    """AC1: a formula names only step targets the README documents.
++
++    `gc.run_target` routing reaches only the roles the consuming rig actually
++    imports, so an undocumented target is a step that silently never runs on a
++    rig that did not happen to import it.
++    """
++
++    def test_run_targets_are_documented_in_the_readme(self) -> None:
++        readme = README.read_text(encoding="utf-8")
++        for path in formula_paths():
++            data = tomllib.loads(path.read_text(encoding="utf-8"))
++            variables = data.get("vars", {})
++            for step in data["steps"]:
++                target = step.get("metadata", {}).get("gc.run_target")
++                if not target:
++                    continue
++                with self.subTest(formula=path.name, step=step["id"]):
++                    # A templated target documents its DEFAULT role: that is
++                    # the one a rig gets without passing anything.
++                    token = TEMPLATE_TOKEN.fullmatch(target)
++                    if token:
++                        var = variables.get(token.group(1), {})
++                        self.assertIn(
++                            "default",
++                            var,
++                            "a templated run target needs a default, or the step "
++                            "routes nowhere when the caller passes nothing",
++                        )
++                        resolved = var["default"]
++                    else:
++                        resolved = target
++                    self.assertIn(
++                        resolved,
++                        readme,
++                        f"step target {resolved!r} is not documented in README.md",
++                    )
++
++
++class RedGreenGateTests(unittest.TestCase):
++    """AC4 + the green-gate half of the same invariant."""
++
++    @classmethod
++    def setUpClass(cls) -> None:
++        cls.path = FORMULAS / "mol-tdd-red-green.formula.toml"
++        cls.text = cls.path.read_text(encoding="utf-8")
++        cls.data = tomllib.loads(cls.text)
++        cls.steps = step_bodies(cls.data)
++
++    def test_formula_is_present_and_well_formed(self) -> None:
++        self.assertEqual(self.data["formula"], "mol-tdd-red-green")
++        self.assertEqual(self.data["contract"], "graph.v2")
++
++    def test_contract_bead_is_the_required_input(self) -> None:
++        variables = self.data.get("vars", {})
++        self.assertIn("contract_bead", variables)
++        self.assertTrue(variables["contract_bead"]["required"])
++
++    def test_companion_vars_carry_defaults(self) -> None:
++        variables = self.data.get("vars", {})
++        for name in ("implementer_target", "contracts_dir"):
++            with self.subTest(var=name):
++                self.assertIn(name, variables)
++                self.assertIn("default", variables[name])
++        self.assertEqual(variables["implementer_target"]["default"], "gastown.polecat")
++
++    def test_red_gate_step_invokes_gauntlet_lint(self) -> None:
++        self.assertIn("assert-red", self.steps)
++        self.assertIn("gauntlet lint", shell_text(self.steps["assert-red"]))
++
++    def test_red_gate_step_never_invokes_run_local(self) -> None:
++        # The whole point: `run local` exits 0 on a skip-guarded scaffold, so
++        # using it here would assert GREEN on an empty contract. The step's
++        # prose explains exactly that, so the check reads the shell it runs.
++        self.assertNotIn("gauntlet run local", shell_text(self.steps["assert-red"]))
++
++    def test_no_step_treats_a_run_local_exit_zero_as_proof_of_red(self) -> None:
++        # Only the implement loop and the green gate may run the contract at
++        # all; a red assertion built on `run local` is inverted, not weaker.
++        allowed = {"implement", "assert-green"}
++        for step_id, body in self.steps.items():
++            if "gauntlet run local" not in shell_text(body):
++                continue
++            with self.subTest(step=step_id):
++                self.assertIn(
++                    step_id,
++                    allowed,
++                    "only the implement and green-gate steps may run the contract",
++                )
++
++    def test_green_gate_requires_both_lint_and_a_bead_scoped_run(self) -> None:
++        green = shell_text(self.steps["assert-green"])
++        self.assertIn("gauntlet lint", green)
++        self.assertIn("gauntlet run local", green)
++        # A run whose tests all skipped exits 0. The green gate has to reject
++        # that explicitly or it inherits the same hole as the red gate.
++        self.assertIn("skipped", green)
++
++    def test_scaffold_step_asserts_a_bats_artifact(self) -> None:
++        scaffold = shell_text(self.steps["scaffold"])
++        self.assertIn("gauntlet scaffold --from-bead", scaffold)
++        # The emitted artifact's extension is what routes a bead-scoped run to
++        # the bats runner, so the step has to check it rather than assume it.
++        self.assertIn('!= "bats"', scaffold)
++
++
++class LanePinnedToBatsTests(unittest.TestCase):
++    """AC7: the loop must not reach the hurl lane."""
++
++    def test_no_formula_step_passes_contracts_hurl(self) -> None:
++        for path in formula_paths():
++            text = path.read_text(encoding="utf-8")
++            with self.subTest(formula=path.name):
++                self.assertNotIn("--contracts=hurl", text)
++
++    def test_every_run_local_invocation_pins_the_bats_lane(self) -> None:
++        # An unpinned `run local` defaults to `all`, which does include hurl.
++        seen = 0
++        for path in formula_paths():
++            data = tomllib.loads(path.read_text(encoding="utf-8"))
++            for step_id, body in step_bodies(data).items():
++                for line in shell_lines(body):
++                    if "gauntlet run local" not in line:
++                        continue
++                    seen += 1
++                    with self.subTest(formula=path.name, step=step_id):
++                        self.assertIn("--contracts=bats", line)
++        self.assertGreater(seen, 0, "no run local invocation found — the scan is wrong")
++
++    def test_readme_records_the_smoke_bead(self) -> None:
++        # AC7 requires the bead the end-to-end smoke ran against to be named,
++        # so the claim is reproducible rather than asserted.
++        readme = README.read_text(encoding="utf-8")
++        self.assertRegex(readme, r"\bgaunt-8ibp\b")
++
++
++class ConfigPurityTests(unittest.TestCase):
++    """A published pack must be configuration-pure.
++
++    Author-absolute host paths do not resolve in a consumer city. Mirrors the
++    pr-pipeline guard (pr-pipeline/tests/test_pr_pipeline_formulas.py).
++    """
++
++    def test_no_author_absolute_paths(self) -> None:
++        for path in list(formula_paths()) + [README, PACK_ROOT / "pack.toml"]:
++            text = path.read_text(encoding="utf-8")
++            with self.subTest(asset=path.name):
++                self.assertNotIn("/home/ds", text)
++                self.assertNotIn("/Users/", text)
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.50.1 (Apple Git-155)
+
