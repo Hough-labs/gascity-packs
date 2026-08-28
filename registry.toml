@@ -323,6 +323,6 @@ schema = 1
   [[pack.release]]
     version = "0.1.0"
     ref = "main"
-    commit = "25a61a8d6ea4baad60ea160e6d12fde187f11639"
-    hash = "sha256:729ecab80288f93f026383c6235c24f71330191d46213376e1e726c056f7bea0"
+    commit = "29b22053620445ed5926417f2311ab368ad6aa06"
+    hash = "sha256:0a79997472f09d45bb7a0c22d7357d3558594157e25ac359d336c4189a19e683"
     description = "Initial gauntlet-tdd release: the RED-to-GREEN contract loop as one formula (mol-tdd-red-green) plus a wrapper command, pinned to the bats lane with gauntlet lint as the red gate."
