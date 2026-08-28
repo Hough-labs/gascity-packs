@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 28 Aug 2026 17:17:44 -0400
+Subject: [PATCH 48/48] ci: fire the branch-filtered workflows on integration,
+ not main (gcp-75ed)
+
+Every workflow that carries a branch filter on this fork was scoped
+`branches: [main]`, but no work on this rig ever touches main. Polecats
+branch from `integration`, the refinery merges into `integration`, and
+that is where every fork commit lands. The result was a CI config that
+gated exactly the branch nobody's PR targets and never ran on the branch
+all work flows through -- the structural reason integration rot (e.g.
+the no-bare-bd guard red since 2026-07-31) went unnoticed until someone
+ran the suite by hand.
+
+This REPLACES `main` with `integration` in the six branch filters rather
+than adding integration alongside it. main here is a pure upstream
+mirror -- `git log upstream/main..origin/main` is empty -- so running the
+fork's CI there would test upstream's tree on a branch nobody develops
+on: noise, not coverage. Three files carry filters and change (ci.yml,
+codeql.yml, pack-release-compatibility.yml, two lines each);
+supported-pack-nightly.yml and gascity-pack-inference.yml have no branch
+filter and deliberately do not gain one -- they are schedule /
+workflow_dispatch only. `schedule:` blocks, `runs-on:` labels, and
+pack-release-compatibility.yml's `paths:` filters are untouched.
+
+Nothing is committed to main, by design: for `push` and `pull_request`
+GitHub evaluates the workflow file from the triggering ref, so
+integration's own copy governs integration work. Workflow registration
+follows from the file existing on the default branch, which is already
+true in upstream's version and needs no edit of ours.
+
+Validation: all six filters now read `[integration]` and none read
+`[main]`; the three files still parse under yaml.safe_load; the diff on
+pack-release-compatibility.yml is the two branches lines and nothing
+else; go build, go vet, go test -race, golangci-lint and
+validate_registry.py all clean. The pack pytest suite is unchanged from
+baseline -- 2 failed / 814 passed, with the same two failures
+(test_formula_assets claim-command subprocess timeouts) reproduced on
+the unmodified integration tip 6a9d06f. Filed separately.
+
+Follow-up: the end-to-end proof (a run actually appearing for an
+integration-targeted push) can only be observed after this merges.
+---
+ .github/workflows/ci.yml                         | 4 ++--
+ .github/workflows/codeql.yml                     | 4 ++--
+ .github/workflows/pack-release-compatibility.yml | 4 ++--
+ 3 files changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 382d94a..ebc8ff8 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -2,9 +2,9 @@ name: CI
+ 
+ on:
+   pull_request:
+-    branches: [main]
++    branches: [integration]
+   push:
+-    branches: [main]
++    branches: [integration]
+ 
+ permissions:
+   contents: read
+diff --git a/.github/workflows/codeql.yml b/.github/workflows/codeql.yml
+index 1475e91..2199766 100644
+--- a/.github/workflows/codeql.yml
++++ b/.github/workflows/codeql.yml
+@@ -2,9 +2,9 @@ name: CodeQL
+ 
+ on:
+   pull_request:
+-    branches: [main]
++    branches: [integration]
+   push:
+-    branches: [main]
++    branches: [integration]
+   schedule:
+     - cron: "37 3 * * 1"
+ 
+diff --git a/.github/workflows/pack-release-compatibility.yml b/.github/workflows/pack-release-compatibility.yml
+index cd29f63..b651cf3 100644
+--- a/.github/workflows/pack-release-compatibility.yml
++++ b/.github/workflows/pack-release-compatibility.yml
+@@ -2,7 +2,7 @@ name: Pack Release Compatibility
+ 
+ on:
+   pull_request:
+-    branches: [main]
++    branches: [integration]
+     paths:
+       - registry.toml
+       - scripts/pack_release_compat.py
+@@ -10,7 +10,7 @@ on:
+       - .github/workflows/pack-release-compatibility.yml
+       - "*/pack.toml"
+   push:
+-    branches: [main]
++    branches: [integration]
+     paths:
+       - registry.toml
+       - scripts/pack_release_compat.py
+-- 
+2.50.1 (Apple Git-155)
+

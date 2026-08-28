@@ -2,7 +2,7 @@ name: Pack Release Compatibility
 
 on:
   pull_request:
-    branches: [main]
+    branches: [integration]
     paths:
       - registry.toml
       - scripts/pack_release_compat.py
@@ -10,7 +10,7 @@ on:
       - .github/workflows/pack-release-compatibility.yml
       - "*/pack.toml"
   push:
-    branches: [main]
+    branches: [integration]
     paths:
       - registry.toml
       - scripts/pack_release_compat.py
