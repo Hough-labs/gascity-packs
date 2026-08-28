@@ -674,8 +674,123 @@ PY
     done
 }
 
+test_work_bead_is_claimed_for_the_whole_run() {
+    # gcp-5gir: mol-polecat-work only ever claimed its own STEP beads, so the
+    # WORK bead stayed open+unassigned from dispatch until the refinery handoff.
+    # For the whole implementation window it was indistinguishable, in
+    # `gc bd ready`, from a bead nobody had touched — and a second `gc sling` onto
+    # it spawns a duplicate polecat whose later push supersedes the first,
+    # discarding work that was already written and self-reviewed.
+    local formula prompt fragment setup_block submit_block
+    formula="$GASTOWN/formulas/mol-polecat-work.toml"
+    prompt="$GASTOWN/agents/polecat/prompt.template.md"
+    fragment="$GASTOWN/template-fragments/approval-fallacy.template.md"
+
+    parse_toml "$formula"
+
+    setup_block=$(python3 - "$formula" <<'PY'
+import sys
+import tomllib
+
+data = tomllib.load(open(sys.argv[1], "rb"))
+step = next(s for s in data["steps"] if s["id"] == "workspace-setup")
+print(step["description"])
+PY
+)
+    submit_block=$(python3 - "$formula" <<'PY'
+import sys
+import tomllib
+
+data = tomllib.load(open(sys.argv[1], "rb"))
+step = next(s for s in data["steps"] if s["id"] == "submit-and-exit")
+print(step["description"])
+PY
+)
+
+    # The claim itself. Status AND assignee: status alone leaves the witness's
+    # orphan pass blind (it skips unassigned beads), assignee alone leaves the
+    # bead in `gc bd ready`, which is the defect.
+    [[ "$setup_block" == *'gc bd update "$WORK_BEAD_ID" --status=in_progress --assignee="$POLECAT_SESSION"'* ]] ||
+        fail "workspace-setup must claim the WORK bead with both status=in_progress and an assignee"
+
+    # It has to happen before the worktree is built, not somewhere later: every
+    # second the bead spends open+unassigned is a second another planner can
+    # sling a duplicate polecat onto it.
+    python3 - "$formula" <<'PY' || fail "the work-bead claim must land in step 1, before the worktree is created"
+import sys
+import tomllib
+
+data = tomllib.load(open(sys.argv[1], "rb"))
+step = next(s for s in data["steps"] if s["id"] == "workspace-setup")
+text = step["description"]
+claim = text.index('gc bd update "$WORK_BEAD_ID" --status=in_progress')
+if claim >= text.index("**2. Ensure worktree exists.**"):
+    raise SystemExit(1)
+PY
+
+    # A write that exits 0 is not a claim: `--status` on this bead has been seen
+    # not to stick (gcp-s14g), and a status that stays `open` leaves it in
+    # `gc bd ready` with the fix reading as applied.
+    [[ "$setup_block" == *'CLAIMED_STATUS'* && "$setup_block" == *'CLAIMED_ASSIGNEE'* ]] ||
+        fail "workspace-setup must read the work-bead claim back instead of trusting the write"
+
+    # The done sequence, the resume re-verify and the worktree reaper all read
+    # `assignee == polecat_session` as "a polecat still holds this". Stamping
+    # only the assignee leaves a crashed predecessor's tag behind, and the bead
+    # reads as already handed to the refinery.
+    [[ "$setup_block" == *'--assignee="$POLECAT_SESSION" --set-metadata polecat_session="$POLECAT_SESSION"'* ]] ||
+        fail "the work-bead claim must stamp polecat_session together with the assignee"
+
+    # Never steal a bead the refinery or an operator escalation already owns.
+    [[ "$setup_block" == *'[ "$CURRENT_ASSIGNEE" != "$POLECAT_SESSION" ]'* ]] ||
+        fail "the claim must leave a foreign assignee alone rather than overwrite it"
+
+    # The bead's own note: pool dispatch leaves gc.routed_to blank on the work
+    # bead on purpose so scale_check can see pool demand. Stamping it here
+    # breaks spawn accounting instead of fixing visibility.
+    [[ "$setup_block" != *'gc.routed_to='* ]] ||
+        fail "the work-bead claim must not stamp gc.routed_to; routing lives on the molecule root"
+
+    # Release is a single assignee move, session -> refinery. A release that
+    # passed through unassigned would re-open the very window this closes.
+    [[ "$submit_block" == *'gc bd update "$WORK_BEAD_ID" --status=open --assignee="$REFINERY_TARGET"'* ]] ||
+        fail "submit-and-exit must hand the work bead straight to the refinery"
+
+    # Holding the claim means `gc hook --claim`'s crash-recovery tier
+    # (`gc bd list --status in_progress --assignee=<you> --limit=1`) can return the
+    # WORK bead instead of the next formula step — at every step boundary, where
+    # the successor step is still stored `open`. Without the re-point the
+    # molecule stops advancing and the branch is never pushed (gcp-tl8's shape).
+    grep -F 'gc.step_ref" // empty' "$prompt" >/dev/null ||
+        fail "the startup claim block must detect a hook result that is not a formula step"
+    grep -F 'STEP_REPOINTED' "$prompt" >/dev/null ||
+        fail "the startup claim block must re-point at the molecule's next ready step"
+    python3 - "$prompt" <<'PY' || fail "the step re-point must run before the polecat_session stamp, so the stamp lands on the bead actually being executed"
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+block = text[text.index("bash <<'GC_CLAIM'"): text.index("GC_CLAIM\n```")]
+if "STEP_REPOINTED" not in block:
+    raise SystemExit(1)
+if block.index("STEP_REPOINTED") >= block.index('--set-metadata polecat_session='):
+    raise SystemExit(1)
+PY
+
+    # A resumed molecule finds its work bead held by its own PREVIOUS session
+    # (pool restarts mint a new identity). Reading that as "handed off" drains
+    # with the branch unpushed — the failure the guard exists to prevent.
+    local guard
+    for guard in "$prompt" "$fragment"; do
+        grep -F '[ "$WORK_ASSIGNEE" != "$WORK_SESSION_TAG" ]' "$guard" >/dev/null ||
+            fail "$(basename "$guard") must not read a previous polecat session's own claim as a completed handoff"
+        grep -F 'metadata.polecat_session' "$guard" >/dev/null ||
+            fail "$(basename "$guard") must read metadata.polecat_session to tell a held bead from a handed-off one"
+    done
+}
+
 test_dog_assets_are_pack_local
 test_retired_dog_formulas_are_not_reintroduced
+test_work_bead_is_claimed_for_the_whole_run
 test_submit_and_exit_cannot_be_replayed
 test_post_merge_worktree_teardown_has_an_owner
 test_polecat_home_teardown_has_an_owner

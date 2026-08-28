@@ -243,8 +243,37 @@ if [ "$ASSIGNEE" != "$EXPECTED_ASSIGNEE" ] || [ "$STATUS" != "in_progress" ]; th
   exit 0
 fi
 
-# Ownership confirmed. Stamp a stable session identity so the churn-watcher and
-# the resume re-verify can key on metadata.polecat_session.
+# Ownership confirmed. Now make sure this is a STEP, not the work bead itself.
+# mol-polecat-work claims the WORK bead for the whole run (status=in_progress,
+# assignee=this session) so it stops sitting in `gc bd ready` where a second sling
+# can land on it. The cost is that `gc hook --claim`'s crash-recovery tier —
+# `gc bd list --status in_progress --assignee=<you> --limit=1` — can now hand that
+# work bead back instead of your next formula step. It happens at every step
+# boundary: the step you just closed is gone and its successor is still stored
+# `open`, so the work bead is the only in_progress match. Working it directly
+# skips self-review and submit-and-exit, and the branch is never pushed. When
+# the hook returns a bead carrying no `gc.step_ref`, re-point at the molecule's
+# next ready step. (gcp-tl8 is the same shape on the refinery: a held work bead
+# resumed as the patrol wisp on every restart.)
+STEP_REF="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].metadata."gc.step_ref" // empty' 2>/dev/null)"
+if [ -z "$STEP_REF" ]; then
+  # Tier 2 of the same work query, filtered to formula steps in jq rather than
+  # by a flag, so this stays readable on any bd the hook itself can drive.
+  NEXT_STEP_ID="$(gc bd ready --assignee="$EXPECTED_ASSIGNEE" --limit=0 --json 2>/dev/null |
+    jq -r '[.[] | select((.metadata."gc.step_ref" // "") != "")] | .[0].id // empty' 2>/dev/null)"
+  if [ -n "$NEXT_STEP_ID" ] && [ "$NEXT_STEP_ID" != "$WORK_ID" ]; then
+    gc bd update "$NEXT_STEP_ID" --claim >/dev/null 2>&1 \
+      || echo "WARN could not claim step bead $NEXT_STEP_ID; it is already assigned to this session, so executing it anyway"
+    echo "STEP_REPOINTED hook returned work bead $WORK_ID; this session is mid-molecule, continuing with step $NEXT_STEP_ID"
+    WORK_ID="$NEXT_STEP_ID"
+    SHOW_JSON="$(gc bd show "$WORK_ID" --json 2>/dev/null)"
+  fi
+  # No ready step means the molecule has nothing runnable right now: keep the
+  # work bead, read your formula steps, and let the done sequence decide.
+fi
+
+# Stamp a stable session identity so the churn-watcher and the resume re-verify
+# can key on metadata.polecat_session.
 gc bd update "$WORK_ID" --set-metadata polecat_session="$EXPECTED_ASSIGNEE" \
   || echo "WARN metadata stamp failed for $WORK_ID; churn-watcher/resume lose session keying (proceeding — the claim is valid)"
 
@@ -258,6 +287,12 @@ has already drain-acked — stop and exit. Only after it prints `CLAIMED_BEAD_ID
 formula steps and begin. The claim checks assigned work first (session bead ID,
 runtime session name, then alias) and only falls through to unassigned pool work
 routed to `${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat`.
+
+`STEP_REPOINTED` is not a bail-out and never drain-acks. It means the assigned
+tier handed back this session's own in-flight WORK bead — which
+`mol-polecat-work` holds `in_progress` for the whole run, so a second sling
+cannot land on it — instead of your next formula step, and the block moved you
+onto that step. The `CLAIMED_BEAD_ID` printed after it is the bead to run.
 
 **Resume / crash re-verify (FIRST action on restart).** Pool restarts mint a
 NEW session identity. If you wake into a session that context says was already
@@ -419,6 +454,7 @@ fi
 WORK_BEAD_ID=""
 WORK_STATUS=""
 WORK_ASSIGNEE=""
+WORK_SESSION_TAG=""
 READ_OK=0
 READ_TRY=0
 while [ "$READ_TRY" -lt 3 ]; do
@@ -430,6 +466,7 @@ while [ "$READ_TRY" -lt 3 ]; do
     SHOW_CODE=$?
     WORK_STATUS=$(printf '%s' "$WORK_JSON" | jq -r '.[0].status // empty' 2>/dev/null)
     WORK_ASSIGNEE=$(printf '%s' "$WORK_JSON" | jq -r '.[0].assignee // empty' 2>/dev/null)
+    WORK_SESSION_TAG=$(printf '%s' "$WORK_JSON" | jq -r '.[0].metadata.polecat_session // empty' 2>/dev/null)
     if [ "$SHOW_CODE" -eq 0 ] && [ -n "$WORK_STATUS" ]; then
       READ_OK=1
       break
@@ -437,13 +474,17 @@ while [ "$READ_TRY" -lt 3 ]; do
   fi
   sleep 1
 done
-# Only POSITIVE evidence counts: the bead is closed, or it is assigned to
-# somebody who is not this session (the refinery). "Not in_progress for me" is
-# NOT evidence — a molecule's work bead is never assigned to the polecat
-# session in the first place, so that test reports already-submitted on work
-# that has not been submitted at all, and drains with the branch unpushed.
+# Only POSITIVE evidence counts: the bead is closed, or it is held by somebody
+# who is not a polecat — the refinery. "Not in_progress for me" is NOT evidence,
+# and neither is a bare "assigned to somebody else": mol-polecat-work's
+# workspace-setup claims the WORK bead for the session implementing it, and a
+# pool restart mints a NEW session identity, so a resumed molecule legitimately
+# finds the bead still held by its own PREVIOUS session — which
+# metadata.polecat_session names. Reading that as a handoff drains with the
+# branch unpushed, the exact failure this guard exists to prevent.
 if [ "$READ_OK" -eq 1 ] && { [ "$WORK_STATUS" = "closed" ] ||
-     { [ -n "$WORK_ASSIGNEE" ] && [ "$WORK_ASSIGNEE" != "$EXPECTED_ASSIGNEE" ]; }; }; then
+     { [ -n "$WORK_ASSIGNEE" ] && [ "$WORK_ASSIGNEE" != "$EXPECTED_ASSIGNEE" ] &&
+       [ "$WORK_ASSIGNEE" != "$WORK_SESSION_TAG" ]; }; }; then
   echo "ALREADY_SUBMITTED $WORK_BEAD_ID status=$WORK_STATUS assignee=$WORK_ASSIGNEE — submit-and-exit already ran; draining."
   gc runtime drain-ack
   exit

@@ -76,7 +76,7 @@ Every check is idempotent — safe to re-run after crash/restart.
 2. `metadata.target` on the parent convoy chain
 3. the rig repo's default branch
 
-**1. Fetch latest and derive your work bead:**
+**1. Fetch latest, derive your work bead, and claim it:**
 ```bash
 git fetch --prune origin
 CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
@@ -87,6 +87,81 @@ if [ -z "$WORK_BEAD_ID" ]; then
   exit 1
 fi
 ```
+
+Claim the WORK bead itself, not just the step beads the molecule claims for
+you. Until this write lands the work bead is `open` and unassigned for the
+whole run, so it sits in `gc bd ready` looking exactly like a bead nobody
+has touched — while you are already building on it. Every seat that surveys ready
+work (the mayor, a backlog groomer, another crew seat) can therefore `gc sling`
+a second polecat onto the bead you are implementing, and per the polecat
+contract the later push supersedes: work already written and self-reviewed is
+discarded. Observed live on winnow-x32.4, winnow-x32.5 and winnow-48fm, and
+reproduced first-party on this rig by the sling that dispatched gcp-5gir.
+
+```bash
+POLECAT_SESSION="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
+CLAIM_JSON=$(gc bd show "$WORK_BEAD_ID" --json 2>/dev/null)
+CURRENT_ASSIGNEE=$(printf '%s' "$CLAIM_JSON" | jq -r '.[0].assignee // empty' 2>/dev/null)
+if [ -n "$CURRENT_ASSIGNEE" ] && [ "$CURRENT_ASSIGNEE" != "$POLECAT_SESSION" ]; then
+    echo "WARN $WORK_BEAD_ID is assigned to $CURRENT_ASSIGNEE, not this session; leaving the assignee alone."
+    echo "WARN a refinery-owned or operator-escalated work bead is not yours to re-claim. Continue; submit-and-exit's guards decide the handoff."
+else
+    gc bd update "$WORK_BEAD_ID" --status=in_progress --assignee="$POLECAT_SESSION" --set-metadata polecat_session="$POLECAT_SESSION"
+    # Read the claim back. `--status` on this bead has been observed not to
+    # stick (gcp-s14g), and a status that stays `open` leaves the bead sitting
+    # in `gc bd ready` — the exact re-sling window this claim exists to close.
+    # The loop always ENDS on a read, so the verdict below is never a stale
+    # snapshot taken before the last retry landed.
+    CLAIMED_STATUS=""
+    CLAIMED_ASSIGNEE=""
+    CLAIM_TRY=0
+    while [ "$CLAIM_TRY" -lt 3 ]; do
+        CLAIM_TRY=$((CLAIM_TRY + 1))
+        CLAIM_JSON=$(gc bd show "$WORK_BEAD_ID" --json 2>/dev/null)
+        CLAIMED_STATUS=$(printf '%s' "$CLAIM_JSON" | jq -r '.[0].status // empty' 2>/dev/null)
+        CLAIMED_ASSIGNEE=$(printf '%s' "$CLAIM_JSON" | jq -r '.[0].assignee // empty' 2>/dev/null)
+        [ "$CLAIMED_STATUS" = "in_progress" ] && [ "$CLAIMED_ASSIGNEE" = "$POLECAT_SESSION" ] && break
+        [ "$CLAIM_TRY" -lt 3 ] &&
+            gc bd update "$WORK_BEAD_ID" --status=in_progress --assignee="$POLECAT_SESSION" --set-metadata polecat_session="$POLECAT_SESSION" >/dev/null 2>&1
+    done
+    [ "$CLAIMED_STATUS" = "in_progress" ] && [ "$CLAIMED_ASSIGNEE" = "$POLECAT_SESSION" ] ||
+        echo "WARN $WORK_BEAD_ID reads status=${CLAIMED_STATUS:-unreadable} assignee=${CLAIMED_ASSIGNEE:-none} after the claim; it may still be re-slung out from under you. Proceeding — the implementation is not blocked on this."
+fi
+```
+
+`polecat_session` rides along with the assignee so the two can never disagree.
+Downstream readers — the witness's worktree reaper, the resume re-verify, and
+the done sequence's already-submitted guard — use `assignee == polecat_session`
+to tell "a polecat still holds this" from "this was handed to the refinery". A
+claim that set only the assignee would leave a crashed predecessor's stamp in
+place and read as a completed handoff.
+
+Do NOT reach for `gc.routed_to` to achieve this. Pool dispatch leaves that key
+blank on the work bead **on purpose** and carries the routing on the molecule
+root, which is what lets `scale_check` see pool demand; stamping it here breaks
+the spawn accounting instead of fixing the visibility.
+
+`submit-and-exit` is the single release point: the assignee goes straight from
+this session to the refinery, so ownership is never ambiguous and the bead
+never re-enters `gc bd ready` mid-flight. Two consequences follow from holding
+the claim for the whole run, and both are load-bearing:
+
+- **If you crash, the bead does not drift back into the pool by itself.** It
+  stays `in_progress` and assigned to a session that is never coming back —
+  which is precisely the shape the witness's `recover-orphaned-beads` step
+  hunts for: it salvages the worktree, then returns the bead to the pool.
+  Before this claim that pass could not see the bead at all (it skips
+  unassigned beads), so the only "recovery" was a duplicate sling.
+- **`gc hook --claim` can now hand you back this work bead** instead of your
+  next formula step. Its crash-recovery tier is
+  `gc bd list --status in_progress --assignee=<you> --limit=1`, and at a step
+  boundary the work bead is the only match — the step you just closed is gone
+  and its successor is still stored `open`. The polecat startup claim block
+  re-points at the molecule's next ready step whenever the hook returns a bead
+  carrying no `gc.step_ref`; do not drop that guard, or the molecule stops
+  advancing and the branch is never pushed. This is the same shape as gcp-tl8,
+  where a refinery holding a work bead `in_progress` resumed it as its patrol
+  wisp on every restart.
 
 **2. Ensure worktree exists.**
 
@@ -574,6 +649,12 @@ Set `assignee` to the configured refinery named-session identity and clear
 `gc.routed_to` because the direct assignment is the handoff. Generic pool
 demand is represented by unassigned work with `gc.routed_to=<target>`, so
 named-session work should not retain pool-demand metadata.
+
+This write is also the ONE release of the claim `workspace-setup` took on the
+work bead. The assignee moves this session -> refinery in a single update: it
+never passes through unassigned, so there is no window in which a bead with a
+pushed branch reappears in `gc bd ready` and gets re-slung to a second polecat
+(gcp-5gir). Do not "release first, then reassign".
 
 The refinery will pick this up, rebase onto {{base_branch}}, run tests,
 merge, and close the bead. If there's a conflict, the refinery puts the
