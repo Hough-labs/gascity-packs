@@ -70,8 +70,25 @@ def shell_lines(body: str) -> list[str]:
             inside = stripped[3:].strip() == "bash" if not inside else False
             continue
         if inside:
-            lines.append(raw)
+            lines.append(strip_comment(raw))
     return lines
+
+
+def strip_comment(line: str) -> str:
+    """Drop a trailing `#` shell comment.
+
+    Without this, a comment that names a command reads as an invocation of it
+    — the `# gauntlet run local --contracts-dir <path>` note beside RUN_ARGS
+    is documentation, not a run. Only a `#` that opens a word and sits outside
+    a double-quoted span counts, so `"sha256:#..."`-style content is safe.
+    """
+    quoted = False
+    for index, char in enumerate(line):
+        if char == '"':
+            quoted = not quoted
+        elif char == "#" and not quoted and (index == 0 or line[index - 1] in " \t"):
+            return line[:index].rstrip()
+    return line
 
 
 def shell_text(body: str) -> str:
@@ -256,6 +273,78 @@ class LanePinnedToBatsTests(unittest.TestCase):
         # so the claim is reproducible rather than asserted.
         readme = README.read_text(encoding="utf-8")
         self.assertRegex(readme, r"\bgaunt-8ibp\b")
+
+
+class CliSurfaceTests(unittest.TestCase):
+    """The two gauntlet commands spell the contracts directory differently.
+
+    `gauntlet lint [path]` takes a POSITIONAL path and rejects the flag form
+    outright (`lint: unknown flag: --contracts-dir`); `gauntlet run local`
+    takes `--contracts-dir <path>`. Getting it backwards kills the red gate
+    for any caller who sets `contracts_dir` — and only for those callers, so
+    it survives every test run that leaves the var at its empty default.
+    """
+
+    def test_no_lint_invocation_passes_contracts_dir(self) -> None:
+        for path in formula_paths():
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
+            for step_id, body in step_bodies(data).items():
+                for line in shell_lines(body):
+                    if "gauntlet lint" not in line:
+                        continue
+                    with self.subTest(formula=path.name, step=step_id):
+                        self.assertNotIn(
+                            "--contracts-dir",
+                            line,
+                            "gauntlet lint takes a positional path, not --contracts-dir",
+                        )
+
+
+class NoCrossStepShellStateTests(unittest.TestCase):
+    """A shell variable set in one step is empty in the next.
+
+    Each formula step is a separate agent turn, and a step carrying
+    `gc.run_target` is a separate session entirely, so nothing survives in the
+    shell between them. The dangerous case is not a crash: an unset
+    `$LINT_ARGS` reads as "gauntlet's default .gauntlet", so a later gate
+    silently addresses a different tree than the one scaffolded into and still
+    reports success. Values that must cross a step boundary go through the
+    root bead's notes; everything else is re-derived from a `{{var}}`, which
+    does render in every step.
+    """
+
+    # Set by the environment, not by the step.
+    AMBIENT = frozenset({"HOME", "PATH", "PWD", "TMPDIR", "USER", "SHELL", "IFS"})
+    AMBIENT_PREFIXES = ("GC_", "BEADS_", "BD_")
+
+    # An assignment opens a command: at a line start, or after a separator
+    # (`;`, `&&`, `||`, `then`, `do`). re.M matters — shell snippets are
+    # multi-line, and without it only the very first line would ever match,
+    # which reports every variable as cross-step.
+    ASSIGNED = re.compile(
+        r"(?:^|;|&&|\|\||\bthen\b|\bdo\b)[ \t]*([A-Z_][A-Z0-9_]*)=", re.M
+    )
+    USED = re.compile(r"\$\{?([A-Z_][A-Z0-9_]*)")
+
+    def _is_ambient(self, name: str) -> bool:
+        return name in self.AMBIENT or name.startswith(self.AMBIENT_PREFIXES)
+
+    def test_every_shell_var_a_step_reads_is_set_in_that_step(self) -> None:
+        for path in formula_paths():
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
+            for step_id, body in step_bodies(data).items():
+                shell = shell_text(body)
+                assigned = set(self.ASSIGNED.findall(shell))
+                for name in sorted(set(self.USED.findall(shell))):
+                    if self._is_ambient(name):
+                        continue
+                    with self.subTest(formula=path.name, step=step_id, var=name):
+                        self.assertIn(
+                            name,
+                            assigned,
+                            f"${name} is read in step {step_id} but set in an earlier "
+                            "step — shell state does not cross a step boundary",
+                        )
 
 
 class ConfigPurityTests(unittest.TestCase):

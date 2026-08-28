@@ -105,21 +105,36 @@ ACCEPTANCE=$(gc bd show "{{contract_bead}}" --json | jq -r '.[0].acceptance_crit
 [ -n "$ACCEPTANCE" ] || halt "{{contract_bead}} has no acceptance criteria to scaffold from"
 ```
 
-Resolve the contracts directory once, and reuse `$CONTRACTS_FLAG` verbatim in
-every later gauntlet invocation so all four steps address the same tree:
+Resolve the contracts directory. **The two commands spell it differently** —
+`gauntlet lint` takes a POSITIONAL path and rejects `--contracts-dir` with
+`lint: unknown flag`, while `gauntlet run local` takes the flag. Passing the
+flag form to lint is not a loud failure you would notice: it aborts that one
+gate. Derive both spellings from the same value:
 
 ```bash
-CONTRACTS_FLAG=""
-if [ -n "{{contracts_dir}}" ]; then
-    CONTRACTS_FLAG="--contracts-dir {{contracts_dir}}"
+CONTRACTS_DIR="{{contracts_dir}}"
+LINT_ARGS=""                                    # gauntlet lint [path]
+RUN_ARGS=""                                     # gauntlet run local --contracts-dir <path>
+if [ -n "$CONTRACTS_DIR" ]; then
+    LINT_ARGS="$CONTRACTS_DIR"
+    RUN_ARGS="--contracts-dir $CONTRACTS_DIR"
 fi
 
 gc bd update "$ROOT_ID" --notes "contract_bead: {{contract_bead}}
 repo_root: $REPO_ROOT
-contracts_flag: ${CONTRACTS_FLAG:-<default .gauntlet>}
+contracts_dir: ${CONTRACTS_DIR:-<default .gauntlet>}
 lane: bats
 status: in_progress"
 ```
+
+**Each step re-derives these three lines from `{{contracts_dir}}` itself.**
+Do not set them once here and expect them downstream: a formula step is a
+separate agent turn, and the routed `implement` step is a separate session
+entirely, so a shell variable set in this step is empty in the next one. An
+empty `$LINT_ARGS` silently means "gauntlet's default `.gauntlet`", so the
+later gates would address a different tree than the one scaffolded into and
+still report success. The template token renders in every step; the shell
+variable does not survive one.
 
 **Note on bead resolution.** `gauntlet scaffold --from-bead` resolves the bead
 through the `bd` CLI itself, using the store that the CWD resolves to. Inside a
@@ -129,7 +144,8 @@ an inherited `BEADS_DIR` is pointing the CLI at a different store — that is
 the failure, not a missing bead.
 
 **Exit criteria:** In repo root, `gauntlet` present, `{{contract_bead}}`
-readable with non-empty acceptance criteria, `$CONTRACTS_FLAG` resolved.
+readable with non-empty acceptance criteria, contracts directory recorded on
+the root bead.
 """
 
 [[steps]]
@@ -192,10 +208,23 @@ finding, which is what "red" means here.
 ```bash
 ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
 
+CONTRACTS_DIR="{{contracts_dir}}"
+LINT_ARGS=""
+[ -n "$CONTRACTS_DIR" ] && LINT_ARGS="$CONTRACTS_DIR"
+
 set +e
-gauntlet lint $CONTRACTS_FLAG --json > /tmp/tdd-lint-red-$$.json 2>/tmp/tdd-lint-red-$$.err
+gauntlet lint $LINT_ARGS --json > /tmp/tdd-lint-red-$$.json
 LINT_STATUS=$?
 set -e
+```
+
+`--json` writes the whole report to **stdout**, not stderr, and `findings` is
+`null` when clean and an array of `{path, line, kind, message}` when not:
+
+```json
+{ "scanned": 1, "clean": 0,
+  "findings": [ { "path": ".gauntlet/x.bats", "line": 5, "kind": "todo_skip",
+                  "message": "scaffold placeholder 'skip \"TODO\"' left in test" } ] }
 ```
 
 A non-zero exit with at least one finding is RED, and the loop proceeds. A
@@ -210,13 +239,17 @@ if [ "$LINT_STATUS" -eq 0 ]; then
     exit 1
 fi
 
-RED_FINDINGS=$(sed -n 's/.*findings=\\([0-9][0-9]*\\).*/\\1/p' /tmp/tdd-lint-red-$$.err | tail -1)
+RED_FINDINGS=$(jq -r '.findings // [] | length' /tmp/tdd-lint-red-$$.json)
 gc bd update "$ROOT_ID" --notes "red_findings: ${RED_FINDINGS:-unparsed}
 red_proven: yes"
 ```
 
 Record the finding list in the run log — it is the to-do list the implement
-step works from, one entry per unproven assertion.
+step works from, one entry per unproven assertion:
+
+```bash
+jq -r '.findings[] | "\\(.path):\\(.line)  \\(.kind)  \\(.message)"' /tmp/tdd-lint-red-$$.json
+```
 
 **Exit criteria:** `gauntlet lint` exited non-zero, the finding count is
 recorded as `red_findings:` on the root bead, and `red_proven: yes` is set.
@@ -232,6 +265,21 @@ Routed to `{{implementer_target}}` — a gc-native dispatch, so the witness sees
 a real session and the refinery sees a real branch. `gauntlet loop --exec`
 would drive the same cycle as an opaque subprocess; that is the wrong
 orchestration model here, because a subprocess is invisible to both.
+
+This step runs in its own session, so nothing the earlier steps put in a
+shell variable is still set. Read the contract path back off the root bead,
+where the scaffold step recorded it, and re-derive the run flag:
+
+```bash
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
+CONTRACT_PATH=$(gc bd show "$ROOT_ID" --json |
+    jq -r '.[0].notes // ""' | sed -n 's/^contract_path: //p' | tail -1)
+[ -n "$CONTRACT_PATH" ] || { echo "no contract_path on the root bead" >&2; exit 1; }
+
+CONTRACTS_DIR="{{contracts_dir}}"
+RUN_ARGS=""
+[ -n "$CONTRACTS_DIR" ] && RUN_ARGS="--contracts-dir $CONTRACTS_DIR"
+```
 
 Work from the red findings recorded by the previous step. For each stub in
 `$CONTRACT_PATH`:
@@ -253,7 +301,7 @@ Two rules that decide whether the loop meant anything:
 Iterate locally against the bats lane until it holds:
 
 ```bash
-gauntlet run local "{{contract_bead}}" $CONTRACTS_FLAG --contracts=bats
+gauntlet run local "{{contract_bead}}" $RUN_ARGS --contracts=bats
 ```
 
 Commit the contract and the implementation together. The contract is part of
@@ -276,10 +324,18 @@ a file with every stub still skipped runs green.
 ```bash
 ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
 
+CONTRACTS_DIR="{{contracts_dir}}"
+LINT_ARGS=""                                    # positional path
+RUN_ARGS=""                                     # --contracts-dir flag
+if [ -n "$CONTRACTS_DIR" ]; then
+    LINT_ARGS="$CONTRACTS_DIR"
+    RUN_ARGS="--contracts-dir $CONTRACTS_DIR"
+fi
+
 set +e
-gauntlet lint $CONTRACTS_FLAG > /tmp/tdd-lint-green-$$.log 2>&1
+gauntlet lint $LINT_ARGS > /tmp/tdd-lint-green-$$.log 2>&1
 LINT_STATUS=$?
-gauntlet run local "{{contract_bead}}" $CONTRACTS_FLAG --contracts=bats > /tmp/tdd-run-green-$$.log 2>&1
+gauntlet run local "{{contract_bead}}" $RUN_ARGS --contracts=bats > /tmp/tdd-run-green-$$.log 2>&1
 RUN_STATUS=$?
 set -e
 

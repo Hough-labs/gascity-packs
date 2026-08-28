@@ -64,6 +64,15 @@ The formula assumes these verbs, all of which are dispatched in
 | prove GREEN | `gauntlet run local <bead-id> [--contracts-dir <path>] --contracts=bats` |
 | drop the red-by-design tag | `gauntlet bats untag-green` |
 
+**The two commands spell the contracts directory differently.** `gauntlet
+lint` takes a positional path and rejects the flag form outright —
+`lint: unknown flag: --contracts-dir` — while `gauntlet run local` takes
+`--contracts-dir <path>`. The formula derives both spellings from the single
+`contracts_dir` var, and the test suite asserts no lint invocation is given
+the flag. Worth knowing because the failure is invisible at the default: with
+`contracts_dir` unset, both forms collapse to `.gauntlet` and the mistake
+never shows.
+
 Verified against gauntlet at commit `201c94f` — `git describe --tags` reports
 **`v0.1.0-454-g201c94f`**. The CLI has no `--version` flag and no `version`
 subcommand, so `git describe` in the gauntlet checkout is the version marker
