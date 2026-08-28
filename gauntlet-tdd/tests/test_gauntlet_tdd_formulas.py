@@ -368,7 +368,7 @@ class NoteWritesAppendTests(unittest.TestCase):
             data = tomllib.loads(path.read_text(encoding="utf-8"))
             for step_id, body in step_bodies(data).items():
                 for line in shell_lines(body):
-                    if "bd update" not in line:
+                    if "gc bd update" not in line:
                         continue
                     with self.subTest(formula=path.name, step=step_id, line=line):
                         self.assertIsNone(
