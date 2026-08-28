@@ -156,6 +156,23 @@ cannot drift onto the hurl lane, and the two open hurl-corpus defects in the
 gauntlet repo (`gaunt-4bzz`, `gaunt-svhp`) stay off this pack's path by
 construction rather than by luck.
 
+## Why run state is appended, never replaced
+
+The molecule root bead is the control bead, and every step writes its run
+state there with `gc bd update <root-id> --append-notes`. **Never `--notes`:
+that flag REPLACES the field.**
+
+This is not a tidiness preference — it is the one cross-step handoff the loop
+depends on. `scaffold` records `contract_path:`, and `implement` reads it
+back two steps later to know which file it is working on. A replacing write
+anywhere in between erases it, and `gc bd update` still exits 0, so the loss
+surfaces as an unexplained `no contract_path on the root bead` at the
+implement gate rather than at the write that caused it.
+
+Appending also leaves the witness's and refinery's own annotations on a
+shared bead intact. The `implement` reader takes `tail -1`, so a key written
+more than once resolves to the latest value.
+
 ## Related: `gauntlet loop`
 
 `gauntlet loop --bead <id> [--exit-on-green] [--max-iter N] [--exec '<cmd>']`
@@ -198,7 +215,7 @@ python3 -m pytest gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py -q
 
 The suite is pack-local, mirroring `pr-pipeline/tests/`. It asserts the
 formulas parse, declare their required vars, name only documented step
-targets, keep the red gate on `gauntlet lint`, and keep the lane pinned to
-bats. `.github/workflows/ci.yml` names `gauntlet-tdd/tests` in its pytest path
+targets, keep the red gate on `gauntlet lint`, keep the lane pinned to bats,
+and write run state with `--append-notes` rather than `--notes`. `.github/workflows/ci.yml` names `gauntlet-tdd/tests` in its pytest path
 list — that list is explicit, not a glob, so a new pack's suite is invisible
 to CI until it is added there.
