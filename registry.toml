@@ -313,3 +313,16 @@ schema = 1
     commit = "636fdfaaf54195b293e8e56d5e9c30e4b8d5a9ef"
     hash = "sha256:ba0428bf51627bf465a693f2426cf6be0cef70ae81b043fce3ce6761a4772290"
     description = "First registry release of the superpowers build factory."
+
+[[pack]]
+  name = "gauntlet-tdd"
+  description = "The gauntlet RED-to-GREEN contract loop as a pack: scaffold a .bats contract from a bead's acceptance criteria, prove it red with gauntlet lint, route implementation to the rig's implementer, prove it green with a bead-scoped run (mol-tdd-red-green)."
+  source = "https://github.com/gastownhall/gascity-packs/tree/main/gauntlet-tdd"
+  source_kind = "git"
+
+  [[pack.release]]
+    version = "0.1.0"
+    ref = "main"
+    commit = "c84a27ba9bc290f67cbf24ba86e663e7268d6798"
+    hash = "sha256:3e93803831adc79d19da3d9bb06e9bc23518d1013ab1432da81a4d18b40de7ff"
+    description = "Initial gauntlet-tdd release: the RED-to-GREEN contract loop as one formula (mol-tdd-red-green) plus a wrapper command, pinned to the bats lane with gauntlet lint as the red gate."
