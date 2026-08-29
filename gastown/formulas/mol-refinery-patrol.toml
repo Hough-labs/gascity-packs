@@ -1212,6 +1212,10 @@ merge_ff_push() {
   # outright whenever the lane is busy. The refinery IS a queue: waiting for a
   # slot is what it is for, and a measured 28.2-minute queue (gc-wisp-wt5u) is
   # cheaper than a refused merge. Overridable per rig, exported per push.
+  # A budget long enough to outlive the remote's idle timeout is a DIFFERENT
+  # failure — the push dies mid-flight rather than being refused — so if raising
+  # this starts producing torn pushes instead of merges, that interaction is
+  # what to look at, not the refusal status below.
   mfp_push_wait="${REFINERY_PUSH_GATE_MAX_WAIT_SECONDS:-3000}"
 
   while [ "$mfp_attempt" -lt "$mfp_max" ]; do

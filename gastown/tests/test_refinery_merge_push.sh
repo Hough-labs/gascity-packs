@@ -369,13 +369,13 @@ test_rejected_push_with_a_moving_target_still_retries() {
     # target really does advance each time. That is the racing-pusher case the
     # retry bound exists for, so the lane must keep retrying and must exhaust
     # into status 6 — which now means what it says.
-    local tmp got c1 c2 attempts
+    local tmp got attempts n
     tmp=$(mktemp -d)
     make_rig "$tmp"
     # Build the racing chain BEFORE the hook is armed, so pushing it does not
-    # trip the hook. Both commits are fast-forwards of dev, so each update-ref
+    # trip the hook. Every commit is a fast-forward of dev, so each update-ref
     # below is the advance a real racing pusher would produce.
-    local racer="$tmp/racer" n
+    local racer="$tmp/racer"
     git_q clone "$ORIGIN" "$racer"
     : >"$tmp/chain"
     # One racing commit per possible push attempt, so every rejection this test
@@ -386,8 +386,6 @@ test_rejected_push_with_a_moving_target_still_retries() {
         git_q -C "$racer" commit -m "chore: racing bump $n"
         git -C "$racer" rev-parse HEAD >>"$tmp/chain"
     done
-    c1=$(sed -n '1p' "$tmp/chain")
-    c2=$(sed -n '2p' "$tmp/chain")
     git_q -C "$racer" push origin HEAD:refs/heads/racing
 
     # Reject the incoming push, but move dev on the way out: the rejection now
@@ -416,10 +414,10 @@ HOOK
         fail "a rejected push against a target that kept moving returned $(status_of "$got"), want 6 (retries exhausted)"
     [ "$attempts" -gt 1 ] ||
         fail "a measurably racing target was pushed $attempts time(s), want more than 1 — the retry bound exists for this case"
-    git --git-dir="$ORIGIN" merge-base --is-ancestor "$c1" "$(origin_tip)" ||
-        fail "harness bug: dev should have been raced past $c1, found $(origin_tip)"
-    [ "$(origin_tip)" != "$c1" ] || [ "$attempts" -lt 2 ] ||
-        fail "harness bug: dev raced $attempts times but stopped at $c1, not $c2"
+    # The hook advances dev to chain entry n on push n, so the tip pins how many
+    # advances the lane actually saw — not just that something moved.
+    [ "$(origin_tip)" = "$(sed -n "${attempts}p" "$tmp/chain")" ] ||
+        fail "harness bug: after $attempts rejected push(es) dev should sit at racing commit #$attempts, found $(origin_tip)"
     rm -rf "$tmp"
 }
 
