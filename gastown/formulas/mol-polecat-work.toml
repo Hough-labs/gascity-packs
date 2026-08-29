@@ -130,11 +130,13 @@ fi
 ```
 
 `polecat_session` rides along with the assignee so the two can never disagree.
-Downstream readers — the witness's worktree reaper, the resume re-verify, and
-the done sequence's already-submitted guard — use `assignee == polecat_session`
-to tell "a polecat still holds this" from "this was handed to the refinery". A
-claim that set only the assignee would leave a crashed predecessor's stamp in
-place and read as a completed handoff.
+Downstream readers — the witness's worktree reaper and the resume re-verify —
+use `assignee == polecat_session` to tell "a polecat still holds this" from
+"somebody else took it". A claim that set only the assignee would leave a
+crashed predecessor's stamp in place and read as a completed handoff. The done
+sequence's already-submitted guard does not need that comparison at all: it
+tests the assignee against the refinery target directly, which excludes both a
+predecessor session and any third party the bead was parked on (gcp-0pa4).
 
 Do NOT reach for `gc.routed_to` to achieve this. Pool dispatch leaves that key
 blank on the work bead **on purpose** and carries the routing on the molecule
@@ -432,8 +434,8 @@ A re-entered submit-and-exit must not re-write bead state. Step 8 sets the
 assignee and clears `gc.routed_to`; run a second time on a bead the refinery
 has since parked, it silently pulls that bead back out of an escalation. Bail
 out before touching anything when all three marks of a completed handoff are
-present — target recorded, branch on origin at this commit, and the bead handed
-to somebody who is not this session:
+present — target recorded, branch on origin at this commit, and the bead held by
+the refinery itself:
 
 ```bash
 # Re-derived rather than inherited: run each block in its own shell and the
@@ -442,6 +444,9 @@ to somebody who is not this session:
 CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
 WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
 STEP_SESSION="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
+# Resolved with the exact expression step 8 writes, so the mark this guard reads
+# and the handoff it stands for can never disagree.
+REFINERY_TARGET="${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery"
 STEP_BEAD_ID=$(gc bd list --assignee="$STEP_SESSION" --status=open,in_progress \
   --metadata-field gc.step_ref=mol-polecat-work.submit-and-exit \
   --include-infra --limit=0 --json 2>/dev/null | jq -r '.[0].id // empty')
@@ -455,7 +460,7 @@ if [ -n "$SUBMITTED_BRANCH" ]; then
 fi
 if [ -n "$SUBMITTED_TARGET" ] && [ -n "$SUBMITTED_REMOTE" ] &&
    [ "$SUBMITTED_REMOTE" = "$(git rev-parse HEAD)" ] &&
-   [ -n "$SUBMITTED_ASSIGNEE" ] && [ "$SUBMITTED_ASSIGNEE" != "$STEP_SESSION" ]; then
+   [ "$SUBMITTED_ASSIGNEE" = "$REFINERY_TARGET" ]; then
     echo "ALREADY_SUBMITTED $WORK_BEAD_ID target=$SUBMITTED_TARGET branch=$SUBMITTED_BRANCH assignee=$SUBMITTED_ASSIGNEE"
     echo "Handoff already completed. Closing this step bead and draining without re-writing bead state."
     [ -n "$STEP_BEAD_ID" ] && gc bd close "$STEP_BEAD_ID" --reason "submit-and-exit: already submitted; no bead state re-written"
@@ -469,6 +474,17 @@ proves nothing — a caller may set it before dispatch to choose the base branch
 — and an unassigned bead with the branch on origin is the shape a witness
 salvage push leaves behind (gcp-7bo9), which is not a handoff this step
 performed.
+
+The assignee mark is an IDENTITY test against `$REFINERY_TARGET`, never
+`!= $STEP_SESSION`. "Somebody who is not me" is satisfied by every third party a
+work bead can end up on — an operator parking it on a crew seat, a witness
+re-routing it, a reviewer taking it — and none of those is this step's handoff.
+Read as evidence, they make a resuming polecat announce ALREADY_SUBMITTED and
+drain while the refinery never receives the work and the branch strands on
+origin unmerged (gcp-0pa4; observed live on winnow-zgr2y.8, parked on
+`winnow/specialists.thomas`). The blast radius scales with parked seats holding
+open beads, so the check has to name the one assignee that means "handed off"
+rather than enumerate the ones that do not.
 
 **3. Branch-shape gate (fails closed — non-negotiable).**
 

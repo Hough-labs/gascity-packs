@@ -443,10 +443,13 @@ step does (never pass a bare or guessed id to `bd`, which fuzzy-matches and can
 reassign the wrong bead); `$GC_BEAD_ID` is the convoy the molecule was poured
 on, and when it is not exported the block below recovers the convoy from the
 step bead you are holding. Only positive evidence — the work bead closed, or
-handed to somebody else — means submit-and-exit already ran. Otherwise run it:
+handed to the refinery — means submit-and-exit already ran. Otherwise run it:
 
 ```bash
 EXPECTED_ASSIGNEE="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
+# The handoff submit-and-exit performs is `assignee = REFINERY_TARGET`, so that
+# exact value is what counts as proof it ran. Same expression the formula writes.
+REFINERY_TARGET="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}refinery"
 # `$GC_BEAD_ID` is not always exported — it was empty in gcp-rz8a's session, so
 # this guard could not run at all. Recover the convoy from the molecule root of
 # the step bead this session is holding rather than skipping the check. The
@@ -470,7 +473,6 @@ fi
 WORK_BEAD_ID=""
 WORK_STATUS=""
 WORK_ASSIGNEE=""
-WORK_SESSION_TAG=""
 READ_OK=0
 READ_TRY=0
 while [ "$READ_TRY" -lt 3 ]; do
@@ -482,7 +484,6 @@ while [ "$READ_TRY" -lt 3 ]; do
     SHOW_CODE=$?
     WORK_STATUS=$(printf '%s' "$WORK_JSON" | jq -r '.[0].status // empty' 2>/dev/null)
     WORK_ASSIGNEE=$(printf '%s' "$WORK_JSON" | jq -r '.[0].assignee // empty' 2>/dev/null)
-    WORK_SESSION_TAG=$(printf '%s' "$WORK_JSON" | jq -r '.[0].metadata.polecat_session // empty' 2>/dev/null)
     if [ "$SHOW_CODE" -eq 0 ] && [ -n "$WORK_STATUS" ]; then
       READ_OK=1
       break
@@ -490,17 +491,18 @@ while [ "$READ_TRY" -lt 3 ]; do
   fi
   sleep 1
 done
-# Only POSITIVE evidence counts: the bead is closed, or it is held by somebody
-# who is not a polecat — the refinery. "Not in_progress for me" is NOT evidence,
-# and neither is a bare "assigned to somebody else": mol-polecat-work's
-# workspace-setup claims the WORK bead for the session implementing it, and a
-# pool restart mints a NEW session identity, so a resumed molecule legitimately
-# finds the bead still held by its own PREVIOUS session — which
-# metadata.polecat_session names. Reading that as a handoff drains with the
-# branch unpushed, the exact failure this guard exists to prevent.
+# Only POSITIVE evidence counts: the bead is closed, or it is held by the
+# REFINERY — the one assignee submit-and-exit's handoff actually produces. Every
+# weaker test has been observed draining a session with the branch unpushed.
+# "Not in_progress for me" is not evidence: a molecule's work bead is never
+# assigned to the polecat session in the first place. Nor is a bare "assigned to
+# somebody else", which is equally true of a resumed molecule finding the bead
+# still held by its own PREVIOUS session (pool restarts mint a new identity) and
+# of any third party a bead can be parked on — an operator moving it to a crew
+# seat, a reviewer taking it. Name the refinery rather than enumerate the
+# identities that are not it.
 if [ "$READ_OK" -eq 1 ] && { [ "$WORK_STATUS" = "closed" ] ||
-     { [ -n "$WORK_ASSIGNEE" ] && [ "$WORK_ASSIGNEE" != "$EXPECTED_ASSIGNEE" ] &&
-       [ "$WORK_ASSIGNEE" != "$WORK_SESSION_TAG" ]; }; }; then
+     [ "$WORK_ASSIGNEE" = "$REFINERY_TARGET" ]; }; then
   echo "ALREADY_SUBMITTED $WORK_BEAD_ID status=$WORK_STATUS assignee=$WORK_ASSIGNEE — submit-and-exit already ran; draining."
   gc runtime drain-ack
   exit

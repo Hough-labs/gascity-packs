@@ -652,6 +652,37 @@ if text.index("ALREADY_SUBMITTED") >= text.index("gc bd update"):
     raise SystemExit(1)
 PY
 
+    # gcp-0pa4: the assignee mark was `!= $STEP_SESSION`, which every third party
+    # a bead can end up on satisfies — an operator parking it on a crew seat, a
+    # witness re-routing it, a reviewer taking it. A resuming polecat read that
+    # as a handoff, drained, and the refinery never received the work while the
+    # branch sat on origin unmerged (observed on winnow-zgr2y.8, parked on
+    # winnow/specialists.thomas). Only one assignee means "submit-and-exit ran".
+    [[ "$submit_block" == *'REFINERY_TARGET="${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery"'* ]] ||
+        fail "the already-submitted guard must resolve the refinery target the same way the handoff writes it"
+    [[ "$submit_block" == *'[ "$SUBMITTED_ASSIGNEE" = "$REFINERY_TARGET" ]'* ]] ||
+        fail "the already-submitted guard must require the work bead to be held by the refinery, not merely by somebody other than this session"
+    [[ "$submit_block" != *'[ "$SUBMITTED_ASSIGNEE" != "$STEP_SESSION" ]'* ]] ||
+        fail "assignee != this session is not proof of a refinery handoff (gcp-0pa4)"
+
+    # The resolve has to sit inside the guard's own block: every fenced block in
+    # this step re-derives its ids because an agent may run each in a fresh
+    # shell, and an empty REFINERY_TARGET here silently turns the identity test
+    # into "assignee is empty", which never fires and never bails out.
+    python3 - "$formula" <<'PY' || fail "the already-submitted guard must resolve REFINERY_TARGET in its own block rather than inherit it"
+import sys
+import tomllib
+
+data = tomllib.load(open(sys.argv[1], "rb"))
+step = next(s for s in data["steps"] if s["id"] == "submit-and-exit")
+text = step["description"]
+guard = text[text.index("**2. Already-submitted guard"): text.index("**3. Branch-shape gate")]
+if 'REFINERY_TARGET="${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery"' not in guard:
+    raise SystemExit(1)
+if guard.index("REFINERY_TARGET=") >= guard.index('[ "$SUBMITTED_ASSIGNEE" = "$REFINERY_TARGET" ]'):
+    raise SystemExit(1)
+PY
+
     # The prompt-side guard could not run at all in the observed session:
     # $GC_BEAD_ID was empty, so it never resolved a work bead. Both copies must
     # recover the convoy, and both must key on POSITIVE evidence — a molecule's
@@ -683,7 +714,16 @@ PY
         ! grep -F '[ "$WORK_STATUS" != "in_progress" ]' "$guard" >/dev/null ||
             fail "$(basename "$guard") must not treat an unassigned work bead as already submitted"
         grep -F '[ "$WORK_STATUS" = "closed" ]' "$guard" >/dev/null ||
-            fail "$(basename "$guard") must require positive evidence (closed, or handed to another assignee)"
+            fail "$(basename "$guard") must require positive evidence (closed, or held by the refinery)"
+
+        # The same gcp-0pa4 defect as the formula guard, in the copy an agent
+        # actually has in context when it decides whether to drain.
+        grep -F 'REFINERY_TARGET="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}refinery"' "$guard" >/dev/null ||
+            fail "$(basename "$guard") must resolve the refinery target the same way the handoff writes it"
+        grep -F '[ "$WORK_ASSIGNEE" = "$REFINERY_TARGET" ]' "$guard" >/dev/null ||
+            fail "$(basename "$guard") must require the work bead to be held by the refinery before draining"
+        ! grep -F '[ "$WORK_ASSIGNEE" != "$EXPECTED_ASSIGNEE" ]' "$guard" >/dev/null ||
+            fail "$(basename "$guard") reads any third-party assignee as a completed handoff (gcp-0pa4)"
     done
 }
 
@@ -812,13 +852,16 @@ PY
 
     # A resumed molecule finds its work bead held by its own PREVIOUS session
     # (pool restarts mint a new identity). Reading that as "handed off" drains
-    # with the branch unpushed — the failure the guard exists to prevent.
+    # with the branch unpushed — the failure the guard exists to prevent. The
+    # escape used to be an explicit `assignee != metadata.polecat_session`
+    # exception; gcp-0pa4 replaced it with the positive
+    # `assignee == $REFINERY_TARGET` test, which excludes a predecessor session
+    # and every other non-refinery identity by construction. Pin the property,
+    # not the mechanism: no polecat session identity is ever the refinery target.
     local guard
     for guard in "$prompt" "$fragment"; do
-        grep -F '[ "$WORK_ASSIGNEE" != "$WORK_SESSION_TAG" ]' "$guard" >/dev/null ||
+        grep -F '[ "$WORK_ASSIGNEE" = "$REFINERY_TARGET" ]' "$guard" >/dev/null ||
             fail "$(basename "$guard") must not read a previous polecat session's own claim as a completed handoff"
-        grep -F 'metadata.polecat_session' "$guard" >/dev/null ||
-            fail "$(basename "$guard") must read metadata.polecat_session to tell a held bead from a handed-off one"
     done
 }
 
