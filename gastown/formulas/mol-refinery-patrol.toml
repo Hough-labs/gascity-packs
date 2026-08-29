@@ -1159,6 +1159,22 @@ gate: an approval authorizes one commit, so when `APPROVAL_REQUIRED` is 1 the
 lane refuses to re-rebase and returns the park status instead, and the next
 patrol iteration re-tests, re-publishes the head, and re-gates it.
 
+**A rejected push is not evidence of a race — measure it.** The lane used to
+attribute every push rejection to target movement and retry on that assumption.
+Rejections have a second, more common cause: the rig's pre-push gate
+(`scripts/gate-slot-run`) does a NON-BLOCKING slot acquire by default
+(`PUSH_GATE_MAX_WAIT_SECONDS=0`) and vetoes the push when both test lanes are
+busy. Under the old lane that veto was reported as movement and then retried
+three times, and every retry re-ran the pre-push hook — so the diagnosis was
+wrong AND the response was to add load to the very gate that was saturated
+(gcp-ileo, twin gascity-mfac; a measured 28.2-minute slot queue is what those
+retries queue behind). Two changes follow from that. The push carries its own
+wait budget, exported for that one command, so the refinery queues for a slot
+instead of being refused one. And on a rejection the lane re-reads
+`origin/$TARGET` and compares it to `BEFORE_SHA` — the same comparison the
+success path already makes — so it retries only when the target measurably
+moved, and returns the distinct refusal status when it did not.
+
 ```bash
 # --- merge-ff-push:begin ---
 # Land `temp` on $TARGET and prove it landed. Reads BRANCH, TARGET,
@@ -1170,7 +1186,10 @@ patrol iteration re-tests, re-publishes the head, and re-gates it.
 #   3 = the re-rebase onto the new tip conflicted
 #   4 = approval-gated and the branch must move; park awaiting review
 #   5 = no-op: origin/$TARGET already contains temp; nothing to land here
-#   6 = retries exhausted while losing the race
+#   6 = retries exhausted while losing the race (measured: the target moved
+#       under every attempt)
+#   7 = the remote REFUSED the push while $TARGET stood still — a push-gate
+#       veto, a receive hook, or permissions. Not a race; retrying cannot help.
 merge_ff_push_cleanup_wt() {
   if [ -n "${mfp_wt:-}" ]; then
     git worktree remove --force "$mfp_wt" >/dev/null 2>&1 || true
@@ -1187,6 +1206,13 @@ merge_ff_push() {
   mfp_parent=""
   mfp_max=3
   mfp_attempt=0
+  # Wait budget for the merge push, and for nothing else in this patrol. The
+  # rig's pre-push gate (scripts/gate-slot-run) reads PUSH_GATE_MAX_WAIT_SECONDS
+  # and defaults it to 0 — a NON-BLOCKING slot acquire that vetoes the push
+  # outright whenever the lane is busy. The refinery IS a queue: waiting for a
+  # slot is what it is for, and a measured 28.2-minute queue (gc-wisp-wt5u) is
+  # cheaper than a refused merge. Overridable per rig, exported per push.
+  mfp_push_wait="${REFINERY_PUSH_GATE_MAX_WAIT_SECONDS:-3000}"
 
   while [ "$mfp_attempt" -lt "$mfp_max" ]; do
     mfp_attempt=$((mfp_attempt + 1))
@@ -1266,11 +1292,31 @@ merge_ff_push() {
       return 2
     fi
 
-    git -C "$mfp_wt" push origin "HEAD:$TARGET"
+    PUSH_GATE_MAX_WAIT_SECONDS="$mfp_push_wait" git -C "$mfp_wt" push origin "HEAD:$TARGET"
     mfp_push_status=$?
     merge_ff_push_cleanup_wt
     if [ "$mfp_push_status" -ne 0 ]; then
-      echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status) — the target advanced between the fetch and the push."
+      # MEASURE the cause; do not assert it. A rejection is either "the target
+      # advanced under us" — retryable, re-rebase and go again — or "the remote
+      # refused this push" (gate veto, receive hook, permissions), which no
+      # number of retries can fix and which every retry pays for in gate load:
+      # each attempt relaunches the pre-push hook and queues for another slot.
+      # The verification below already draws exactly this comparison against the
+      # freshly fetched tip; the rejection path never learned it, so every veto
+      # was reported as movement and then retried three times (gcp-ileo).
+      if ! git fetch origin "+refs/heads/${TARGET}:refs/remotes/origin/${TARGET}"; then
+        echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status) and the follow-up fetch failed, so the cause cannot be measured. STOP. Do not mutate bead state."
+        return 2
+      fi
+      if ! mfp_reject_sha=$(git rev-parse "origin/$TARGET"); then
+        echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status) and origin/$TARGET could not be resolved, so the cause cannot be measured. STOP. Do not mutate bead state."
+        return 2
+      fi
+      if [ "$mfp_reject_sha" = "$BEFORE_SHA" ]; then
+        echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status) and origin/$TARGET is STILL $BEFORE_SHA — the target did not move, so the remote refused this push (push-gate veto, receive hook, or permissions). This is not a race; retrying re-runs the pre-push gate and cannot succeed. STOP. Do not mutate bead state."
+        return 7
+      fi
+      echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status); origin/$TARGET moved $BEFORE_SHA -> $mfp_reject_sha, so the target really did advance between the fetch and the push."
       if [ "${APPROVAL_REQUIRED:-0}" -eq 1 ]; then
         echo "merge-ff-push: approval is keyed to the current head; refusing to re-rebase it. Park for review."
         return 4
@@ -1304,7 +1350,12 @@ merge_ff_push() {
     return 0
   done
 
-  echo "merge-ff-push: could not land $BRANCH on $TARGET in $mfp_max attempts; the target keeps moving. STOP. Do not mutate bead state."
+  # Only reachable after an attempt MEASURED the target moving — either the
+  # ff-merge failed because origin/$TARGET had advanced, or the push was
+  # rejected and the re-read tip differed from the one merged onto. A veto
+  # against a stationary target returns 7 above and never reaches here, so this
+  # message no longer steers the reader toward retrying harder (gcp-ileo).
+  echo "merge-ff-push: could not land $BRANCH on $TARGET in $mfp_max attempts; the target moved under every attempt. STOP. Do not mutate bead state."
   return 6
 }
 # --- merge-ff-push:end ---
@@ -1330,6 +1381,14 @@ If `merge_ff_push` returns anything but 0 or 4: STOP. Debug and retry. Do NOT
 write merge metadata, close the bead, or delete the source branch. Status 4 is
 not a failure — the bead is parked awaiting review exactly as a refused gate
 parks it (see 4b); run **2. Cleanup** and let this step complete.
+
+Status 7 is the one that most invites a wrong next move: the remote refused the
+push while `$TARGET` stood still. Re-running the merge immediately just re-runs
+the pre-push gate, so if the gate is saturated the retry is what keeps it
+saturated. Read the push output for the refusal reason (a busy push-gate lane,
+a receive hook, permissions), clear that, and let the next patrol iteration pick
+the branch back up. Raise `REFINERY_PUSH_GATE_MAX_WAIT_SECONDS` if the refinery
+is losing slots to a genuinely busy gate rather than to a veto.
 
 Both the `--set-metadata` write and the `gc bd close` are required —
 `merged_sha` and `merged_target` are the only forensic breadcrumbs tying a

@@ -27,6 +27,17 @@
 # bead. test_lost_race_rerebases_and_lands_this_branch pins the other half:
 # after a lost race the reported sha must be this branch's tip, never the
 # racing commit that moved the target.
+#
+# A later defect (gcp-ileo, twin gascity-mfac) sat in the same block's rejection
+# path: it ATTRIBUTED every push rejection to target movement without re-reading
+# the remote ref, so a push-gate veto was diagnosed as a race and then retried
+# three times, each retry relaunching the pre-push hook and re-queueing for a
+# test-mac slot it could never win. The cause must be measured, not asserted, so
+# the two rejection shapes are separated here — test_vetoed_push_stops_without_retrying
+# (target stationary: one attempt, distinct status) and
+# test_rejected_push_with_a_moving_target_still_retries (target really moving:
+# keep retrying) — and test_push_carries_an_explicit_gate_wait_budget pins the
+# budget that keeps the refinery queueing for a slot rather than refused one.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -320,13 +331,21 @@ test_noop_ff_does_not_report_a_merge() {
     rm -rf "$tmp"
 }
 
-test_rejected_push_exhausts_retries_without_reporting_a_merge() {
-    local tmp got before after
+test_vetoed_push_stops_without_retrying() {
+    # The push is refused while origin/dev never moves — a pre-push gate veto,
+    # a remote hook, or permissions. The lane used to ATTRIBUTE every rejection
+    # to target movement and retry three times, each retry relaunching the
+    # pre-push hook and so re-queueing for a test-mac gate slot that three
+    # attempts can never win (gcp-ileo). The cause must be MEASURED off the
+    # remote ref: unchanged target => stop after one attempt, and report the
+    # veto rather than a race.
+    local tmp got before after attempts
     tmp=$(mktemp -d)
     make_rig "$tmp"
     before=$(origin_tip)
-    cat >"$ORIGIN/hooks/pre-receive" <<'HOOK'
+    cat >"$ORIGIN/hooks/pre-receive" <<HOOK
 #!/bin/sh
+echo x >>"$tmp/push-attempts"
 echo "push refused by the test" >&2
 exit 1
 HOOK
@@ -334,11 +353,102 @@ HOOK
 
     got=$(run_merge 0 2>/dev/null)
     after=$(origin_tip)
+    attempts=$(wc -l <"$tmp/push-attempts" | tr -d ' ')
 
-    [ "$(status_of "$got")" = "6" ] ||
-        fail "a permanently rejected push returned $(status_of "$got"), want 6 (retries exhausted)"
+    [ "$(status_of "$got")" = "7" ] ||
+        fail "a vetoed push against a target that never moved returned $(status_of "$got"), want 7 (rejected, not raced)"
     [ "$after" = "$before" ] ||
         fail "a rejected push still moved origin/dev from $before to $after"
+    [ "$attempts" = "1" ] ||
+        fail "a vetoed push was attempted $attempts times, want 1 — retrying a veto only adds push-gate load"
+    rm -rf "$tmp"
+}
+
+test_rejected_push_with_a_moving_target_still_retries() {
+    # The other half of the same measurement: the push is rejected AND the
+    # target really does advance each time. That is the racing-pusher case the
+    # retry bound exists for, so the lane must keep retrying and must exhaust
+    # into status 6 — which now means what it says.
+    local tmp got c1 c2 attempts
+    tmp=$(mktemp -d)
+    make_rig "$tmp"
+    # Build the racing chain BEFORE the hook is armed, so pushing it does not
+    # trip the hook. Both commits are fast-forwards of dev, so each update-ref
+    # below is the advance a real racing pusher would produce.
+    local racer="$tmp/racer" n
+    git_q clone "$ORIGIN" "$racer"
+    : >"$tmp/chain"
+    # One racing commit per possible push attempt, so every rejection this test
+    # provokes has a real advance behind it.
+    for n in 1 2 3; do
+        echo "bump $n" >>"$racer/overlay.txt"
+        git_q -C "$racer" add overlay.txt
+        git_q -C "$racer" commit -m "chore: racing bump $n"
+        git -C "$racer" rev-parse HEAD >>"$tmp/chain"
+    done
+    c1=$(sed -n '1p' "$tmp/chain")
+    c2=$(sed -n '2p' "$tmp/chain")
+    git_q -C "$racer" push origin HEAD:refs/heads/racing
+
+    # Reject the incoming push, but move dev on the way out: the rejection now
+    # has a measurable cause, and re-rebasing is the way through it. A receive
+    # hook runs inside git's object quarantine, which forbids ref updates, so
+    # the racing advance has to step outside it.
+    cat >"$ORIGIN/hooks/pre-receive" <<HOOK
+#!/bin/sh
+unset GIT_QUARANTINE_PATH GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+n=\$(wc -l <"$tmp/push-attempts" 2>/dev/null || echo 0)
+n=\$((n + 1))
+echo x >>"$tmp/push-attempts"
+racing=\$(sed -n "\${n}p" "$tmp/chain")
+if [ -n "\$racing" ]; then
+  git --git-dir="$ORIGIN" update-ref refs/heads/dev "\$racing"
+fi
+echo "push refused by the test (race \$n)" >&2
+exit 1
+HOOK
+    chmod +x "$ORIGIN/hooks/pre-receive"
+
+    got=$(run_merge 0 2>/dev/null)
+    attempts=$(wc -l <"$tmp/push-attempts" | tr -d ' ')
+
+    [ "$(status_of "$got")" = "6" ] ||
+        fail "a rejected push against a target that kept moving returned $(status_of "$got"), want 6 (retries exhausted)"
+    [ "$attempts" -gt 1 ] ||
+        fail "a measurably racing target was pushed $attempts time(s), want more than 1 — the retry bound exists for this case"
+    git --git-dir="$ORIGIN" merge-base --is-ancestor "$c1" "$(origin_tip)" ||
+        fail "harness bug: dev should have been raced past $c1, found $(origin_tip)"
+    [ "$(origin_tip)" != "$c1" ] || [ "$attempts" -lt 2 ] ||
+        fail "harness bug: dev raced $attempts times but stopped at $c1, not $c2"
+    rm -rf "$tmp"
+}
+
+test_push_carries_an_explicit_gate_wait_budget() {
+    # The rig's pre-push gate (scripts/gate-slot-run) reads
+    # PUSH_GATE_MAX_WAIT_SECONDS and defaults it to 0 — a non-blocking slot
+    # acquire that vetoes the push whenever both lanes are busy. Running the
+    # merge push under that ambient default is what turned a 28-minute slot
+    # queue into a refused merge. The push must carry its own budget.
+    local tmp got budget
+    tmp=$(mktemp -d)
+    make_rig "$tmp"
+    mkdir -p "$WORK/.git/hooks"
+    cat >"$WORK/.git/hooks/pre-push" <<HOOK
+#!/bin/sh
+printf '%s\n' "\${PUSH_GATE_MAX_WAIT_SECONDS-UNSET}" >>"$tmp/gate-budget"
+exit 0
+HOOK
+    chmod +x "$WORK/.git/hooks/pre-push"
+
+    got=$(run_merge 0 2>/dev/null)
+
+    [ "$(status_of "$got")" = "0" ] ||
+        fail "harness bug: the budget probe hook should not have blocked the merge (status $(status_of "$got"))"
+    budget=$(sed -n '1p' "$tmp/gate-budget")
+    [ -n "$budget" ] && [ "$budget" != "UNSET" ] ||
+        fail "the merge push ran with PUSH_GATE_MAX_WAIT_SECONDS unset — it inherits the gate's non-blocking default (gcp-ileo)"
+    [ "$budget" -gt 0 ] 2>/dev/null ||
+        fail "the merge push ran with PUSH_GATE_MAX_WAIT_SECONDS=$budget; the refinery is a queue and must wait for a slot"
     rm -rf "$tmp"
 }
 
@@ -367,7 +477,9 @@ test_failed_ff_under_approval_parks_without_moving_the_branch
 test_push_that_does_not_advance_the_target_is_refused
 test_target_advanced_by_someone_else_is_refused
 test_noop_ff_does_not_report_a_merge
-test_rejected_push_exhausts_retries_without_reporting_a_merge
+test_vetoed_push_stops_without_retrying
+test_rejected_push_with_a_moving_target_still_retries
+test_push_carries_an_explicit_gate_wait_budget
 
 if [ "$FAILURES" -ne 0 ]; then
     echo "refinery merge-push tests: $FAILURES failure(s)" >&2
