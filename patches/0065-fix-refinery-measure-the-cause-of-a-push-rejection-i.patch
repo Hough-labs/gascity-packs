@@ -1,0 +1,344 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sat, 29 Aug 2026 01:37:49 -0400
+Subject: [PATCH 65/65] fix(refinery): measure the cause of a push rejection
+ instead of assuming a race (gcp-ileo)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`merge_ff_push` attributed every push rejection to target movement and
+retried on that assumption. Rejections have a second, more common cause:
+the rig's pre-push gate (`scripts/gate-slot-run`) does a non-blocking slot
+acquire by default (`PUSH_GATE_MAX_WAIT_SECONDS=0`) and vetoes the push
+outright whenever both test lanes are busy. Under that veto the lane
+reported "the target advanced between the fetch and the push", retried
+three times, and each retry re-rebased and relaunched the pre-push hook —
+so the diagnosis was wrong AND the response was to add load to the very
+gate that was saturated. Exhaustion then surfaced as status 6, "the target
+keeps moving", about a target that had not moved at all, steering the next
+agent toward retrying harder. Filed as gcp-ileo off the gascity-side field
+report gascity-mfac, whose notes carry the file:line analysis; the
+supporting measurement is a 28.2-minute push-gate slot queue on the gascity
+refinery (gc-wisp-wt5u), which is what those retries queue behind.
+
+Four changes, all inside the block between the merge-ff-push sentinels:
+
+- The push carries its own wait budget, exported for that one command
+  (`REFINERY_PUSH_GATE_MAX_WAIT_SECONDS`, default 3000s). The refinery is a
+  queue; waiting for a slot is what it is for, and queueing is cheaper than
+  a refused merge. Nothing else in the patrol inherits a blocking budget.
+- On a rejection the lane now fetches and re-reads `origin/$TARGET`, and
+  compares it to `BEFORE_SHA` — the same comparison the success path
+  already makes, which the rejection path had never learned. An unmeasurable
+  cause (fetch or rev-parse failure) is a hard stop rather than a guess.
+- The retry is gated on that measurement: it re-rebases and retries only
+  when the target measurably moved, and returns immediately otherwise.
+- A stationary-target rejection gets its own status, 7, so the caller and
+  the operator see "the remote refused this push" rather than a race.
+  Status 6 keeps its meaning and is now only reachable after an attempt
+  measured the target moving, so its message is accurate.
+
+The approval check moved below the measurement: under a veto the branch
+does not need to move, so parking it awaiting review would have been the
+wrong disposition as well as the wrong diagnosis.
+
+Contract tests cycled red -> green against the extracted block:
+test_vetoed_push_stops_without_retrying (stationary target: status 7, and
+exactly one push attempt), test_rejected_push_with_a_moving_target_still_retries
+(genuinely racing target: keeps retrying, exhausts into 6) and
+test_push_carries_an_explicit_gate_wait_budget (a probe pre-push hook records
+the budget the push ran under). The moving-target harness has to
+`unset GIT_QUARANTINE_PATH` before advancing the ref, since a receive hook
+runs inside git's object quarantine where ref updates are forbidden.
+
+The old test_rejected_push_exhausts_retries_without_reporting_a_merge asserted
+the buggy disposition — a remote veto exhausting three retries into status 6 —
+so it is replaced by the two shapes above rather than kept.
+---
+ gastown/formulas/mol-refinery-patrol.toml |  67 +++++++++++-
+ gastown/tests/test_refinery_merge_push.sh | 124 ++++++++++++++++++++--
+ 2 files changed, 181 insertions(+), 10 deletions(-)
+
+diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
+index b197556..d419d60 100644
+--- a/gastown/formulas/mol-refinery-patrol.toml
++++ b/gastown/formulas/mol-refinery-patrol.toml
+@@ -1159,6 +1159,22 @@ gate: an approval authorizes one commit, so when `APPROVAL_REQUIRED` is 1 the
+ lane refuses to re-rebase and returns the park status instead, and the next
+ patrol iteration re-tests, re-publishes the head, and re-gates it.
+ 
++**A rejected push is not evidence of a race — measure it.** The lane used to
++attribute every push rejection to target movement and retry on that assumption.
++Rejections have a second, more common cause: the rig's pre-push gate
++(`scripts/gate-slot-run`) does a NON-BLOCKING slot acquire by default
++(`PUSH_GATE_MAX_WAIT_SECONDS=0`) and vetoes the push when both test lanes are
++busy. Under the old lane that veto was reported as movement and then retried
++three times, and every retry re-ran the pre-push hook — so the diagnosis was
++wrong AND the response was to add load to the very gate that was saturated
++(gcp-ileo, twin gascity-mfac; a measured 28.2-minute slot queue is what those
++retries queue behind). Two changes follow from that. The push carries its own
++wait budget, exported for that one command, so the refinery queues for a slot
++instead of being refused one. And on a rejection the lane re-reads
++`origin/$TARGET` and compares it to `BEFORE_SHA` — the same comparison the
++success path already makes — so it retries only when the target measurably
++moved, and returns the distinct refusal status when it did not.
++
+ ```bash
+ # --- merge-ff-push:begin ---
+ # Land `temp` on $TARGET and prove it landed. Reads BRANCH, TARGET,
+@@ -1170,7 +1186,10 @@ patrol iteration re-tests, re-publishes the head, and re-gates it.
+ #   3 = the re-rebase onto the new tip conflicted
+ #   4 = approval-gated and the branch must move; park awaiting review
+ #   5 = no-op: origin/$TARGET already contains temp; nothing to land here
+-#   6 = retries exhausted while losing the race
++#   6 = retries exhausted while losing the race (measured: the target moved
++#       under every attempt)
++#   7 = the remote REFUSED the push while $TARGET stood still — a push-gate
++#       veto, a receive hook, or permissions. Not a race; retrying cannot help.
+ merge_ff_push_cleanup_wt() {
+   if [ -n "${mfp_wt:-}" ]; then
+     git worktree remove --force "$mfp_wt" >/dev/null 2>&1 || true
+@@ -1187,6 +1206,13 @@ merge_ff_push() {
+   mfp_parent=""
+   mfp_max=3
+   mfp_attempt=0
++  # Wait budget for the merge push, and for nothing else in this patrol. The
++  # rig's pre-push gate (scripts/gate-slot-run) reads PUSH_GATE_MAX_WAIT_SECONDS
++  # and defaults it to 0 — a NON-BLOCKING slot acquire that vetoes the push
++  # outright whenever the lane is busy. The refinery IS a queue: waiting for a
++  # slot is what it is for, and a measured 28.2-minute queue (gc-wisp-wt5u) is
++  # cheaper than a refused merge. Overridable per rig, exported per push.
++  mfp_push_wait="${REFINERY_PUSH_GATE_MAX_WAIT_SECONDS:-3000}"
+ 
+   while [ "$mfp_attempt" -lt "$mfp_max" ]; do
+     mfp_attempt=$((mfp_attempt + 1))
+@@ -1266,11 +1292,31 @@ merge_ff_push() {
+       return 2
+     fi
+ 
+-    git -C "$mfp_wt" push origin "HEAD:$TARGET"
++    PUSH_GATE_MAX_WAIT_SECONDS="$mfp_push_wait" git -C "$mfp_wt" push origin "HEAD:$TARGET"
+     mfp_push_status=$?
+     merge_ff_push_cleanup_wt
+     if [ "$mfp_push_status" -ne 0 ]; then
+-      echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status) — the target advanced between the fetch and the push."
++      # MEASURE the cause; do not assert it. A rejection is either "the target
++      # advanced under us" — retryable, re-rebase and go again — or "the remote
++      # refused this push" (gate veto, receive hook, permissions), which no
++      # number of retries can fix and which every retry pays for in gate load:
++      # each attempt relaunches the pre-push hook and queues for another slot.
++      # The verification below already draws exactly this comparison against the
++      # freshly fetched tip; the rejection path never learned it, so every veto
++      # was reported as movement and then retried three times (gcp-ileo).
++      if ! git fetch origin "+refs/heads/${TARGET}:refs/remotes/origin/${TARGET}"; then
++        echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status) and the follow-up fetch failed, so the cause cannot be measured. STOP. Do not mutate bead state."
++        return 2
++      fi
++      if ! mfp_reject_sha=$(git rev-parse "origin/$TARGET"); then
++        echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status) and origin/$TARGET could not be resolved, so the cause cannot be measured. STOP. Do not mutate bead state."
++        return 2
++      fi
++      if [ "$mfp_reject_sha" = "$BEFORE_SHA" ]; then
++        echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status) and origin/$TARGET is STILL $BEFORE_SHA — the target did not move, so the remote refused this push (push-gate veto, receive hook, or permissions). This is not a race; retrying re-runs the pre-push gate and cannot succeed. STOP. Do not mutate bead state."
++        return 7
++      fi
++      echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status); origin/$TARGET moved $BEFORE_SHA -> $mfp_reject_sha, so the target really did advance between the fetch and the push."
+       if [ "${APPROVAL_REQUIRED:-0}" -eq 1 ]; then
+         echo "merge-ff-push: approval is keyed to the current head; refusing to re-rebase it. Park for review."
+         return 4
+@@ -1304,7 +1350,12 @@ merge_ff_push() {
+     return 0
+   done
+ 
+-  echo "merge-ff-push: could not land $BRANCH on $TARGET in $mfp_max attempts; the target keeps moving. STOP. Do not mutate bead state."
++  # Only reachable after an attempt MEASURED the target moving — either the
++  # ff-merge failed because origin/$TARGET had advanced, or the push was
++  # rejected and the re-read tip differed from the one merged onto. A veto
++  # against a stationary target returns 7 above and never reaches here, so this
++  # message no longer steers the reader toward retrying harder (gcp-ileo).
++  echo "merge-ff-push: could not land $BRANCH on $TARGET in $mfp_max attempts; the target moved under every attempt. STOP. Do not mutate bead state."
+   return 6
+ }
+ # --- merge-ff-push:end ---
+@@ -1331,6 +1382,14 @@ write merge metadata, close the bead, or delete the source branch. Status 4 is
+ not a failure — the bead is parked awaiting review exactly as a refused gate
+ parks it (see 4b); run **2. Cleanup** and let this step complete.
+ 
++Status 7 is the one that most invites a wrong next move: the remote refused the
++push while `$TARGET` stood still. Re-running the merge immediately just re-runs
++the pre-push gate, so if the gate is saturated the retry is what keeps it
++saturated. Read the push output for the refusal reason (a busy push-gate lane,
++a receive hook, permissions), clear that, and let the next patrol iteration pick
++the branch back up. Raise `REFINERY_PUSH_GATE_MAX_WAIT_SECONDS` if the refinery
++is losing slots to a genuinely busy gate rather than to a veto.
++
+ Both the `--set-metadata` write and the `gc bd close` are required —
+ `merged_sha` and `merged_target` are the only forensic breadcrumbs tying a
+ closed bead to its merge commit on `$TARGET`. `--unset-metadata
+diff --git a/gastown/tests/test_refinery_merge_push.sh b/gastown/tests/test_refinery_merge_push.sh
+index 074a58e..8edadd5 100755
+--- a/gastown/tests/test_refinery_merge_push.sh
++++ b/gastown/tests/test_refinery_merge_push.sh
+@@ -27,6 +27,17 @@
+ # bead. test_lost_race_rerebases_and_lands_this_branch pins the other half:
+ # after a lost race the reported sha must be this branch's tip, never the
+ # racing commit that moved the target.
++#
++# A later defect (gcp-ileo, twin gascity-mfac) sat in the same block's rejection
++# path: it ATTRIBUTED every push rejection to target movement without re-reading
++# the remote ref, so a push-gate veto was diagnosed as a race and then retried
++# three times, each retry relaunching the pre-push hook and re-queueing for a
++# test-mac slot it could never win. The cause must be measured, not asserted, so
++# the two rejection shapes are separated here — test_vetoed_push_stops_without_retrying
++# (target stationary: one attempt, distinct status) and
++# test_rejected_push_with_a_moving_target_still_retries (target really moving:
++# keep retrying) — and test_push_carries_an_explicit_gate_wait_budget pins the
++# budget that keeps the refinery queueing for a slot rather than refused one.
+ set -uo pipefail
+ 
+ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+@@ -320,13 +331,21 @@ test_noop_ff_does_not_report_a_merge() {
+     rm -rf "$tmp"
+ }
+ 
+-test_rejected_push_exhausts_retries_without_reporting_a_merge() {
+-    local tmp got before after
++test_vetoed_push_stops_without_retrying() {
++    # The push is refused while origin/dev never moves — a pre-push gate veto,
++    # a remote hook, or permissions. The lane used to ATTRIBUTE every rejection
++    # to target movement and retry three times, each retry relaunching the
++    # pre-push hook and so re-queueing for a test-mac gate slot that three
++    # attempts can never win (gcp-ileo). The cause must be MEASURED off the
++    # remote ref: unchanged target => stop after one attempt, and report the
++    # veto rather than a race.
++    local tmp got before after attempts
+     tmp=$(mktemp -d)
+     make_rig "$tmp"
+     before=$(origin_tip)
+-    cat >"$ORIGIN/hooks/pre-receive" <<'HOOK'
++    cat >"$ORIGIN/hooks/pre-receive" <<HOOK
+ #!/bin/sh
++echo x >>"$tmp/push-attempts"
+ echo "push refused by the test" >&2
+ exit 1
+ HOOK
+@@ -334,11 +353,102 @@ HOOK
+ 
+     got=$(run_merge 0 2>/dev/null)
+     after=$(origin_tip)
++    attempts=$(wc -l <"$tmp/push-attempts" | tr -d ' ')
+ 
+-    [ "$(status_of "$got")" = "6" ] ||
+-        fail "a permanently rejected push returned $(status_of "$got"), want 6 (retries exhausted)"
++    [ "$(status_of "$got")" = "7" ] ||
++        fail "a vetoed push against a target that never moved returned $(status_of "$got"), want 7 (rejected, not raced)"
+     [ "$after" = "$before" ] ||
+         fail "a rejected push still moved origin/dev from $before to $after"
++    [ "$attempts" = "1" ] ||
++        fail "a vetoed push was attempted $attempts times, want 1 — retrying a veto only adds push-gate load"
++    rm -rf "$tmp"
++}
++
++test_rejected_push_with_a_moving_target_still_retries() {
++    # The other half of the same measurement: the push is rejected AND the
++    # target really does advance each time. That is the racing-pusher case the
++    # retry bound exists for, so the lane must keep retrying and must exhaust
++    # into status 6 — which now means what it says.
++    local tmp got c1 c2 attempts
++    tmp=$(mktemp -d)
++    make_rig "$tmp"
++    # Build the racing chain BEFORE the hook is armed, so pushing it does not
++    # trip the hook. Both commits are fast-forwards of dev, so each update-ref
++    # below is the advance a real racing pusher would produce.
++    local racer="$tmp/racer" n
++    git_q clone "$ORIGIN" "$racer"
++    : >"$tmp/chain"
++    # One racing commit per possible push attempt, so every rejection this test
++    # provokes has a real advance behind it.
++    for n in 1 2 3; do
++        echo "bump $n" >>"$racer/overlay.txt"
++        git_q -C "$racer" add overlay.txt
++        git_q -C "$racer" commit -m "chore: racing bump $n"
++        git -C "$racer" rev-parse HEAD >>"$tmp/chain"
++    done
++    c1=$(sed -n '1p' "$tmp/chain")
++    c2=$(sed -n '2p' "$tmp/chain")
++    git_q -C "$racer" push origin HEAD:refs/heads/racing
++
++    # Reject the incoming push, but move dev on the way out: the rejection now
++    # has a measurable cause, and re-rebasing is the way through it. A receive
++    # hook runs inside git's object quarantine, which forbids ref updates, so
++    # the racing advance has to step outside it.
++    cat >"$ORIGIN/hooks/pre-receive" <<HOOK
++#!/bin/sh
++unset GIT_QUARANTINE_PATH GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
++n=\$(wc -l <"$tmp/push-attempts" 2>/dev/null || echo 0)
++n=\$((n + 1))
++echo x >>"$tmp/push-attempts"
++racing=\$(sed -n "\${n}p" "$tmp/chain")
++if [ -n "\$racing" ]; then
++  git --git-dir="$ORIGIN" update-ref refs/heads/dev "\$racing"
++fi
++echo "push refused by the test (race \$n)" >&2
++exit 1
++HOOK
++    chmod +x "$ORIGIN/hooks/pre-receive"
++
++    got=$(run_merge 0 2>/dev/null)
++    attempts=$(wc -l <"$tmp/push-attempts" | tr -d ' ')
++
++    [ "$(status_of "$got")" = "6" ] ||
++        fail "a rejected push against a target that kept moving returned $(status_of "$got"), want 6 (retries exhausted)"
++    [ "$attempts" -gt 1 ] ||
++        fail "a measurably racing target was pushed $attempts time(s), want more than 1 — the retry bound exists for this case"
++    git --git-dir="$ORIGIN" merge-base --is-ancestor "$c1" "$(origin_tip)" ||
++        fail "harness bug: dev should have been raced past $c1, found $(origin_tip)"
++    [ "$(origin_tip)" != "$c1" ] || [ "$attempts" -lt 2 ] ||
++        fail "harness bug: dev raced $attempts times but stopped at $c1, not $c2"
++    rm -rf "$tmp"
++}
++
++test_push_carries_an_explicit_gate_wait_budget() {
++    # The rig's pre-push gate (scripts/gate-slot-run) reads
++    # PUSH_GATE_MAX_WAIT_SECONDS and defaults it to 0 — a non-blocking slot
++    # acquire that vetoes the push whenever both lanes are busy. Running the
++    # merge push under that ambient default is what turned a 28-minute slot
++    # queue into a refused merge. The push must carry its own budget.
++    local tmp got budget
++    tmp=$(mktemp -d)
++    make_rig "$tmp"
++    mkdir -p "$WORK/.git/hooks"
++    cat >"$WORK/.git/hooks/pre-push" <<HOOK
++#!/bin/sh
++printf '%s\n' "\${PUSH_GATE_MAX_WAIT_SECONDS-UNSET}" >>"$tmp/gate-budget"
++exit 0
++HOOK
++    chmod +x "$WORK/.git/hooks/pre-push"
++
++    got=$(run_merge 0 2>/dev/null)
++
++    [ "$(status_of "$got")" = "0" ] ||
++        fail "harness bug: the budget probe hook should not have blocked the merge (status $(status_of "$got"))"
++    budget=$(sed -n '1p' "$tmp/gate-budget")
++    [ -n "$budget" ] && [ "$budget" != "UNSET" ] ||
++        fail "the merge push ran with PUSH_GATE_MAX_WAIT_SECONDS unset — it inherits the gate's non-blocking default (gcp-ileo)"
++    [ "$budget" -gt 0 ] 2>/dev/null ||
++        fail "the merge push ran with PUSH_GATE_MAX_WAIT_SECONDS=$budget; the refinery is a queue and must wait for a slot"
+     rm -rf "$tmp"
+ }
+ 
+@@ -367,7 +477,9 @@ test_failed_ff_under_approval_parks_without_moving_the_branch
+ test_push_that_does_not_advance_the_target_is_refused
+ test_target_advanced_by_someone_else_is_refused
+ test_noop_ff_does_not_report_a_merge
+-test_rejected_push_exhausts_retries_without_reporting_a_merge
++test_vetoed_push_stops_without_retrying
++test_rejected_push_with_a_moving_target_still_retries
++test_push_carries_an_explicit_gate_wait_budget
+ 
+ if [ "$FAILURES" -ne 0 ]; then
+     echo "refinery merge-push tests: $FAILURES failure(s)" >&2
+-- 
+2.50.1 (Apple Git-155)
+

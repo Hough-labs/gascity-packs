@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 28 Aug 2026 19:57:33 -0400
-Subject: [PATCH 60/64] fix(gastown): claim the polecat's WORK bead for the
+Subject: [PATCH 60/65] fix(gastown): claim the polecat's WORK bead for the
  whole run (gcp-5gir)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
