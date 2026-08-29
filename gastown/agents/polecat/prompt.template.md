@@ -267,6 +267,8 @@ if [ -z "$STEP_REF" ]; then
     echo "STEP_REPOINTED hook returned work bead $WORK_ID; this session is mid-molecule, continuing with step $NEXT_STEP_ID"
     WORK_ID="$NEXT_STEP_ID"
     SHOW_JSON="$(gc bd show "$WORK_ID" --json 2>/dev/null)"
+    [ -n "$SHOW_JSON" ] ||
+      echo "WARN could not re-read $WORK_ID; run 'gc bd show $WORK_ID' before you start the step"
   fi
   # No ready step means the molecule has nothing runnable right now: keep the
   # work bead, read your formula steps, and let the done sequence decide.
