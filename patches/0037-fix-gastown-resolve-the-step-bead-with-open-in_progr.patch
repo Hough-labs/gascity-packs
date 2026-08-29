@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Mon, 17 Aug 2026 09:21:04 -0400
-Subject: [PATCH 37/63] fix(gastown): resolve the step bead with
+Subject: [PATCH 37/64] fix(gastown): resolve the step bead with
  open,in_progress (gcp-rz8a)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
