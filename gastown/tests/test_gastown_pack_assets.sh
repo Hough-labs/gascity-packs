@@ -784,7 +784,7 @@ PY
     # matches the in-flight step AND the held work bead and returns either, so a
     # ready-only re-point silently finds nothing on the work-bead outcome — the
     # stall it exists to prevent. Resume the claimed step before falling back.
-    python3 - "$prompt" <<'PY' || fail "the step re-point must look for an in_progress step bead before falling back to the blocker-aware bd ready query"
+    python3 - "$prompt" <<'PY' || fail "the step re-point must look for an in_progress step bead before falling back to the blocker-aware gc bd ready query"
 import sys
 
 text = open(sys.argv[1], encoding="utf-8").read()

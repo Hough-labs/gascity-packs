@@ -261,7 +261,7 @@ if [ -z "$STEP_REF" ]; then
   # in_progress, so it cannot see a step this session already claimed — and the
   # hook's recovery tier (`--status in_progress --assignee=<you> --limit=1`)
   # matches BOTH that step and the held work bead, returning either one. Land on
-  # the work bead with `bd ready` as the only fallback and the re-point finds
+  # the work bead with `gc bd ready` as the only fallback and the re-point finds
   # nothing, which is the stall it exists to prevent. Resume the claimed step.
   NEXT_STEP_ID="$(gc bd list --assignee="$EXPECTED_ASSIGNEE" --status=in_progress \
     --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null |
