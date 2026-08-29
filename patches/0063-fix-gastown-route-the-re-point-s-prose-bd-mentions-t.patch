@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 28 Aug 2026 20:56:16 -0400
+Subject: [PATCH 63/63] fix(gastown): route the re-point's prose bd mentions
+ through gc (gcp-5gir)
+
+tests/test_no_bare_bd_commands.py scans shipped pack assets for `bd` calls
+that bypass store-aware routing, and it does not distinguish prose from a
+command line. Two comments added by the step re-point commits wrote a bare
+`bd ready`, so the guard failed on this branch. Prefix both with `gc`; the
+meaning is unchanged and the fallback query itself was already `gc bd ready`.
+---
+ gastown/agents/polecat/prompt.template.md | 2 +-
+ gastown/tests/test_gastown_pack_assets.sh | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/gastown/agents/polecat/prompt.template.md b/gastown/agents/polecat/prompt.template.md
+index e08ad0d..81cb02a 100644
+--- a/gastown/agents/polecat/prompt.template.md
++++ b/gastown/agents/polecat/prompt.template.md
+@@ -261,7 +261,7 @@ if [ -z "$STEP_REF" ]; then
+   # in_progress, so it cannot see a step this session already claimed — and the
+   # hook's recovery tier (`--status in_progress --assignee=<you> --limit=1`)
+   # matches BOTH that step and the held work bead, returning either one. Land on
+-  # the work bead with `bd ready` as the only fallback and the re-point finds
++  # the work bead with `gc bd ready` as the only fallback and the re-point finds
+   # nothing, which is the stall it exists to prevent. Resume the claimed step.
+   NEXT_STEP_ID="$(gc bd list --assignee="$EXPECTED_ASSIGNEE" --status=in_progress \
+     --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null |
+diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
+index 8637e05..d8e87f4 100755
+--- a/gastown/tests/test_gastown_pack_assets.sh
++++ b/gastown/tests/test_gastown_pack_assets.sh
+@@ -784,7 +784,7 @@ PY
+     # matches the in-flight step AND the held work bead and returns either, so a
+     # ready-only re-point silently finds nothing on the work-bead outcome — the
+     # stall it exists to prevent. Resume the claimed step before falling back.
+-    python3 - "$prompt" <<'PY' || fail "the step re-point must look for an in_progress step bead before falling back to the blocker-aware bd ready query"
++    python3 - "$prompt" <<'PY' || fail "the step re-point must look for an in_progress step bead before falling back to the blocker-aware gc bd ready query"
+ import sys
+ 
+ text = open(sys.argv[1], encoding="utf-8").read()
+-- 
+2.50.1 (Apple Git-155)
+

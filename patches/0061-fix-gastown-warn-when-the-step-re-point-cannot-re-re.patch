@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 28 Aug 2026 20:10:33 -0400
+Subject: [PATCH 61/63] fix(gastown): warn when the step re-point cannot
+ re-read its new bead (gcp-5gir)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Self-review touch-up on the STEP_REPOINTED path added by 421663c.
+
+After the re-point swaps WORK_ID to the molecule's next ready step, the
+block re-reads that bead into SHOW_JSON. If that read fails, SHOW_JSON is
+empty and the block's closing `jq` silently prints nothing — the polecat
+gets a CLAIMED_BEAD_ID with no metadata beneath it and no indication that
+anything went wrong. Say so explicitly instead, and name the command that
+recovers it. The re-point itself is unaffected: the claim already landed,
+so this is a reporting gap, not a control-flow one.
+---
+ gastown/agents/polecat/prompt.template.md | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/gastown/agents/polecat/prompt.template.md b/gastown/agents/polecat/prompt.template.md
+index 4640481..ee46623 100644
+--- a/gastown/agents/polecat/prompt.template.md
++++ b/gastown/agents/polecat/prompt.template.md
+@@ -267,6 +267,8 @@ if [ -z "$STEP_REF" ]; then
+     echo "STEP_REPOINTED hook returned work bead $WORK_ID; this session is mid-molecule, continuing with step $NEXT_STEP_ID"
+     WORK_ID="$NEXT_STEP_ID"
+     SHOW_JSON="$(gc bd show "$WORK_ID" --json 2>/dev/null)"
++    [ -n "$SHOW_JSON" ] ||
++      echo "WARN could not re-read $WORK_ID; run 'gc bd show $WORK_ID' before you start the step"
+   fi
+   # No ready step means the molecule has nothing runnable right now: keep the
+   # work bead, read your formula steps, and let the done sequence decide.
+-- 
+2.50.1 (Apple Git-155)
+

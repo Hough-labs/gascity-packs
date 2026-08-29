@@ -1,0 +1,154 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 28 Aug 2026 20:30:58 -0400
+Subject: [PATCH 62/63] fix(gastown): let the step re-point resume an in-flight
+ step bead (gcp-5gir)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Self-review found a hole in the STEP_REPOINTED guard added by 421663c: the
+guard could not fire in one of the two cases it was written for.
+
+The re-point resolved the molecule's next step with `gc bd ready` alone.
+`gc bd ready` is blocker-aware — which is why it is the right query for an
+`open` successor step — but it EXCLUDES in_progress, so it cannot see a step
+this session has already claimed. Meanwhile the hook's crash-recovery tier is
+`gc bd list --status in_progress --assignee=<you> --limit=1`, and now that
+workspace-setup holds the work bead in_progress for the whole run, that query
+matches BOTH the in-flight step and the work bead and may return either.
+
+Verified against live bd on this run's own molecule: with self-review
+(gcp-yhzp) in_progress and submit-and-exit (gcp-pzlc) open behind it,
+`gc bd ready --assignee=<session> --limit=0` returns nothing at all. So on the
+work-bead outcome the re-point silently found no step and left the polecat on
+the work bead — skipping self-review and submit-and-exit, branch never pushed.
+That is the precise stall the guard exists to prevent.
+
+Try the in-flight step first (in_progress + gc.step_ref, which resolves
+gcp-yhzp against live bd), and keep `gc bd ready` as the fallback for the
+next open step. The fallback must stay blocker-aware: an `open` step whose
+predecessor has not closed is not runnable, and taking it from a bare
+`gc bd list` would skip the step in between.
+
+Also scopes the suite's convoy-recovery assertion to the query it actually
+means. It was a file-wide `! grep -- '--status=in_progress '`, which conflated
+two different lookups — the convoy recovery, whose held step bead is stored
+`open` so in_progress alone matches nothing, and this new one, where
+in_progress alone is exactly right. It now asserts --status=open,in_progress
+on the ROOT_BEAD_ID statement itself, in both the prompt and the fragment.
+
+Both new assertions were mutation-checked: each fails red when the behavior
+it pins is reverted, and passes green when restored.
+---
+ gastown/agents/polecat/prompt.template.md | 26 ++++++++++----
+ gastown/tests/test_gastown_pack_assets.sh | 42 ++++++++++++++++++++---
+ 2 files changed, 58 insertions(+), 10 deletions(-)
+
+diff --git a/gastown/agents/polecat/prompt.template.md b/gastown/agents/polecat/prompt.template.md
+index ee46623..e08ad0d 100644
+--- a/gastown/agents/polecat/prompt.template.md
++++ b/gastown/agents/polecat/prompt.template.md
+@@ -257,10 +257,23 @@ fi
+ # resumed as the patrol wisp on every restart.)
+ STEP_REF="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].metadata."gc.step_ref" // empty' 2>/dev/null)"
+ if [ -z "$STEP_REF" ]; then
+-  # Tier 2 of the same work query, filtered to formula steps in jq rather than
+-  # by a flag, so this stays readable on any bd the hook itself can drive.
+-  NEXT_STEP_ID="$(gc bd ready --assignee="$EXPECTED_ASSIGNEE" --limit=0 --json 2>/dev/null |
+-    jq -r '[.[] | select((.metadata."gc.step_ref" // "") != "")] | .[0].id // empty' 2>/dev/null)"
++  # An in-flight step comes first. `gc bd ready` is blocker-aware but EXCLUDES
++  # in_progress, so it cannot see a step this session already claimed — and the
++  # hook's recovery tier (`--status in_progress --assignee=<you> --limit=1`)
++  # matches BOTH that step and the held work bead, returning either one. Land on
++  # the work bead with `bd ready` as the only fallback and the re-point finds
++  # nothing, which is the stall it exists to prevent. Resume the claimed step.
++  NEXT_STEP_ID="$(gc bd list --assignee="$EXPECTED_ASSIGNEE" --status=in_progress \
++    --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null |
++    jq -r '.[0].id // empty' 2>/dev/null)"
++  # Otherwise take the next step the molecule has actually unblocked. This one
++  # must stay blocker-aware — an `open` step whose predecessor has not closed is
++  # not runnable, and jumping to it skips the step in between. Filtered to
++  # formula steps in jq rather than by a flag, so this stays readable on any bd
++  # the hook itself can drive.
++  [ -n "$NEXT_STEP_ID" ] ||
++    NEXT_STEP_ID="$(gc bd ready --assignee="$EXPECTED_ASSIGNEE" --limit=0 --json 2>/dev/null |
++      jq -r '[.[] | select((.metadata."gc.step_ref" // "") != "")] | .[0].id // empty' 2>/dev/null)"
+   if [ -n "$NEXT_STEP_ID" ] && [ "$NEXT_STEP_ID" != "$WORK_ID" ]; then
+     gc bd update "$NEXT_STEP_ID" --claim >/dev/null 2>&1 \
+       || echo "WARN could not claim step bead $NEXT_STEP_ID; it is already assigned to this session, so executing it anyway"
+@@ -270,8 +283,9 @@ if [ -z "$STEP_REF" ]; then
+     [ -n "$SHOW_JSON" ] ||
+       echo "WARN could not re-read $WORK_ID; run 'gc bd show $WORK_ID' before you start the step"
+   fi
+-  # No ready step means the molecule has nothing runnable right now: keep the
+-  # work bead, read your formula steps, and let the done sequence decide.
++  # Neither query matching means the molecule has nothing runnable right now:
++  # keep the work bead, read your formula steps, and let the done sequence
++  # decide.
+ fi
+ 
+ # Stamp a stable session identity so the churn-watcher and the resume re-verify
+diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
+index 959ef32..8637e05 100755
+--- a/gastown/tests/test_gastown_pack_assets.sh
++++ b/gastown/tests/test_gastown_pack_assets.sh
+@@ -663,10 +663,23 @@ PY
+             fail "$(basename "$guard") must not read the convoy straight from \$GC_BEAD_ID; it is not always exported"
+         grep -F 'gc.root_bead_id' "$guard" >/dev/null ||
+             fail "$(basename "$guard") must recover the convoy from the step bead's molecule root"
+-        grep -F -- '--status=open,in_progress' "$guard" >/dev/null ||
+-            fail "$(basename "$guard") must query the held step bead with --status=open,in_progress"
+-        ! grep -F -- '--status=in_progress ' "$guard" >/dev/null ||
+-            fail "$(basename "$guard") queries a claimed step bead, which is stored open, not in_progress"
++        # Scoped to the convoy-recovery query itself. This used to be a
++        # file-wide `! grep -- '--status=in_progress '`, which conflated two
++        # different lookups: the startup claim block legitimately resolves an
++        # in-flight, hook-claimed step with in_progress ALONE (adding `open`
++        # there would let it jump to a step whose predecessor has not closed).
++        # The invariant that actually matters is local to this query — the step
++        # bead it recovers the convoy from is stored `open`, so in_progress
++        # alone matches nothing and the recovery silently yields no convoy.
++        python3 - "$guard" <<'PY' || fail "$(basename "$guard") must recover the convoy's held step bead with --status=open,in_progress; a pool-assigned step bead is stored open, so in_progress alone matches nothing"
++import sys
++
++text = open(sys.argv[1], encoding="utf-8").read()
++start = text.index("ROOT_BEAD_ID=$(gc bd list")
++query = text[start:text.index("CONVOY_ID=$(gc bd show", start)]
++if "--status=open,in_progress" not in query:
++    raise SystemExit(1)
++PY
+         ! grep -F '[ "$WORK_STATUS" != "in_progress" ]' "$guard" >/dev/null ||
+             fail "$(basename "$guard") must not treat an unassigned work bead as already submitted"
+         grep -F '[ "$WORK_STATUS" = "closed" ]' "$guard" >/dev/null ||
+@@ -765,6 +778,27 @@ PY
+         fail "the startup claim block must detect a hook result that is not a formula step"
+     grep -F 'STEP_REPOINTED' "$prompt" >/dev/null ||
+         fail "the startup claim block must re-point at the molecule's next ready step"
++
++    # `gc bd ready` is blocker-aware but EXCLUDES in_progress, so on its own it
++    # cannot see a step this session already claimed. The hook's recovery tier
++    # matches the in-flight step AND the held work bead and returns either, so a
++    # ready-only re-point silently finds nothing on the work-bead outcome — the
++    # stall it exists to prevent. Resume the claimed step before falling back.
++    python3 - "$prompt" <<'PY' || fail "the step re-point must look for an in_progress step bead before falling back to the blocker-aware bd ready query"
++import sys
++
++text = open(sys.argv[1], encoding="utf-8").read()
++block = text[text.index("bash <<'GC_CLAIM'"): text.index("GC_CLAIM\n```")]
++inflight = block.index('--status=in_progress \\\n    --has-metadata-key gc.step_ref')
++if inflight >= block.index("gc bd ready --assignee="):
++    raise SystemExit(1)
++PY
++
++    # The fallback must stay `gc bd ready`, not a bare `gc bd list` over open
++    # steps: an `open` step whose predecessor has not closed is not runnable,
++    # and jumping to it skips the step in between.
++    [[ "$(grep -c -F 'gc bd ready --assignee=' "$prompt")" == "1" ]] ||
++        fail "the step re-point's fallback must remain the single blocker-aware gc bd ready query"
+     python3 - "$prompt" <<'PY' || fail "the step re-point must run before the polecat_session stamp, so the stamp lands on the bead actually being executed"
+ import sys
+ 
+-- 
+2.50.1 (Apple Git-155)
+

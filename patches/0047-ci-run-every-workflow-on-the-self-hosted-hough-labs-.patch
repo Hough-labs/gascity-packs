@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 28 Aug 2026 14:08:56 -0400
-Subject: [PATCH 47/59] ci: run every workflow on the self-hosted
+Subject: [PATCH 47/63] ci: run every workflow on the self-hosted
  hough-labs-k3s runner (gcp-3d7n)
 
 All five workflow files targeted Blacksmith's hosted runners -- six `runs-on`
