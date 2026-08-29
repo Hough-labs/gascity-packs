@@ -257,10 +257,23 @@ fi
 # resumed as the patrol wisp on every restart.)
 STEP_REF="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].metadata."gc.step_ref" // empty' 2>/dev/null)"
 if [ -z "$STEP_REF" ]; then
-  # Tier 2 of the same work query, filtered to formula steps in jq rather than
-  # by a flag, so this stays readable on any bd the hook itself can drive.
-  NEXT_STEP_ID="$(gc bd ready --assignee="$EXPECTED_ASSIGNEE" --limit=0 --json 2>/dev/null |
-    jq -r '[.[] | select((.metadata."gc.step_ref" // "") != "")] | .[0].id // empty' 2>/dev/null)"
+  # An in-flight step comes first. `gc bd ready` is blocker-aware but EXCLUDES
+  # in_progress, so it cannot see a step this session already claimed — and the
+  # hook's recovery tier (`--status in_progress --assignee=<you> --limit=1`)
+  # matches BOTH that step and the held work bead, returning either one. Land on
+  # the work bead with `bd ready` as the only fallback and the re-point finds
+  # nothing, which is the stall it exists to prevent. Resume the claimed step.
+  NEXT_STEP_ID="$(gc bd list --assignee="$EXPECTED_ASSIGNEE" --status=in_progress \
+    --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null |
+    jq -r '.[0].id // empty' 2>/dev/null)"
+  # Otherwise take the next step the molecule has actually unblocked. This one
+  # must stay blocker-aware — an `open` step whose predecessor has not closed is
+  # not runnable, and jumping to it skips the step in between. Filtered to
+  # formula steps in jq rather than by a flag, so this stays readable on any bd
+  # the hook itself can drive.
+  [ -n "$NEXT_STEP_ID" ] ||
+    NEXT_STEP_ID="$(gc bd ready --assignee="$EXPECTED_ASSIGNEE" --limit=0 --json 2>/dev/null |
+      jq -r '[.[] | select((.metadata."gc.step_ref" // "") != "")] | .[0].id // empty' 2>/dev/null)"
   if [ -n "$NEXT_STEP_ID" ] && [ "$NEXT_STEP_ID" != "$WORK_ID" ]; then
     gc bd update "$NEXT_STEP_ID" --claim >/dev/null 2>&1 \
       || echo "WARN could not claim step bead $NEXT_STEP_ID; it is already assigned to this session, so executing it anyway"
@@ -270,8 +283,9 @@ if [ -z "$STEP_REF" ]; then
     [ -n "$SHOW_JSON" ] ||
       echo "WARN could not re-read $WORK_ID; run 'gc bd show $WORK_ID' before you start the step"
   fi
-  # No ready step means the molecule has nothing runnable right now: keep the
-  # work bead, read your formula steps, and let the done sequence decide.
+  # Neither query matching means the molecule has nothing runnable right now:
+  # keep the work bead, read your formula steps, and let the done sequence
+  # decide.
 fi
 
 # Stamp a stable session identity so the churn-watcher and the resume re-verify

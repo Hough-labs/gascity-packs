@@ -663,10 +663,23 @@ PY
             fail "$(basename "$guard") must not read the convoy straight from \$GC_BEAD_ID; it is not always exported"
         grep -F 'gc.root_bead_id' "$guard" >/dev/null ||
             fail "$(basename "$guard") must recover the convoy from the step bead's molecule root"
-        grep -F -- '--status=open,in_progress' "$guard" >/dev/null ||
-            fail "$(basename "$guard") must query the held step bead with --status=open,in_progress"
-        ! grep -F -- '--status=in_progress ' "$guard" >/dev/null ||
-            fail "$(basename "$guard") queries a claimed step bead, which is stored open, not in_progress"
+        # Scoped to the convoy-recovery query itself. This used to be a
+        # file-wide `! grep -- '--status=in_progress '`, which conflated two
+        # different lookups: the startup claim block legitimately resolves an
+        # in-flight, hook-claimed step with in_progress ALONE (adding `open`
+        # there would let it jump to a step whose predecessor has not closed).
+        # The invariant that actually matters is local to this query — the step
+        # bead it recovers the convoy from is stored `open`, so in_progress
+        # alone matches nothing and the recovery silently yields no convoy.
+        python3 - "$guard" <<'PY' || fail "$(basename "$guard") must recover the convoy's held step bead with --status=open,in_progress; a pool-assigned step bead is stored open, so in_progress alone matches nothing"
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+start = text.index("ROOT_BEAD_ID=$(gc bd list")
+query = text[start:text.index("CONVOY_ID=$(gc bd show", start)]
+if "--status=open,in_progress" not in query:
+    raise SystemExit(1)
+PY
         ! grep -F '[ "$WORK_STATUS" != "in_progress" ]' "$guard" >/dev/null ||
             fail "$(basename "$guard") must not treat an unassigned work bead as already submitted"
         grep -F '[ "$WORK_STATUS" = "closed" ]' "$guard" >/dev/null ||
@@ -765,6 +778,27 @@ PY
         fail "the startup claim block must detect a hook result that is not a formula step"
     grep -F 'STEP_REPOINTED' "$prompt" >/dev/null ||
         fail "the startup claim block must re-point at the molecule's next ready step"
+
+    # `gc bd ready` is blocker-aware but EXCLUDES in_progress, so on its own it
+    # cannot see a step this session already claimed. The hook's recovery tier
+    # matches the in-flight step AND the held work bead and returns either, so a
+    # ready-only re-point silently finds nothing on the work-bead outcome — the
+    # stall it exists to prevent. Resume the claimed step before falling back.
+    python3 - "$prompt" <<'PY' || fail "the step re-point must look for an in_progress step bead before falling back to the blocker-aware bd ready query"
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+block = text[text.index("bash <<'GC_CLAIM'"): text.index("GC_CLAIM\n```")]
+inflight = block.index('--status=in_progress \\\n    --has-metadata-key gc.step_ref')
+if inflight >= block.index("gc bd ready --assignee="):
+    raise SystemExit(1)
+PY
+
+    # The fallback must stay `gc bd ready`, not a bare `gc bd list` over open
+    # steps: an `open` step whose predecessor has not closed is not runnable,
+    # and jumping to it skips the step in between.
+    [[ "$(grep -c -F 'gc bd ready --assignee=' "$prompt")" == "1" ]] ||
+        fail "the step re-point's fallback must remain the single blocker-aware gc bd ready query"
     python3 - "$prompt" <<'PY' || fail "the step re-point must run before the polecat_session stamp, so the stamp lands on the bead actually being executed"
 import sys
 
