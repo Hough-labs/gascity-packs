@@ -141,6 +141,10 @@ without catching the mismatch (upstream #1833).
 # --status=open,in_progress, never open alone (gcp-s14g): a bead routed here
 # with a branch and no close is unfinished merge work whatever its status, and
 # an open-only scan hides exactly the beads this fallback exists to catch.
+# This is a REPORT, not a claim: it names candidates and changes nothing. The
+# claiming version of the same scan lives in `mol-refinery-patrol` step
+# `find-work`, which runs every pass and converts routed -> assigned. Do not
+# turn this loop into a merge path (gcp-mi9t).
 ORPHANS=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --metadata-field gc.routed_to="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}refinery" --status=open,in_progress --json 2>/dev/null \
   | jq -r '.[] | select(.metadata.branch != null) | .id')
 for ORPHAN in $ORPHANS; do
@@ -331,7 +335,7 @@ alert the witness, not `gc mail send`.
 | Pour next wisp | Run `mol-refinery-patrol` step `next-iteration`, section 2. The bare `gc bd mol wisp` call under Startup is the cold-start bootstrap only — it skips the validate/assign/burn ordering. |
 | Burn current wisp | Follow Patrol Lifecycle Discipline Rule 1: pour next wisp, validate `NEXT`, assign it to `$GC_AGENT`, then burn `$CURRENT_WISP`. Never run a standalone burn. |
 | Reject a bead to the pool | Run `mol-refinery-patrol` step `rebase` (conflict) or `handle-failures` (test failure). The update must set `gc.routed_to` or the bead is silently orphaned. |
-| Find assigned work | `gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee="$GC_AGENT" --status=open,in_progress` (never `--status=open` alone — an `in_progress` bead with a branch is merge work, and an open-only scan hides it forever) |
+| Find work | Run `mol-refinery-patrol` step `find-work`. It scans assigned work AND `gc.routed_to=<self>` with no assignee, claiming the latter under `$GC_AGENT`; a one-line copy of only the assignee half is how routed work went unseen for hours (gcp-mi9t). Never `--status=open` alone either — an `in_progress` bead with a branch is merge work, and an open-only scan hides it forever (gcp-s14g). |
 | Snapshot event position | `gc events --seq` |
 | Wait for assignment | `gc events --watch --type=bead.updated --after=$SEQ` |
 | Read work metadata | `gc bd show $WORK --json \| jq '.[0].metadata'` |

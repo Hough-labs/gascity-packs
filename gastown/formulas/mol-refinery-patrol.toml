@@ -204,11 +204,27 @@ needs = ["check-inbox"]
 description = """
 **Config: event_timeout = {{event_timeout}}**
 
-Search for work beads assigned to you with branch metadata:
+Search for work beads assigned to you, then for work merely routed to you:
 ```bash
 # --- find-work-query:begin ---
+REFINERY_SELF="${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery"
 WORK=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee=$GC_AGENT --status=open,in_progress \
   --exclude-type=epic --has-metadata-key=branch --limit=1 --json | jq -r '.[0].id // empty')
+if [ -z "$WORK" ]; then
+  ROUTED=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --no-assignee --status=open,in_progress \
+    --exclude-type=epic --has-metadata-key=branch \
+    --metadata-field gc.routed_to="$REFINERY_SELF" --limit=1 --json | jq -r '.[0].id // empty')
+  if [ -n "$ROUTED" ]; then
+    gc bd update "$ROUTED" --assignee="$GC_AGENT" --status=in_progress \
+      --set-metadata gc.routed_to=""
+    CLAIMED=$(gc bd show "$ROUTED" --json | jq -r '.[0].assignee // empty')
+    if [ "$CLAIMED" = "$GC_AGENT" ]; then
+      WORK=$ROUTED
+    else
+      echo "SKIP $ROUTED: routed to me, but the claim read back as '$CLAIMED'. Not mine; leaving it."
+    fi
+  fi
+fi
 # --- find-work-query:end ---
 ```
 
@@ -240,6 +256,39 @@ short-circuit (ancestor + `fork_sha` commit count) closes a branch that
 previously landed, and the false-completion guard refuses a branch that
 introduces no change. Status was never the thing protecting that; it was only
 hiding the work.
+
+**The second query — `gc.routed_to=<self>` with no assignee (gcp-mi9t).** A
+bead carrying `gc.routed_to=<rig>/{{binding_prefix}}refinery` and no assignee
+is real merge work that the assignee scan cannot see, and nothing else in the
+town converts it. For a POOL role that shape is correct and self-healing: the
+supervisor's scale check spawns a claimer, which assigns the bead to itself.
+The refinery is a singleton patrol with no such path, so a routed-unassigned
+bead sits until a human names its id in a nudge (observed: th-lm5n ~72min,
+th-albz ~31min — rescued by hand, which is not a mechanism). This query is
+that missing conversion.
+
+It is deliberately narrow, because a widened find-work scan is how a merge
+queue starts stealing live work:
+
+- **`--no-assignee`.** A bead routed to the refinery but assigned to somebody
+  else — an operator parking it, a polecat mid-implementation — is not yours.
+  The assignee field, not the routing hint, decides ownership.
+- **It runs only when the assignee scan came back empty.** Assigned work
+  always wins, and the common path pays no extra query.
+- **The claim is verified by read-back, not assumed.** The write is followed
+  by a `gc bd show` that must report `$GC_AGENT`; anything else means another
+  writer got there first and the candidate is dropped for this pass, not
+  merged.
+
+**Claim by writing `--assignee="$GC_AGENT"`, NOT with the `--claim` flag.**
+`gc bd update --claim` sets the assignee to `$BEADS_ACTOR`, which is the runtime *session
+name* (`gastown__refinery-gc-xxxx`), not the canonical role identity every
+other query in this formula and in the refinery prompt scans on. Claiming that
+way would hand the bead an assignee the primary query above cannot match, so a
+crash mid-merge would re-hide the bead behind a dead session's name — the exact
+invisibility this step exists to remove. Clearing `gc.routed_to` in the same
+write completes the conversion: the bead is now assigned work, and the routed
+scan must not keep offering it.
 
 If found: read the bead metadata to confirm it has a branch:
 ```bash

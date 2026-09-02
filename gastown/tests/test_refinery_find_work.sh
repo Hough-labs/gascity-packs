@@ -16,9 +16,18 @@
 # These tests never assert the fix by grepping the flag alone — a flag string
 # proves nothing about which beads come back. The shipped query text is
 # extracted from the formula between its sentinels and EXECUTED against a stub
-# `gc bd list` that filters a fixture the way the real one does, so a
-# regression to an open-only scan shows up here as "the in_progress bead was
-# not found" rather than as a silent queue stall in production.
+# that filters a fixture the way the real store does, so a regression to an
+# open-only scan shows up here as "the in_progress bead was not found" rather
+# than as a silent queue stall in production.
+#
+# The second half of the contract is gcp-mi9t: the scan was assignee-only, so a
+# bead carrying `gc.routed_to=<rig>/gastown.refinery` with NO assignee was
+# invisible. For a pool role that shape self-heals (the supervisor spawns a
+# claimer); the refinery is a singleton patrol with no such path, so such beads
+# sat until a human named their ids in a nudge (th-lm5n ~72min, th-albz
+# ~31min). The step now converts routed -> assigned itself. The stub models the
+# write and the read-back, so "found it" and "claimed it under the identity the
+# primary scan can see" are separate, executed assertions.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -35,12 +44,24 @@ fail() {
 
 # The block under test is the shipped formula text, extracted between its
 # sentinels — not a transcription that could drift from what the refinery runs.
+#
+# Formula placeholders are substituted from the formula's own [vars] defaults,
+# because the block now composes the refinery's identity from
+# {{binding_prefix}} and an unsubstituted "{{...}}" would silently make every
+# routed lookup miss. Callers may override one var (used to exercise both the
+# bound "gastown." binding this rig ships and the unbound default). Any
+# placeholder left over after substitution is a hard error: a future edit that
+# reaches for a var this harness cannot supply fails here rather than passing
+# vacuously.
+#
+# Usage: extract_find_work_query <outfile> [var] [value]
 extract_find_work_query() {
-    python3 - "$FORMULA" "$1" <<'PY'
+    python3 - "$FORMULA" "$1" "${2:-}" "${3:-}" <<'PY'
+import re
 import sys
 import tomllib
 
-formula, out = sys.argv[1], sys.argv[2]
+formula, out, override_var, override_value = sys.argv[1:5]
 begin = "# --- find-work-query:begin ---"
 end = "# --- find-work-query:end ---"
 
@@ -55,82 +76,195 @@ blocks = [
 if len(blocks) != 1:
     sys.exit(f"expected exactly one find-work-query block, found {len(blocks)}")
 
+block = blocks[0]
+values = {name: spec.get("default", "") for name, spec in (doc.get("vars") or {}).items()}
+if override_var:
+    if override_var not in values:
+        sys.exit(f"{override_var!r} is not a declared var of this formula")
+    values[override_var] = override_value
+for name, value in values.items():
+    block = block.replace("{{%s}}" % name, value)
+
+leftover = sorted(set(re.findall(r"\{\{[^}]*\}\}", block)))
+if leftover:
+    sys.exit(f"find-work-query block has unsubstituted placeholders: {leftover}")
+
 with open(out, "w") as handle:
-    handle.write(blocks[0])
+    handle.write(block)
 PY
 }
 
-# Stub `gc` implementing just enough of `bd list` to answer the shipped query. # gc-bd-argv-tail: prose, not an invocation
-# It models assignee equality, a comma-separated status filter,
-# --has-metadata-key, --exclude-type, and --limit. Anything else is an error, so
-# a query that grows a flag this stub does not model fails loudly instead of
-# passing vacuously.
+# Stub `gc` implementing just enough of the beads CLI to answer the shipped
+# query: a list filter, the claiming write, and the read-back. It models
+# assignee equality, --no-assignee, a comma-separated status filter,
+# --has-metadata-key, --metadata-field, --exclude-type and --limit. Anything
+# else is an error, so a query that grows a flag this stub does not model fails
+# loudly instead of passing vacuously.
+#
+# The write really mutates the fixture, so the read-back the shipped block
+# performs is a genuine read of what the write left behind — not a stub that
+# agrees with itself. GC_STUB_CLAIM_HIJACK simulates another writer winning the
+# race: the write lands under that identity instead, and the block must decline
+# the bead.
 write_gc_stub() {
     local dir="$1"
     cat >"$dir/gc" <<'STUB'
 #!/usr/bin/env bash
-if [ "${1:-}" != "bd" ] || [ "${2:-}" != "list" ]; then
+if [ "${1:-}" != "bd" ]; then
     echo "stub gc: unexpected invocation: $*" >&2
     exit 64
 fi
+verb="${2:-}"
 shift 2
-printf '%s\n' "$*" >>"$GC_STUB_LOG"
-exec python3 "$GC_STUB_FILTER" "$GC_STUB_FIXTURE" "$@"
+printf '%s %s\n' "$verb" "$*" >>"$GC_STUB_LOG"
+case "$verb" in
+    list|update|show) exec python3 "$GC_STUB_FILTER" "$verb" "$GC_STUB_FIXTURE" "$@" ;;
+    *) echo "stub gc: unmodelled beads subcommand: $verb" >&2; exit 64 ;;
+esac
 STUB
     chmod +x "$dir/gc"
 
     cat >"$dir/filter.py" <<'PY'
 import json
+import os
 import sys
 
-fixture, *args = sys.argv[1:]
+verb, fixture, *args = sys.argv[1:]
 with open(fixture) as handle:
     beads = json.load(handle)
 
-assignee = None
-statuses = None
-metadata_key = None
-excluded_types = set()
-limit = None
 
-for arg in args:
-    if arg == "--json":
-        continue
-    if arg.startswith("--rig="):
-        continue
-    if arg.startswith("--assignee="):
-        assignee = arg.split("=", 1)[1]
-    elif arg.startswith("--status="):
-        statuses = set(arg.split("=", 1)[1].split(","))
-    elif arg.startswith("--has-metadata-key="):
-        metadata_key = arg.split("=", 1)[1]
-    elif arg.startswith("--exclude-type="):
-        excluded_types.update(arg.split("=", 1)[1].split(","))
-    elif arg.startswith("--limit="):
-        limit = int(arg.split("=", 1)[1])
-    else:
-        sys.exit(f"stub gc bd list: unmodelled flag {arg!r}")
+def flags(argv):
+    """Yield (name, value) for both --flag=value and `--flag value` forms."""
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if not arg.startswith("--"):
+            yield None, arg
+            index += 1
+            continue
+        if "=" in arg:
+            name, value = arg.split("=", 1)
+            yield name, value
+            index += 1
+            continue
+        # A valueless flag is followed by its value unless the next token is
+        # itself a flag. --json and --no-assignee take no value.
+        if arg in ("--json", "--no-assignee"):
+            yield arg, None
+            index += 1
+            continue
+        if index + 1 >= len(argv):
+            sys.exit(f"stub gc: flag {arg!r} is missing its value")
+        yield arg, argv[index + 1]
+        index += 2
 
-# `bd list` hides closed issues unless asked. # gc-bd-argv-tail: prose, not an invocation
-# The stub mirrors that so a query cannot appear to work by sweeping closed
-# beads back into the queue.
-matched = [
-    bead
-    for bead in beads
-    if bead.get("status") != "closed"
-    and (assignee is None or bead.get("assignee") == assignee)
-    and (statuses is None or bead.get("status") in statuses)
-    and (metadata_key is None or (bead.get("metadata") or {}).get(metadata_key))
-    and bead.get("issue_type") not in excluded_types
-]
-if limit:
-    matched = matched[:limit]
-print(json.dumps(matched))
+
+def emit(matched):
+    print(json.dumps(matched))
+
+
+if verb == "list":
+    assignee = None
+    no_assignee = False
+    statuses = None
+    metadata_key = None
+    metadata_fields = {}
+    excluded_types = set()
+    limit = None
+    for name, value in flags(args):
+        if name in ("--json", None):
+            continue
+        if name == "--rig":
+            continue
+        elif name == "--assignee":
+            assignee = value
+        elif name == "--no-assignee":
+            no_assignee = True
+        elif name == "--status":
+            statuses = set(value.split(","))
+        elif name == "--has-metadata-key":
+            metadata_key = value
+        elif name == "--metadata-field":
+            key, _, expected = value.partition("=")
+            metadata_fields[key] = expected
+        elif name == "--exclude-type":
+            excluded_types.update(value.split(","))
+        elif name == "--limit":
+            limit = int(value)
+        else:
+            sys.exit(f"stub gc list: unmodelled flag {name!r}")
+
+    # The real list hides closed issues unless asked. The stub mirrors that so a
+    # query cannot appear to work by sweeping closed beads back into the queue.
+    matched = [
+        bead
+        for bead in beads
+        if bead.get("status") != "closed"
+        and (assignee is None or bead.get("assignee") == assignee)
+        and (not no_assignee or not bead.get("assignee"))
+        and (statuses is None or bead.get("status") in statuses)
+        and (metadata_key is None or (bead.get("metadata") or {}).get(metadata_key))
+        and all(
+            (bead.get("metadata") or {}).get(key) == expected
+            for key, expected in metadata_fields.items()
+        )
+        and bead.get("issue_type") not in excluded_types
+    ]
+    if limit:
+        matched = matched[:limit]
+    emit(matched)
+
+elif verb == "show":
+    bead_id = None
+    for name, value in flags(args):
+        if name is None:
+            bead_id = value
+        elif name == "--json":
+            continue
+        else:
+            sys.exit(f"stub gc show: unmodelled flag {name!r}")
+    emit([bead for bead in beads if bead.get("id") == bead_id])
+
+elif verb == "update":
+    bead_id = None
+    updates = {}
+    metadata_updates = {}
+    for name, value in flags(args):
+        if name is None:
+            bead_id = value
+        elif name in ("--assignee", "--status"):
+            updates[name.lstrip("-")] = value
+        elif name == "--set-metadata":
+            key, _, new_value = value.partition("=")
+            metadata_updates[key] = new_value
+        else:
+            sys.exit(f"stub gc update: unmodelled flag {name!r}")
+
+    hijack = os.environ.get("GC_STUB_CLAIM_HIJACK", "")
+    if hijack and "assignee" in updates:
+        updates["assignee"] = hijack
+
+    target = next((bead for bead in beads if bead.get("id") == bead_id), None)
+    if target is None:
+        sys.exit(f"stub gc update: no such bead {bead_id!r}")
+    target.update(updates)
+    metadata = target.setdefault("metadata", {})
+    for key, new_value in metadata_updates.items():
+        if new_value:
+            metadata[key] = new_value
+        else:
+            metadata.pop(key, None)
+    with open(fixture, "w") as handle:
+        json.dump(beads, handle)
+
+else:
+    sys.exit(f"stub gc: unmodelled subcommand {verb!r}")
 PY
 }
 
 bead() {
-    # bead <id> <status> <assignee> [branch] [type]
+    # bead <id> <status> <assignee> [branch] [type] [routed_to]
     python3 - "$@" <<'PY'
 import json
 import sys
@@ -138,38 +272,72 @@ import sys
 bead_id, status, assignee = sys.argv[1:4]
 branch = sys.argv[4] if len(sys.argv) > 4 else ""
 issue_type = sys.argv[5] if len(sys.argv) > 5 else "task"
+routed_to = sys.argv[6] if len(sys.argv) > 6 else ""
+metadata = {}
+if branch:
+    metadata["branch"] = branch
+if routed_to:
+    metadata["gc.routed_to"] = routed_to
 print(json.dumps({
     "id": bead_id,
     "status": status,
     "assignee": assignee,
     "issue_type": issue_type,
-    "metadata": {"branch": branch} if branch else {},
+    "metadata": metadata,
 }))
 PY
 }
 
 # Run the shipped query against a fixture and echo the WORK it resolves.
+#
+# The block's own diagnostics go to $TMP/run.log rather than into the captured
+# value, so a step that declines a bead and says why cannot be mistaken for a
+# step that resolved one. $TMP/fixture.json is left holding whatever the block
+# wrote to it, which is how the claim is asserted.
+#
+# Usage: run_find_work <fixture-json> <agent> [rig] [block] [claim-hijack]
 run_find_work() {
     local fixture_json="$1"
     local agent="$2"
     local rig="${3:-}"
+    local script="${4:-$TMP/find-work.sh}"
+    local hijack="${5:-}"
     local out
 
     printf '%s' "$fixture_json" >"$TMP/fixture.json"
     : >"$TMP/stub.log"
+    : >"$TMP/run.log"
     out=$(
         PATH="$TMP/bin:$PATH" \
         GC_STUB_FIXTURE="$TMP/fixture.json" \
         GC_STUB_FILTER="$TMP/bin/filter.py" \
         GC_STUB_LOG="$TMP/stub.log" \
+        GC_STUB_CLAIM_HIJACK="$hijack" \
         GC_AGENT="$agent" \
         GC_RIG="$rig" \
-            bash -c 'set -uo pipefail; . "$1"; printf "%s" "$WORK"' _ "$TMP/find-work.sh" 2>&1
+            bash -c 'set -uo pipefail; . "$1" >"$2" 2>&1; printf "%s" "$WORK"' \
+                _ "$script" "$TMP/run.log"
     ) || {
-        echo "__ERROR__ $out"
+        echo "__ERROR__ $(cat "$TMP/run.log")"
         return
     }
+    if grep -q "^stub gc" "$TMP/run.log"; then
+        echo "__ERROR__ $(cat "$TMP/run.log")"
+        return
+    fi
     printf '%s' "$out"
+}
+
+# The assignee the fixture bead ended up with after the block ran.
+claimed_assignee() {
+    python3 -c 'import json,sys; print(next((b["assignee"] for b in json.load(open(sys.argv[1])) if b["id"] == sys.argv[2]), "__missing__"))' \
+        "$TMP/fixture.json" "$1"
+}
+
+# The value of one metadata key on the fixture bead after the block ran.
+claimed_metadata() {
+    python3 -c 'import json,sys; print(next((b.get("metadata", {}).get(sys.argv[3], "") for b in json.load(open(sys.argv[1])) if b["id"] == sys.argv[2]), "__missing__"))' \
+        "$TMP/fixture.json" "$1" "$2"
 }
 
 fixture() {
@@ -272,6 +440,151 @@ test_open_only_scans_are_not_reintroduced() {
         fail "the refinery orphan scan must not regress to an open-only filter"
 }
 
+# ── gcp-mi9t: routed-but-unassigned work ─────────────────────────────────────
+# REFINERY is the identity this rig's refinery actually runs under: the gastown
+# pack is imported with binding_prefix "gastown.", so gc.routed_to values name
+# "<rig>/gastown.refinery". BOUND_ONLY re-extracts the shipped block under that
+# binding; the declared default ("" — the pack unbound) is exercised separately
+# by test_routed_scan_composes_its_identity_from_the_binding.
+REFINERY="winnow/gastown.refinery"
+
+test_routed_but_unassigned_bead_is_found_and_claimed() {
+    # The gcp-mi9t regression. Nothing in the town converts routed -> assigned
+    # for a singleton patrol, so before this the bead was invisible forever.
+    local got
+    got=$(run_find_work \
+        "$(fixture "$(bead winnow-th5n open "" polecat/winnow-th5n task "$REFINERY")")" \
+        "$REFINERY" winnow "$BOUND_ONLY")
+    [[ "$got" == "winnow-th5n" ]] ||
+        fail "a routed, unassigned bead with metadata.branch must be found, got '$got'"
+
+    # Found is not enough: it must be converted to assigned work, or the next
+    # patrol pass re-discovers it and the crash path re-hides it.
+    local assignee
+    assignee=$(claimed_assignee winnow-th5n)
+    [[ "$assignee" == "$REFINERY" ]] ||
+        fail "the claim must write the role identity the primary scan matches, got '$assignee'"
+
+    # The routing hint has done its job; leaving it makes the bead look like
+    # unclaimed demand to anything else reading routed_to.
+    local routed
+    routed=$(claimed_metadata winnow-th5n gc.routed_to)
+    [[ -z "$routed" ]] ||
+        fail "the claim must clear gc.routed_to, got '$routed'"
+}
+
+test_routed_scan_does_not_claim_with_the_session_identity() {
+    # `--claim` would write $BEADS_ACTOR (a session name like
+    # gastown__refinery-gc-xxxx), which --assignee=$GC_AGENT cannot match, so a
+    # crash mid-merge would re-hide the bead behind a dead session's name.
+    run_find_work \
+        "$(fixture "$(bead winnow-th5n open "" polecat/winnow-th5n task "$REFINERY")")" \
+        "$REFINERY" winnow "$BOUND_ONLY" >/dev/null
+    ! grep -E '^update .*--claim( |$)' "$TMP/stub.log" >/dev/null ||
+        fail "the claim must name \$GC_AGENT explicitly, not inherit the session actor"
+    # Anchored to an `update` line: the list queries carry --assignee too, so an
+    # unanchored grep would pass without a claim ever being written.
+    grep -E "^update .*--assignee=$REFINERY( |$)" "$TMP/stub.log" >/dev/null ||
+        fail "the claim must write the canonical role identity"
+}
+
+test_a_lost_claim_race_yields_no_work() {
+    # Another writer got there first. The block reads back what the write
+    # actually left and must decline the bead rather than merging a branch it
+    # does not own.
+    local got
+    got=$(run_find_work \
+        "$(fixture "$(bead winnow-th5n open "" polecat/winnow-th5n task "$REFINERY")")" \
+        "$REFINERY" winnow "$BOUND_ONLY" winnow/gastown.furiosa)
+    [[ -z "$got" ]] ||
+        fail "a claim that read back under another identity must not become work, got '$got'"
+}
+
+test_routed_bead_assigned_to_someone_else_is_not_stolen() {
+    # A routing hint is not ownership: an operator parking a bead on a seat, or
+    # a polecat still holding it, both look like this.
+    local got
+    got=$(run_find_work \
+        "$(fixture "$(bead winnow-th5n open winnow/gastown.furiosa polecat/winnow-th5n task "$REFINERY")")" \
+        "$REFINERY" winnow "$BOUND_ONLY")
+    [[ -z "$got" ]] ||
+        fail "a routed bead held by another agent must not be claimed, got '$got'"
+}
+
+test_routed_bead_for_another_agent_is_ignored() {
+    local got
+    got=$(run_find_work \
+        "$(fixture "$(bead winnow-pool open "" polecat/winnow-pool task winnow/gastown.polecat)")" \
+        "$REFINERY" winnow "$BOUND_ONLY")
+    [[ -z "$got" ]] ||
+        fail "work routed to the polecat pool is not the refinery's, got '$got'"
+}
+
+test_routed_bead_without_branch_is_not_merge_work() {
+    local got
+    got=$(run_find_work \
+        "$(fixture "$(bead winnow-nobranch open "" "" task "$REFINERY")")" \
+        "$REFINERY" winnow "$BOUND_ONLY")
+    [[ -z "$got" ]] ||
+        fail "the routed scan must keep the branch requirement, got '$got'"
+}
+
+test_assigned_work_wins_and_the_routed_scan_is_not_consulted() {
+    # Assigned work is already yours; a second query would only widen the
+    # window in which the refinery can pick up something it should not.
+    local got
+    got=$(run_find_work \
+        "$(fixture \
+            "$(bead winnow-451o open "$REFINERY" polecat/winnow-451o)" \
+            "$(bead winnow-th5n open "" polecat/winnow-th5n task "$REFINERY")")" \
+        "$REFINERY" winnow "$BOUND_ONLY")
+    [[ "$got" == "winnow-451o" ]] ||
+        fail "assigned work must win over routed work, got '$got'"
+    ! grep -F -- "--metadata-field" "$TMP/stub.log" >/dev/null ||
+        fail "the routed scan must not run when the assignee scan already found work"
+    local assignee
+    assignee=$(claimed_assignee winnow-th5n)
+    [[ -z "$assignee" ]] ||
+        fail "the routed bead must be left untouched this pass, got '$assignee'"
+}
+
+test_routed_scan_composes_its_identity_from_the_binding() {
+    # The identity is built from {{binding_prefix}}, not hardcoded. Under the
+    # declared default (the pack unbound) the same block must look for
+    # "<rig>/refinery" — and must NOT match the bound spelling.
+    local got
+    got=$(run_find_work \
+        "$(fixture "$(bead winnow-unbound open "" polecat/winnow-unbound task winnow/refinery)")" \
+        winnow/refinery winnow "$TMP/find-work-unbound.sh")
+    [[ "$got" == "winnow-unbound" ]] ||
+        fail "the unbound binding must look for <rig>/refinery, got '$got'"
+
+    got=$(run_find_work \
+        "$(fixture "$(bead winnow-th5n open "" polecat/winnow-th5n task "$REFINERY")")" \
+        winnow/refinery winnow "$TMP/find-work-unbound.sh")
+    [[ -z "$got" ]] ||
+        fail "the unbound binding must not match a bound routed_to value, got '$got'"
+}
+
+test_routed_scan_is_rig_scoped_when_gc_rig_is_set() {
+    run_find_work \
+        "$(fixture "$(bead winnow-th5n open "" polecat/winnow-th5n task "$REFINERY")")" \
+        "$REFINERY" winnow "$BOUND_ONLY" >/dev/null
+    [[ $(grep -c -- '--rig=winnow' "$TMP/stub.log") -ge 2 ]] ||
+        fail "both find-work queries must scope to the rig database"
+}
+
+test_prompt_points_at_the_step_instead_of_restating_it() {
+    # A role prompt is injected as authoritative context; a formula step has to
+    # be opened deliberately. A quick-reference cell restating only the assignee
+    # half of find-work is the lossy copy an agent actually runs — the same
+    # drift class that once dropped gc.routed_to from the rejection flow.
+    grep -F 'gc.routed_to=<self>' "$REFINERY_PROMPT" >/dev/null ||
+        fail "the refinery prompt must name the routed half of find-work"
+    ! grep -E '^\| Find [^|]*\| `gc bd list' "$REFINERY_PROMPT" >/dev/null ||
+        fail "the prompt must point at the find-work step, not restate its query in a cell"
+}
+
 test_polecat_handoff_verifies_the_status_it_writes() {
     # The other half of gcp-s14g: the submit handoff writes --status=open and
     # that write was observed not to stick. It reads back and corrects once,
@@ -289,7 +602,11 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/gastown-find-work.XXXXXX") || exit 1
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/bin"
 write_gc_stub "$TMP/bin"
-extract_find_work_query "$TMP/find-work.sh" || exit 1
+# The shipped block under this rig's real binding, and under the formula's
+# declared default, so the identity it composes is tested both ways.
+BOUND_ONLY="$TMP/find-work.sh"
+extract_find_work_query "$TMP/find-work.sh" binding_prefix "gastown." || exit 1
+extract_find_work_query "$TMP/find-work-unbound.sh" || exit 1
 
 test_in_progress_bead_with_branch_is_found
 test_open_bead_with_branch_is_still_found
@@ -299,7 +616,17 @@ test_other_agents_in_progress_work_is_not_stolen
 test_epics_are_excluded
 test_empty_queue_yields_no_work
 test_query_is_rig_scoped_when_gc_rig_is_set
+test_routed_but_unassigned_bead_is_found_and_claimed
+test_routed_scan_does_not_claim_with_the_session_identity
+test_a_lost_claim_race_yields_no_work
+test_routed_bead_assigned_to_someone_else_is_not_stolen
+test_routed_bead_for_another_agent_is_ignored
+test_routed_bead_without_branch_is_not_merge_work
+test_assigned_work_wins_and_the_routed_scan_is_not_consulted
+test_routed_scan_composes_its_identity_from_the_binding
+test_routed_scan_is_rig_scoped_when_gc_rig_is_set
 test_open_only_scans_are_not_reintroduced
+test_prompt_points_at_the_step_instead_of_restating_it
 test_polecat_handoff_verifies_the_status_it_writes
 
 if [ "$FAILURES" -ne 0 ]; then
