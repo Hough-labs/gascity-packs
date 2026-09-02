@@ -321,6 +321,10 @@ run_on_main() {
         set +eu
         cd "$REPO" || exit 1
         BRANCH="$1"
+        # Step 3 compares against the rig's resolved default branch (the
+        # recover-orphaned-beads step resolves it up front, gcp-5ddt); these
+        # fixtures are cut on main.
+        DEFAULT_BRANCH=main
         ON_MAIN=
         { . "$STEP3"; } >>"$ERRLOG" 2>&1
         printf '%s' "$ON_MAIN"
