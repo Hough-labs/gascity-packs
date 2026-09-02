@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 28 Aug 2026 14:22:34 -0400
-Subject: [PATCH 48/72] fix(tests): build pack test environments from an
+Subject: [PATCH 48/73] fix(tests): build pack test environments from an
  allowlist (gcp-9ur)
 
 Seven tests in the pack suite passed on CI and failed for anyone running the

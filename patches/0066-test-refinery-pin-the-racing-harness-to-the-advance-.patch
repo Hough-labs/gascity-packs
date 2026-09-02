@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sat, 29 Aug 2026 01:46:38 -0400
-Subject: [PATCH 66/72] test(refinery): pin the racing harness to the advance
+Subject: [PATCH 66/73] test(refinery): pin the racing harness to the advance
  count it provoked (gcp-ileo)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

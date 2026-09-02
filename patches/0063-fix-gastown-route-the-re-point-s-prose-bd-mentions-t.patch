@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 28 Aug 2026 20:56:16 -0400
-Subject: [PATCH 63/72] fix(gastown): route the re-point's prose bd mentions
+Subject: [PATCH 63/73] fix(gastown): route the re-point's prose bd mentions
  through gc (gcp-5gir)
 
 tests/test_no_bare_bd_commands.py scans shipped pack assets for `bd` calls
