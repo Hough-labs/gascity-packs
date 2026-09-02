@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 16 Aug 2026 22:02:24 -0400
-Subject: [PATCH 41/71] fix(github-pr-review): make the run-review launch
+Subject: [PATCH 41/72] fix(github-pr-review): make the run-review launch
  snippet copy-pasteable (gcp-m7dn)
 
 The outcome-gate commit put `gc bd update <root-bead-id> --set-metadata ...`

@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Wed, 2 Sep 2026 16:22:10 -0400
+Subject: [PATCH 72/72] ci: drop actions/setup-python and use the runner
+ image's system Python (gcp-gtux)
+
+actions/setup-python installs a portable CPython from actions/python-versions
+that is built --enable-shared with no RPATH, so its bundled
+libpython3.12.so.1.0 has to be registered with the dynamic linker to be
+loadable. Registration writes to /etc/ld.so.conf.d and runs ldconfig, both of
+which need root -- and the ARC runner container ends with `USER runner`
+(uid 1001). Verified in a live pod: the interpreter and its library are both
+on disk, ldconfig knows nothing about libpython, `ldd` reports
+"libpython3.12.so.1.0 => not found", and the binary only runs when
+LD_LIBRARY_PATH is set by hand. Every subsequent `python3 ...` step exited 127.
+
+The image already ships system Python 3.12.3 at /usr/bin/python3, which
+satisfies every `python-version: "3.12"` pin in the repo, so the fix is to stop
+downloading a second interpreter rather than to work around the linker. On a
+self-hosted runner, taking the toolchain from the image is the correct posture
+-- the same principle as the Go half of gcp-k9cy, in the opposite direction:
+Go is added to the image so workflows stop assuming an ambient toolchain;
+Python's redundant downloader is removed so workflows stop fighting the one
+already there. The image-side alternative (pre-seed /opt/hostedtoolcache and
+run ldconfig at build time, as the hosted images do) is materially more work
+and would still carry a second Python for no gain.
+
+Removes the three-line `Set up Python` block at five sites -- ci.yml,
+gascity-pack-inference.yml, pack-release-compatibility.yml, and both jobs in
+supported-pack-nightly.yml -- and nothing else. The second nightly site also
+carried `if: steps.subset.outputs.run_gate == 'true'`, which goes with the
+step. No runs-on, step, or version changes.
+
+Validation: all four files re-parse under yaml.safe_load; the diff is exactly
+the five blocks and their trailing blank lines; local pre-flights green
+(go vet, golangci-lint 0 issues, validate_registry.py ok, go test ok).
+
+Follow-ups, not fixed here: the `python3 -m pip install` steps now run against
+the system interpreter, so they depend on the image providing a usable pip
+(PEP 668 marks Ubuntu 24.04's python3 externally-managed); this could not be
+verified from the repo, which does not define the runner image. Separately,
+pack-release-compatibility.yml still pins go-version "1.22" while ci.yml
+resolves 1.25.9 from go.mod -- real skew, explicitly out of this bead's scope.
+---
+ .github/workflows/ci.yml                         |  5 -----
+ .github/workflows/gascity-pack-inference.yml     |  5 -----
+ .github/workflows/pack-release-compatibility.yml |  5 -----
+ .github/workflows/supported-pack-nightly.yml     | 11 -----------
+ 4 files changed, 26 deletions(-)
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index bc19095..f15613f 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -19,11 +19,6 @@ jobs:
+         with:
+           fetch-depth: 0
+ 
+-      - name: Set up Python
+-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+-        with:
+-          python-version: "3.12"
+-
+       - name: Set up Go
+         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+         with:
+diff --git a/.github/workflows/gascity-pack-inference.yml b/.github/workflows/gascity-pack-inference.yml
+index c80d0cc..d1e6c2f 100644
+--- a/.github/workflows/gascity-pack-inference.yml
++++ b/.github/workflows/gascity-pack-inference.yml
+@@ -90,11 +90,6 @@ jobs:
+           path: .gascity-ci
+           ref: ${{ github.event.client_payload.gascity_setup_ref || github.event.inputs.gascity_setup_ref || 'main' }}
+ 
+-      - name: Set up Python
+-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+-        with:
+-          python-version: "3.12"
+-
+       - name: Set up Go
+         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+         with:
+diff --git a/.github/workflows/pack-release-compatibility.yml b/.github/workflows/pack-release-compatibility.yml
+index b651cf3..059fc72 100644
+--- a/.github/workflows/pack-release-compatibility.yml
++++ b/.github/workflows/pack-release-compatibility.yml
+@@ -63,11 +63,6 @@ jobs:
+           fetch-depth: 0
+           ref: ${{ github.event.client_payload.registry_ref || github.event.inputs.registry_ref || github.ref }}
+ 
+-      - name: Set up Python
+-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+-        with:
+-          python-version: "3.12"
+-
+       - name: Set up Go
+         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+         with:
+diff --git a/.github/workflows/supported-pack-nightly.yml b/.github/workflows/supported-pack-nightly.yml
+index db7e496..a38034c 100644
+--- a/.github/workflows/supported-pack-nightly.yml
++++ b/.github/workflows/supported-pack-nightly.yml
+@@ -66,11 +66,6 @@ jobs:
+           fetch-depth: 0
+           ref: ${{ github.event.inputs.pack_ref || github.ref }}
+ 
+-      - name: Set up Python
+-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+-        with:
+-          python-version: "3.12"
+-
+       - name: Install Python test dependencies
+         run: python3 -m pip install PyYAML pytest
+ 
+@@ -206,12 +201,6 @@ jobs:
+           path: .gascity-ci
+           ref: ${{ github.event.inputs.gascity_setup_ref || 'main' }}
+ 
+-      - name: Set up Python
+-        if: steps.subset.outputs.run_gate == 'true'
+-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+-        with:
+-          python-version: "3.12"
+-
+       - name: Set up Go
+         if: steps.subset.outputs.run_gate == 'true'
+         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 31 Jul 2026 04:19:19 -0400
-Subject: [PATCH 09/71] fix(gastown): pass --include-infra on every patrol wisp
+Subject: [PATCH 09/72] fix(gastown): pass --include-infra on every patrol wisp
  query (gcp-xbl)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

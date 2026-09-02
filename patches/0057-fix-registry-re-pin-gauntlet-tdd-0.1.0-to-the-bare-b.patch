@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 28 Aug 2026 19:16:08 -0400
-Subject: [PATCH 57/71] fix(registry): re-pin gauntlet-tdd 0.1.0 to the
+Subject: [PATCH 57/72] fix(registry): re-pin gauntlet-tdd 0.1.0 to the
  bare-bd-guard subtree (gcp-dnxq)
 
 29b2205 changed the pack subtree again (the note-write guard's own `bd`
