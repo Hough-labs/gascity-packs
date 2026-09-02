@@ -1,0 +1,290 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Wed, 2 Sep 2026 14:46:22 -0400
+Subject: [PATCH 67/67] fix(gastown): report lost work before the child gate in
+ polecat-home-audit (gcp-fzjo)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The child gate ran before the two lost-work report gates and short-circuited
+the rest of the loop, so a home hosting any per-bead worktree was never
+inspected for uncommitted paths or unpublished commits. Its justifying comment
+— "the per-bead reaper owns children; once it has cleared them the home becomes
+eligible" — does not hold: the reaper runs dry-run today (the witness passes no
+--no-dry-run), and even at full strength a child kept for a legitimately open
+bead masks its parent home's report for that child's whole lifetime. The
+masking is self-sustaining: a home with children is the home that has been
+doing work, and the gate re-fires every cycle for as long as the children live.
+
+Live proof at filing: gastown.nux emitted home_dirty_kept on 2026-08-27 and
+08-28, then went silent the moment children appeared, with the same uncommitted
+path still on disk. On gascity the sweep reported nothing for gastown.furiosa,
+which a hand scan found detached with 61 uncommitted paths.
+
+The two verdicts are independent facts, not competing ones, so neither
+short-circuits the other now. Gates 3a/3b (dirty, unpublished) are evaluated
+for every home and record their verdicts; gate 4 (children, THE TRAP) follows
+and records its own. Each sets a KEEP flag rather than skipping the loop, and a
+single skip after the gates counts the home once — so a home kept for two
+reasons logs both lines and still reports skipped=1. Gate 4 keeps governing
+removal exactly as before: it now suppresses the teardown and nothing else.
+The unreadable paths (git status / rev-list failed or cut short by the budget)
+still abandon the home immediately, because nothing further can be established
+about a checkout git cannot read.
+
+Flipping the reaper to --no-dry-run is a separate rollout decision and does not
+substitute for this: the ordering coupled lost-work reporting to unrelated
+per-bead state.
+
+Validation: new test_a_home_with_children_is_still_reported_for_lost_work
+covers both masked shapes (dirty behind a child, unpushed behind a child),
+asserts both verdicts are emitted, asserts THE TRAP still defers teardown, and
+asserts the summary counts each home once. Verified red against the pre-fix
+script ("the dirt in a home with children was never reported") and green after.
+Full gastown shell suite, go vet/build/test, golangci-lint and
+validate_registry all clean. mol-witness-patrol's verdict table is updated so
+home_children_kept no longer reads as a statement about the home's contents.
+---
+ gastown/assets/scripts/polecat-home-audit.sh | 86 ++++++++++++++------
+ gastown/formulas/mol-witness-patrol.toml     |  2 +-
+ gastown/tests/test_polecat_home_audit.sh     | 68 ++++++++++++++++
+ 3 files changed, 128 insertions(+), 28 deletions(-)
+
+diff --git a/gastown/assets/scripts/polecat-home-audit.sh b/gastown/assets/scripts/polecat-home-audit.sh
+index 3af363d..20baa44 100755
+--- a/gastown/assets/scripts/polecat-home-audit.sh
++++ b/gastown/assets/scripts/polecat-home-audit.sh
+@@ -42,6 +42,13 @@
+ #   eligible on a later cycle. Deferring costs a cycle; guessing costs a
+ #   working tree.
+ #
++#   That deferral suppresses the TEARDOWN and nothing else (gcp-fzjo). The
++#   lost-work reports are evaluated for every home before the child gate is
++#   reached, because a home with children is the home most likely to be dirty
++#   and the one whose dirt persists longest — the child gate re-fires every
++#   cycle for as long as the per-bead worktrees live, so ordering it first hid
++#   the dirt for that whole span.
++#
+ # Gates — ALL must hold before a home is removed:
+ #   1. Path shape is a polecat agent home: .../polecats/<agent>, i.e. the
+ #      parent directory is literally `polecats`. That excludes the per-bead
+@@ -56,8 +63,7 @@
+ #      sweep concludes that nobody owns anything and clears every home on the
+ #      rig. That is mol-witness-patrol's absent-confirm discipline (gcp-g98) —
+ #      a confirmation read that fails is not proof of absence.
+-#   3. The home holds no per-bead child worktrees — THE TRAP above.
+-#   4. `git status --porcelain` is empty AND `git rev-list HEAD --not --remotes`
++#   3. `git status --porcelain` is empty AND `git rev-list HEAD --not --remotes`
+ #      is empty. Unlike the per-bead reaper, this script DOES gate on
+ #      unpublished commits: that reaper can skip the check because a closed
+ #      bead is the refinery's own proof the work landed, and a home has no bead
+@@ -65,6 +71,13 @@
+ #      that belonged to no branch; establishing they were superseded took
+ #      reading content at origin, which a sweep must not attempt on its own.
+ #      So unbranched commits are REPORTED, never silently removed.
++#   4. The home holds no per-bead child worktrees — THE TRAP above.
++#
++#   Gate 3 is a REPORT and gate 4 is a REMOVAL decision, so they are evaluated
++#   in that order and neither short-circuits the other: a home can log both
++#   `home_dirty_kept` and `home_children_kept` in one cycle, and is skipped
++#   once. Gate 4 first was the bug in gcp-fzjo — it silenced gate 3 entirely
++#   for any home with a child.
+ #
+ # Staged rollout: REAL REMOVAL IS OPT-IN, matching the per-bead reaper and the
+ # city's posture for the native gascity reaper. Without --no-dry-run this
+@@ -489,29 +502,14 @@ while IFS= read -r WT; do
+             ;;
+     esac
+ 
+-    # Gate 3: THE TRAP. A home whose subtree holds per-bead worktrees is not
+-    # disposable no matter who owns the home itself — when this was filed, a
+-    # LIVE polecat from another namepool slot was working inside a dead home's
+-    # `worktrees/`. Any child at all defers, because establishing that a child
+-    # is dead means reading its bead, and bead-keyed guards are what this
+-    # script exists to stop relying on. The per-bead reaper owns children; once
+-    # it has cleared them the home becomes eligible.
+-    CHILD_COUNT=0
+-    if [ -d "$WT/worktrees" ]; then
+-        for child in "$WT"/worktrees/*; do
+-            [ -e "$child" ] || continue
+-            CHILD_COUNT=$((CHILD_COUNT + 1))
+-        done
+-    fi
+-    if [ "$CHILD_COUNT" -gt 0 ]; then
+-        record home_children_kept "$AGENT" "$WT" \
+-            "$CHILD_COUNT per-bead worktree(s) live under this home; teardown of the home would take them with it" \
+-            has_child_worktrees
+-        SKIPPED=$((SKIPPED + 1))
+-        continue
+-    fi
++    # A home can be undisposable for two INDEPENDENT reasons — it holds lost
++    # work, or it hosts per-bead children — and the two verdicts must not
++    # compete for the one skip. KEEP records "not removable this cycle"; every
++    # gate that sets it has already recorded its own verdict, and the single
++    # skip after the gates counts the home once.
++    KEEP=0
+ 
+-    # Gate 4a: never discard uncommitted work. Ignored files are build
++    # Gate 3a: never discard uncommitted work. Ignored files are build
+     # artifacts and are excluded by `git status --porcelain`; untracked
+     # non-ignored files are reported and block removal so the witness can
+     # salvage them. This is the check a respawned namepool slot fails on.
+@@ -548,11 +546,10 @@ while IFS= read -r WT; do
+         record home_dirty_kept "$AGENT" "$WT" \
+             "$(printf '%s\n' "$DIRTY" | wc -l | tr -d ' ') uncommitted path(s)" \
+             uncommitted_work
+-        SKIPPED=$((SKIPPED + 1))
+-        continue
++        KEEP=1
+     fi
+ 
+-    # Gate 4b: commits reachable from HEAD but from no remote-tracking ref.
++    # Gate 3b: commits reachable from HEAD but from no remote-tracking ref.
+     # The per-bead reaper deliberately does NOT make this check, because a
+     # rebase-merging refinery rewrites hashes and a closed bead is its own
+     # proof the work landed. A home has no bead, so nothing else here can say
+@@ -595,6 +592,41 @@ while IFS= read -r WT; do
+         record home_unpublished_commits_kept "$AGENT" "$WT" \
+             "$UNPUSHED commit(s) on ${HEAD_REF:-a detached HEAD} reach no remote; whether they are superseded needs a content check at origin, which this sweep does not make" \
+             unpublished_commits
++        KEEP=1
++    fi
++
++    # Gate 4: THE TRAP. A home whose subtree holds per-bead worktrees is not
++    # disposable no matter who owns the home itself — when this was filed, a
++    # LIVE polecat from another namepool slot was working inside a dead home's
++    # `worktrees/`. Any child at all defers, because establishing that a child
++    # is dead means reading its bead, and bead-keyed guards are what this
++    # script exists to stop relying on. The per-bead reaper owns children; once
++    # it has cleared them the home becomes eligible.
++    #
++    # This gate governs TEARDOWN ONLY, which is why it runs after the reports
++    # above rather than before them (gcp-fzjo). It used to come first and skip
++    # the rest of the loop, which coupled lost-work reporting to unrelated
++    # per-bead state: a home with any child was never reached by 3a/3b, so its
++    # dirt stayed invisible for as long as the children lived — and the reaper
++    # correctly keeps a child whose bead is still open, which can be a long
++    # time. The two facts are not mutually exclusive: gastown.nux emitted
++    # `home_dirty_kept` on 2026-08-27 and 08-28, then went silent the moment
++    # children appeared, with the same uncommitted path still on disk.
++    CHILD_COUNT=0
++    if [ -d "$WT/worktrees" ]; then
++        for child in "$WT"/worktrees/*; do
++            [ -e "$child" ] || continue
++            CHILD_COUNT=$((CHILD_COUNT + 1))
++        done
++    fi
++    if [ "$CHILD_COUNT" -gt 0 ]; then
++        record home_children_kept "$AGENT" "$WT" \
++            "$CHILD_COUNT per-bead worktree(s) live under this home; teardown of the home would take them with it" \
++            has_child_worktrees
++        KEEP=1
++    fi
++
++    if [ "$KEEP" -eq 1 ]; then
+         SKIPPED=$((SKIPPED + 1))
+         continue
+     fi
+diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
+index 3909595..31522e3 100644
+--- a/gastown/formulas/mol-witness-patrol.toml
++++ b/gastown/formulas/mol-witness-patrol.toml
+@@ -692,7 +692,7 @@ tail -n 50 "${LOG_DIR:-$GC_CITY/.gc/runtime/logs}/polecat-home-audit.log" | jq -
+ | `home_removal_pending` | Passed every gate; dry-run, so NOT removed | Routine while the rollout is staged — this is the would-remove set to review |
+ | `home_removed` | Removed. Routine, and only once `--no-dry-run` is wired | Log only. `worktree-setup.sh` recreates the home when the slot next spawns |
+ | `home_removal_failed` | The directory survived removal | Investigate permissions or mounts, mail the mayor — same as `worktree_reap_failed` above |
+-| `home_children_kept` | The home holds per-bead worktrees, so removing it would take them too | None — expected. The reaper clears children first; the home becomes eligible on a later cycle |
++| `home_children_kept` | The home holds per-bead worktrees, so removing it would take them too | None on its own — expected. The reaper clears children first; the home becomes eligible on a later cycle. It defers TEARDOWN only and says nothing about the home's contents, so read it alongside any `home_dirty_kept` / `home_unpublished_commits_kept` line for the same agent — one home can carry both |
+ | `home_dirty_kept` | Uncommitted work in a home nothing owns | **This is the failure this step exists to prevent.** A respawned namepool slot inherits it and fails submit-and-exit's clean-state check (gascity-vst). Salvage or clear it by hand |
+ | `home_unpublished_commits_kept` | Commits reaching no remote, often on a detached HEAD | Investigate by hand. Whether they are superseded takes a CONTENT check at origin — a rebase/squash-merging refinery rewrites hashes, so `git merge-base --is-ancestor` lies here. The sweep deliberately does not guess |
+ | `home_owner_unconfirmed` | The roster parsed but this home's liveness query did not answer | Nothing was removed. If it repeats, the roster shape has drifted |
+diff --git a/gastown/tests/test_polecat_home_audit.sh b/gastown/tests/test_polecat_home_audit.sh
+index dc6ff41..f22fede 100755
+--- a/gastown/tests/test_polecat_home_audit.sh
++++ b/gastown/tests/test_polecat_home_audit.sh
+@@ -262,6 +262,73 @@ JSON
+     rm -rf "$tmp"
+ }
+ 
++test_a_home_with_children_is_still_reported_for_lost_work() {
++    # gcp-fzjo: the child gate used to run FIRST and skip the rest of the loop,
++    # so a home with any per-bead child was never inspected for dirt or for
++    # unpublished commits. Every home that has been doing work has children, so
++    # this silenced the lost-work report on exactly the homes most likely to
++    # hold lost work — and it stayed silent for as long as the children lived,
++    # which for a legitimately open bead is a long time. Live proof at the time
++    # of filing: gastown.nux emitted `home_dirty_kept` for two days, then went
++    # quiet the moment children appeared, with the same uncommitted path still
++    # on disk.
++    #
++    # The two verdicts are independent and must not compete: report first,
++    # defer teardown second, skip the home once.
++    local tmp rig origin bin homes sessions logdir log
++    tmp=$(make_tmp)
++    rig="$tmp/rig"
++    origin="$tmp/origin.git"
++    bin="$tmp/bin"
++    homes="$tmp/city/.gc/worktrees/rig/polecats"
++    sessions="$tmp/sessions.json"
++    logdir="$tmp/logs"
++    mkdir -p "$logdir"
++
++    setup_rig "$rig" "$origin"
++    write_gc_stub "$bin"
++
++    # `masked` is dirty AND hosts a child — the shape the old ordering hid.
++    add_home "$rig" "$homes" masked
++    git -C "$rig" worktree add -q "$homes/masked/worktrees/rig-child" --detach origin/main
++    echo scratch >"$homes/masked/seed.txt"
++
++    # `buried` carries unpublished commits behind a child, the same masking on
++    # the other lost-work gate.
++    add_home "$rig" "$homes" buried
++    git -C "$rig" worktree add -q "$homes/buried/worktrees/rig-other" --detach origin/main
++    git -C "$homes/buried" commit -q --allow-empty -m "work that never left"
++
++    echo '{"sessions":[]}' >"$sessions"
++
++    GC_RIG=rig LOG_DIR="$logdir" GC_SESSIONS_JSON="$sessions" PATH="$bin:$PATH" \
++        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out.txt" 2>&1 ||
++        fail "audit exited non-zero: $(cat "$tmp/out.txt")"
++
++    [[ -e "$homes/masked/worktrees/rig-child/seed.txt" ]] ||
++        fail "THE TRAP still holds: a child worktree was removed with its host home"
++    [[ -e "$homes/masked/seed.txt" && -e "$homes/buried/seed.txt" ]] ||
++        fail "a home with children was removed; the child gate must still defer teardown"
++
++    log="$logdir/polecat-home-audit.log"
++    jq -e 'select(.agent == "masked" and .event == "home_dirty_kept")' "$log" >/dev/null ||
++        fail "the dirt in a home with children was never reported; the child gate masked it"
++    jq -e 'select(.agent == "buried" and .event == "home_unpublished_commits_kept")' "$log" >/dev/null ||
++        fail "unpublished commits in a home with children were never reported"
++
++    # Both verdicts, not one instead of the other — the child gate suppresses
++    # teardown only, so it still has to say why the home stays.
++    jq -e 'select(.agent == "masked" and .event == "home_children_kept")' "$log" >/dev/null ||
++        fail "the child deferral stopped being reported once the lost-work gate also fired"
++
++    # One home, one skip: the two verdicts must not double-count the home in
++    # the summary a patrol reads first.
++    grep -F 'skipped=2 of 2' "$tmp/out.txt" >/dev/null ||
++        fail "a home kept for two reasons was counted twice: $(cat "$tmp/out.txt")"
++
++    rm -rf "$tmp"
++}
++
+ test_the_home_is_matched_by_its_own_work_dir_too() {
+     # A session whose name does not follow <rig>/<agent> still states which
+     # directory it occupies. Ownership must be honoured on that key alone, or a
+@@ -647,6 +714,7 @@ test_every_line_is_stamped_at_the_event_not_at_the_run() {
+ 
+ test_removes_only_unowned_childless_clean_published_homes
+ test_a_home_with_child_worktrees_is_never_removed
++test_a_home_with_children_is_still_reported_for_lost_work
+ test_the_home_is_matched_by_its_own_work_dir_too
+ test_real_removal_is_opt_in
+ test_an_unreadable_session_roster_removes_nothing
+-- 
+2.50.1 (Apple Git-155)
+

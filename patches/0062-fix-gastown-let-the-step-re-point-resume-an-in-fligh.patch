@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 28 Aug 2026 20:30:58 -0400
-Subject: [PATCH 62/66] fix(gastown): let the step re-point resume an in-flight
+Subject: [PATCH 62/67] fix(gastown): let the step re-point resume an in-flight
  step bead (gcp-5gir)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
