@@ -262,6 +262,73 @@ JSON
     rm -rf "$tmp"
 }
 
+test_a_home_with_children_is_still_reported_for_lost_work() {
+    # gcp-fzjo: the child gate used to run FIRST and skip the rest of the loop,
+    # so a home with any per-bead child was never inspected for dirt or for
+    # unpublished commits. Every home that has been doing work has children, so
+    # this silenced the lost-work report on exactly the homes most likely to
+    # hold lost work — and it stayed silent for as long as the children lived,
+    # which for a legitimately open bead is a long time. Live proof at the time
+    # of filing: gastown.nux emitted `home_dirty_kept` for two days, then went
+    # quiet the moment children appeared, with the same uncommitted path still
+    # on disk.
+    #
+    # The two verdicts are independent and must not compete: report first,
+    # defer teardown second, skip the home once.
+    local tmp rig origin bin homes sessions logdir log
+    tmp=$(make_tmp)
+    rig="$tmp/rig"
+    origin="$tmp/origin.git"
+    bin="$tmp/bin"
+    homes="$tmp/city/.gc/worktrees/rig/polecats"
+    sessions="$tmp/sessions.json"
+    logdir="$tmp/logs"
+    mkdir -p "$logdir"
+
+    setup_rig "$rig" "$origin"
+    write_gc_stub "$bin"
+
+    # `masked` is dirty AND hosts a child — the shape the old ordering hid.
+    add_home "$rig" "$homes" masked
+    git -C "$rig" worktree add -q "$homes/masked/worktrees/rig-child" --detach origin/main
+    echo scratch >"$homes/masked/seed.txt"
+
+    # `buried` carries unpublished commits behind a child, the same masking on
+    # the other lost-work gate.
+    add_home "$rig" "$homes" buried
+    git -C "$rig" worktree add -q "$homes/buried/worktrees/rig-other" --detach origin/main
+    git -C "$homes/buried" commit -q --allow-empty -m "work that never left"
+
+    echo '{"sessions":[]}' >"$sessions"
+
+    GC_RIG=rig LOG_DIR="$logdir" GC_SESSIONS_JSON="$sessions" PATH="$bin:$PATH" \
+        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out.txt" 2>&1 ||
+        fail "audit exited non-zero: $(cat "$tmp/out.txt")"
+
+    [[ -e "$homes/masked/worktrees/rig-child/seed.txt" ]] ||
+        fail "THE TRAP still holds: a child worktree was removed with its host home"
+    [[ -e "$homes/masked/seed.txt" && -e "$homes/buried/seed.txt" ]] ||
+        fail "a home with children was removed; the child gate must still defer teardown"
+
+    log="$logdir/polecat-home-audit.log"
+    jq -e 'select(.agent == "masked" and .event == "home_dirty_kept")' "$log" >/dev/null ||
+        fail "the dirt in a home with children was never reported; the child gate masked it"
+    jq -e 'select(.agent == "buried" and .event == "home_unpublished_commits_kept")' "$log" >/dev/null ||
+        fail "unpublished commits in a home with children were never reported"
+
+    # Both verdicts, not one instead of the other — the child gate suppresses
+    # teardown only, so it still has to say why the home stays.
+    jq -e 'select(.agent == "masked" and .event == "home_children_kept")' "$log" >/dev/null ||
+        fail "the child deferral stopped being reported once the lost-work gate also fired"
+
+    # One home, one skip: the two verdicts must not double-count the home in
+    # the summary a patrol reads first.
+    grep -F 'skipped=2 of 2' "$tmp/out.txt" >/dev/null ||
+        fail "a home kept for two reasons was counted twice: $(cat "$tmp/out.txt")"
+
+    rm -rf "$tmp"
+}
+
 test_the_home_is_matched_by_its_own_work_dir_too() {
     # A session whose name does not follow <rig>/<agent> still states which
     # directory it occupies. Ownership must be honoured on that key alone, or a
@@ -647,6 +714,7 @@ test_every_line_is_stamped_at_the_event_not_at_the_run() {
 
 test_removes_only_unowned_childless_clean_published_homes
 test_a_home_with_child_worktrees_is_never_removed
+test_a_home_with_children_is_still_reported_for_lost_work
 test_the_home_is_matched_by_its_own_work_dir_too
 test_real_removal_is_opt_in
 test_an_unreadable_session_roster_removes_nothing
