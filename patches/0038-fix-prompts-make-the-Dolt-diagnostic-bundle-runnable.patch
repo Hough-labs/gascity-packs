@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 27 Aug 2026 12:33:25 -0400
-Subject: [PATCH 38/67] fix(prompts): make the Dolt diagnostic bundle runnable
+Subject: [PATCH 38/69] fix(prompts): make the Dolt diagnostic bundle runnable
  and endpoint-aware (gcp-02bn)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

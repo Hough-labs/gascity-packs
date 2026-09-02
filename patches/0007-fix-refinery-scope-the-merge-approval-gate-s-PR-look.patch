@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 31 Jul 2026 20:03:07 -0400
-Subject: [PATCH 07/67] fix(refinery): scope the merge-approval gate's PR
+Subject: [PATCH 07/69] fix(refinery): scope the merge-approval gate's PR
  lookup to origin (gcp-3ty)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

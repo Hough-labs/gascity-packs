@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Wed, 2 Sep 2026 14:52:20 -0400
+Subject: [PATCH 69/69] fix(gastown): make the default-branch fetch safe under
+ set -e (gcp-5ddt)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Self-review touch-up on the resolution block added in the previous commit.
+The refresh was written as `[ -n "$DEFAULT_BRANCH" ] && git fetch ...`,
+which evaluates to non-zero whenever the variable is empty — the exact
+case the next line is there to handle. Under `set -e` that aborts the
+step before the fail-closed branch can run, turning a graceful skip into
+an abandoned patrol leg. The `git fetch` itself is likewise best-effort:
+the ref is verified with `git rev-parse` immediately afterwards, so a
+transient fetch failure should fall into that check rather than kill the
+step.
+
+Rewritten as a plain `if` with `|| true` on the fetch. Behaviour is
+otherwise unchanged; the guard still fails closed when the branch cannot
+be resolved.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ gastown/formulas/mol-witness-patrol.toml | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
+index 53a0cbc..46066ff 100644
+--- a/gastown/formulas/mol-witness-patrol.toml
++++ b/gastown/formulas/mol-witness-patrol.toml
+@@ -351,7 +351,9 @@ if [ -z "$DEFAULT_BRANCH" ]; then
+   DEFAULT_BRANCH=$(git ls-remote --symref origin HEAD 2>/dev/null |
+     awk '$1 == "ref:" { sub("refs/heads/", "", $2); print $2; exit }')
+ fi
+-[ -n "$DEFAULT_BRANCH" ] && git fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1
++if [ -n "$DEFAULT_BRANCH" ]; then
++  git fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1 || true
++fi
+ if [ -z "$DEFAULT_BRANCH" ] ||
+    ! git rev-parse --verify --quiet "origin/$DEFAULT_BRANCH" >/dev/null; then
+   # FAIL CLOSED: skip this bead entirely, do not recover it. Step 3's
+-- 
+2.50.1 (Apple Git-155)
+

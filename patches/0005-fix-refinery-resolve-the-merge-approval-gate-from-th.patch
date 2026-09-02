@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 31 Jul 2026 17:37:54 -0400
-Subject: [PATCH 05/67] fix(refinery): resolve the merge approval gate from the
+Subject: [PATCH 05/69] fix(refinery): resolve the merge approval gate from the
  formula's own pack tree (gcp-amo)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

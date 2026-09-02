@@ -1,0 +1,346 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Wed, 2 Sep 2026 14:44:25 -0400
+Subject: [PATCH 68/69] fix(gastown): resolve the rig's default branch in
+ witness orphan recovery (gcp-5ddt)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`mol-witness-patrol`'s `recover-orphaned-beads` step decided whether an
+orphaned bead's work had already landed by asking
+`git merge-base --is-ancestor origin/$BRANCH origin/main`. On a rig whose
+default branch is not `main` that is not a comparison against the wrong
+branch — the ref does not resolve at all, so git exits 128 and the caller
+reads a plain non-zero. The guard reads that as "not merged" and falls
+through to Step 3b, which force-removes the worktree and runs
+`gc workflow delete-source && gc workflow reopen-source`: completed,
+already-merged work goes back in the pool for re-dispatch.
+
+The blast radius is every rig that is not on `main` — gauntlet is
+`master`, winnow `dev`, gascity `edge-integration`. It is latent rather
+than loud: it needs an orphaned bead whose branch already merged, and
+every command on the failure path exits non-zero into a branch that
+reads as a normal negative, so it presents as a rare "finished work got
+re-dispatched" with nothing in a log to attribute it to.
+
+The step now resolves the default branch once, up front, from
+`git symbolic-ref refs/remotes/origin/HEAD`, falling back to
+`git ls-remote --symref origin HEAD` for a worktree cut with `--detach`
+(which never gets a local `origin/HEAD`). Both refs are verified with
+`git rev-parse --verify` before the comparison, because
+`merge-base --is-ancestor` returns 1 for "not an ancestor" and 128 for
+"no such ref" and a bare `if` cannot separate them — that collapse is
+the whole bug. An unresolvable default branch now fails CLOSED: the bead
+is skipped and the mayor is mailed, rather than being reset. A guard
+whose error path is destructive must decline to act, not guess.
+
+Two smaller changes ride along in the same guard. Case C's unpushed-commit
+listing used the same hardcoded `origin/main` and now uses the resolved
+branch. And the `git log main --oneline | grep -q "$BRANCH"` alternative
+is dropped rather than repaired: it matches any commit whose *subject*
+mentions the branch name, so it fails in the opposite direction — closing
+a bead whose work never landed. The reachability test is the one that
+answers the question the guard is asking.
+
+Validation. Added
+`test_witness_orphan_recovery_resolves_the_rigs_default_branch` to
+tests/test_prompt_formula_command_drift.py, alongside the existing
+lossy-restatement detectors, with a reusable
+`hardcoded_main_ref_violations` scanner over fenced shell. Run against
+the unfixed formula it fails and names all three sites (lines 360, 398,
+400); against the fix it passes. The shell was also exercised directly in
+a throwaway repo whose default branch is `master` and which has no `main`:
+the old check reported rc=128 "not merged" for a genuinely merged branch,
+while the new one reports merged=yes for the merged branch, no for an
+unmerged one, and no for a branch never pushed. The `origin/HEAD`-unset
+fallback and the fail-closed path were each exercised the same way.
+Full suite: 117 passed, 7 skipped; gastown/tests/test_gastown_pack_assets.sh
+passes; go vet / build / test -race clean.
+
+Not in scope: `mol-digest-generate.toml` still hardcodes `main` in its
+merge listing — that is gcp-7h8, same defect family, and its failure mode
+is an under-reporting digest rather than a destructive state change. The
+new detector is therefore scoped to the witness patrol step rather than
+run repo-wide; widening it is the natural last step of gcp-7h8.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ gastown/formulas/mol-witness-patrol.toml   |  70 ++++++++++--
+ tests/test_prompt_formula_command_drift.py | 124 +++++++++++++++++++++
+ 2 files changed, 184 insertions(+), 10 deletions(-)
+
+diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
+index 31522e3..53a0cbc 100644
+--- a/gastown/formulas/mol-witness-patrol.toml
++++ b/gastown/formulas/mol-witness-patrol.toml
+@@ -334,6 +334,37 @@ WORKTREE=$(echo "$META" | jq -r '.worktree // empty')
+ BRANCH=$(echo "$META" | jq -r '.branch // empty')
+ ```
+ 
++Resolve the rig's default branch before you go any further. Case C and Step 3
++both compare against it, and neither may assume `main`: rigs run on `master`
++(gauntlet), `dev` (winnow) and `edge-integration` (gascity) too. Against those,
++a hardcoded `origin/main` does not resolve at all — git exits 128 and the
++caller reads a plain negative, which in Step 3 means "not merged" and sends
++finished work back to the pool (gcp-5ddt).
++
++```bash
++# Run from the rig root or the bead's worktree — either is inside the repo.
++DEFAULT_REF=$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null || true)
++DEFAULT_BRANCH=${DEFAULT_REF#refs/remotes/origin/}
++if [ -z "$DEFAULT_BRANCH" ]; then
++  # origin/HEAD is not set in every clone — a worktree cut with --detach never
++  # gets one. Ask the remote instead of guessing a name.
++  DEFAULT_BRANCH=$(git ls-remote --symref origin HEAD 2>/dev/null |
++    awk '$1 == "ref:" { sub("refs/heads/", "", $2); print $2; exit }')
++fi
++[ -n "$DEFAULT_BRANCH" ] && git fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1
++if [ -z "$DEFAULT_BRANCH" ] ||
++   ! git rev-parse --verify --quiet "origin/$DEFAULT_BRANCH" >/dev/null; then
++  # FAIL CLOSED: skip this bead entirely, do not recover it. Step 3's
++  # already-merged guard cannot run without this ref, and the cost of guessing
++  # wrong is re-dispatching completed work. Leaving the bead orphaned for one
++  # more cycle is cheap; re-dispatching merged work is not.
++  echo "SKIP <bead>: cannot resolve origin's default branch in $(pwd)"
++  gc mail send mayor/ -s "WITNESS: orphan recovery skipped — unresolvable default branch" \
++    -m "Bead <bead>: could not resolve origin's default branch (origin/HEAD unset and git ls-remote --symref gave nothing). Skipped recovery rather than risk re-dispatching already-merged work. Fix by setting origin/HEAD on this rig: git remote set-head origin --auto"
++  # Continue with the next orphaned bead.
++fi
++```
++
+ Check the bead and worktree state, then act:
+ 
+ **Case A: Branch exists on origin (work already published).**
+@@ -357,7 +388,7 @@ Work is committed locally but never pushed. Branch is not yet canonical.
+ ```bash
+ cd "$WORKTREE"
+ BRANCH=$(git branch --show-current)
+-git log origin/main..HEAD --oneline  # Shows unpushed commits
++git log "origin/$DEFAULT_BRANCH"..HEAD --oneline  # Shows unpushed commits
+ ```
+ Commit any remaining uncommitted/untracked work first (safeguard):
+ ```bash
+@@ -390,28 +421,47 @@ no branch on origin.**
+ Nothing to salvage. The bead goes back to pool and a new polecat
+ starts fresh.
+ 
+-**Step 3: Verify work on main before resetting.**
++**Step 3: Verify the work already landed on the default branch before resetting.**
+ 
+-Before resetting the bead to pool, check if the branch was already merged
+-to main (polecat finished, pushed, but crashed before closing the bead):
++Before resetting the bead to pool, check whether the branch was already merged
++into `origin/$DEFAULT_BRANCH` — the polecat finished and pushed, but crashed
++before the bead was closed. This is the guard that stops the witness
++re-dispatching completed work, so it uses reachability and nothing weaker:
+ ```bash
+-git log main --oneline | grep -q "$BRANCH"
+-# Or check if branch commits are reachable from main:
+-git merge-base --is-ancestor origin/$BRANCH origin/main
++if ! git rev-parse --verify --quiet "origin/$BRANCH" >/dev/null; then
++  # Nothing was ever published under this branch (Case E). There is no merge
++  # to detect, so the reset below is the correct outcome.
++  MERGED=no
++elif git merge-base --is-ancestor "origin/$BRANCH" "origin/$DEFAULT_BRANCH"; then
++  MERGED=yes
++else
++  MERGED=no
++fi
+ ```
+ 
+-If the work is already on main:
++Both refs are verified before the comparison on purpose. `git merge-base
++--is-ancestor` exits 1 for "not an ancestor" and 128 for "no such ref", and a
++bare `if` cannot tell those apart. That collapse *is* the bug this guard was
++hardened against: with `origin/main` hardcoded, every rig whose default branch
++is something else took the 128 path, read it as "not merged", and fell through
++to Step 3b — which force-removes the worktree and reopens the source bead,
++putting merged work back in the pool (gcp-5ddt). Do not reintroduce a
++`git log <branch> | grep -q "$BRANCH"` check alongside this one either: it
++matches any commit whose *subject* mentions the branch name, so it fails in the
++opposite direction, closing beads whose work never landed.
++
++If `MERGED=yes`:
+ - **Close the bead** (work is done, don't re-dispatch). Use `--force`: the bead
+   is still assigned to the crashed polecat, so this is a cross-actor close and
+   bd's close-authority guard (gastownhall/beads#3734) would otherwise refuse it:
+ ```bash
+ gc bd close <bead> --force
+ gc mail send mayor/ -s "ORPHAN_CLOSED: <bead> already merged" \
+-  -m "Branch $BRANCH already on main. Closed instead of resetting."
++  -m "Branch $BRANCH already on $DEFAULT_BRANCH. Closed instead of resetting."
+ ```
+ - Clean up worktree and skip to Step 4.
+ 
+-If the work is NOT on main, proceed with reset:
++If `MERGED=no`, proceed with reset:
+ 
+ **Step 3b: Clean up worktree and return bead to pool.**
+ 
+diff --git a/tests/test_prompt_formula_command_drift.py b/tests/test_prompt_formula_command_drift.py
+index 8864836..fa61f55 100644
+--- a/tests/test_prompt_formula_command_drift.py
++++ b/tests/test_prompt_formula_command_drift.py
+@@ -23,6 +23,7 @@ from __future__ import annotations
+ from pathlib import Path
+ import re
+ import subprocess
++import tomllib
+ 
+ 
+ REPO_ROOT = Path(__file__).resolve().parents[1]
+@@ -50,6 +51,13 @@ BD_SEARCH_STATUS = re.compile(
+ )
+ 
+ REFINERY_PATROL = Path("gastown/formulas/mol-refinery-patrol.toml")
++WITNESS_PATROL = Path("gastown/formulas/mol-witness-patrol.toml")
++
++# A git command naming `main` as a branch. The no-backtick clause is the same
++# one the detectors above use to separate an invocation from prose about one.
++# `origin/main` and a bare `main` argument both match; `maintenance`,
++# `domain/main-thing` and the like do not.
++GIT_MAIN_REF = re.compile(r"\bgit\b[^`\n]*?(?<![\w/-])(?:origin/)?main(?![\w/-])")
+ 
+ SCANNED_SUFFIXES = frozenset({".md", ".toml", ".sh"})
+ 
+@@ -275,6 +283,58 @@ def bd_search_status_violations(path: Path, text: str) -> list[str]:
+     return violations
+ 
+ 
++def hardcoded_main_ref_violations(path: Path, text: str) -> list[str]:
++    """An agent-executed git command must not assume the default branch is `main`.
++
++    Rigs do not agree on a default branch: gauntlet is `master`, winnow is
++    `dev`, gascity is `edge-integration`. Against any of them a command naming
++    `origin/main` does not compare against the wrong branch — the ref does not
++    resolve at all, so git exits 128 and the caller reads a bare non-zero.
++
++    That is indistinguishable from an honest negative, which is what makes it
++    worth a detector rather than a review note. `mol-witness-patrol`'s
++    orphan-recovery guard asked `git merge-base --is-ancestor origin/$BRANCH
++    origin/main` to decide whether an orphaned bead's work had already landed.
++    On every non-`main` rig that check exited 128, read as "not merged", and
++    fell through to the reset path — which force-removes the worktree and runs
++    `gc workflow delete-source && gc workflow reopen-source`, putting completed,
++    merged work back in the pool. All four closed gauntlet beads checked at the
++    time would have been misjudged this way (gcp-5ddt).
++
++    Resolve the branch instead — `git symbolic-ref refs/remotes/origin/HEAD`,
++    falling back to `git ls-remote --symref origin HEAD` — and treat an
++    unresolvable result as a reason to skip, never as a negative result.
++    """
++    violations = []
++    for lang, start, body in fenced_blocks(text):
++        if lang not in {"bash", "sh", ""}:
++            continue
++        for offset, command in logical_commands(body):
++            if not GIT_MAIN_REF.search(command):
++                continue
++            violations.append(
++                f"{path.relative_to(REPO_ROOT)}:{start + offset - 1}: "
++                f"git command hardcodes `main`:\n    {command}"
++            )
++    return violations
++
++
++def witness_orphan_recovery_step() -> str:
++    """The `recover-orphaned-beads` step description, straight from the formula."""
++    with (REPO_ROOT / WITNESS_PATROL).open("rb") as handle:
++        formula = tomllib.load(handle)
++    steps = [
++        step
++        for step in formula["steps"]
++        if step.get("id") == "recover-orphaned-beads"
++    ]
++    assert len(steps) == 1, (
++        f"expected exactly one recover-orphaned-beads step in {WITNESS_PATROL}, "
++        f"found {len(steps)} — the assertions below no longer cover the guard"
++    )
++    return steps[0]["description"]
++
++
+ def test_pool_returning_updates_declare_routing() -> None:
+     violations = []
+     for path in gastown_assets():
+@@ -379,6 +439,47 @@ def test_refinery_duplicate_check_sees_in_progress_bugs() -> None:
+     )
+ 
+ 
++def test_witness_orphan_recovery_resolves_the_rigs_default_branch() -> None:
++    """The already-merged guard must compare against the rig's real default.
++
++    This guard is the one thing standing between a crashed polecat's finished
++    work and a re-dispatch, and its error path is the destructive one: anything
++    it cannot prove merged goes back to the pool. So it has to resolve the
++    branch rather than name one, and it has to skip the bead when it cannot.
++    """
++    step = witness_orphan_recovery_step()
++
++    assert not hardcoded_main_ref_violations(REPO_ROOT / WITNESS_PATROL, step), (
++        "orphan recovery must not name `main`: on a master/dev/edge-integration "
++        "rig the ref does not resolve, git exits 128, and 'not merged' sends "
++        "already-merged work back to the pool:\n"
++        + "\n".join(hardcoded_main_ref_violations(REPO_ROOT / WITNESS_PATROL, step))
++    )
++
++    assert "git symbolic-ref --quiet refs/remotes/origin/HEAD" in step, (
++        "orphan recovery must resolve the default branch from origin/HEAD"
++    )
++    assert "git ls-remote --symref origin HEAD" in step, (
++        "origin/HEAD is unset in a worktree cut with --detach — orphan recovery "
++        "needs the remote fallback, or it fails closed on healthy rigs"
++    )
++    assert (
++        'git merge-base --is-ancestor "origin/$BRANCH" "origin/$DEFAULT_BRANCH"'
++        in step
++    ), "the already-merged check must compare the branch against the resolved default"
++
++    # Fail closed: an unresolvable default branch skips the bead rather than
++    # falling through to the reset. `git merge-base --is-ancestor` exits 1 for
++    # "not an ancestor" and 128 for "no such ref", so the guard cannot tell an
++    # unresolvable ref from a real negative once it reaches the comparison.
++    assert 'git rev-parse --verify --quiet "origin/$DEFAULT_BRANCH"' in step, (
++        "verify the resolved default branch before comparing against it"
++    )
++    assert "FAIL CLOSED" in step, (
++        "an unresolvable default branch must skip recovery, not reset the bead"
++    )
++
++
+ def test_detectors_catch_the_drift_they_are_named_for() -> None:
+     fixture = REPO_ROOT / "fixture.md"
+ 
+@@ -399,6 +500,29 @@ def test_detectors_catch_the_drift_they_are_named_for() -> None:
+         fixture, 'gc bd update $WORK --status=open --assignee="$REFINERY_TARGET"'
+     )
+ 
++    assert hardcoded_main_ref_violations(
++        fixture,
++        "```bash\ngit merge-base --is-ancestor origin/$BRANCH origin/main\n```",
++    )
++    assert hardcoded_main_ref_violations(fixture, "```bash\ngit log main --oneline\n```")
++    assert hardcoded_main_ref_violations(
++        fixture, "```bash\ngit log origin/main..HEAD --oneline\n```"
++    )
++    # The resolved form is what the detector is steering toward.
++    assert not hardcoded_main_ref_violations(
++        fixture,
++        '```bash\ngit merge-base --is-ancestor "origin/$BRANCH" "origin/$DEFAULT_BRANCH"\n```',
++    )
++    # Only fenced shell is scanned, so prose explaining the bug — which every
++    # fix for it has to write — is not itself a violation.
++    assert not hardcoded_main_ref_violations(
++        fixture, "Never run `git merge-base --is-ancestor origin/$BRANCH origin/main`."
++    )
++    # A branch whose name merely starts with "main" is not the default branch.
++    assert not hardcoded_main_ref_violations(
++        fixture, "```bash\ngit checkout maintenance-1.x\n```"
++    )
++
+     # Built line-by-line rather than with embedded "\n" escapes: a literal
+     # backslash-n immediately before `gc` reads as a bare `bd` invocation to
+     # tests/test_no_bare_bd_commands.py, whose gc-prefix check is line-based.
+-- 
+2.50.1 (Apple Git-155)
+
