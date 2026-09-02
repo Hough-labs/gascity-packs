@@ -30,6 +30,24 @@
 #      (metadata.polecat_session). A roster read that fails or does not parse
 #      is `unconfirmed`, not `absent`, and skips the reap.
 #
+# THE OTHER REMOVAL AUTHORITY — a path with no bead at all (gcp-0u14):
+#   Not every leaf under `worktrees/` is a bead id. `g7nf-base` was hand-made
+#   by an agent, and `gc bd show` answers "no issue found matching" for it
+#   forever. Treating that as a transient store failure retried it every cycle
+#   for as long as the directory existed, and an unreapable child pins its
+#   parent polecat home open just as long. So the two conditions are separated
+#   on bd's OWN error class, never on a regex guess at id shape:
+#     - bd could not answer (error, timeout, fuzzy hit, id absent from a batch
+#       bd said nothing about) -> TRANSIENT. Skip, retry next cycle. Unchanged.
+#     - bd answered "no issue found matching <id>" -> PERMANENT. Decide once,
+#       on the worktree's own evidence, and log `worktree_no_such_bead`.
+#   Gates 2 and 4 need a bead and cannot bind on that path, so it must clear
+#   gate 3 plus:
+#   5. HEAD is reachable from a remote-tracking ref (`git branch --remotes
+#      --contains`) — the content exists somewhere other than this directory.
+#      Failing that is a FINDING (`worktree_unpublished_kept`), not a retry:
+#      the condition never resolves itself, so the witness is told once.
+#
 # COST MODEL — why this script is shaped the way it is (gcp-ntbf):
 #   It runs as the witness pre_start, which gascity bounds by [session]
 #   setup_timeout (10s by default) and SIGKILLs on overrun. A killed pre_start
@@ -59,10 +77,13 @@
 # Flip it by adding --no-dry-run to the pre_start in agents/witness/agent.toml
 # once the logged would-reap set has been reviewed across several cycles.
 #
-# Deliberately NOT gated on "every commit is on a remote": a rebase-merging
-# refinery rewrites commit hashes and then deletes the merged branch, so a
-# genuinely merged worktree always looks like it holds unpublished commits.
-# Bead closure is the refinery's own proof that the work landed.
+# The CLOSED-BEAD path is deliberately NOT gated on "every commit is on a
+# remote": a rebase-merging refinery rewrites commit hashes and then deletes the
+# merged branch, so a genuinely merged worktree always looks like it holds
+# unpublished commits. Bead closure is the refinery's own proof that the work
+# landed. Gate 5 is not a reversal of that — it binds only on the no-such-bead
+# path, which has no closure to stand on and would otherwise have no evidence
+# at all.
 #
 # Output: one JSON line per decision appended to LOG_FILE, plus a human
 # summary on stdout. Idempotent and safe to re-run: a reaped worktree stops
@@ -343,8 +364,20 @@ CANDIDATES=$(printf '%s\n' "$WT_LIST" \
         esac
         [ "$(basename "$(dirname "$wt")")" = "worktrees" ] || continue
         # The leaf is the bead id. Anything else is not ours to remove.
+        #
+        # The dot is IN the class because a sub-bead id carries one
+        # (`feryn-derh.1`), and a whitelist without it dropped every split
+        # bead's worktree here — before the bulk read, before any `record`, so
+        # no event was emitted at all and the log read as a complete clean pass
+        # (gcp-ac59). That silence is the reason this was a P1: it hid the
+        # data-at-risk case too, since a dotted worktree holding stranded work
+        # could never surface as `worktree_dirty_kept` either. On winnow it was
+        # half the eligible set. Admitting the dot must not admit traversal, so
+        # `.` / `..` / any embedded `..` are still refused — the leading- and
+        # trailing-dot guards mirror the `-*` / `*-` ones, since a bead id
+        # begins and ends with neither separator.
         case "$(basename "$wt")" in
-            *[!a-zA-Z0-9-]* | '' | -* | *-) continue ;;
+            *[!a-zA-Z0-9.-]* | '' | -* | *- | .* | *. | *..*) continue ;;
         esac
         printf '%s\n' "$wt"
     done || true)
@@ -383,13 +416,64 @@ EOF
 # clean cycle that examined nothing.
 BEADS_FILE=$(mktemp)
 SESSIONS_FILE=$(mktemp)
-trap 'rm -f "$BEADS_FILE" "$SESSIONS_FILE"' EXIT
+# bd's stderr is EVIDENCE, not noise. It is the only place the store says which
+# of the ids it was handed do not exist, and that verdict is what separates a
+# path this run should decide about once from one it should retry next cycle
+# (gcp-0u14). Discarding it to /dev/null is what made every missing bead look
+# transient.
+BEAD_ERR_FILE=$(mktemp)
+NOT_FOUND_FILE=$(mktemp)
+: >"$NOT_FOUND_FILE"
+trap 'rm -f "$BEADS_FILE" "$SESSIONS_FILE" "$BEAD_ERR_FILE" "$NOT_FOUND_FILE"' EXIT
 
 BEAD_QUERY_LIMIT=$(budget_left)
 BEAD_QUERY_RC=0
 run_bounded "$BEAD_QUERY_LIMIT" "${GC_BD[@]}" show "${BEAD_IDS_ARGV[@]}" --json \
-    >"$BEADS_FILE" 2>/dev/null || BEAD_QUERY_RC=$?
+    >"$BEADS_FILE" 2>"$BEAD_ERR_FILE" || BEAD_QUERY_RC=$?
 BEAD_QUERY_OUTCOME=$(classify_outcome "$BEAD_QUERY_LIMIT" "$BEAD_QUERY_RC")
+
+# The ids bd itself declared absent, keyed on bd's OWN error class rather than
+# on a regex guess at what a bead id looks like. bd writes one line per missing
+# id:
+#
+#     Error fetching g7nf-base: no issue found matching "g7nf-base"
+#
+# Anything else on stderr — a store error, a timeout notice, a warning — leaves
+# the id out of this set and therefore transient, which is the conservative
+# direction: the worst case is one more retry, not a removal on a guess.
+#
+# Only honoured when bd RAN TO COMPLETION. `ok` is the mixed batch (some ids
+# resolved, exit 0); `failed` is the all-missing batch, where bd exits 1 and
+# prints an error OBJECT instead of an array. A `timeout` or `skipped` outcome
+# means the process was killed or never started, so its partial stderr is not a
+# verdict about anything and every id stays transient.
+case "$BEAD_QUERY_OUTCOME" in
+    ok | failed)
+        sed -n 's/.*no issue found matching "\([^"]*\)".*/\1/p' "$BEAD_ERR_FILE" \
+            | sort -u >"$NOT_FOUND_FILE" || : >"$NOT_FOUND_FILE"
+        ;;
+esac
+
+# bead_is_absent <id> — bd answered and said this id resolves to no bead. A
+# PERMANENT condition: the id will not start existing later, so retrying it
+# every cycle forever is the bug (gcp-0u14).
+bead_is_absent() {
+    [ -s "$NOT_FOUND_FILE" ] && grep -Fxq -- "$1" "$NOT_FOUND_FILE"
+}
+
+if ! jq -e 'type == "array"' "$BEADS_FILE" >/dev/null 2>&1 &&
+    [ "$BEAD_QUERY_OUTCOME" = failed ] &&
+    [ "$(wc -l <"$NOT_FOUND_FILE" | tr -d ' ')" -eq "${#BEAD_IDS_ARGV[@]}" ]; then
+    # Every id in the batch came back "no issue found matching". bd exits 1 and
+    # prints an error OBJECT rather than an array in that case, which the
+    # array check below reads as a dead store — so a rig whose ONLY candidate
+    # is a no-such-bead path used to abort the whole cycle as
+    # `worktree_bead_query_failed`, pointing the reader at a Dolt server that
+    # was answering perfectly. It answered; the answer was "none of these
+    # exist". Normalise to an empty array and let the per-candidate gates
+    # decide, exactly as they would in a mixed batch.
+    printf '[]' >"$BEADS_FILE"
+fi
 
 if ! jq -e 'type == "array"' "$BEADS_FILE" >/dev/null 2>&1; then
     # No usable answer for ANY bead. An unreadable bead is not proof the work
@@ -550,59 +634,80 @@ while IFS=$'\037' read -r STATUS OWNER WT; do
     EXAMINED=$((EXAMINED + 1))
 
     BEAD=$(basename "$WT")
+    # Why this worktree is disposable, if it turns out to be. The two paths
+    # reach the same removal through different evidence, and `worktree_reaped`
+    # must not report the closed-bead one for a path that never had a bead.
+    REAP_DETAIL="bead closed"
+    NO_SUCH_BEAD=0
 
     if [ -z "$STATUS" ]; then
-        # An unreadable bead is not proof the work is done. Leave the worktree
-        # alone; a later cycle retries once bd is readable again.
-        record worktree_bead_unreadable "$BEAD" "$WT" \
-            "the bulk gc bd show answered, but echoed no row for this bead id" \
-            bead_absent_from_batch
-        SKIPPED=$((SKIPPED + 1))
-        continue
-    fi
-
-    # Gate 2: only closed beads. in_progress/open worktrees belong to a live
-    # polecat, or to the orphan-recovery path in mol-witness-patrol.
-    if [ "$STATUS" != "closed" ]; then
-        SKIPPED=$((SKIPPED + 1))
-        continue
-    fi
-
-    # Gate 4: a polecat still reworking a FIX_NEEDED PR keeps its worktree even
-    # though the bead is already closed by the PR handoff. A roster we could not
-    # read tells us nothing about that polecat, so it skips too.
-    ensure_roster
-    case "$(session_state "$OWNER")" in
-        live)
-            record worktree_owner_live "$BEAD" "$WT" "session $OWNER still live"
+        if ! bead_is_absent "$BEAD"; then
+            # bd could not answer FOR THIS ID — a store error, a fuzzy hit that
+            # echoed a different id, a read cut short. Transient: an unreadable
+            # bead is not proof the work is done. Leave the worktree alone; a
+            # later cycle retries once bd is readable again.
+            record worktree_bead_unreadable "$BEAD" "$WT" \
+                "the bulk gc bd show answered, but echoed no row for this bead id" \
+                bead_absent_from_batch
             SKIPPED=$((SKIPPED + 1))
             continue
-            ;;
-        unconfirmed)
-            case "$ROSTER_REASON" in
-                budget_spent_before_roster_read)
-                    # Nobody asked the roster anything. Saying it was unreadable
-                    # would point at a subsystem this run never touched.
-                    TRUNCATED=1
-                    record worktree_budget_truncated "$BEAD" "$WT" \
-                        "the ${BUDGET_SECONDS}s budget was spent before the session roster was read; liveness unchecked at candidate $EXAMINED of $TOTAL" \
-                        "$ROSTER_REASON"
-                    ;;
-                roster_read_timed_out)
-                    record worktree_owner_unconfirmed "$BEAD" "$WT" \
-                        "gc session list did not answer within the ${ROSTER_LIMIT}s left of the ${BUDGET_SECONDS}s budget; a read cut short is not proof of absence" \
-                        "$ROSTER_REASON"
-                    ;;
-                *)
-                    record worktree_owner_unconfirmed "$BEAD" "$WT" \
-                        "session roster unreadable ($ROSTER_REASON); a failed read is not proof of absence" \
-                        "$ROSTER_REASON"
-                    ;;
-            esac
+        fi
+        # bd answered, and the answer was that this id resolves to no bead —
+        # `g7nf-base`, a hand-made scratch worktree under `worktrees/`, is the
+        # shape. That is PERMANENT: treating it as a transient store failure
+        # retried it every cycle forever, and an unreapable child pins its
+        # parent polecat home open just as permanently (gcp-0u14). Decide once.
+        NO_SUCH_BEAD=1
+        record worktree_no_such_bead "$BEAD" "$WT" \
+            "gc bd reports no issue matching this id, so no bead closure will ever authorise the reap; deciding on the worktree's own evidence instead of retrying" \
+            no_such_bead
+        # Gate 2 needs a bead status and gate 4 needs a bead's polecat_session,
+        # so neither can bind here. Gate 3 (clean tree) and gate 5 (content
+        # published) below carry the whole safety burden for this path.
+    else
+        # Gate 2: only closed beads. in_progress/open worktrees belong to a live
+        # polecat, or to the orphan-recovery path in mol-witness-patrol.
+        if [ "$STATUS" != "closed" ]; then
             SKIPPED=$((SKIPPED + 1))
             continue
-            ;;
-    esac
+        fi
+
+        # Gate 4: a polecat still reworking a FIX_NEEDED PR keeps its worktree even
+        # though the bead is already closed by the PR handoff. A roster we could not
+        # read tells us nothing about that polecat, so it skips too.
+        ensure_roster
+        case "$(session_state "$OWNER")" in
+            live)
+                record worktree_owner_live "$BEAD" "$WT" "session $OWNER still live"
+                SKIPPED=$((SKIPPED + 1))
+                continue
+                ;;
+            unconfirmed)
+                case "$ROSTER_REASON" in
+                    budget_spent_before_roster_read)
+                        # Nobody asked the roster anything. Saying it was unreadable
+                        # would point at a subsystem this run never touched.
+                        TRUNCATED=1
+                        record worktree_budget_truncated "$BEAD" "$WT" \
+                            "the ${BUDGET_SECONDS}s budget was spent before the session roster was read; liveness unchecked at candidate $EXAMINED of $TOTAL" \
+                            "$ROSTER_REASON"
+                        ;;
+                    roster_read_timed_out)
+                        record worktree_owner_unconfirmed "$BEAD" "$WT" \
+                            "gc session list did not answer within the ${ROSTER_LIMIT}s left of the ${BUDGET_SECONDS}s budget; a read cut short is not proof of absence" \
+                            "$ROSTER_REASON"
+                        ;;
+                    *)
+                        record worktree_owner_unconfirmed "$BEAD" "$WT" \
+                            "session roster unreadable ($ROSTER_REASON); a failed read is not proof of absence" \
+                            "$ROSTER_REASON"
+                        ;;
+                esac
+                SKIPPED=$((SKIPPED + 1))
+                continue
+                ;;
+        esac
+    fi
 
     # Gate 3: never discard uncommitted work. Ignored files are artifacts and
     # are excluded by `git status --porcelain`; untracked non-ignored files are
@@ -643,8 +748,46 @@ while IFS=$'\037' read -r STATUS OWNER WT; do
         continue
     fi
 
+    # Gate 5: for a no-such-bead path ONLY, the committed content must already
+    # be published. The header explains why the closed-bead path is deliberately
+    # not gated on this — a rebase-merging refinery rewrites hashes, so bead
+    # closure is the better proof and this test would reject genuinely merged
+    # work. But a path with no bead HAS no closure to stand on, and something
+    # has to. So the gate binds exactly where the other evidence is missing.
+    #
+    # "Published" is `git branch --remotes --contains`: HEAD reachable from any
+    # remote-tracking ref in the rig. That is what made g7nf-base a leak rather
+    # than lost work. A path that fails it is a FINDING, not a retry — the whole
+    # point of gcp-0u14 is that this condition never resolves itself, so the
+    # witness is told once and the worktree is kept.
+    if [ "$NO_SUCH_BEAD" -eq 1 ]; then
+        HEAD_LIMIT=$(budget_left)
+        HEAD_RC=0
+        WT_HEAD=$(run_bounded "$HEAD_LIMIT" git -C "$WT" rev-parse HEAD 2>/dev/null) || HEAD_RC=$?
+        CONTAINS=""
+        CONTAINS_RC=0
+        if [ "$(classify_outcome "$HEAD_LIMIT" "$HEAD_RC")" = ok ] && [ -n "$WT_HEAD" ]; then
+            CONTAINS_LIMIT=$(budget_left)
+            CONTAINS=$(run_bounded "$CONTAINS_LIMIT" \
+                git -C "$RIG_ROOT" branch --remotes --contains "$WT_HEAD" 2>/dev/null) ||
+                CONTAINS_RC=$?
+            if [ "$(classify_outcome "$CONTAINS_LIMIT" "$CONTAINS_RC")" != ok ]; then
+                CONTAINS=""
+            fi
+        fi
+        if [ -z "$CONTAINS" ]; then
+            record worktree_unpublished_kept "$BEAD" "$WT" \
+                "no bead authorises this reap and HEAD is on no remote-tracking branch, so the commits here exist nowhere else; kept for the witness to salvage" \
+                no_such_bead_content_unpublished
+            SKIPPED=$((SKIPPED + 1))
+            continue
+        fi
+        REAP_DETAIL="no such bead; HEAD published on $(printf '%s\n' "$CONTAINS" |
+            tr -d ' ' | paste -sd, -)"
+    fi
+
     if [ "$DRY_RUN" -eq 1 ]; then
-        record worktree_reap_pending "$BEAD" "$WT" "dry run"
+        record worktree_reap_pending "$BEAD" "$WT" "dry run — $REAP_DETAIL"
         REAPED=$((REAPED + 1))
         continue
     fi
@@ -662,7 +805,7 @@ while IFS=$'\037' read -r STATUS OWNER WT; do
         continue
     fi
 
-    record worktree_reaped "$BEAD" "$WT" "bead closed"
+    record worktree_reaped "$BEAD" "$WT" "$REAP_DETAIL"
     REAPED=$((REAPED + 1))
 done <<EOF
 $DECISIONS

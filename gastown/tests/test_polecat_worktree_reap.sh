@@ -19,10 +19,24 @@ write_gc_stub() {
 #   gc bd --rig <rig> show <bead>... --json   (many ids in ONE call)
 #   gc session list --state=all --json
 #
+# The `bd show` arm reproduces real bd's THREE observable behaviours for a
+# missing id, because the reaper now decides transient-vs-permanent on bd's own
+# error class and a stub that silently omits an id would test a bd that does not
+# exist (gcp-0u14):
+#   - an id that resolves      -> its row in the stdout array
+#   - an id that does not      -> one stderr line, verbatim shape:
+#                                 Error fetching <id>: no issue found matching "<id>"
+#   - NO id resolves           -> an error OBJECT on stdout, exit 1
+#
 # Test hooks:
 #   GC_BD_CALLS      append one byte per `gc bd show` call, so a test can
 #                    assert the read is bulk and not per-worktree
 #   GC_BD_DELAY      seconds to stall a bead read (budget tests)
+#   GC_BD_STORE_ERROR non-empty: the read fails for a reason that is NOT
+#                    "no such bead" — the transient case that must still retry
+#   GC_BD_FUZZY      an id bd answers with a DIFFERENT row for (a fuzzy hit):
+#                    no exact echo AND no not-found line, so the reaper can see
+#                    neither a bead nor a verdict. Transient.
 #   GC_SESSION_DELAY seconds to stall a roster read (budget tests)
 case "$1" in
     session)
@@ -36,6 +50,10 @@ case "$1" in
             shift
             if [ -n "${GC_BD_CALLS:-}" ]; then printf 'x' >>"$GC_BD_CALLS"; fi
             if [ -n "${GC_BD_DELAY:-}" ]; then sleep "$GC_BD_DELAY"; fi
+            if [ -n "${GC_BD_STORE_ERROR:-}" ]; then
+                echo "Error: dial tcp 127.0.0.1:3307: connect: connection refused" >&2
+                exit 1
+            fi
             ids=""
             for a in "$@"; do
                 case "$a" in
@@ -44,10 +62,27 @@ case "$1" in
                 ids="$ids$a
 "
             done
-            jq -c --arg ids "$ids" '
+            rows=$(jq -c --arg ids "$ids" '
                 ($ids | split("\n") | map(select(length > 0))) as $want
                 | [ .[] | select(.id as $i | $want | index($i)) ]
-            ' "$GC_BEADS_JSON"
+            ' "$GC_BEADS_JSON")
+            for a in $ids; do
+                if [ "$a" = "${GC_BD_FUZZY:-}" ]; then
+                    # Answered, but with somebody else's row. The reaper keys
+                    # results by the id bd ECHOED, so this id gets no status.
+                    rows=$(printf '%s' "$rows" |
+                        jq -c --arg id "$a-other" '. + [{id:$id, status:"closed", metadata:{}}]')
+                    continue
+                fi
+                if ! printf '%s' "$rows" | jq -e --arg id "$a" 'any(.id == $id)' >/dev/null; then
+                    echo "Error fetching $a: no issue found matching \"$a\"" >&2
+                fi
+            done
+            if [ "$(printf '%s' "$rows" | jq -r 'length')" = "0" ]; then
+                printf '{"error":"no issues found matching the provided IDs","schema_version":1}'
+                exit 1
+            fi
+            printf '%s' "$rows"
         else
             printf '[]'
         fi
@@ -118,6 +153,18 @@ add_bead_worktree() {
     git -C "$1" worktree add -q "$2/worktrees/$3" --detach HEAD
 }
 
+
+publish_rig() {
+    # publish_rig <rig> <bare-remote> — give the rig a remote-tracking ref, so
+    # `git branch --remotes --contains` has something to answer with. Gate 5
+    # asks "does this content exist anywhere other than this directory", and a
+    # bare remote is the only honest way to model that.
+    git init -q --bare "$2"
+    git -C "$1" remote add origin "$2"
+    git -C "$1" push -q origin HEAD:refs/heads/main
+    git -C "$1" fetch -q origin
+}
+
 test_reaps_only_closed_clean_unowned_bead_worktrees() {
     local tmp rig bin home beads sessions logdir
     tmp=$(mktemp -d)
@@ -166,7 +213,13 @@ JSON
 ]}
 JSON
 
+    # wt-unknown is the TRANSIENT unreadable case, so it must be a lookup bd
+    # could not answer rather than one it answered "no such bead" to — those are
+    # different verdicts now (gcp-0u14). A fuzzy hit is the real shape of it:
+    # bd replies, but with a different id, so this worktree gets no status and
+    # no not-found line either.
     GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+        GC_BD_FUZZY=wt-unknown \
         PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out.txt" 2>&1 ||
         fail "reaper exited non-zero: $(cat "$tmp/out.txt")"
 
@@ -726,6 +779,206 @@ JSON
     rm -rf "$tmp"
 }
 
+test_dotted_sub_bead_worktrees_are_enumerated() {
+    # A split bead's id carries a dot (`feryn-derh.1`), and the leaf whitelist
+    # did not admit one — so every sub-bead worktree was dropped during
+    # CANDIDATE ENUMERATION, upstream of the bulk read, of `git status`, and of
+    # any `record` call. No event of any kind was emitted, so the log read as a
+    # complete clean pass while on winnow half the eligible set was invisible
+    # (gcp-ac59). The silence is the defect — it hid the data-at-risk case as
+    # well as the routine one — so this pins the reap AND the enumeration.
+    local tmp rig bin home beads sessions logdir log
+    tmp=$(mktemp -d)
+    rig="$tmp/rig"
+    bin="$tmp/bin"
+    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
+    beads="$tmp/beads.json"
+    sessions="$tmp/sessions.json"
+    logdir="$tmp/logs"
+    log="$logdir/polecat-worktree-reap.log"
+    mkdir -p "$logdir"
+
+    setup_rig "$rig"
+    write_gc_stub "$bin"
+
+    add_bead_worktree "$rig" "$home" wt-plain
+    add_bead_worktree "$rig" "$home" wt-split.1
+    add_bead_worktree "$rig" "$home" wt-split.10
+
+    # Admitting the dot must not admit path traversal, and a leaf that is not a
+    # bead id at all is still not ours to touch.
+    add_bead_worktree "$rig" "$home" 'a..b'
+    add_bead_worktree "$rig" "$home" '.hidden'
+
+    cat >"$beads" <<'JSON'
+[
+  {"id":"wt-plain","status":"closed","metadata":{"polecat_session":"deadsess"}},
+  {"id":"wt-split.1","status":"closed","metadata":{"polecat_session":"deadsess"}},
+  {"id":"wt-split.10","status":"closed","metadata":{"polecat_session":"deadsess"}}
+]
+JSON
+    printf '{"sessions":[]}' >"$sessions"
+
+    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out.txt" 2>&1 ||
+        fail "reaper exited non-zero: $(cat "$tmp/out.txt")"
+
+    [[ ! -e "$home/worktrees/wt-split.1" ]] ||
+        fail "a dotted sub-bead worktree was not reaped; the leaf whitelist still drops the dot"
+    [[ ! -e "$home/worktrees/wt-split.10" ]] ||
+        fail "a multi-digit dotted sub-bead worktree was not reaped"
+    [[ ! -e "$home/worktrees/wt-plain" ]] ||
+        fail "an undotted worktree was not reaped; the whitelist change broke the normal case"
+
+    [[ -e "$home/worktrees/a..b" ]] ||
+        fail "a leaf containing .. was reaped; widening the class must not admit traversal"
+    [[ -e "$home/worktrees/.hidden" ]] ||
+        fail "a dot-prefixed leaf was reaped; a bead id never starts with a separator"
+
+    # Enumeration, not just the outcome: a dropped candidate produces NO event,
+    # which is the half of this defect that made the log lie.
+    [[ "$(jq -r 'select(.bead == "wt-split.1") | .event' "$log" | tail -n 1)" == "worktree_reaped" ]] ||
+        fail "the dotted worktree produced no reap event; it was never enumerated"
+    ! grep -F '"bead":"a..b"' "$log" >/dev/null ||
+        fail "a traversal-shaped leaf was enumerated as a candidate"
+    ! grep -F '"bead":".hidden"' "$log" >/dev/null ||
+        fail "a dot-prefixed leaf was enumerated as a candidate"
+
+    rm -rf "$tmp"
+}
+
+test_a_permanently_missing_bead_is_decided_not_retried() {
+    # `g7nf-base` is a hand-made scratch worktree under `worktrees/`: bd answers
+    # "no issue found matching" for it and always will. Treating that as a
+    # transient store failure retried it every cycle forever and pinned the
+    # parent polecat home open with it (gcp-0u14). It must be DECIDED — on the
+    # worktree's own evidence, since no bead closure will ever authorise it.
+    local tmp rig bin home beads sessions logdir log
+    tmp=$(mktemp -d)
+    rig="$tmp/rig"
+    bin="$tmp/bin"
+    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
+    beads="$tmp/beads.json"
+    sessions="$tmp/sessions.json"
+    logdir="$tmp/logs"
+    log="$logdir/polecat-worktree-reap.log"
+    mkdir -p "$logdir"
+
+    setup_rig "$rig"
+    publish_rig "$rig" "$tmp/remote.git"
+    write_gc_stub "$bin"
+
+    add_bead_worktree "$rig" "$home" wt-closed
+    add_bead_worktree "$rig" "$home" wt-gone-published
+    add_bead_worktree "$rig" "$home" wt-gone-unpublished
+    add_bead_worktree "$rig" "$home" wt-gone-dirty
+
+    # Gate 5's failing case: a commit that exists in this directory and nowhere
+    # else. Removing it would be the only copy lost.
+    echo local >"$home/worktrees/wt-gone-unpublished/local.txt"
+    git -C "$home/worktrees/wt-gone-unpublished" add local.txt
+    git -C "$home/worktrees/wt-gone-unpublished" commit -qm "unpublished work"
+
+    echo scratch >"$home/worktrees/wt-gone-dirty/seed.txt"
+
+    cat >"$beads" <<'JSON'
+[{"id":"wt-closed","status":"closed","metadata":{"polecat_session":"deadsess"}}]
+JSON
+    printf '{"sessions":[]}' >"$sessions"
+
+    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out.txt" 2>&1 ||
+        fail "reaper exited non-zero: $(cat "$tmp/out.txt")"
+
+    # The permanent condition must be NAMED, every time, whatever the gates then
+    # decide — the distinct event is what stops this being silent.
+    [[ "$(reason_for "$log" worktree_no_such_bead)" == "no_such_bead" ]] ||
+        fail "a bead bd reports as absent was not recorded as no_such_bead"
+    ! jq -e 'select(.event == "worktree_bead_unreadable") |
+             select(.bead | startswith("wt-gone"))' "$log" >/dev/null ||
+        fail "a permanently-absent bead was logged as transiently unreadable; it will be retried forever"
+
+    # Clean and published: the content exists elsewhere, so this is a leak.
+    [[ ! -e "$home/worktrees/wt-gone-published" ]] ||
+        fail "a no-such-bead worktree that is clean and published was not reaped"
+    [[ "$(jq -r 'select(.bead == "wt-gone-published" and .event == "worktree_reaped") | .detail' "$log" | tail -n 1)" == *"no such bead"* ]] ||
+        fail "the reap of a no-such-bead path was reported as a closed-bead reap"
+
+    # Clean but published nowhere: a FINDING, not a removal and not a retry.
+    [[ -e "$home/worktrees/wt-gone-unpublished" ]] ||
+        fail "a no-such-bead worktree holding the only copy of its commits was reaped"
+    [[ "$(jq -r 'select(.bead == "wt-gone-unpublished") | .event' "$log" | tail -n 1)" == "worktree_unpublished_kept" ]] ||
+        fail "an unpublished no-such-bead worktree was not surfaced as a finding"
+    [[ "$(reason_for "$log" worktree_unpublished_kept)" == "no_such_bead_content_unpublished" ]] ||
+        fail "the unpublished finding does not name why it was kept"
+
+    # Dirty still wins: gate 3 binds on this path exactly as on the other.
+    [[ -e "$home/worktrees/wt-gone-dirty" ]] ||
+        fail "a no-such-bead worktree with uncommitted work was reaped"
+    [[ "$(jq -r 'select(.bead == "wt-gone-dirty") | .event' "$log" | tail -n 1)" == "worktree_dirty_kept" ]] ||
+        fail "a dirty no-such-bead worktree was not reported for salvage"
+
+    # And the ordinary closed-bead path is untouched by any of it.
+    [[ ! -e "$home/worktrees/wt-closed" ]] ||
+        fail "the closed-bead reap regressed"
+
+    # A store that cannot answer AT ALL stays transient — the distinction is
+    # bd's error class, never a guess at what a bead id looks like.
+    rm -f "$log"
+    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+        GC_BD_STORE_ERROR=1 PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run \
+        >"$tmp/err.txt" 2>&1 ||
+        fail "reaper exited non-zero on a failing store: $(cat "$tmp/err.txt")"
+
+    [[ "$(reason_for "$log" worktree_bead_query_failed)" == "bead_query_failed" ]] ||
+        fail "a store that errored for a reason other than no-such-bead was not reported as a store failure"
+    ! grep -F '"event":"worktree_no_such_bead"' "$log" >/dev/null ||
+        fail "a store error was mistaken for a permanent no-such-bead verdict"
+    [[ -e "$home/worktrees/wt-gone-unpublished" ]] ||
+        fail "a worktree was reaped while the store was unreadable"
+
+    rm -rf "$tmp"
+}
+
+test_an_all_missing_batch_is_not_a_store_failure() {
+    # bd exits 1 and prints an error OBJECT — not an array — when NO id in the
+    # batch resolves. The array check read that as a dead store, so a rig whose
+    # only candidate was a no-such-bead path aborted the whole cycle as
+    # `worktree_bead_query_failed` and sent the reader at a Dolt server that was
+    # answering perfectly (gcp-0u14).
+    local tmp rig bin home beads sessions logdir log
+    tmp=$(mktemp -d)
+    rig="$tmp/rig"
+    bin="$tmp/bin"
+    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
+    beads="$tmp/beads.json"
+    sessions="$tmp/sessions.json"
+    logdir="$tmp/logs"
+    log="$logdir/polecat-worktree-reap.log"
+    mkdir -p "$logdir"
+
+    setup_rig "$rig"
+    publish_rig "$rig" "$tmp/remote.git"
+    write_gc_stub "$bin"
+    add_bead_worktree "$rig" "$home" wt-gone
+
+    printf '[]' >"$beads"
+    printf '{"sessions":[]}' >"$sessions"
+
+    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out.txt" 2>&1 ||
+        fail "reaper exited non-zero: $(cat "$tmp/out.txt")"
+
+    ! grep -F '"event":"worktree_bead_query_failed"' "$log" >/dev/null ||
+        fail "a batch bd answered in full was reported as a store failure"
+    grep -F '"event":"worktree_no_such_bead"' "$log" >/dev/null ||
+        fail "the sole no-such-bead candidate was never decided"
+    [[ ! -e "$home/worktrees/wt-gone" ]] ||
+        fail "a clean, published, no-such-bead worktree was not reaped"
+
+    rm -rf "$tmp"
+}
+
 test_reaps_only_closed_clean_unowned_bead_worktrees
 test_real_removal_is_opt_in
 test_unreadable_session_roster_skips_the_reap
@@ -736,5 +989,8 @@ test_budget_expiry_yields_the_witness_start
 test_every_line_is_stamped_at_the_event_not_at_the_run
 test_budget_truncation_is_not_reported_as_an_external_failure
 test_git_status_failure_is_distinguished_from_a_short_budget
+test_dotted_sub_bead_worktrees_are_enumerated
+test_a_permanently_missing_bead_is_decided_not_retried
+test_an_all_missing_batch_is_not_a_store_failure
 
 echo "polecat worktree reap tests passed"
