@@ -27,7 +27,7 @@ jobs:
             slack-full/cli/go.sum
 
       - name: Install Python test dependencies
-        run: python3 -m pip install PyYAML pytest jsonschema
+        run: python3 -m pip install --break-system-packages PyYAML pytest jsonschema
 
       - name: Validate registry
         # --require-git: without git, no commit or content-hash verification runs at

@@ -67,7 +67,7 @@ jobs:
           ref: ${{ github.event.inputs.pack_ref || github.ref }}
 
       - name: Install Python test dependencies
-        run: python3 -m pip install PyYAML pytest
+        run: python3 -m pip install --break-system-packages PyYAML pytest
 
       - name: Run supported-pack contract tests
         run: python3 -m pytest tests/test_gascity_pack_inference_gate.py gascity/tests/test_formula_assets.py -q
@@ -226,7 +226,7 @@ jobs:
 
       - name: Install Python test dependencies
         if: steps.subset.outputs.run_gate == 'true'
-        run: python3 -m pip install PyYAML pytest
+        run: python3 -m pip install --break-system-packages PyYAML pytest
 
       - name: Install Gas City
         if: steps.subset.outputs.run_gate == 'true'

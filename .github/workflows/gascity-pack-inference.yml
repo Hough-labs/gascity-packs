@@ -110,7 +110,7 @@ jobs:
           .gascity-ci/.github/scripts/install-claude-native.sh "${CLAUDE_VERSION}" --cache
 
       - name: Install Python test dependencies
-        run: python3 -m pip install PyYAML pytest
+        run: python3 -m pip install --break-system-packages PyYAML pytest
 
       - name: Install Gas City
         env:
