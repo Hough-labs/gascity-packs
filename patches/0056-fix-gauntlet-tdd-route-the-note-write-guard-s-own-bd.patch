@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 28 Aug 2026 19:15:28 -0400
-Subject: [PATCH 56/73] fix(gauntlet-tdd): route the note-write guard's own bd
+Subject: [PATCH 56/74] fix(gauntlet-tdd): route the note-write guard's own bd
  match through gc (gcp-dnxq)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

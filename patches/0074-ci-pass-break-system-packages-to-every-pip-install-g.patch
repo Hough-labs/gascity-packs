@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Wed, 2 Sep 2026 18:57:55 -0400
+Subject: [PATCH 74/74] ci: pass --break-system-packages to every pip install
+ (gcp-83v1)
+
+gcp-gtux dropped actions/setup-python in favour of the runner image's system
+Python, which fixed the unresolvable libpython3.12.so.1.0 but exposed the next
+layer: run 33681470318's "Install Python test dependencies" step died with
+"/usr/bin/python3: No module named pip". Ubuntu's minimal python3 ships neither
+pip nor ensurepip, and /usr/lib/python3.12/EXTERNALLY-MANAGED is present, so
+even once python3-pip is installed a system-wide `pip install` is refused with
+"error: externally-managed-environment".
+
+The image half (python3-pip + python3-venv in the arc-runner apt list) landed in
+bastion f60d755a and is live on the published :stable tag. This is the workflow
+half: the four `python3 -m pip install` call sites now pass
+--break-system-packages. The runner container is ephemeral and single-purpose,
+so there is no system Python installation to protect -- exactly the case the
+flag exists for. A venv is the cleaner answer in principle, but it would add
+create/activate ceremony to four separate call sites and buy nothing inside a
+throwaway container.
+
+Restoring actions/setup-python was explicitly rejected: it would trade this pip
+failure back for the nine-test libpython failure gcp-gtux fixed. The
+image-provided interpreter stays; it just needed pip alongside it.
+
+Validation: the fix is inert until CI actually runs against the new image, so
+it cannot be proven locally -- the image half's liveness was verified
+independently by running a throwaway pod from the published :stable tag with
+imagePullPolicy=Always (python3 -m pip -> pip 24.0). Green CI on this branch is
+the confirming signal.
+---
+ .github/workflows/ci.yml                     | 2 +-
+ .github/workflows/gascity-pack-inference.yml | 2 +-
+ .github/workflows/supported-pack-nightly.yml | 4 ++--
+ 3 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index f15613f..db5a0ad 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -27,7 +27,7 @@ jobs:
+             slack-full/cli/go.sum
+ 
+       - name: Install Python test dependencies
+-        run: python3 -m pip install PyYAML pytest jsonschema
++        run: python3 -m pip install --break-system-packages PyYAML pytest jsonschema
+ 
+       - name: Validate registry
+         # --require-git: without git, no commit or content-hash verification runs at
+diff --git a/.github/workflows/gascity-pack-inference.yml b/.github/workflows/gascity-pack-inference.yml
+index d1e6c2f..c95bfb3 100644
+--- a/.github/workflows/gascity-pack-inference.yml
++++ b/.github/workflows/gascity-pack-inference.yml
+@@ -110,7 +110,7 @@ jobs:
+           .gascity-ci/.github/scripts/install-claude-native.sh "${CLAUDE_VERSION}" --cache
+ 
+       - name: Install Python test dependencies
+-        run: python3 -m pip install PyYAML pytest
++        run: python3 -m pip install --break-system-packages PyYAML pytest
+ 
+       - name: Install Gas City
+         env:
+diff --git a/.github/workflows/supported-pack-nightly.yml b/.github/workflows/supported-pack-nightly.yml
+index a38034c..bca7320 100644
+--- a/.github/workflows/supported-pack-nightly.yml
++++ b/.github/workflows/supported-pack-nightly.yml
+@@ -67,7 +67,7 @@ jobs:
+           ref: ${{ github.event.inputs.pack_ref || github.ref }}
+ 
+       - name: Install Python test dependencies
+-        run: python3 -m pip install PyYAML pytest
++        run: python3 -m pip install --break-system-packages PyYAML pytest
+ 
+       - name: Run supported-pack contract tests
+         run: python3 -m pytest tests/test_gascity_pack_inference_gate.py gascity/tests/test_formula_assets.py -q
+@@ -226,7 +226,7 @@ jobs:
+ 
+       - name: Install Python test dependencies
+         if: steps.subset.outputs.run_gate == 'true'
+-        run: python3 -m pip install PyYAML pytest
++        run: python3 -m pip install --break-system-packages PyYAML pytest
+ 
+       - name: Install Gas City
+         if: steps.subset.outputs.run_gate == 'true'
+-- 
+2.50.1 (Apple Git-155)
+

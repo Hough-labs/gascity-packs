@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 31 Jul 2026 23:23:19 -0400
-Subject: [PATCH 17/73] test: build drift-suite fixtures line-by-line, not with
+Subject: [PATCH 17/74] test: build drift-suite fixtures line-by-line, not with
  embedded escapes (gcp-co9)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
