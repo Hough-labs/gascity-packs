@@ -23,6 +23,7 @@ from __future__ import annotations
 from pathlib import Path
 import re
 import subprocess
+import tomllib
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -50,6 +51,13 @@ BD_SEARCH_STATUS = re.compile(
 )
 
 REFINERY_PATROL = Path("gastown/formulas/mol-refinery-patrol.toml")
+WITNESS_PATROL = Path("gastown/formulas/mol-witness-patrol.toml")
+
+# A git command naming `main` as a branch. The no-backtick clause is the same
+# one the detectors above use to separate an invocation from prose about one.
+# `origin/main` and a bare `main` argument both match; `maintenance`,
+# `domain/main-thing` and the like do not.
+GIT_MAIN_REF = re.compile(r"\bgit\b[^`\n]*?(?<![\w/-])(?:origin/)?main(?![\w/-])")
 
 SCANNED_SUFFIXES = frozenset({".md", ".toml", ".sh"})
 
@@ -275,6 +283,58 @@ def bd_search_status_violations(path: Path, text: str) -> list[str]:
     return violations
 
 
+def hardcoded_main_ref_violations(path: Path, text: str) -> list[str]:
+    """An agent-executed git command must not assume the default branch is `main`.
+
+    Rigs do not agree on a default branch: gauntlet is `master`, winnow is
+    `dev`, gascity is `edge-integration`. Against any of them a command naming
+    `origin/main` does not compare against the wrong branch — the ref does not
+    resolve at all, so git exits 128 and the caller reads a bare non-zero.
+
+    That is indistinguishable from an honest negative, which is what makes it
+    worth a detector rather than a review note. `mol-witness-patrol`'s
+    orphan-recovery guard asked `git merge-base --is-ancestor origin/$BRANCH
+    origin/main` to decide whether an orphaned bead's work had already landed.
+    On every non-`main` rig that check exited 128, read as "not merged", and
+    fell through to the reset path — which force-removes the worktree and runs
+    `gc workflow delete-source && gc workflow reopen-source`, putting completed,
+    merged work back in the pool. All four closed gauntlet beads checked at the
+    time would have been misjudged this way (gcp-5ddt).
+
+    Resolve the branch instead — `git symbolic-ref refs/remotes/origin/HEAD`,
+    falling back to `git ls-remote --symref origin HEAD` — and treat an
+    unresolvable result as a reason to skip, never as a negative result.
+    """
+    violations = []
+    for lang, start, body in fenced_blocks(text):
+        if lang not in {"bash", "sh", ""}:
+            continue
+        for offset, command in logical_commands(body):
+            if not GIT_MAIN_REF.search(command):
+                continue
+            violations.append(
+                f"{path.relative_to(REPO_ROOT)}:{start + offset - 1}: "
+                f"git command hardcodes `main`:\n    {command}"
+            )
+    return violations
+
+
+def witness_orphan_recovery_step() -> str:
+    """The `recover-orphaned-beads` step description, straight from the formula."""
+    with (REPO_ROOT / WITNESS_PATROL).open("rb") as handle:
+        formula = tomllib.load(handle)
+    steps = [
+        step
+        for step in formula["steps"]
+        if step.get("id") == "recover-orphaned-beads"
+    ]
+    assert len(steps) == 1, (
+        f"expected exactly one recover-orphaned-beads step in {WITNESS_PATROL}, "
+        f"found {len(steps)} — the assertions below no longer cover the guard"
+    )
+    return steps[0]["description"]
+
+
 def test_pool_returning_updates_declare_routing() -> None:
     violations = []
     for path in gastown_assets():
@@ -379,6 +439,47 @@ def test_refinery_duplicate_check_sees_in_progress_bugs() -> None:
     )
 
 
+def test_witness_orphan_recovery_resolves_the_rigs_default_branch() -> None:
+    """The already-merged guard must compare against the rig's real default.
+
+    This guard is the one thing standing between a crashed polecat's finished
+    work and a re-dispatch, and its error path is the destructive one: anything
+    it cannot prove merged goes back to the pool. So it has to resolve the
+    branch rather than name one, and it has to skip the bead when it cannot.
+    """
+    step = witness_orphan_recovery_step()
+
+    assert not hardcoded_main_ref_violations(REPO_ROOT / WITNESS_PATROL, step), (
+        "orphan recovery must not name `main`: on a master/dev/edge-integration "
+        "rig the ref does not resolve, git exits 128, and 'not merged' sends "
+        "already-merged work back to the pool:\n"
+        + "\n".join(hardcoded_main_ref_violations(REPO_ROOT / WITNESS_PATROL, step))
+    )
+
+    assert "git symbolic-ref --quiet refs/remotes/origin/HEAD" in step, (
+        "orphan recovery must resolve the default branch from origin/HEAD"
+    )
+    assert "git ls-remote --symref origin HEAD" in step, (
+        "origin/HEAD is unset in a worktree cut with --detach — orphan recovery "
+        "needs the remote fallback, or it fails closed on healthy rigs"
+    )
+    assert (
+        'git merge-base --is-ancestor "origin/$BRANCH" "origin/$DEFAULT_BRANCH"'
+        in step
+    ), "the already-merged check must compare the branch against the resolved default"
+
+    # Fail closed: an unresolvable default branch skips the bead rather than
+    # falling through to the reset. `git merge-base --is-ancestor` exits 1 for
+    # "not an ancestor" and 128 for "no such ref", so the guard cannot tell an
+    # unresolvable ref from a real negative once it reaches the comparison.
+    assert 'git rev-parse --verify --quiet "origin/$DEFAULT_BRANCH"' in step, (
+        "verify the resolved default branch before comparing against it"
+    )
+    assert "FAIL CLOSED" in step, (
+        "an unresolvable default branch must skip recovery, not reset the bead"
+    )
+
+
 def test_detectors_catch_the_drift_they_are_named_for() -> None:
     fixture = REPO_ROOT / "fixture.md"
 
@@ -397,6 +498,29 @@ def test_detectors_catch_the_drift_they_are_named_for() -> None:
     # Handing a bead to a named assignee is not a pool return.
     assert not pool_return_violations(
         fixture, 'gc bd update $WORK --status=open --assignee="$REFINERY_TARGET"'
+    )
+
+    assert hardcoded_main_ref_violations(
+        fixture,
+        "```bash\ngit merge-base --is-ancestor origin/$BRANCH origin/main\n```",
+    )
+    assert hardcoded_main_ref_violations(fixture, "```bash\ngit log main --oneline\n```")
+    assert hardcoded_main_ref_violations(
+        fixture, "```bash\ngit log origin/main..HEAD --oneline\n```"
+    )
+    # The resolved form is what the detector is steering toward.
+    assert not hardcoded_main_ref_violations(
+        fixture,
+        '```bash\ngit merge-base --is-ancestor "origin/$BRANCH" "origin/$DEFAULT_BRANCH"\n```',
+    )
+    # Only fenced shell is scanned, so prose explaining the bug — which every
+    # fix for it has to write — is not itself a violation.
+    assert not hardcoded_main_ref_violations(
+        fixture, "Never run `git merge-base --is-ancestor origin/$BRANCH origin/main`."
+    )
+    # A branch whose name merely starts with "main" is not the default branch.
+    assert not hardcoded_main_ref_violations(
+        fixture, "```bash\ngit checkout maintenance-1.x\n```"
     )
 
     # Built line-by-line rather than with embedded "\n" escapes: a literal

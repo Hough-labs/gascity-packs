@@ -334,6 +334,37 @@ WORKTREE=$(echo "$META" | jq -r '.worktree // empty')
 BRANCH=$(echo "$META" | jq -r '.branch // empty')
 ```
 
+Resolve the rig's default branch before you go any further. Case C and Step 3
+both compare against it, and neither may assume `main`: rigs run on `master`
+(gauntlet), `dev` (winnow) and `edge-integration` (gascity) too. Against those,
+a hardcoded `origin/main` does not resolve at all — git exits 128 and the
+caller reads a plain negative, which in Step 3 means "not merged" and sends
+finished work back to the pool (gcp-5ddt).
+
+```bash
+# Run from the rig root or the bead's worktree — either is inside the repo.
+DEFAULT_REF=$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null || true)
+DEFAULT_BRANCH=${DEFAULT_REF#refs/remotes/origin/}
+if [ -z "$DEFAULT_BRANCH" ]; then
+  # origin/HEAD is not set in every clone — a worktree cut with --detach never
+  # gets one. Ask the remote instead of guessing a name.
+  DEFAULT_BRANCH=$(git ls-remote --symref origin HEAD 2>/dev/null |
+    awk '$1 == "ref:" { sub("refs/heads/", "", $2); print $2; exit }')
+fi
+[ -n "$DEFAULT_BRANCH" ] && git fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1
+if [ -z "$DEFAULT_BRANCH" ] ||
+   ! git rev-parse --verify --quiet "origin/$DEFAULT_BRANCH" >/dev/null; then
+  # FAIL CLOSED: skip this bead entirely, do not recover it. Step 3's
+  # already-merged guard cannot run without this ref, and the cost of guessing
+  # wrong is re-dispatching completed work. Leaving the bead orphaned for one
+  # more cycle is cheap; re-dispatching merged work is not.
+  echo "SKIP <bead>: cannot resolve origin's default branch in $(pwd)"
+  gc mail send mayor/ -s "WITNESS: orphan recovery skipped — unresolvable default branch" \
+    -m "Bead <bead>: could not resolve origin's default branch (origin/HEAD unset and git ls-remote --symref gave nothing). Skipped recovery rather than risk re-dispatching already-merged work. Fix by setting origin/HEAD on this rig: git remote set-head origin --auto"
+  # Continue with the next orphaned bead.
+fi
+```
+
 Check the bead and worktree state, then act:
 
 **Case A: Branch exists on origin (work already published).**
@@ -357,7 +388,7 @@ Work is committed locally but never pushed. Branch is not yet canonical.
 ```bash
 cd "$WORKTREE"
 BRANCH=$(git branch --show-current)
-git log origin/main..HEAD --oneline  # Shows unpushed commits
+git log "origin/$DEFAULT_BRANCH"..HEAD --oneline  # Shows unpushed commits
 ```
 Commit any remaining uncommitted/untracked work first (safeguard):
 ```bash
@@ -390,28 +421,47 @@ no branch on origin.**
 Nothing to salvage. The bead goes back to pool and a new polecat
 starts fresh.
 
-**Step 3: Verify work on main before resetting.**
+**Step 3: Verify the work already landed on the default branch before resetting.**
 
-Before resetting the bead to pool, check if the branch was already merged
-to main (polecat finished, pushed, but crashed before closing the bead):
+Before resetting the bead to pool, check whether the branch was already merged
+into `origin/$DEFAULT_BRANCH` — the polecat finished and pushed, but crashed
+before the bead was closed. This is the guard that stops the witness
+re-dispatching completed work, so it uses reachability and nothing weaker:
 ```bash
-git log main --oneline | grep -q "$BRANCH"
-# Or check if branch commits are reachable from main:
-git merge-base --is-ancestor origin/$BRANCH origin/main
+if ! git rev-parse --verify --quiet "origin/$BRANCH" >/dev/null; then
+  # Nothing was ever published under this branch (Case E). There is no merge
+  # to detect, so the reset below is the correct outcome.
+  MERGED=no
+elif git merge-base --is-ancestor "origin/$BRANCH" "origin/$DEFAULT_BRANCH"; then
+  MERGED=yes
+else
+  MERGED=no
+fi
 ```
 
-If the work is already on main:
+Both refs are verified before the comparison on purpose. `git merge-base
+--is-ancestor` exits 1 for "not an ancestor" and 128 for "no such ref", and a
+bare `if` cannot tell those apart. That collapse *is* the bug this guard was
+hardened against: with `origin/main` hardcoded, every rig whose default branch
+is something else took the 128 path, read it as "not merged", and fell through
+to Step 3b — which force-removes the worktree and reopens the source bead,
+putting merged work back in the pool (gcp-5ddt). Do not reintroduce a
+`git log <branch> | grep -q "$BRANCH"` check alongside this one either: it
+matches any commit whose *subject* mentions the branch name, so it fails in the
+opposite direction, closing beads whose work never landed.
+
+If `MERGED=yes`:
 - **Close the bead** (work is done, don't re-dispatch). Use `--force`: the bead
   is still assigned to the crashed polecat, so this is a cross-actor close and
   bd's close-authority guard (gastownhall/beads#3734) would otherwise refuse it:
 ```bash
 gc bd close <bead> --force
 gc mail send mayor/ -s "ORPHAN_CLOSED: <bead> already merged" \
-  -m "Branch $BRANCH already on main. Closed instead of resetting."
+  -m "Branch $BRANCH already on $DEFAULT_BRANCH. Closed instead of resetting."
 ```
 - Clean up worktree and skip to Step 4.
 
-If the work is NOT on main, proceed with reset:
+If `MERGED=no`, proceed with reset:
 
 **Step 3b: Clean up worktree and return bead to pool.**
 
