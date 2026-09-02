@@ -351,7 +351,9 @@ if [ -z "$DEFAULT_BRANCH" ]; then
   DEFAULT_BRANCH=$(git ls-remote --symref origin HEAD 2>/dev/null |
     awk '$1 == "ref:" { sub("refs/heads/", "", $2); print $2; exit }')
 fi
-[ -n "$DEFAULT_BRANCH" ] && git fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1
+if [ -n "$DEFAULT_BRANCH" ]; then
+  git fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1 || true
+fi
 if [ -z "$DEFAULT_BRANCH" ] ||
    ! git rev-parse --verify --quiet "origin/$DEFAULT_BRANCH" >/dev/null; then
   # FAIL CLOSED: skip this bead entirely, do not recover it. Step 3's
