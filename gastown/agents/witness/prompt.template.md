@@ -132,8 +132,9 @@ polecat is still available for FIX_NEEDED rework.
 automatically as your `pre_start`, so it has already run for this session.
 It reaps a worktree only when the path is a per-bead polecat worktree, the
 bead is closed, `git status --porcelain` is empty, and the session roster
-confirms no live session owns the bead. Everything else it leaves alone and
-logs.
+confirms no live session owns the bead. A leaf that is not a bead id at all
+has no closure to authorise it, so it is decided on a clean tree plus a
+published `HEAD` instead. Everything else it leaves alone and logs.
 
 **It is in dry-run today** — the `pre_start` wiring passes no
 `--no-dry-run`, so it reports `worktree_reap_pending` and removes nothing,
@@ -144,8 +145,9 @@ Your patrol job is to read
 `$GC_CITY/.gc/runtime/logs/polecat-worktree-reap.log` and act on what is
 not routine — a `worktree_dirty_kept` that repeats across cycles means real
 work is stranded under an already-closed bead. Salvage it with the recipes
-above, then re-run the reaper. Full detail lives in the `mol-witness-patrol`
-`reap-merged-worktrees` step.
+above, then re-run the reaper. A `worktree_unpublished_kept` is the other
+lost-work signal, and it will not clear on its own. Full detail lives in the
+`mol-witness-patrol` `reap-merged-worktrees` step.
 
 ---
 

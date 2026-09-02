@@ -563,7 +563,9 @@ patrol; the flip is an operator decision — append `--no-dry-run` to the
 has been reviewed across several cycles and no live worktree ever appeared
 in it. Treat the log as a report, not as a completed cleanup.
 
-**What it will and will not remove.** All four gates must hold:
+**What it will and will not remove.** There are two removal authorities.
+On the ordinary one — a worktree under a bead — all four of these must
+hold:
 
 1. The path is a per-bead polecat worktree
    (`.../polecats/<agent>/worktrees/<bead-id>`). A polecat's persistent
@@ -581,10 +583,26 @@ in it. Treat the log as a report, not as a completed cleanup.
    fails is not proof of absence, the same rule the orphan-recovery step
    above applies before it touches a bead.
 
-It deliberately does NOT require every commit to be on a remote: a
+That path deliberately does NOT require every commit to be on a remote: a
 rebase-merging refinery rewrites hashes and then deletes the merged branch,
 so a genuinely merged worktree always looks like it holds unpublished
 commits. Bead closure is the refinery's own proof that the work landed.
+
+A path whose leaf is not a bead id at all takes the OTHER route. `bd` answers
+"no issue found matching" for it forever, so no bead closure will ever
+authorise the reap and gates 2 and 4 cannot bind. Treating that as a transient
+store failure retried it every cycle for as long as the directory existed, and
+an unreapable child pins its parent polecat home open just as long
+(`gcp-0u14`). The reaper separates the two on `bd`'s own error class — a
+lookup that errors for any reason OTHER than "no issue found matching" stays
+transient — logs `worktree_no_such_bead`, and then decides on the worktree's
+own evidence: gate 3 above, plus
+
+5. `HEAD` is reachable from a remote-tracking ref, so the commits exist
+   somewhere other than that directory. This gate binds ONLY here, where there
+   is no bead closure to stand on. A path that fails it is kept and reported as
+   `worktree_unpublished_kept` — a finding, not a retry, because the condition
+   never resolves itself.
 
 **Review the log.** Every decision lands in
 `$GC_CITY/.gc/runtime/logs/polecat-worktree-reap.log` as one JSON line
@@ -624,7 +642,9 @@ jq -r 'select(.reason != "") | [.ts, .event, .reason, .budget_remaining, .bead] 
 | `worktree_owner_live` | Closed bead, polecat still alive (PR rework) | None — expected; next cycle retries |
 | `worktree_budget_truncated` | A check was NEVER ATTEMPTED — the run's budget was already spent when it came due. Nothing external failed. `reason` names the check that did not happen (`budget_spent_before_worktree_list` / `_bead_query` / `_roster_read` / `_git_status`) | Not an outage; do not chase the named subsystem. Read it as "this cycle was too short", exactly like `worktree_budget_exhausted` below |
 | `worktree_owner_unconfirmed` | Liveness is unknown, so the reap was skipped. `reason`: `roster_read_timed_out` (the read did not finish in the budget left), `roster_read_failed` (`gc session list` errored), `roster_unparseable` (it answered with a shape we do not recognise) | **`roster_read_timed_out` → the budget is the suspect first**; the detail names the seconds it got. Only `roster_read_failed`/`roster_unparseable` implicate the roster itself — then check `gc doctor`. Nothing was removed either way |
-| `worktree_bead_unreadable` | The bulk `gc bd show` answered, but echoed no row for this bead id (`reason: bead_absent_from_batch`) | Usually a worktree whose bead was deleted or renamed. If it repeats across many beads, check Dolt health |
+| `worktree_bead_unreadable` | The bulk `gc bd show` answered, but echoed no row for this bead id AND did not say the id does not exist (`reason: bead_absent_from_batch`) — a fuzzy hit that echoed a different id, or a per-id read failure. TRANSIENT: retried next cycle | If it repeats across many beads, check Dolt health. An id `bd` positively reports as absent is `worktree_no_such_bead` below, not this |
+| `worktree_no_such_bead` | `bd` answered "no issue found matching" for this leaf (`reason: no_such_bead`), so it is not a bead worktree at all — typically a scratch directory hand-made under `worktrees/`. PERMANENT, so it is decided once instead of retried forever | Log only. The gate-3 / gate-5 line for the same path is the one that says what actually happened to it |
+| `worktree_unpublished_kept` | A no-such-bead path that is clean but whose `HEAD` is on no remote-tracking branch (`reason: no_such_bead_content_unpublished`), so its commits exist nowhere else. Nothing was removed | A real finding, and it will NOT resolve on its own — inspect the worktree by hand. If the commits matter, push them somewhere; if they do not, remove the directory yourself. Mail the mayor if you cannot tell |
 | `worktree_status_unreadable` | `git status` actually ran inside the worktree and did not answer. `reason`: `git_status_timed_out` (cut short by the budget left) or `git_status_failed` (non-zero exit) | **`git_status_timed_out` → budget first.** `git_status_failed` is the real one: inspect by hand, likely a broken or moved checkout |
 | `worktree_reap_failed` | Directory survived removal | Investigate permissions/mounts, mail mayor |
 | `worktree_list_failed` | `git worktree list` ran and did not answer, so no candidate was enumerated. `reason`: `worktree_list_timed_out` or `worktree_list_failed` | Timed out → budget first. Failed → the rig checkout itself is unhealthy; inspect `$RIG_ROOT` by hand |

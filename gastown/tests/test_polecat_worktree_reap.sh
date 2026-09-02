@@ -19,7 +19,7 @@ write_gc_stub() {
 #   gc bd --rig <rig> show <bead>... --json   (many ids in ONE call)
 #   gc session list --state=all --json
 #
-# The `bd show` arm reproduces real bd's THREE observable behaviours for a
+# The `gc bd show` arm reproduces real bd's THREE observable behaviours for a
 # missing id, because the reaper now decides transient-vs-permanent on bd's own
 # error class and a stub that silently omits an id would test a bd that does not
 # exist (gcp-0u14):
