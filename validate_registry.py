@@ -19,10 +19,29 @@ from urllib.parse import urlparse
 # <owner>/<pack> name; they never get an entry here. That keeps this validator a
 # purely local, network-free, fail-closed check: every source it accepts is one
 # whose content it can actually verify against the local object database.
+#
+# "THIS repository" means the upstream repo AND the Hough-labs fork it is
+# developed in, because those are two remote names for one object database: a
+# commit on either is in the local worktree's history, so its content hash is
+# verifiable here exactly the same way. The distinction matters for a pack that
+# lives ONLY in the fork -- gauntlet-tdd is closed-source and is never
+# upstreamed, so an upstream `source` for it names a repository that does not
+# contain the pinned commit. Accepting the fork URL keeps the fail-closed
+# guarantee (still no network, still verified against local objects) while
+# letting a fork-only pack state where it actually lives. A repository outside
+# this pair remains an external source and is refused.
 CANONICAL_REPO_HOST = "github.com"
 CANONICAL_REPO_OWNER = "gastownhall"
 CANONICAL_REPO_NAME = "gascity-packs"
 CANONICAL_REPO_URL = f"https://{CANONICAL_REPO_HOST}/{CANONICAL_REPO_OWNER}/{CANONICAL_REPO_NAME}"
+FORK_REPO_OWNER = "Hough-labs"
+FORK_REPO_NAME = "gascity-packs"
+FORK_REPO_URL = f"https://{CANONICAL_REPO_HOST}/{FORK_REPO_OWNER}/{FORK_REPO_NAME}"
+# Ordered: the upstream repo is the default a message should suggest.
+ACCEPTED_REPOS = (
+    (CANONICAL_REPO_OWNER, CANONICAL_REPO_NAME),
+    (FORK_REPO_OWNER, FORK_REPO_NAME),
+)
 PACK_PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 PACK_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*(/[a-z0-9][a-z0-9-]*)?$")
@@ -221,10 +240,16 @@ def parse_source(source: str) -> SourceSpec:
     owner, repo, *rest = segments
     if repo.endswith(".git"):
         raise SourceError(f"source must use the canonical repository URL {CANONICAL_REPO_URL}")
-    if owner != CANONICAL_REPO_OWNER or repo != CANONICAL_REPO_NAME:
-        # A different repo on github.com is still an external source.
-        if (owner.lower(), repo.lower()) == (CANONICAL_REPO_OWNER, CANONICAL_REPO_NAME):
-            raise SourceError(f"source must use the canonical repository URL {CANONICAL_REPO_URL}")
+    if (owner, repo) not in ACCEPTED_REPOS:
+        # A different repo on github.com is still an external source. Mis-cased
+        # spellings of an accepted repo are not: name the exact URL to use, so a
+        # typo does not read as "publish this somewhere else".
+        for accepted_owner, accepted_name in ACCEPTED_REPOS:
+            if (owner.lower(), repo.lower()) == (accepted_owner.lower(), accepted_name.lower()):
+                raise SourceError(
+                    "source must use the canonical repository URL "
+                    f"https://{CANONICAL_REPO_HOST}/{accepted_owner}/{accepted_name}"
+                )
         raise SourceError(_FOREIGN_SOURCE_MESSAGE)
 
     if not rest:
