@@ -47,6 +47,44 @@ test_retired_dog_formulas_are_not_reintroduced() {
         fail "gastown pack should not advertise retired dog formulas"
 }
 
+test_digest_archive_bead_is_not_left_open() {
+    # gcp-156c: step 3 was labelled "archive" but only ran `gc bd create`,
+    # which files an issue `open`, and nothing ever closed it. A digest runs
+    # daily, so that leaked one permanently-open task per run, forever --
+    # hand-clearing them does nothing because the next cycle files another.
+    # `gc bd create` has no create-time status flag, so capture-then-close is
+    # the only available shape; pin it here so "archive" cannot silently go
+    # back to meaning "file work nobody actions".
+    local formula="$GASTOWN/formulas/mol-digest-generate.toml"
+
+    [[ -f "$formula" ]] || fail "missing digest formula"
+    parse_toml "$formula"
+
+    grep -F 'DIGEST_BEAD=$(gc bd create --type=task' "$formula" >/dev/null ||
+        fail "digest archive step must capture the id of the bead it creates"
+    grep -F 'gc bd close "$DIGEST_BEAD"' "$formula" >/dev/null ||
+        fail "digest archive step must close the bead it creates; an open one leaks every run"
+    grep -F "jq -r '.id // empty'" "$formula" >/dev/null ||
+        fail "digest bead id capture must degrade to empty rather than feed a garbled id to close"
+    grep -F 'if [ -n "$DIGEST_BEAD" ]; then' "$formula" >/dev/null ||
+        fail "a failed id capture must be reported, not silently swallowed back into the leak"
+
+    # The archival record has to stay findable, or closing it just hides the
+    # digest history instead of tidying the backlog.
+    grep -F -- '--label=digest,{{period}}' "$formula" >/dev/null ||
+        fail "the archived digest bead must keep its digest label so the record stays findable"
+
+    python3 - "$formula" <<'DIGEST_ORDER' || fail "the digest bead must be closed inside the archive step, after it is created"
+import sys
+text = open(sys.argv[1], encoding="utf-8").read()
+start = text.index('**3. Archive as bead:**')
+end = text.index('**4. Close work bead')
+block = text[start:end]
+if block.index('gc bd create --type=task') >= block.index('gc bd close "$DIGEST_BEAD"'):
+    raise SystemExit(1)
+DIGEST_ORDER
+}
+
 test_shutdown_dance_contracts_are_executable() {
     local formula="$GASTOWN/formulas/mol-shutdown-dance.toml"
 
@@ -872,6 +910,7 @@ test_submit_and_exit_cannot_be_replayed
 test_post_merge_worktree_teardown_has_an_owner
 test_polecat_home_teardown_has_an_owner
 test_dolt_push_outage_detection_is_wired
+test_digest_archive_bead_is_not_left_open
 test_shutdown_dance_contracts_are_executable
 test_shutdown_dance_lifecycle_and_audit_contracts
 test_composition_is_documented
