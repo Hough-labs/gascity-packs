@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import io
 import pathlib
 import socket
@@ -16,6 +17,36 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "scripts"))
 
 import discord_intake_common as common
+
+
+@contextlib.contextmanager
+def virtual_clock():
+    """Run a deadline-bounded retry loop on virtual time instead of the wall clock.
+
+    ``resolve_routable_session_candidate_eventually`` (and its ready-state sibling)
+    poll until ``time.monotonic()`` passes a deadline, pacing themselves with
+    ``time.sleep``. Stubbing only ``sleep`` removes the pacing but keeps the
+    wall-clock deadline, so the loop spins at full speed for the entire real
+    timeout -- ~43M iterations over 30s, and ~5GiB of recorded calls if the stubs
+    are MagicMocks. That is what OOM-killed the CI runner at its 4Gi cgroup limit.
+
+    Advancing a fake ``monotonic`` from the stubbed ``sleep`` keeps the loop's
+    real semantics -- it still burns its whole retry budget, ~120 iterations at a
+    0.25s delay -- while costing no wall time and no memory. Sleeps advance by at
+    least a hair so a ``sleep(0)`` caller can never wedge the loop forever.
+    """
+    state = {"now": 0.0}
+
+    def fake_monotonic() -> float:
+        return state["now"]
+
+    def fake_sleep(seconds: float = 0.0) -> None:
+        state["now"] += max(float(seconds), 1e-6)
+
+    with mock.patch.object(common.time, "monotonic", new=fake_monotonic), mock.patch.object(
+        common.time, "sleep", new=fake_sleep
+    ):
+        yield
 
 
 class DiscordIntakeCommonTests(unittest.TestCase):
@@ -1029,7 +1060,7 @@ class DiscordIntakeCommonTests(unittest.TestCase):
             common,
             "deliver_session_message",
             return_value={"status": "accepted", "id": "gc-new"},
-        ), mock.patch.object(common.time, "sleep"):
+        ), virtual_clock():
             current = common.ensure_room_launch_session(launch)
 
         create_agent_session.assert_called_once()
@@ -1074,7 +1105,7 @@ class DiscordIntakeCommonTests(unittest.TestCase):
             common,
             "deliver_session_message",
             return_value={"status": "accepted", "id": "gc-maya"},
-        ), mock.patch.object(common.time, "sleep"):
+        ), virtual_clock():
             current = common.ensure_room_launch_session(launch)
 
         create_agent_session.assert_called_once()
@@ -1134,7 +1165,7 @@ class DiscordIntakeCommonTests(unittest.TestCase):
             common,
             "create_agent_session",
             return_value={"alias": "dc-123-sky"},
-        ), mock.patch.object(common.time, "sleep"):
+        ), virtual_clock():
             with self.assertRaisesRegex(common.GCAPIError, "created launch session is not routable yet"):
                 common.ensure_room_launch_session(launch)
 
