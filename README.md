@@ -251,12 +251,16 @@ GC=/path/to/gc make registry-validate
 ### Publishing a pack to the registry
 
 > **`registry.toml` describes packs that live in this repository only.** Its
-> `source` must be a `https://github.com/gastownhall/gascity-packs/tree/<ref>/<dir>`
-> URL (or the bare repository URL for a root pack) — anything else is rejected,
-> because the content hash can only be verified against this repository's own
-> history. If your pack lives in **your** repo, you do not need a PR here: publish
-> it directly to the Gas City registry under a scoped `<owner>/<pack>` name and you
-> keep ownership of it.
+> `source` must be a `/tree/<ref>/<dir>` URL (or the bare repository URL for a
+> root pack) on `github.com/gastownhall/gascity-packs` or on the
+> `github.com/Hough-labs/gascity-packs` fork — anything else is rejected, because
+> the content hash can only be verified against this repository's own history.
+> The fork counts as the same history: it is a second remote over one object
+> database, so a commit on either is verifiable locally. Use the fork URL only
+> for a pack that exists only there — `gauntlet-tdd` is closed-source and is
+> never upstreamed, so the fork is its permanent home. If your pack lives in
+> **your** repo, you do not need a PR here: publish it directly to the Gas City
+> registry under a scoped `<owner>/<pack>` name and you keep ownership of it.
 
 `registry.toml` is the public catalog. Each `[[pack.release]]` carries a
 content hash that `validate_registry.py` enforces against the pack tree at the
