@@ -45,6 +45,37 @@ def test_parse_source_accepts_bare_repo_url_as_root_pack() -> None:
     assert spec == validate_registry.SourceSpec(ref=None, pack_path="")
 
 
+def test_parse_source_accepts_fork_tree_url() -> None:
+    """gauntlet-tdd is fork-only, so its source must be allowed to say so.
+
+    The fork and the upstream repo are two remotes over one object database, so
+    a fork URL is verifiable against local git exactly like an upstream one.
+    """
+    spec = validate_registry.parse_source(
+        "https://github.com/Hough-labs/gascity-packs/tree/integration/gauntlet-tdd"
+    )
+
+    assert spec == validate_registry.SourceSpec(ref="integration", pack_path="gauntlet-tdd")
+
+
+def test_parse_source_accepts_bare_fork_repo_url_as_root_pack() -> None:
+    spec = validate_registry.parse_source("https://github.com/Hough-labs/gascity-packs")
+
+    assert spec == validate_registry.SourceSpec(ref=None, pack_path="")
+
+
+def test_parse_source_rejects_miscased_fork_owner_by_naming_the_fork_url() -> None:
+    """A typo must point at the fork's own URL, not read as "go publish elsewhere"."""
+    with pytest.raises(validate_registry.SourceError) as excinfo:
+        validate_registry.parse_source(
+            "https://github.com/hough-labs/gascity-packs/tree/integration/gauntlet-tdd"
+        )
+
+    message = str(excinfo.value)
+    assert "canonical repository URL" in message
+    assert "https://github.com/Hough-labs/gascity-packs" in message
+
+
 def test_parse_source_tolerates_trailing_slash_and_host_case() -> None:
     spec = validate_registry.parse_source(
         "https://GITHUB.COM/gastownhall/gascity-packs/tree/main/cass/"
