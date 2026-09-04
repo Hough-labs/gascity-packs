@@ -1,0 +1,128 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 3 Sep 2026 20:23:40 -0400
+Subject: [PATCH 76/76] test(discord): run launch-retry loops on a virtual
+ clock (gcp-sq1r)
+
+The `Run Python pack tests` CI step was OOM-killed at the runner pod's 4Gi
+cgroup limit, surfacing as GitHub's "self-hosted runner lost communication"
+annotation with no failing step (the kernel took Runner.Listener in the same
+memcg sweep, so the agent stopped heartbeating and never uploaded the log).
+Measured per-file, then per-test: one test accounted for the entire footprint.
+
+`resolve_routable_session_candidate_eventually` polls until `time.monotonic()`
+passes a 30s deadline, pacing itself with `time.sleep(0.25)`. Three tests
+stubbed `common.time.sleep` with a bare `mock.patch.object`, which removes the
+pacing but leaves the wall-clock deadline intact -- so the loop spun at full
+speed for the whole 30 real seconds. Measured 43M iterations, and because the
+stubs are MagicMocks every one of those calls is retained in `mock_calls` /
+`call_args_list`. That recording, not the production code, is the allocation:
+re-running the same loop with plain function stubs peaks at 32.7MB, with
+MagicMock stubs at 5120MB.
+
+Replacing the bare sleep stub with a `virtual_clock()` helper -- a fake
+`monotonic` advanced by a plain-function `sleep` -- keeps the test's real
+semantics (it still exhausts the full 30s retry budget, ~120 iterations at the
+0.25s delay) while costing no wall time and no recorded calls. Applied to all
+three sites, so the two hydration tests that currently self-bound by iteration
+counter cannot regress into the same spin if those counters ever change. No
+production change: with a real `sleep` the loop was always well behaved.
+
+Validation, on the exact CI argument list from ci.yml line 44
+(`python3 -m pytest tests contributing/tests gascity/tests discord/tests
+github/tests slack-full/tests slack-channel/tests pr-pipeline/tests
+gauntlet-tdd/tests -q`), max RSS via /usr/bin/time -l:
+
+  before  5,422,563,328 B = 5.05 GiB   102.1s
+  after     155,353,088 B =  148 MiB    55.9s
+
+839 passed, 7 skipped, 9483 subtests in both runs -- same result set, so this
+is a cost change only. 5.05 GiB against a 4Gi limit is the OOM; the observed
+anon-rss of 3.87GiB was simply where the kernel caught it on the way up.
+
+The suite's honest high-water mark is ~148 MiB, so 4Gi is ~27x headroom and
+raising the runner pod's memory limit in bastion (half (A) on this bead --
+modules/linux/helm/arc/runner-scale-set-hough-labs-values.yaml, already 221%
+overcommitted at maxRunners=6) is NOT needed and should stay parked.
+---
+ discord/tests/test_discord_intake_common.py | 37 +++++++++++++++++++--
+ 1 file changed, 34 insertions(+), 3 deletions(-)
+
+diff --git a/discord/tests/test_discord_intake_common.py b/discord/tests/test_discord_intake_common.py
+index 40b02e0..d31ba68 100755
+--- a/discord/tests/test_discord_intake_common.py
++++ b/discord/tests/test_discord_intake_common.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import contextlib
+ import io
+ import pathlib
+ import socket
+@@ -18,6 +19,36 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "scripts"))
+ import discord_intake_common as common
+ 
+ 
++@contextlib.contextmanager
++def virtual_clock():
++    """Run a deadline-bounded retry loop on virtual time instead of the wall clock.
++
++    ``resolve_routable_session_candidate_eventually`` (and its ready-state sibling)
++    poll until ``time.monotonic()`` passes a deadline, pacing themselves with
++    ``time.sleep``. Stubbing only ``sleep`` removes the pacing but keeps the
++    wall-clock deadline, so the loop spins at full speed for the entire real
++    timeout -- ~43M iterations over 30s, and ~5GiB of recorded calls if the stubs
++    are MagicMocks. That is what OOM-killed the CI runner at its 4Gi cgroup limit.
++
++    Advancing a fake ``monotonic`` from the stubbed ``sleep`` keeps the loop's
++    real semantics -- it still burns its whole retry budget, ~120 iterations at a
++    0.25s delay -- while costing no wall time and no memory. Sleeps advance by at
++    least a hair so a ``sleep(0)`` caller can never wedge the loop forever.
++    """
++    state = {"now": 0.0}
++
++    def fake_monotonic() -> float:
++        return state["now"]
++
++    def fake_sleep(seconds: float = 0.0) -> None:
++        state["now"] += max(float(seconds), 1e-6)
++
++    with mock.patch.object(common.time, "monotonic", new=fake_monotonic), mock.patch.object(
++        common.time, "sleep", new=fake_sleep
++    ):
++        yield
++
++
+ class DiscordIntakeCommonTests(unittest.TestCase):
+     def setUp(self) -> None:
+         self.tempdir = tempfile.TemporaryDirectory()
+@@ -1029,7 +1060,7 @@ class DiscordIntakeCommonTests(unittest.TestCase):
+             common,
+             "deliver_session_message",
+             return_value={"status": "accepted", "id": "gc-new"},
+-        ), mock.patch.object(common.time, "sleep"):
++        ), virtual_clock():
+             current = common.ensure_room_launch_session(launch)
+ 
+         create_agent_session.assert_called_once()
+@@ -1074,7 +1105,7 @@ class DiscordIntakeCommonTests(unittest.TestCase):
+             common,
+             "deliver_session_message",
+             return_value={"status": "accepted", "id": "gc-maya"},
+-        ), mock.patch.object(common.time, "sleep"):
++        ), virtual_clock():
+             current = common.ensure_room_launch_session(launch)
+ 
+         create_agent_session.assert_called_once()
+@@ -1134,7 +1165,7 @@ class DiscordIntakeCommonTests(unittest.TestCase):
+             common,
+             "create_agent_session",
+             return_value={"alias": "dc-123-sky"},
+-        ), mock.patch.object(common.time, "sleep"):
++        ), virtual_clock():
+             with self.assertRaisesRegex(common.GCAPIError, "created launch session is not routable yet"):
+                 common.ensure_room_launch_session(launch)
+ 
+-- 
+2.50.1 (Apple Git-155)
+

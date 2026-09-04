@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 28 Aug 2026 17:17:44 -0400
-Subject: [PATCH 49/75] ci: fire the branch-filtered workflows on integration,
+Subject: [PATCH 49/76] ci: fire the branch-filtered workflows on integration,
  not main (gcp-75ed)
 
 Every workflow that carries a branch filter on this fork was scoped

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 3 Sep 2026 20:14:40 -0400
-Subject: [PATCH 75/75] ci: install gc from its release archive instead of
+Subject: [PATCH 75/76] ci: install gc from its release archive instead of
  building it (gcp-m0ei)
 
 Seven runner pods were evicted in 36 minutes on 2026-09-03, every one of them

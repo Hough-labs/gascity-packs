@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Wed, 2 Sep 2026 16:22:10 -0400
-Subject: [PATCH 72/75] ci: drop actions/setup-python and use the runner
+Subject: [PATCH 72/76] ci: drop actions/setup-python and use the runner
  image's system Python (gcp-gtux)
 
 actions/setup-python installs a portable CPython from actions/python-versions

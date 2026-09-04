@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Wed, 2 Sep 2026 18:01:13 -0400
-Subject: [PATCH 73/75] fix(refinery): find-work scans gc.routed_to=<self>, not
+Subject: [PATCH 73/76] fix(refinery): find-work scans gc.routed_to=<self>, not
  assignee alone (gcp-mi9t)
 
 mol-refinery-patrol's find-work step scanned by assignee only, so a work bead
