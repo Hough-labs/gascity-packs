@@ -36,7 +36,6 @@ CANONICAL_REPO_NAME = "gascity-packs"
 CANONICAL_REPO_URL = f"https://{CANONICAL_REPO_HOST}/{CANONICAL_REPO_OWNER}/{CANONICAL_REPO_NAME}"
 FORK_REPO_OWNER = "Hough-labs"
 FORK_REPO_NAME = "gascity-packs"
-FORK_REPO_URL = f"https://{CANONICAL_REPO_HOST}/{FORK_REPO_OWNER}/{FORK_REPO_NAME}"
 # Ordered: the upstream repo is the default a message should suggest.
 ACCEPTED_REPOS = (
     (CANONICAL_REPO_OWNER, CANONICAL_REPO_NAME),
