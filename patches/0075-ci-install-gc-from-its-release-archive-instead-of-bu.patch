@@ -1,0 +1,620 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 3 Sep 2026 20:14:40 -0400
+Subject: [PATCH 75/75] ci: install gc from its release archive instead of
+ building it (gcp-m0ei)
+
+Seven runner pods were evicted in 36 minutes on 2026-09-03, every one of them
+at the `Install Gas City` step, with kubelet stating the cause verbatim:
+"Container runner exceeded its local ephemeral storage limit \"4Gi\"". The
+12:56:30Z eviction lands in the same second as run 33757782065's
+`##[error]Process completed with exit code 130` -- 128+SIGINT, the pod being
+evicted out from under an in-flight `go install`, which GitHub then rendered as
+"The operation was canceled" with no cause. Both crons armed by gcp-5yma were
+red on their first day.
+
+This is not the gcp-sq1r memory OOM: `dmesg` over the window that brackets all
+seven evictions reports zero OOM kills. It is disk.
+
+Measured the step cold on linux/amd64 (anvil, Go 1.26, isolated GOMODCACHE and
+GOCACHE) to establish rather than assume the cost:
+
+    go install github.com/gastownhall/gascity/cmd/gc@main
+      GOMODCACHE   2.32 GiB     (gc links Dolt: arrow, thrift, aws-sdk-go-v2,
+      GOCACHE      1.89 GiB      cloud.google.com/go, envoyproxy, otel, ...)
+      gc binary    252 MiB
+      total        4.46 GiB      in 1m38s on 16 cores
+    release archive install
+      tarball      44 MiB (deleted after extraction)
+      gc binary    125 MiB (stripped)
+      total       ~170 MiB       in 2.3s
+
+The build does not fit in the 4Gi container limit on its own, before the two
+checkouts, the Go toolchain, Node, dolt, bd and claude are counted. That also
+retires the bead's open hypothesis about which earlier step tipped it over:
+none had to. It equally explains why push/PR CI only mostly survived -- ci.yml
+ran the same install and was sitting on the cliff, not clear of it.
+
+The 4Gi limit itself is correct and is left alone. Its own comment records that
+before it existed a 5.5G renovate clone crossed kubelet's nodefs line and
+evicted nine unrelated pods while sparing the culprit. Raising it is the
+Overseer's lane in bastion, and is not needed if the step stops asking for
+4.46 GiB.
+
+Instead `gc` joins the tools that already install as verified prebuilt archives
+-- dolt, bd and claude, via gastownhall/gascity's install-*-archive.sh. The new
+.github/scripts/install-gascity-archive.sh follows those scripts closely
+(platform tuple, checksum verification, --cache into RUNNER_TOOL_CACHE +
+GITHUB_PATH, a final `gc version`) and maps the workflows' documented
+GASCITY_REF values onto published releases: main/edge to the rolling `edge`
+pre-release, latest via the /releases/latest redirect, and vX.Y.Z or X.Y.Z to
+that tag. It exports the resolved path as GC_BIN, so callers stop reaching
+through `go env GOPATH`, which the archive install never populates.
+
+Two details worth naming. The tool-cache key includes the checksum, not just
+the tag: `edge` is rolling and a tag-only key would serve a stale gc for the
+rest of a runner's life. And the bearer token is confined to the api.github.com
+request -- a release download redirects to objects.githubusercontent.com and
+curl -L replays custom headers onto the redirect target, so a blanket auth
+header would hand the token to another host. Everything fetched here is public;
+the token is only a rate-limit courtesy, and the script works without one.
+
+A ref with no published archive (a branch, a commit sha) still falls back to
+`go install`, loudly, warning about the disk cost. That path is only reachable
+from a manual workflow_dispatch against an unreleased gascity ref; no scheduled
+run takes it. Keeping it means this change does not quietly narrow the
+documented "ref/version" input, and it is why actions/setup-go stays in all
+four workflows -- the nightly needs `go` anyway, for the gate's
+`go version -m` gc/bd compatibility check.
+
+Guarded by two tests in tests/test_gascity_pack_inference_gate.py, alongside
+the existing runner-label sweep. The first is tree-wide for the same reason
+that one is: the regression that matters is the workflow added later, which
+would otherwise go red at 3am rather than here. Verified red against the
+pre-change workflows ("ci.yml: builds gc from source: go install
+github.com/gastownhall/gascity/cmd/gc@latest") and green after.
+
+Validation: the installer exercised end to end, unauthenticated, on darwin/arm64
+for latest, v1.4.1 and 1.4.1 (all three resolving to one cached binary) and on
+anvil linux/amd64 for main -> edge, including the cache-hit path and the
+go-install fallback branch; shellcheck clean; validate_registry.py --require-git
+ok; the full ci.yml Python suite at 840 passed / 9483 subtests.
+
+Follow-up, not taken here: pack-release-compatibility.yml's actions/setup-go now
+has no in-workflow Go consumer except the fallback, so dropping it would free
+the toolchain's share of the same 4Gi -- deferred rather than bundled, since it
+is a separate claim needing its own verification. Also filed: a load-sensitive
+2s subprocess timeout in gascity/tests/test_formula_assets.py that flakes under
+full-suite load and passes in isolation, unrelated to this diff.
+---
+ .github/scripts/install-gascity-archive.sh    | 286 ++++++++++++++++++
+ .github/workflows/ci.yml                      |  21 +-
+ .github/workflows/gascity-pack-inference.yml  |  10 +-
+ .../workflows/pack-release-compatibility.yml  |   9 +-
+ .github/workflows/supported-pack-nightly.yml  |  11 +-
+ tests/test_gascity_pack_inference_gate.py     |  82 +++++
+ 6 files changed, 397 insertions(+), 22 deletions(-)
+ create mode 100755 .github/scripts/install-gascity-archive.sh
+
+diff --git a/.github/scripts/install-gascity-archive.sh b/.github/scripts/install-gascity-archive.sh
+new file mode 100755
+index 0000000..f839906
+--- /dev/null
++++ b/.github/scripts/install-gascity-archive.sh
+@@ -0,0 +1,286 @@
++#!/usr/bin/env bash
++# install-gascity-archive.sh — install `gc` from a published release archive.
++#
++# `go install github.com/gastownhall/gascity/cmd/gc@REF` compiles Gas City, and
++# Gas City links Dolt. Measured cold on linux/amd64 (gcp-m0ei), that build costs
++#
++#     GOMODCACHE   2.32 GiB
++#     GOCACHE      1.89 GiB
++#     gc binary    252 MiB
++#     ------------------------
++#     total        4.46 GiB
++#
++# on a runner container whose ephemeral-storage limit is 4Gi. The build alone
++# does not fit, which is why every `Install Gas City` step evicted the pod
++# ("Container runner exceeded its local ephemeral storage limit \"4Gi\"") and
++# GitHub rendered the corpse as exit 130 / "The operation was canceled".
++#
++# The same release the module proxy serves is also published as a prebuilt
++# archive: 44 MiB compressed, a 125 MiB stripped binary, ~170 MiB peak. That is
++# the footprint this script pays, and it is the footprint dolt, bd and claude
++# already pay via their own install-*-archive.sh siblings in gastownhall/gascity.
++# Bringing `gc` onto that footing also drops a multi-minute Dolt compile from
++# every job.
++#
++# Usage: install-gascity-archive.sh REF [--cache]
++#
++# REF matches the workflows' GASCITY_REF input:
++#   main | edge     the rolling `edge` pre-release built from gascity main
++#   latest          the newest stable release
++#   v1.4.1 | 1.4.1  that exact release tag
++#   anything else   no archive exists for it (a branch, a commit sha), so the
++#                   script falls back to `go install` and says so loudly. That
++#                   path costs the 4.46 GiB above; it exists only so a manual
++#                   workflow_dispatch against an unreleased gascity ref keeps
++#                   working, and it is never taken by a scheduled run.
++#
++# --cache installs under RUNNER_TOOL_CACHE and appends the bin directory to
++# GITHUB_PATH, as the sibling installers do. Either way the resolved binary path
++# is exported as GC_BIN via GITHUB_ENV so workflow steps can name it without
++# going through `go env GOPATH`.
++
++set -euo pipefail
++
++REPO="gastownhall/gascity"
++
++usage() {
++  cat >&2 <<'USAGE'
++Usage: install-gascity-archive.sh REF [--cache]
++
++Downloads a Gas City release tarball, verifies its SHA-256, and installs gc.
++REF is main/edge, latest, or a release version such as v1.4.1. Use --cache on
++self-hosted runners to install under RUNNER_TOOL_CACHE and add that bin
++directory to GITHUB_PATH.
++USAGE
++}
++
++ref="${1:-}"
++if [[ -z "$ref" ]]; then
++  usage
++  exit 2
++fi
++shift || true
++
++use_cache=false
++while (($#)); do
++  case "$1" in
++    --cache) use_cache=true ;;
++    -h|--help)
++      usage
++      exit 0
++      ;;
++    *)
++      echo "Unknown argument: $1" >&2
++      usage
++      exit 2
++      ;;
++  esac
++  shift
++done
++
++case "$(uname -s)" in
++  Darwin) os=darwin ;;
++  Linux) os=linux ;;
++  *)
++    echo "Unsupported OS: $(uname -s)" >&2
++    exit 1
++    ;;
++esac
++
++case "$(uname -m)" in
++  arm64|aarch64) arch=arm64 ;;
++  x86_64|amd64) arch=amd64 ;;
++  *)
++    echo "Unsupported architecture: $(uname -m)" >&2
++    exit 1
++    ;;
++esac
++
++platform_tuple="${os}_${arch}"
++
++fetch() {
++  curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors --retry-connrefused "$@"
++}
++
++# Auth is confined to api.github.com. A release download redirects to
++# objects.githubusercontent.com, and curl -L replays custom headers on the
++# redirect target, so attaching the bearer to every fetch would hand the token
++# to a different host. Everything this script downloads is public; the token is
++# only ever a rate-limit courtesy on the API call.
++fetch_api() {
++  local auth=()
++  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
++    auth=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
++  fi
++  fetch "${auth[@]}" -H "Accept: application/vnd.github+json" "$@"
++}
++
++export_gc_bin() {
++  local target="$1"
++  if [[ -n "${GITHUB_ENV:-}" ]]; then
++    echo "GC_BIN=${target}" >> "$GITHUB_ENV"
++  fi
++}
++
++# `go install` is the escape hatch for a ref with no published archive. It is
++# the pre-gcp-m0ei behaviour, disk cost included, so it warns rather than
++# failing silently into a 4.46 GiB build on a 4Gi budget.
++install_from_source() {
++  local reason="$1"
++  echo "WARNING: ${reason}" >&2
++  echo "WARNING: falling back to 'go install ...@${ref}', which needs ~4.46 GiB of" >&2
++  echo "WARNING: ephemeral storage (GOMODCACHE + GOCACHE + binary) and may evict the runner." >&2
++  go install "github.com/${REPO}/cmd/gc@${ref}"
++  local bin_dir
++  bin_dir="$(go env GOPATH)/bin"
++  if [[ -n "${GITHUB_PATH:-}" ]]; then
++    echo "$bin_dir" >> "$GITHUB_PATH"
++  fi
++  export_gc_bin "${bin_dir}/gc"
++  "${bin_dir}/gc" version
++  exit 0
++}
++
++# Resolve REF to a release tag and to the version token goreleaser embeds in the
++# asset name (the tag without its leading `v`, or `edge` for the rolling build).
++resolve_latest_tag() {
++  # The /releases/latest redirect is unauthenticated and not subject to the API
++  # rate limit, so it stays reliable on a runner with no token; the API is the
++  # fallback for the case where the redirect is unavailable.
++  local url tag
++  url="$(curl -fsSL -o /dev/null -w '%{url_effective}' --retry 5 --retry-delay 2 --retry-all-errors \
++    "https://github.com/${REPO}/releases/latest" 2>/dev/null || true)"
++  tag="${url##*/}"
++  if [[ -n "$tag" && "$tag" != "latest" ]]; then
++    printf '%s' "$tag"
++    return 0
++  fi
++  fetch_api "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null |
++    jq -r '.tag_name // empty'
++}
++
++case "$ref" in
++  main|edge)
++    tag="edge"
++    version="edge"
++    ;;
++  latest)
++    tag="$(resolve_latest_tag)"
++    if [[ -z "$tag" ]]; then
++      install_from_source "could not resolve the latest ${REPO} release tag"
++    fi
++    version="${tag#v}"
++    ;;
++  v[0-9]*)
++    tag="$ref"
++    version="${ref#v}"
++    ;;
++  [0-9]*)
++    tag="v${ref}"
++    version="$ref"
++    ;;
++  *)
++    install_from_source "${REPO} publishes no release archive for ref '${ref}'"
++    ;;
++esac
++
++archive="gascity_${version}_${platform_tuple}.tar.gz"
++download_base="https://github.com/${REPO}/releases/download/${tag}"
++
++# Prefer the checksum GitHub computes server-side for the asset; fall back to the
++# checksums.txt goreleaser publishes alongside it when the API is unreachable or
++# rate-limited. Both are logged so a mismatch is diagnosable from the job output.
++release_asset_sha() {
++  if command -v jq >/dev/null 2>&1; then
++    local digest
++    digest="$(fetch_api "https://api.github.com/repos/${REPO}/releases/tags/${tag}" 2>/dev/null |
++      jq -r --arg asset "$archive" '.assets[] | select(.name == $asset) | .digest // empty' |
++      sed 's/^sha256://')"
++    if [[ -n "$digest" ]]; then
++      printf '%s' "$digest"
++      return 0
++    fi
++  fi
++  fetch "${download_base}/gascity_${version}_checksums.txt" 2>/dev/null |
++    awk -v asset="$archive" '$2 == asset { print $1; exit }'
++}
++
++expected_sha="$(release_asset_sha)"
++if [[ -z "$expected_sha" ]]; then
++  echo "No Gas City checksum found for ${tag}/${platform_tuple} (asset ${archive})" >&2
++  exit 1
++fi
++
++sha256_file() {
++  if command -v sha256sum >/dev/null 2>&1; then
++    sha256sum "$1" | cut -d ' ' -f 1
++  else
++    shasum -a 256 "$1" | cut -d ' ' -f 1
++  fi
++}
++
++install_binary() {
++  local src="$1"
++  local dst="$2"
++  mkdir -p "$(dirname "$dst")"
++  install -m 0755 "$src" "$dst"
++}
++
++install_binary_with_sudo_fallback() {
++  local src="$1"
++  local dst="$2"
++  local dst_dir
++  dst_dir="$(dirname "$dst")"
++  mkdir -p "$dst_dir"
++  if [[ -w "$dst_dir" ]]; then
++    install_binary "$src" "$dst"
++  elif command -v sudo >/dev/null 2>&1; then
++    sudo install -m 0755 "$src" "$dst"
++  else
++    echo "Cannot write $dst and sudo is unavailable" >&2
++    exit 1
++  fi
++}
++
++if $use_cache; then
++  cache_root="${RUNNER_TOOL_CACHE:-$HOME/.local}"
++  # Keyed on the checksum, not the tag alone: `edge` is a rolling pre-release
++  # whose asset is replaced whenever gascity main moves, so a tag-only key would
++  # happily serve a stale gc for the rest of the runner's life.
++  bin_dir="${cache_root}/gascity-gc/${tag}/${expected_sha:0:16}/${platform_tuple}/bin"
++else
++  bin_dir="${GASCITY_INSTALL_BIN_DIR:-/usr/local/bin}"
++fi
++
++target="${bin_dir}/gc"
++if $use_cache && [[ -x "$target" ]]; then
++  echo "Reusing cached Gas City ${tag} at ${target}"
++else
++  tmp="$(mktemp -d)"
++  trap 'rm -rf "$tmp"' EXIT
++  fetch -o "${tmp}/${archive}" "${download_base}/${archive}"
++  actual_sha="$(sha256_file "${tmp}/${archive}")"
++  if [[ "$actual_sha" != "$expected_sha" ]]; then
++    echo "Gas City checksum mismatch for ${tag}/${platform_tuple}" >&2
++    echo "expected: $expected_sha" >&2
++    echo "actual:   $actual_sha" >&2
++    exit 1
++  fi
++  tar -xzf "${tmp}/${archive}" -C "$tmp" gc
++  if $use_cache; then
++    install_binary "${tmp}/gc" "$target"
++  else
++    install_binary_with_sudo_fallback "${tmp}/gc" "$target"
++  fi
++  # The tarball is the largest transient on disk; drop it before the caller's
++  # next step rather than at job teardown.
++  rm -rf "$tmp"
++  trap - EXIT
++fi
++
++if $use_cache && [[ -n "${GITHUB_PATH:-}" ]]; then
++  echo "$bin_dir" >> "$GITHUB_PATH"
++fi
++export_gc_bin "$target"
++
++"$target" version
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index db5a0ad..5863af1 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -38,10 +38,16 @@ jobs:
+       - name: Run Python pack tests
+         run: python3 -m pytest tests contributing/tests gascity/tests discord/tests github/tests slack-full/tests slack-channel/tests pr-pipeline/tests gauntlet-tdd/tests -q
+ 
++      # Installed once, from the published release archive, and reused by every
++      # step below that needs gc. `go install` of cmd/gc costs 4.46 GiB of
++      # ephemeral storage (gcp-m0ei) against the runner container's 4Gi limit --
++      # this job survived it only by a margin, and the nightly did not. The
++      # script exports the resolved binary as GC_BIN.
++      - name: Install Gas City
++        run: .github/scripts/install-gascity-archive.sh latest --cache
++
+       - name: Lint and exercise shared role prompt composition
+         run: |
+-          go install github.com/gastownhall/gascity/cmd/gc@latest
+-          GC_BIN="$(go env GOPATH)/bin/gc"
+           for pack in gascity gascity/roles bmad compound-engineering gstack superpowers; do
+             "$GC_BIN" lint "$pack"
+           done
+@@ -81,12 +87,11 @@ jobs:
+       # RPP conformance gate. Non-blocking until gascity main ships the
+       # Runtime Provider Protocol (the runtime-provider-packs PoC branch
+       # merges) — `gc runtime check` does not exist on gascity main yet, so
+-      # `@latest` cannot satisfy this today. Flip continue-on-error to false
+-      # (and pin @<version>) once RPP lands on gascity main. The install is a
+-      # tool install, not a Go import, so the pack keeps zero gascity deps.
++      # `latest` cannot satisfy this today. Flip continue-on-error to false
++      # (and pin a version) once RPP lands on gascity main. gc arrives as a
++      # prebuilt tool binary, not a Go import, so the pack keeps zero gascity
++      # deps; GC_BIN comes from the Install Gas City step above.
+       - name: Run runtime-cloudflare RPP conformance
+         working-directory: runtime-cloudflare
+         continue-on-error: true
+-        run: |
+-          go install github.com/gastownhall/gascity/cmd/gc@latest
+-          GC_BIN="$(go env GOPATH)/bin/gc" ./conformance.sh
++        run: ./conformance.sh
+diff --git a/.github/workflows/gascity-pack-inference.yml b/.github/workflows/gascity-pack-inference.yml
+index c95bfb3..3ceb012 100644
+--- a/.github/workflows/gascity-pack-inference.yml
++++ b/.github/workflows/gascity-pack-inference.yml
+@@ -112,13 +112,13 @@ jobs:
+       - name: Install Python test dependencies
+         run: python3 -m pip install --break-system-packages PyYAML pytest
+ 
++      # Release archive rather than `go install` — see gcp-m0ei: compiling gc
++      # needs 4.46 GiB of ephemeral storage against a 4Gi container limit. The
++      # script exports the resolved binary as GC_BIN.
+       - name: Install Gas City
+         env:
+           GASCITY_REF: ${{ github.event.client_payload.gascity_ref || github.event.inputs.gascity_ref || 'latest' }}
+-        run: |
+-          go install "github.com/gastownhall/gascity/cmd/gc@${GASCITY_REF}"
+-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+-          "$(go env GOPATH)/bin/gc" version
++        run: .github/scripts/install-gascity-archive.sh "${GASCITY_REF}" --cache
+ 
+       - name: Run inference runner unit tests
+         run: python3 -m pytest tests/test_gascity_pack_inference_gate.py -q
+@@ -147,7 +147,7 @@ jobs:
+           PACK: ${{ github.event.client_payload.pack || github.event.inputs.pack || 'all-supported' }}
+         run: |
+           python3 scripts/gascity_pack_inference_gate.py \
+-            --gc-bin "$(go env GOPATH)/bin/gc" \
++            --gc-bin "$GC_BIN" \
+             --workdir "$RUNNER_TEMP/gascity-pack-inference" \
+             --pack "${PACK:-all-supported}" \
+             --gate "${GATE:-all}" \
+diff --git a/.github/workflows/pack-release-compatibility.yml b/.github/workflows/pack-release-compatibility.yml
+index 059fc72..b3e3dcd 100644
+--- a/.github/workflows/pack-release-compatibility.yml
++++ b/.github/workflows/pack-release-compatibility.yml
+@@ -68,19 +68,20 @@ jobs:
+         with:
+           go-version: "1.22"
+ 
++      # Release archive rather than `go install` — see gcp-m0ei: compiling gc
++      # needs 4.46 GiB of ephemeral storage against a 4Gi container limit. The
++      # script exports the resolved binary as GC_BIN.
+       - name: Install Gas City
+         env:
+           GASCITY_REF: ${{ github.event.client_payload.gascity_ref || github.event.inputs.gascity_ref || 'latest' }}
+-        run: |
+-          go install "github.com/gastownhall/gascity/cmd/gc@${GASCITY_REF}"
+-          "$(go env GOPATH)/bin/gc" version
++        run: .github/scripts/install-gascity-archive.sh "${GASCITY_REF}" --cache
+ 
+       - name: Run pack release compatibility smoke
+         env:
+           EXERCISE: ${{ github.event.client_payload.exercise || github.event.inputs.exercise || 'both' }}
+           PACK: ${{ github.event.client_payload.pack || github.event.inputs.pack }}
+         run: |
+-          args=(--gc-bin "$(go env GOPATH)/bin/gc" --exercise "${EXERCISE:-both}")
++          args=(--gc-bin "$GC_BIN" --exercise "${EXERCISE:-both}")
+           if [ -n "${PACK:-}" ]; then
+             args+=(--pack "$PACK")
+           fi
+diff --git a/.github/workflows/supported-pack-nightly.yml b/.github/workflows/supported-pack-nightly.yml
+index bca7320..9035bc2 100644
+--- a/.github/workflows/supported-pack-nightly.yml
++++ b/.github/workflows/supported-pack-nightly.yml
+@@ -228,14 +228,15 @@ jobs:
+         if: steps.subset.outputs.run_gate == 'true'
+         run: python3 -m pip install --break-system-packages PyYAML pytest
+ 
++      # Installed from the published release archive, not `go install`: building
++      # gc from source costs 4.46 GiB of ephemeral storage on its own (gcp-m0ei)
++      # against the runner container's 4Gi limit, which evicted this pod seven
++      # times in 36 minutes. The script exports the resolved binary as GC_BIN.
+       - name: Install Gas City
+         if: steps.subset.outputs.run_gate == 'true'
+         env:
+           GASCITY_REF: ${{ github.event.inputs.gascity_ref || 'main' }}
+-        run: |
+-          go install "github.com/gastownhall/gascity/cmd/gc@${GASCITY_REF}"
+-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+-          "$(go env GOPATH)/bin/gc" version
++        run: .github/scripts/install-gascity-archive.sh "${GASCITY_REF}" --cache
+ 
+       - name: Validate Manifold Claude configuration
+         if: steps.subset.outputs.run_gate == 'true'
+@@ -261,7 +262,7 @@ jobs:
+           GATE_TIMEOUT: ${{ github.event.inputs.timeout || matrix.gate_timeout }}
+         run: |
+           python3 scripts/gascity_pack_inference_gate.py \
+-            --gc-bin "$(go env GOPATH)/bin/gc" \
++            --gc-bin "$GC_BIN" \
+             --workdir "$RUNNER_TEMP/supported-pack-nightly/${{ matrix.pack }}" \
+             --pack "${{ matrix.pack }}" \
+             --gate "${{ matrix.gate }}" \
+diff --git a/tests/test_gascity_pack_inference_gate.py b/tests/test_gascity_pack_inference_gate.py
+index 3448ddc..604a455 100644
+--- a/tests/test_gascity_pack_inference_gate.py
++++ b/tests/test_gascity_pack_inference_gate.py
+@@ -523,6 +523,88 @@ def test_ci_workflows_use_self_hosted_runner_labels() -> None:
+                 assert stripped == "runs-on: hough-labs-k3s", f"{workflow_path.name}: {stripped}"
+ 
+ 
++def test_no_workflow_compiles_gas_city_from_source() -> None:
++    # `go install github.com/gastownhall/gascity/cmd/gc@REF` compiles Gas City,
++    # and Gas City links Dolt. Measured cold on linux/amd64 (gcp-m0ei) that
++    # build needs 2.32 GiB of GOMODCACHE + 1.89 GiB of GOCACHE + a 252 MiB
++    # binary = 4.46 GiB, on a runner container whose ephemeral-storage limit is
++    # 4Gi. The build does not fit on its own, so kubelet evicted the pod at the
++    # `Install Gas City` step -- seven times in 36 minutes -- and GitHub
++    # rendered that as exit 130 / "The operation was canceled" with no cause.
++    #
++    # The same releases are published as prebuilt archives (~170 MiB peak), so
++    # gc is installed the way dolt, bd and claude already are. This is a
++    # tree-wide sweep rather than a per-file check for the same reason as the
++    # runner-label gate above: the regression that matters is the workflow
++    # somebody adds later, which would go red at 3am instead of here.
++    workflow_dir = gascity_pack_inference_gate.REPO_ROOT / ".github" / "workflows"
++    workflow_paths = sorted(
++        [*workflow_dir.glob("*.yml"), *workflow_dir.glob("*.yaml")]
++    )
++    assert workflow_paths, "no workflow files found -- the sweep below would vacuously pass"
++
++    installer = gascity_pack_inference_gate.REPO_ROOT / ".github" / "scripts" / "install-gascity-archive.sh"
++    assert installer.is_file()
++    assert os.access(installer, os.X_OK), "the installer must be executable -- workflows invoke it directly"
++
++    installs_gc = 0
++    for workflow_path in workflow_paths:
++        workflow = workflow_path.read_text(encoding="utf-8")
++        for line in workflow.splitlines():
++            # Comments in these files quote the command they replaced, so match
++            # on what the runner would actually execute.
++            code = line.split("#", 1)[0]
++            assert "go install" not in code or "gascity/cmd/gc" not in code, (
++                f"{workflow_path.name}: builds gc from source: {line.strip()}"
++            )
++        if "install-gascity-archive.sh" in workflow:
++            installs_gc += 1
++        # A step that still resolves gc out of GOPATH would silently point at a
++        # path the archive install never writes.
++        assert "go env GOPATH)/bin/gc" not in workflow, workflow_path.name
++
++    # ci.yml, gascity-pack-inference.yml, pack-release-compatibility.yml and
++    # supported-pack-nightly.yml. codeql.yml installs no gc.
++    assert installs_gc == 4, f"expected four workflows to install gc, found {installs_gc}"
++
++
++def test_gas_city_installer_covers_the_refs_the_workflows_pass() -> None:
++    # The workflows pass GASCITY_REF straight through, and its documented values
++    # are main, latest and a version tag. Each maps to a published release; an
++    # unreleased ref (a branch, a commit sha) has no archive, so the script
++    # keeps the old `go install` path for it rather than failing a manual
++    # dispatch -- loudly, because that path is what evicts the runner.
++    installer = (
++        gascity_pack_inference_gate.REPO_ROOT / ".github" / "scripts" / "install-gascity-archive.sh"
++    ).read_text(encoding="utf-8")
++
++    assert "main|edge)" in installer
++    assert "latest)" in installer
++    assert "v[0-9]*)" in installer
++    assert "install_from_source" in installer
++    assert "gascity_${version}_${platform_tuple}.tar.gz" in installer
++    # Never install an unverified binary, and never key the cache on the tag
++    # alone: `edge` rolls, so a tag-only key serves a stale gc forever.
++    assert 'if [[ "$actual_sha" != "$expected_sha" ]]; then' in installer
++    assert '${expected_sha:0:16}' in installer
++    # The bearer token must not ride the release download's cross-host redirect.
++    assert "Authorization: Bearer" in installer
++    assert installer.count("Authorization: Bearer") == 1
++    assert "fetch_api" in installer
++
++    for workflow_name in (
++        "ci.yml",
++        "gascity-pack-inference.yml",
++        "pack-release-compatibility.yml",
++        "supported-pack-nightly.yml",
++    ):
++        workflow = (
++            gascity_pack_inference_gate.REPO_ROOT / ".github" / "workflows" / workflow_name
++        ).read_text(encoding="utf-8")
++        assert ".github/scripts/install-gascity-archive.sh" in workflow, workflow_name
++        assert "--cache" in workflow, workflow_name
++
++
+ def test_readme_includes_blacksmith_sponsor_badge() -> None:
+     readme = (gascity_pack_inference_gate.REPO_ROOT / "README.md").read_text(encoding="utf-8")
+     readme_lines = {line.strip() for line in readme.splitlines()}
+-- 
+2.50.1 (Apple Git-155)
+
