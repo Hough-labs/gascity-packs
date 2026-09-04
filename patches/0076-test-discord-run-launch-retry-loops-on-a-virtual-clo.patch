@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 3 Sep 2026 20:23:40 -0400
-Subject: [PATCH 76/78] test(discord): run launch-retry loops on a virtual
+Subject: [PATCH 76/79] test(discord): run launch-retry loops on a virtual
  clock (gcp-sq1r)
 
 The `Run Python pack tests` CI step was OOM-killed at the runner pod's 4Gi

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 31 Jul 2026 16:26:45 -0400
-Subject: [PATCH 15/78] fix(hooks): enforce the patches/ export on every branch
+Subject: [PATCH 15/79] fix(hooks): enforce the patches/ export on every branch
  push (gcp-2qk)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

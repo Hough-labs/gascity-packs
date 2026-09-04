@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 3 Sep 2026 22:31:28 -0400
-Subject: [PATCH 77/78] fix(registry): point gauntlet-tdd at the fork it
+Subject: [PATCH 77/79] fix(registry): point gauntlet-tdd at the fork it
  actually lives in (gcp-kk4l)
 
 `Latest pack releases` has been red on integration since 2026-08-29. The

@@ -1,0 +1,142 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 4 Sep 2026 18:05:33 -0400
+Subject: [PATCH 79/79] fix(digest): close the archival digest bead instead of
+ leaking it (gcp-156c)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`mol-digest-generate` step 3 is labelled "Archive as bead" but only ran
+`gc bd create`, which files an issue in `open` status. Nothing in the
+formula ever closed it — step 4 closes the work wisp, not the digest
+record — so a formula the deacon dispatches every 24h filed one
+permanently-open task per run, forever. Six had accumulated by the time a
+mayor session cleared them by hand on 2026-09-04, and hand-clearing is not
+a fix because the next cycle files another. This is one of the two active
+generators found in that day's HQ backlog audit.
+
+The digest content is already delivered to the mayor by mail in step 2, so
+the bead is an archival copy nobody actions. `gc bd create` has no
+create-time status flag (verified against bd 1.2.2 — `--dry-run` reports
+`Status: open` and `--help` lists no `--status`), so the only available
+shape is to capture the new id and close it immediately. `--json` returns a
+single object carrying `.id`, so `jq -r '.id // empty'` is the capture;
+a failed capture is reported rather than feeding an empty id to `gc bd
+close`, which would silently restore the leak the change exists to remove.
+Closing does not hide the record — it stays findable via
+`gc bd list --label=digest`, which the acceptance criteria require.
+
+Pinned by a new contract test in the gastown pack-assets suite: it asserts
+the id is captured, that the close targets that captured id, that the close
+happens after the create and inside the archive step, that the empty-id
+guard is present, and that the digest label survives. Cycled red (reverted
+formula: "digest archive step must capture the id of the bead it creates")
+then green. Full local gates green: go vet, golangci-lint (0 issues),
+validate_registry.py, go test, all 11 gastown shell suites, and
+`pytest tests -q` (122 passed, 7 skipped). shellcheck clean on the edited
+test.
+
+Follow-up left alone as out of scope: step 4 still carries a raw
+`<work-bead>` placeholder, the same shape test_gastown_pack_assets.sh
+already forbids in mol-shutdown-dance.
+---
+ gastown/formulas/mol-digest-generate.toml | 20 ++++++++++--
+ gastown/tests/test_gastown_pack_assets.sh | 39 +++++++++++++++++++++++
+ 2 files changed, 57 insertions(+), 2 deletions(-)
+
+diff --git a/gastown/formulas/mol-digest-generate.toml b/gastown/formulas/mol-digest-generate.toml
+index 638981d..b31082c 100644
+--- a/gastown/formulas/mol-digest-generate.toml
++++ b/gastown/formulas/mol-digest-generate.toml
+@@ -171,12 +171,28 @@ gc mail send mayor/ -s "Gas Town Digest: $DATE" -m "$DIGEST"
+ ```
+ 
+ **3. Archive as bead:**
++
++`gc bd create` files the bead `open` and there is no create-time status
++flag, so the id has to be captured and closed straight away. The digest
++content was already delivered to the mayor by mail in step 2 — this bead is
++an archival record, not work anyone actions. Leaving it open files one
++permanently-open task per run, forever.
++
+ ```bash
+-gc bd create --type=task \
++DIGEST_BEAD=$(gc bd create --type=task \
+   --title="Digest: $DATE" \
+-  --label=digest,{{period}}
++  --label=digest,{{period}} --json | jq -r '.id // empty')
++if [ -n "$DIGEST_BEAD" ]; then
++  gc bd close "$DIGEST_BEAD" \
++    --reason "Archival digest record; content delivered to mayor by mail in step 2"
++else
++  echo "WARN: could not capture the digest bead id; look for a stray open bead with 'gc bd list --label=digest --status=open'"
++fi
+ ```
+ 
++Closing it does not hide it: the record stays findable with
++`gc bd list --label=digest`.
++
+ **4. Close work bead, signal reconciler, and exit:**
+ ```bash
+ gc bd close <work-bead> --reason "Digest generated and sent"
+diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
+index 79c7f1e..248d078 100755
+--- a/gastown/tests/test_gastown_pack_assets.sh
++++ b/gastown/tests/test_gastown_pack_assets.sh
+@@ -47,6 +47,44 @@ test_retired_dog_formulas_are_not_reintroduced() {
+         fail "gastown pack should not advertise retired dog formulas"
+ }
+ 
++test_digest_archive_bead_is_not_left_open() {
++    # gcp-156c: step 3 was labelled "archive" but only ran `gc bd create`,
++    # which files an issue `open`, and nothing ever closed it. A digest runs
++    # daily, so that leaked one permanently-open task per run, forever --
++    # hand-clearing them does nothing because the next cycle files another.
++    # `gc bd create` has no create-time status flag, so capture-then-close is
++    # the only available shape; pin it here so "archive" cannot silently go
++    # back to meaning "file work nobody actions".
++    local formula="$GASTOWN/formulas/mol-digest-generate.toml"
++
++    [[ -f "$formula" ]] || fail "missing digest formula"
++    parse_toml "$formula"
++
++    grep -F 'DIGEST_BEAD=$(gc bd create --type=task' "$formula" >/dev/null ||
++        fail "digest archive step must capture the id of the bead it creates"
++    grep -F 'gc bd close "$DIGEST_BEAD"' "$formula" >/dev/null ||
++        fail "digest archive step must close the bead it creates; an open one leaks every run"
++    grep -F "jq -r '.id // empty'" "$formula" >/dev/null ||
++        fail "digest bead id capture must degrade to empty rather than feed a garbled id to close"
++    grep -F 'if [ -n "$DIGEST_BEAD" ]; then' "$formula" >/dev/null ||
++        fail "a failed id capture must be reported, not silently swallowed back into the leak"
++
++    # The archival record has to stay findable, or closing it just hides the
++    # digest history instead of tidying the backlog.
++    grep -F -- '--label=digest,{{period}}' "$formula" >/dev/null ||
++        fail "the archived digest bead must keep its digest label so the record stays findable"
++
++    python3 - "$formula" <<'DIGEST_ORDER' || fail "the digest bead must be closed inside the archive step, after it is created"
++import sys
++text = open(sys.argv[1], encoding="utf-8").read()
++start = text.index('**3. Archive as bead:**')
++end = text.index('**4. Close work bead')
++block = text[start:end]
++if block.index('gc bd create --type=task') >= block.index('gc bd close "$DIGEST_BEAD"'):
++    raise SystemExit(1)
++DIGEST_ORDER
++}
++
+ test_shutdown_dance_contracts_are_executable() {
+     local formula="$GASTOWN/formulas/mol-shutdown-dance.toml"
+ 
+@@ -872,6 +910,7 @@ test_submit_and_exit_cannot_be_replayed
+ test_post_merge_worktree_teardown_has_an_owner
+ test_polecat_home_teardown_has_an_owner
+ test_dolt_push_outage_detection_is_wired
++test_digest_archive_bead_is_not_left_open
+ test_shutdown_dance_contracts_are_executable
+ test_shutdown_dance_lifecycle_and_audit_contracts
+ test_composition_is_documented
+-- 
+2.50.1 (Apple Git-155)
+
