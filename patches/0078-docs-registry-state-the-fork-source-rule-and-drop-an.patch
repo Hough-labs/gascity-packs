@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 3 Sep 2026 22:34:47 -0400
+Subject: [PATCH 78/78] docs(registry): state the fork-source rule and drop an
+ unused constant (gcp-kk4l)
+
+Self-review follow-ups to the gauntlet-tdd fork-source fix.
+
+README's "Publishing a pack to the registry" note still said the only accepted
+`source` host path was gastownhall/gascity-packs, which is now false and would
+send a contributor to fix a "wrong" URL that the validator accepts. It now names
+both accepted repos, explains why the fork counts as the same history (one
+object database behind two remotes), and says plainly that the fork URL is for a
+pack that exists only there -- gauntlet-tdd being the closed-source case. The
+"publish your own pack to the Gas City registry instead" guidance is unchanged;
+a third-party repo is still refused.
+
+FORK_REPO_URL was introduced alongside the fork constants but nothing referenced
+it -- CANONICAL_REPO_URL is used in error messages, and the mis-cased-owner
+branch builds its URL from the matched pair. Removed rather than left as a
+constant a future reader would assume is load-bearing.
+
+Validation: go mod download, go vet, golangci-lint (0 issues), go build, go test,
+python3 validate_registry.py registry.toml and --require-git, pytest tests
+(122 passed / 7 skipped), gc pack release validate registry.toml (33 checked) --
+all green after these edits.
+---
+ README.md            | 16 ++++++++++------
+ validate_registry.py |  1 -
+ 2 files changed, 10 insertions(+), 7 deletions(-)
+
+diff --git a/README.md b/README.md
+index c74a1db..267995d 100644
+--- a/README.md
++++ b/README.md
+@@ -251,12 +251,16 @@ GC=/path/to/gc make registry-validate
+ ### Publishing a pack to the registry
+ 
+ > **`registry.toml` describes packs that live in this repository only.** Its
+-> `source` must be a `https://github.com/gastownhall/gascity-packs/tree/<ref>/<dir>`
+-> URL (or the bare repository URL for a root pack) — anything else is rejected,
+-> because the content hash can only be verified against this repository's own
+-> history. If your pack lives in **your** repo, you do not need a PR here: publish
+-> it directly to the Gas City registry under a scoped `<owner>/<pack>` name and you
+-> keep ownership of it.
++> `source` must be a `/tree/<ref>/<dir>` URL (or the bare repository URL for a
++> root pack) on `github.com/gastownhall/gascity-packs` or on the
++> `github.com/Hough-labs/gascity-packs` fork — anything else is rejected, because
++> the content hash can only be verified against this repository's own history.
++> The fork counts as the same history: it is a second remote over one object
++> database, so a commit on either is verifiable locally. Use the fork URL only
++> for a pack that exists only there — `gauntlet-tdd` is closed-source and is
++> never upstreamed, so the fork is its permanent home. If your pack lives in
++> **your** repo, you do not need a PR here: publish it directly to the Gas City
++> registry under a scoped `<owner>/<pack>` name and you keep ownership of it.
+ 
+ `registry.toml` is the public catalog. Each `[[pack.release]]` carries a
+ content hash that `validate_registry.py` enforces against the pack tree at the
+diff --git a/validate_registry.py b/validate_registry.py
+index b972c18..daaa58b 100755
+--- a/validate_registry.py
++++ b/validate_registry.py
+@@ -36,7 +36,6 @@ CANONICAL_REPO_NAME = "gascity-packs"
+ CANONICAL_REPO_URL = f"https://{CANONICAL_REPO_HOST}/{CANONICAL_REPO_OWNER}/{CANONICAL_REPO_NAME}"
+ FORK_REPO_OWNER = "Hough-labs"
+ FORK_REPO_NAME = "gascity-packs"
+-FORK_REPO_URL = f"https://{CANONICAL_REPO_HOST}/{FORK_REPO_OWNER}/{FORK_REPO_NAME}"
+ # Ordered: the upstream repo is the default a message should suggest.
+ ACCEPTED_REPOS = (
+     (CANONICAL_REPO_OWNER, CANONICAL_REPO_NAME),
+-- 
+2.50.1 (Apple Git-155)
+

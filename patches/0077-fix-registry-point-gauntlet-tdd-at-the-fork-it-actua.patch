@@ -1,0 +1,163 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 3 Sep 2026 22:31:28 -0400
+Subject: [PATCH 77/78] fix(registry): point gauntlet-tdd at the fork it
+ actually lives in (gcp-kk4l)
+
+`Latest pack releases` has been red on integration since 2026-08-29. The
+gauntlet-tdd entry pinned commit 62de3319 while declaring a `source` of
+gastownhall/gascity-packs. That commit exists only in the Hough-labs fork, so
+`gc pack release validate` cloned upstream, failed to check the sha out, and
+reported `unable to read tree`. gauntlet-tdd is a closed-source pack that is
+never upstreamed, so an upstream `source` for it can never be correct -- it
+names a repository that structurally cannot contain the pack.
+
+registry.toml now declares the fork URL and the fork branch that holds the
+commit. `gc pack release validate` accepts it as-is: the release hash is
+unchanged and still verifies (`registry release hashes ok (33 checked)`), and
+the full compatibility path -- import install / import check / config show /
+formula list / skill list -- passes for the pack. Only gauntlet-tdd's `source`
+and `ref` are touched; no other entry and no hash changes.
+
+That alone would have traded one red check for another. validate_registry.py --
+run by ci.yml as `--require-git`, and used by pack_release_compat.py as the
+fallback when a gc binary predates `pack release` -- hardcoded a single accepted
+repo and refused the fork as an "external pack source". Its actual invariant is
+that it only accepts sources it can verify against the local object database,
+and the fork satisfies that: fork and upstream are two remotes over one object
+database, so a commit on either is in this worktree's history and hashes
+identically. The accepted set is now that pair rather than upstream alone;
+anything outside it is still refused with the same fail-closed message, and a
+mis-cased spelling of either now names that repo's own URL instead of reading as
+"go publish this elsewhere".
+
+Validation: go vet clean; golangci-lint 0 issues; go test ok; pytest tests 122
+passed / 7 skipped; validate_registry.py --require-git ok; gc pack release
+validate registry.toml ok (33 checked); scripts/pack_release_compat.py --pack
+gauntlet-tdd smoke passed. The three new parse_source tests were confirmed red
+against the pre-change validator and green after.
+---
+ registry.toml                   |  4 ++--
+ tests/test_validate_registry.py | 31 +++++++++++++++++++++++++++++++
+ validate_registry.py            | 33 +++++++++++++++++++++++++++++----
+ 3 files changed, 62 insertions(+), 6 deletions(-)
+
+diff --git a/registry.toml b/registry.toml
+index 1f815e8..cbe5cb7 100644
+--- a/registry.toml
++++ b/registry.toml
+@@ -317,12 +317,12 @@ schema = 1
+ [[pack]]
+   name = "gauntlet-tdd"
+   description = "The gauntlet RED-to-GREEN contract loop as a pack: scaffold a .bats contract from a bead's acceptance criteria, prove it red with gauntlet lint, route implementation to the rig's implementer, prove it green with a bead-scoped run (mol-tdd-red-green)."
+-  source = "https://github.com/gastownhall/gascity-packs/tree/main/gauntlet-tdd"
++  source = "https://github.com/Hough-labs/gascity-packs/tree/integration/gauntlet-tdd"
+   source_kind = "git"
+ 
+   [[pack.release]]
+     version = "0.1.0"
+-    ref = "main"
++    ref = "integration"
+     commit = "62de3319316d87275623a90f37ed426a62853288"
+     hash = "sha256:851ea09226728eb4e34ddbbf98186495516059af96ac8787c9921db070630f86"
+     description = "Initial gauntlet-tdd release: the RED-to-GREEN contract loop as one formula (mol-tdd-red-green) plus a wrapper command, pinned to the bats lane with gauntlet lint as the red gate."
+diff --git a/tests/test_validate_registry.py b/tests/test_validate_registry.py
+index a03473f..198f8f0 100644
+--- a/tests/test_validate_registry.py
++++ b/tests/test_validate_registry.py
+@@ -45,6 +45,37 @@ def test_parse_source_accepts_bare_repo_url_as_root_pack() -> None:
+     assert spec == validate_registry.SourceSpec(ref=None, pack_path="")
+ 
+ 
++def test_parse_source_accepts_fork_tree_url() -> None:
++    """gauntlet-tdd is fork-only, so its source must be allowed to say so.
++
++    The fork and the upstream repo are two remotes over one object database, so
++    a fork URL is verifiable against local git exactly like an upstream one.
++    """
++    spec = validate_registry.parse_source(
++        "https://github.com/Hough-labs/gascity-packs/tree/integration/gauntlet-tdd"
++    )
++
++    assert spec == validate_registry.SourceSpec(ref="integration", pack_path="gauntlet-tdd")
++
++
++def test_parse_source_accepts_bare_fork_repo_url_as_root_pack() -> None:
++    spec = validate_registry.parse_source("https://github.com/Hough-labs/gascity-packs")
++
++    assert spec == validate_registry.SourceSpec(ref=None, pack_path="")
++
++
++def test_parse_source_rejects_miscased_fork_owner_by_naming_the_fork_url() -> None:
++    """A typo must point at the fork's own URL, not read as "go publish elsewhere"."""
++    with pytest.raises(validate_registry.SourceError) as excinfo:
++        validate_registry.parse_source(
++            "https://github.com/hough-labs/gascity-packs/tree/integration/gauntlet-tdd"
++        )
++
++    message = str(excinfo.value)
++    assert "canonical repository URL" in message
++    assert "https://github.com/Hough-labs/gascity-packs" in message
++
++
+ def test_parse_source_tolerates_trailing_slash_and_host_case() -> None:
+     spec = validate_registry.parse_source(
+         "https://GITHUB.COM/gastownhall/gascity-packs/tree/main/cass/"
+diff --git a/validate_registry.py b/validate_registry.py
+index e07c545..b972c18 100755
+--- a/validate_registry.py
++++ b/validate_registry.py
+@@ -19,10 +19,29 @@ from urllib.parse import urlparse
+ # <owner>/<pack> name; they never get an entry here. That keeps this validator a
+ # purely local, network-free, fail-closed check: every source it accepts is one
+ # whose content it can actually verify against the local object database.
++#
++# "THIS repository" means the upstream repo AND the Hough-labs fork it is
++# developed in, because those are two remote names for one object database: a
++# commit on either is in the local worktree's history, so its content hash is
++# verifiable here exactly the same way. The distinction matters for a pack that
++# lives ONLY in the fork -- gauntlet-tdd is closed-source and is never
++# upstreamed, so an upstream `source` for it names a repository that does not
++# contain the pinned commit. Accepting the fork URL keeps the fail-closed
++# guarantee (still no network, still verified against local objects) while
++# letting a fork-only pack state where it actually lives. A repository outside
++# this pair remains an external source and is refused.
+ CANONICAL_REPO_HOST = "github.com"
+ CANONICAL_REPO_OWNER = "gastownhall"
+ CANONICAL_REPO_NAME = "gascity-packs"
+ CANONICAL_REPO_URL = f"https://{CANONICAL_REPO_HOST}/{CANONICAL_REPO_OWNER}/{CANONICAL_REPO_NAME}"
++FORK_REPO_OWNER = "Hough-labs"
++FORK_REPO_NAME = "gascity-packs"
++FORK_REPO_URL = f"https://{CANONICAL_REPO_HOST}/{FORK_REPO_OWNER}/{FORK_REPO_NAME}"
++# Ordered: the upstream repo is the default a message should suggest.
++ACCEPTED_REPOS = (
++    (CANONICAL_REPO_OWNER, CANONICAL_REPO_NAME),
++    (FORK_REPO_OWNER, FORK_REPO_NAME),
++)
+ PACK_PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+ 
+ PACK_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*(/[a-z0-9][a-z0-9-]*)?$")
+@@ -221,10 +240,16 @@ def parse_source(source: str) -> SourceSpec:
+     owner, repo, *rest = segments
+     if repo.endswith(".git"):
+         raise SourceError(f"source must use the canonical repository URL {CANONICAL_REPO_URL}")
+-    if owner != CANONICAL_REPO_OWNER or repo != CANONICAL_REPO_NAME:
+-        # A different repo on github.com is still an external source.
+-        if (owner.lower(), repo.lower()) == (CANONICAL_REPO_OWNER, CANONICAL_REPO_NAME):
+-            raise SourceError(f"source must use the canonical repository URL {CANONICAL_REPO_URL}")
++    if (owner, repo) not in ACCEPTED_REPOS:
++        # A different repo on github.com is still an external source. Mis-cased
++        # spellings of an accepted repo are not: name the exact URL to use, so a
++        # typo does not read as "publish this somewhere else".
++        for accepted_owner, accepted_name in ACCEPTED_REPOS:
++            if (owner.lower(), repo.lower()) == (accepted_owner.lower(), accepted_name.lower()):
++                raise SourceError(
++                    "source must use the canonical repository URL "
++                    f"https://{CANONICAL_REPO_HOST}/{accepted_owner}/{accepted_name}"
++                )
+         raise SourceError(_FOREIGN_SOURCE_MESSAGE)
+ 
+     if not rest:
+-- 
+2.50.1 (Apple Git-155)
+

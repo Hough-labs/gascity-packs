@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Wed, 2 Sep 2026 14:52:20 -0400
-Subject: [PATCH 69/76] fix(gastown): make the default-branch fetch safe under
+Subject: [PATCH 69/78] fix(gastown): make the default-branch fetch safe under
  set -e (gcp-5ddt)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
