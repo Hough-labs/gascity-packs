@@ -112,13 +112,13 @@ jobs:
       - name: Install Python test dependencies
         run: python3 -m pip install --break-system-packages PyYAML pytest
 
+      # Release archive rather than `go install` — see gcp-m0ei: compiling gc
+      # needs 4.46 GiB of ephemeral storage against a 4Gi container limit. The
+      # script exports the resolved binary as GC_BIN.
       - name: Install Gas City
         env:
           GASCITY_REF: ${{ github.event.client_payload.gascity_ref || github.event.inputs.gascity_ref || 'latest' }}
-        run: |
-          go install "github.com/gastownhall/gascity/cmd/gc@${GASCITY_REF}"
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-          "$(go env GOPATH)/bin/gc" version
+        run: .github/scripts/install-gascity-archive.sh "${GASCITY_REF}" --cache
 
       - name: Run inference runner unit tests
         run: python3 -m pytest tests/test_gascity_pack_inference_gate.py -q
@@ -147,7 +147,7 @@ jobs:
           PACK: ${{ github.event.client_payload.pack || github.event.inputs.pack || 'all-supported' }}
         run: |
           python3 scripts/gascity_pack_inference_gate.py \
-            --gc-bin "$(go env GOPATH)/bin/gc" \
+            --gc-bin "$GC_BIN" \
             --workdir "$RUNNER_TEMP/gascity-pack-inference" \
             --pack "${PACK:-all-supported}" \
             --gate "${GATE:-all}" \

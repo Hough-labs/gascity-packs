@@ -228,14 +228,15 @@ jobs:
         if: steps.subset.outputs.run_gate == 'true'
         run: python3 -m pip install --break-system-packages PyYAML pytest
 
+      # Installed from the published release archive, not `go install`: building
+      # gc from source costs 4.46 GiB of ephemeral storage on its own (gcp-m0ei)
+      # against the runner container's 4Gi limit, which evicted this pod seven
+      # times in 36 minutes. The script exports the resolved binary as GC_BIN.
       - name: Install Gas City
         if: steps.subset.outputs.run_gate == 'true'
         env:
           GASCITY_REF: ${{ github.event.inputs.gascity_ref || 'main' }}
-        run: |
-          go install "github.com/gastownhall/gascity/cmd/gc@${GASCITY_REF}"
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-          "$(go env GOPATH)/bin/gc" version
+        run: .github/scripts/install-gascity-archive.sh "${GASCITY_REF}" --cache
 
       - name: Validate Manifold Claude configuration
         if: steps.subset.outputs.run_gate == 'true'
@@ -261,7 +262,7 @@ jobs:
           GATE_TIMEOUT: ${{ github.event.inputs.timeout || matrix.gate_timeout }}
         run: |
           python3 scripts/gascity_pack_inference_gate.py \
-            --gc-bin "$(go env GOPATH)/bin/gc" \
+            --gc-bin "$GC_BIN" \
             --workdir "$RUNNER_TEMP/supported-pack-nightly/${{ matrix.pack }}" \
             --pack "${{ matrix.pack }}" \
             --gate "${{ matrix.gate }}" \

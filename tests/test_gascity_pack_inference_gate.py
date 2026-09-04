@@ -523,6 +523,88 @@ def test_ci_workflows_use_self_hosted_runner_labels() -> None:
                 assert stripped == "runs-on: hough-labs-k3s", f"{workflow_path.name}: {stripped}"
 
 
+def test_no_workflow_compiles_gas_city_from_source() -> None:
+    # `go install github.com/gastownhall/gascity/cmd/gc@REF` compiles Gas City,
+    # and Gas City links Dolt. Measured cold on linux/amd64 (gcp-m0ei) that
+    # build needs 2.32 GiB of GOMODCACHE + 1.89 GiB of GOCACHE + a 252 MiB
+    # binary = 4.46 GiB, on a runner container whose ephemeral-storage limit is
+    # 4Gi. The build does not fit on its own, so kubelet evicted the pod at the
+    # `Install Gas City` step -- seven times in 36 minutes -- and GitHub
+    # rendered that as exit 130 / "The operation was canceled" with no cause.
+    #
+    # The same releases are published as prebuilt archives (~170 MiB peak), so
+    # gc is installed the way dolt, bd and claude already are. This is a
+    # tree-wide sweep rather than a per-file check for the same reason as the
+    # runner-label gate above: the regression that matters is the workflow
+    # somebody adds later, which would go red at 3am instead of here.
+    workflow_dir = gascity_pack_inference_gate.REPO_ROOT / ".github" / "workflows"
+    workflow_paths = sorted(
+        [*workflow_dir.glob("*.yml"), *workflow_dir.glob("*.yaml")]
+    )
+    assert workflow_paths, "no workflow files found -- the sweep below would vacuously pass"
+
+    installer = gascity_pack_inference_gate.REPO_ROOT / ".github" / "scripts" / "install-gascity-archive.sh"
+    assert installer.is_file()
+    assert os.access(installer, os.X_OK), "the installer must be executable -- workflows invoke it directly"
+
+    installs_gc = 0
+    for workflow_path in workflow_paths:
+        workflow = workflow_path.read_text(encoding="utf-8")
+        for line in workflow.splitlines():
+            # Comments in these files quote the command they replaced, so match
+            # on what the runner would actually execute.
+            code = line.split("#", 1)[0]
+            assert "go install" not in code or "gascity/cmd/gc" not in code, (
+                f"{workflow_path.name}: builds gc from source: {line.strip()}"
+            )
+        if "install-gascity-archive.sh" in workflow:
+            installs_gc += 1
+        # A step that still resolves gc out of GOPATH would silently point at a
+        # path the archive install never writes.
+        assert "go env GOPATH)/bin/gc" not in workflow, workflow_path.name
+
+    # ci.yml, gascity-pack-inference.yml, pack-release-compatibility.yml and
+    # supported-pack-nightly.yml. codeql.yml installs no gc.
+    assert installs_gc == 4, f"expected four workflows to install gc, found {installs_gc}"
+
+
+def test_gas_city_installer_covers_the_refs_the_workflows_pass() -> None:
+    # The workflows pass GASCITY_REF straight through, and its documented values
+    # are main, latest and a version tag. Each maps to a published release; an
+    # unreleased ref (a branch, a commit sha) has no archive, so the script
+    # keeps the old `go install` path for it rather than failing a manual
+    # dispatch -- loudly, because that path is what evicts the runner.
+    installer = (
+        gascity_pack_inference_gate.REPO_ROOT / ".github" / "scripts" / "install-gascity-archive.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "main|edge)" in installer
+    assert "latest)" in installer
+    assert "v[0-9]*)" in installer
+    assert "install_from_source" in installer
+    assert "gascity_${version}_${platform_tuple}.tar.gz" in installer
+    # Never install an unverified binary, and never key the cache on the tag
+    # alone: `edge` rolls, so a tag-only key serves a stale gc forever.
+    assert 'if [[ "$actual_sha" != "$expected_sha" ]]; then' in installer
+    assert '${expected_sha:0:16}' in installer
+    # The bearer token must not ride the release download's cross-host redirect.
+    assert "Authorization: Bearer" in installer
+    assert installer.count("Authorization: Bearer") == 1
+    assert "fetch_api" in installer
+
+    for workflow_name in (
+        "ci.yml",
+        "gascity-pack-inference.yml",
+        "pack-release-compatibility.yml",
+        "supported-pack-nightly.yml",
+    ):
+        workflow = (
+            gascity_pack_inference_gate.REPO_ROOT / ".github" / "workflows" / workflow_name
+        ).read_text(encoding="utf-8")
+        assert ".github/scripts/install-gascity-archive.sh" in workflow, workflow_name
+        assert "--cache" in workflow, workflow_name
+
+
 def test_readme_includes_blacksmith_sponsor_badge() -> None:
     readme = (gascity_pack_inference_gate.REPO_ROOT / "README.md").read_text(encoding="utf-8")
     readme_lines = {line.strip() for line in readme.splitlines()}

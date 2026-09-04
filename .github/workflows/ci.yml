@@ -38,10 +38,16 @@ jobs:
       - name: Run Python pack tests
         run: python3 -m pytest tests contributing/tests gascity/tests discord/tests github/tests slack-full/tests slack-channel/tests pr-pipeline/tests gauntlet-tdd/tests -q
 
+      # Installed once, from the published release archive, and reused by every
+      # step below that needs gc. `go install` of cmd/gc costs 4.46 GiB of
+      # ephemeral storage (gcp-m0ei) against the runner container's 4Gi limit --
+      # this job survived it only by a margin, and the nightly did not. The
+      # script exports the resolved binary as GC_BIN.
+      - name: Install Gas City
+        run: .github/scripts/install-gascity-archive.sh latest --cache
+
       - name: Lint and exercise shared role prompt composition
         run: |
-          go install github.com/gastownhall/gascity/cmd/gc@latest
-          GC_BIN="$(go env GOPATH)/bin/gc"
           for pack in gascity gascity/roles bmad compound-engineering gstack superpowers; do
             "$GC_BIN" lint "$pack"
           done
@@ -81,12 +87,11 @@ jobs:
       # RPP conformance gate. Non-blocking until gascity main ships the
       # Runtime Provider Protocol (the runtime-provider-packs PoC branch
       # merges) — `gc runtime check` does not exist on gascity main yet, so
-      # `@latest` cannot satisfy this today. Flip continue-on-error to false
-      # (and pin @<version>) once RPP lands on gascity main. The install is a
-      # tool install, not a Go import, so the pack keeps zero gascity deps.
+      # `latest` cannot satisfy this today. Flip continue-on-error to false
+      # (and pin a version) once RPP lands on gascity main. gc arrives as a
+      # prebuilt tool binary, not a Go import, so the pack keeps zero gascity
+      # deps; GC_BIN comes from the Install Gas City step above.
       - name: Run runtime-cloudflare RPP conformance
         working-directory: runtime-cloudflare
         continue-on-error: true
-        run: |
-          go install github.com/gastownhall/gascity/cmd/gc@latest
-          GC_BIN="$(go env GOPATH)/bin/gc" ./conformance.sh
+        run: ./conformance.sh
