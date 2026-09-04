@@ -110,45 +110,35 @@ jobs:
       - name: Install Python test dependencies
         run: python3 -m pip install --break-system-packages PyYAML pytest
 
+      # Release archive rather than `go install` — see gcp-m0ei: compiling gc
+      # needs 4.46 GiB of ephemeral storage against a 4Gi container limit. The
+      # script exports the resolved binary as GC_BIN.
       - name: Install Gas City
         env:
           GASCITY_REF: ${{ github.event.client_payload.gascity_ref || github.event.inputs.gascity_ref || 'latest' }}
+        run: .github/scripts/install-gascity-archive.sh "${GASCITY_REF}" --cache
+
+      # The gate imports the builtin core/bd packs from a git checkout of the
+      # SAME gascity revision gc was built from (GASCITY_SOURCE_ROOT): module
+      # zips drop file modes, so pack scripts gc execs would exit 126. The
+      # archive install exports GASCITY_SOURCE_REF (the release tag, or the ref
+      # it fell back to building); fetch only that, shallow, so the disk budget
+      # gcp-m0ei bought back stays bought.
+      - name: Check out the matching gascity source
         run: |
-          # Resolve the ref once so gc and the builtin core/bd packs the gate
-          # imports (GASCITY_SOURCE_ROOT) come from the same gascity revision.
-          # A query such as @latest comes back without .Origin, so resolve the
-          # ref to a version first, then read that exact version's commit.
-          gascity_query="$(go mod download -json "github.com/gastownhall/gascity@${GASCITY_REF}")" || {
-            echo "$gascity_query" >&2
-            exit 1
-          }
-          gascity_version="$(jq -er .Version <<<"$gascity_query")"
-          gascity_module="$(go mod download -json "github.com/gastownhall/gascity@${gascity_version}")" || {
-            echo "$gascity_module" >&2
-            exit 1
-          }
-          gascity_commit="$(jq -er .Origin.Hash <<<"$gascity_module")" || {
-            echo "no commit recorded for gascity ${gascity_version}: $gascity_module" >&2
-            exit 1
-          }
-          go install "github.com/gastownhall/gascity/cmd/gc@${gascity_version}"
-          # Import core/bd from a git checkout of that commit, never the module
-          # cache directory: module zips drop file modes, so every pack script gc
-          # execs would fail with exit 126.
           gascity_src="${RUNNER_TEMP}/gascity-src"
           git init --quiet "$gascity_src"
-          git -C "$gascity_src" fetch --quiet --depth 1 https://github.com/gastownhall/gascity.git "$gascity_commit"
+          git -C "$gascity_src" fetch --quiet --depth 1 https://github.com/gastownhall/gascity.git \
+            "${GASCITY_SOURCE_REF:?the install step did not export GASCITY_SOURCE_REF}"
           git -C "$gascity_src" checkout --quiet --detach FETCH_HEAD
           echo "GASCITY_SOURCE_ROOT=${gascity_src}" >> "$GITHUB_ENV"
-          echo "gascity ${GASCITY_REF} resolved to ${gascity_version} (${gascity_commit}) at ${gascity_src}"
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-          "$(go env GOPATH)/bin/gc" version
+          echo "gascity source ${GASCITY_SOURCE_REF} at ${gascity_src} ($(git -C "$gascity_src" rev-parse --short HEAD))"
 
       # bd must embed the same beads module as gc (the gate refuses a
       # mismatch), so derive it from the gc just installed instead of pinning it.
       - name: Install bd matching gc's beads module
         run: |
-          scripts/install_bd_matching_gc.sh "$(go env GOPATH)/bin/gc" \
+          scripts/install_bd_matching_gc.sh "${GC_BIN}" \
             .gascity-ci/.github/scripts/install-bd-archive.sh
 
       - name: Run inference runner unit tests
@@ -178,7 +168,7 @@ jobs:
           PACK: ${{ github.event.client_payload.pack || github.event.inputs.pack || 'all-supported' }}
         run: |
           python3 scripts/gascity_pack_inference_gate.py \
-            --gc-bin "$(go env GOPATH)/bin/gc" \
+            --gc-bin "$GC_BIN" \
             --workdir "$RUNNER_TEMP/gascity-pack-inference" \
             --pack "${PACK:-all-supported}" \
             --gate "${GATE:-all}" \

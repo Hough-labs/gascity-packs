@@ -68,19 +68,20 @@ jobs:
         with:
           go-version: "1.22"
 
+      # Release archive rather than `go install` — see gcp-m0ei: compiling gc
+      # needs 4.46 GiB of ephemeral storage against a 4Gi container limit. The
+      # script exports the resolved binary as GC_BIN.
       - name: Install Gas City
         env:
           GASCITY_REF: ${{ github.event.client_payload.gascity_ref || github.event.inputs.gascity_ref || 'latest' }}
-        run: |
-          go install "github.com/gastownhall/gascity/cmd/gc@${GASCITY_REF}"
-          "$(go env GOPATH)/bin/gc" version
+        run: .github/scripts/install-gascity-archive.sh "${GASCITY_REF}" --cache
 
       - name: Run pack release compatibility smoke
         env:
           EXERCISE: ${{ github.event.client_payload.exercise || github.event.inputs.exercise || 'both' }}
           PACK: ${{ github.event.client_payload.pack || github.event.inputs.pack }}
         run: |
-          args=(--gc-bin "$(go env GOPATH)/bin/gc" --exercise "${EXERCISE:-both}")
+          args=(--gc-bin "$GC_BIN" --exercise "${EXERCISE:-both}")
           if [ -n "${PACK:-}" ]; then
             args+=(--pack "$PACK")
           fi
