@@ -1098,8 +1098,18 @@ needs = ["recover-orphaned-beads"]
 description = """
 The step above recovers a crashed polecat's bead and its task worktree, and
 the refinery's `task-artifact-cleanup` retires a task worktree after a
-verified merge. This step covers the worktree neither of those can reach: a
-polecat's persistent agent home at `<city>/.gc/worktrees/<rig>/polecats/<agent>`.
+verified merge. This step covers the worktree neither of those can reach: an
+agent's persistent home at `<city>/.gc/worktrees/<rig>/<lane-tree>/<agent>`.
+
+**Read the candidate set as wider than "polecats" (gcp-elv3).** The sweep
+gates on the home SHAPE — one level under a lane tree, two under the rig's
+worktree root — and not on the tree's name, because naming `polecats` made
+it blind to every `views/<view-home>` on a rig running view lanes. Two
+consequences for you: view homes now appear, which is the point; and so do
+`crew/<slot>` homes, which have the same shape and the same respawn hazard
+but were never swept before. Removal is still opt-in, so treat the first
+few cycles of `home_removal_pending` on a crew slot as something to READ
+rather than something that happened.
 
 **Why it needs a step of its own.** A per-bead worktree is found through
 its bead. A home has NO bead, so every guard the rig owns is structurally

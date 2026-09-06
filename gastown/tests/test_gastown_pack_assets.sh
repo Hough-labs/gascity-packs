@@ -849,8 +849,17 @@ test_polecat_home_teardown_has_an_owner() {
 
     # The gates are the safety contract; losing any one turns housekeeping into
     # data loss.
-    grep -F '[ "$(basename "$(dirname "$wt")")" = "polecats" ]' "$audit" >/dev/null ||
-        fail "home audit must restrict candidates to polecat agent homes"
+    # Shape, not tree name (gcp-elv3): a home is `<lane-tree>/<agent>`, two
+    # levels under the rig's worktree root. The `polecats` literal this
+    # replaced is what hid every `views/<view-home>` from the sweep.
+    grep -F '[ "${worktrees_root##*/}" = worktrees ]' "$audit" >/dev/null ||
+        fail "home audit must restrict candidates to agent homes under the rig's worktree root"
+    grep -F '[ "${lane_tree##*/}" != worktrees ]' "$audit" >/dev/null ||
+        fail "home audit must exclude the per-bead worktrees one level deeper; those are the reaper's"
+    grep -F '[ "$wt" != "$MAIN_WT" ]' "$audit" >/dev/null ||
+        fail "home audit must exclude the main worktree; it is the canonical checkout, never a candidate"
+    ! grep -E '^[[:space:]]*\*/[A-Za-z]+/\*' "$audit" >/dev/null ||
+        fail "home audit must not gate on a lane-tree name; that is the blind spot gcp-elv3 closed"
     grep -F 'record home_children_kept' "$audit" >/dev/null ||
         fail "home audit must defer a home that still hosts per-bead worktrees; a LIVE polecat from another slot can be working inside a dead home's subtree (gcp-actg)"
     grep -F 'git -C "$WT" status --porcelain' "$audit" >/dev/null ||

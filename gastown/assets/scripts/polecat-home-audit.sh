@@ -50,11 +50,14 @@
 #   the dirt for that whole span.
 #
 # Gates — ALL must hold before a home is removed:
-#   1. Path shape is a polecat agent home: .../polecats/<agent>, i.e. the
-#      parent directory is literally `polecats`. That excludes the per-bead
-#      worktrees (parent `worktrees`), the rig root, and every non-polecat
-#      agent's worktree. The candidate sets of this script and the per-bead
-#      reaper are disjoint by construction.
+#   1. Path shape is an agent home: `<lane-tree>/<agent>` two levels under the
+#      rig's worktree root, i.e. `<city>/.gc/worktrees/<rig>/<tree>/<agent>`.
+#      That excludes the per-bead worktrees one level deeper (parent
+#      `worktrees`, and polecat-worktree-reap.sh's business), the rig root, and
+#      the refinery worktree, which sits beside the trees rather than in one.
+#      The candidate sets of this script and the per-bead reaper are disjoint
+#      by construction. The tree NAME is deliberately not tested — see THE
+#      LANE-TREE BLIND SPOT below.
 #   2. The session roster holds no LIVE session for this home — matched on the
 #      session's own `work_dir`, and on `<rig>/<agent>` derived from the path.
 #      The roster is the only ownership key here, so a read that fails, times
@@ -78,6 +81,35 @@
 #   `home_dirty_kept` and `home_children_kept` in one cycle, and is skipped
 #   once. Gate 4 first was the bug in gcp-fzjo — it silenced gate 3 entirely
 #   for any home with a child.
+#
+# THE LANE-TREE BLIND SPOT — why gate 1 does not name a tree (gcp-elv3):
+#   Gate 1 used to require the parent directory to be literally `polecats`.
+#   gascity does not keep every agent home there: a rig running view lanes gets
+#   a second tree at `<rig>/views/<view-home>`, whose homes and per-bead
+#   children are byte-identical in shape and differ only in the tree name. Both
+#   this sweep and the per-bead reaper dropped those paths before any `record`,
+#   so winnow's 4 view homes and 16 view worktrees produced no log line at all —
+#   `/views/` appears in 0 of 1293 reap-log entries across every rig and all
+#   time. Silence from a blind guard is indistinguishable from silence from a
+#   healthy rig, which makes the failure mode undetectable rather than absent.
+#
+#   So the gate tests the SHAPE — a home is `<tree>/<agent>` two levels under
+#   the rig's worktree root — and not the tree's name. A second `views` literal
+#   would only move the blind spot to whatever lane gascity names next. The
+#   `worktrees` segment the gate DOES name is gascity's own layout constant
+#   (`<city>/.gc/worktrees/<rig>/…`), not a lane name; the same segment already
+#   backs the `<rig>/<agent>` roster key derived further down.
+#
+#   KNOWN WIDENING: every rig also has a `crew/` tree, and crew workspaces are
+#   namepool slots of exactly this shape, so they enter the candidate set too.
+#   That is a real behaviour change on rigs that run no view lanes, and it is
+#   deliberate rather than incidental: a respawned crew slot inherits an
+#   abandoned checkout the same way a polecat slot does, which is the whole
+#   reason this sweep exists. Every gate below still applies unchanged — a live
+#   session, uncommitted work, unpublished commits, or any child worktree all
+#   defer — and the staged rollout means nothing is removed while the widened
+#   `home_removal_pending` set is reviewed. Excluding crew again would mean
+#   another tree literal, which is the bug this bead closes.
 #
 # Staged rollout: REAL REMOVAL IS OPT-IN, matching the per-bead reaper and the
 # city's posture for the native gascity reaper. Without --no-dry-run this
@@ -303,7 +335,7 @@ WT_LIST_RC=0
 WT_LIST=$(run_bounded "$WT_LIST_LIMIT" git -C "$RIG_ROOT" worktree list --porcelain 2>/dev/null) || WT_LIST_RC=$?
 WT_LIST_OUTCOME=$(classify_outcome "$WT_LIST_LIMIT" "$WT_LIST_RC")
 if [ "$WT_LIST_OUTCOME" != ok ]; then
-    # "no polecat homes under $RIG_ROOT" is a claim about the rig. A run that
+    # "no agent homes under $RIG_ROOT" is a claim about the rig. A run that
     # never got the list is not entitled to make it.
     case "$WT_LIST_OUTCOME" in
         skipped)
@@ -328,24 +360,41 @@ if [ "$WT_LIST_OUTCOME" != ok ]; then
     exit 0
 fi
 
+# git lists the MAIN worktree first, and it is the canonical checkout — never a
+# candidate whatever its path looks like. The `polecats` literal gate 1 used to
+# carry excluded it incidentally; keyed on shape alone it must be named.
+MAIN_WT=$(printf '%s\n' "$WT_LIST" | sed -n 's/^worktree //p' | head -1)
+
 CANDIDATES=$(printf '%s\n' "$WT_LIST" \
     | sed -n 's/^worktree //p' \
     | while IFS= read -r wt; do
-        # Gate 1: polecat AGENT HOME shape. The parent directory must be
-        # literally `polecats`, which admits `.../polecats/<agent>` and nothing
-        # else — not the per-bead worktrees one level deeper (parent
-        # `worktrees`, and polecat-worktree-reap.sh's business), not the rig
-        # root, not another agent's worktree.
-        case "$wt" in
-            */polecats/*) ;;
-            *) continue ;;
-        esac
-        [ "$(basename "$(dirname "$wt")")" = "polecats" ] || continue
+        # Gate 1: AGENT HOME shape — `<lane-tree>/<agent>` two levels under the
+        # rig's worktree root, `<city>/.gc/worktrees/<rig>/<tree>/<agent>`.
+        # Plain parameter expansion rather than a basename/dirname pipeline:
+        # this runs for every registered worktree on the rig, and the run has a
+        # wall clock to keep.
+        [ "$wt" != "$MAIN_WT" ] || continue
+        [ "$wt" != "$RIG_ROOT" ] || continue
+        lane_tree=${wt%/*}                  # <city>/.gc/worktrees/<rig>/<tree>
+        rig_dir=${lane_tree%/*}             # <city>/.gc/worktrees/<rig>
+        worktrees_root=${rig_dir%/*}        # <city>/.gc/worktrees
+        # One level deeper is a per-bead worktree — the reaper's business, and
+        # the one place a `worktrees` segment appears that is NOT the layout
+        # root the next test looks for.
+        [ "${lane_tree##*/}" != worktrees ] || continue
+        # The rig's worktree root itself. This is the layout constant, not a
+        # lane name: it admits `polecats/<agent>` and `views/<view-home>` alike,
+        # and excludes the refinery worktree, which sits beside the trees at
+        # `<rig>/refinery` rather than inside one. The depth is declared in this
+        # same pack — `agents/polecat/agent.toml` sets work_dir to
+        # `.gc/worktrees/{{.Rig}}/polecats/{{.AgentBase}}` and
+        # `agents/refinery/agent.toml` to `.gc/worktrees/{{.Rig}}/refinery`.
+        [ "${worktrees_root##*/}" = worktrees ] || continue
         printf '%s\n' "$wt"
     done || true)
 
 if [ -z "$CANDIDATES" ]; then
-    echo "polecat-home-audit: no polecat agent homes under $RIG_ROOT"
+    echo "polecat-home-audit: no agent homes under $RIG_ROOT"
     exit 0
 fi
 
@@ -425,7 +474,7 @@ fi
 #
 # Two keys, because either alone has a hole. `work_dir` is the session's own
 # statement of which directory it occupies and is exact — the live roster
-# records `/…/.gc/worktrees/<rig>/polecats/<agent>` verbatim. The
+# records `/…/.gc/worktrees/<rig>/<lane-tree>/<agent>` verbatim. The
 # `<rig>/<agent>` name derived from the path covers a session recorded with a
 # different work_dir shape (a resumed session, a provider that rewrote it).
 # Matching either way is deliberately generous: an extra match defers a home,
@@ -472,10 +521,11 @@ while IFS= read -r WT; do
     fi
     EXAMINED=$((EXAMINED + 1))
 
-    # .../worktrees/<rig>/polecats/<agent> — the agent is the leaf and the rig
-    # segment is two levels up. Derived from the path rather than from $RIG_NAME
-    # so the roster key is the one the session actually records, which is the
-    # city's rig name even when this run was given a different --rig label.
+    # .../worktrees/<rig>/<lane-tree>/<agent> — the agent is the leaf and the
+    # rig segment is two levels up, whichever lane tree sits between them.
+    # Derived from the path rather than from $RIG_NAME so the roster key is the
+    # one the session actually records, which is the city's rig name even when
+    # this run was given a different --rig label.
     AGENT=$(basename "$WT")
     RIG_SEGMENT=$(basename "$(dirname "$(dirname "$WT")")")
     ROSTER_NAME="$RIG_SEGMENT/$AGENT"

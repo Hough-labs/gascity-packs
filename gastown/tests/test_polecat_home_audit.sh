@@ -712,6 +712,74 @@ test_every_line_is_stamped_at_the_event_not_at_the_run() {
     rm -rf "$tmp"
 }
 
+test_lane_trees_other_than_polecats_are_audited() {
+    # gcp-elv3. Gate 1 used to require the home's parent directory to be
+    # literally `polecats`, so a rig running view lanes had its entire
+    # `views/<view-home>` tree — same shape, different tree name — dropped
+    # before any `record`. winnow ran four such homes and `/views/` appeared in
+    # 0 of 1293 reap-log entries: silence from a blind guard, indistinguishable
+    # from silence from a healthy rig.
+    #
+    # The gate is the SHAPE now, so the tree name must not matter — `nextlane`
+    # is a name nothing in this repo knows, and it must be audited exactly like
+    # `polecats`. What still matters is the DEPTH: the refinery worktree sits
+    # beside the trees at `<rig>/refinery`, not inside one, and stays out.
+    local tmp rig origin bin rigwt sessions logdir log
+    tmp=$(make_tmp)
+    rig="$tmp/rig"
+    origin="$tmp/origin.git"
+    bin="$tmp/bin"
+    rigwt="$tmp/city/.gc/worktrees/rig"
+    sessions="$tmp/sessions.json"
+    logdir="$tmp/logs"
+    log="$logdir/polecat-home-audit.log"
+    mkdir -p "$logdir"
+
+    setup_rig "$rig" "$origin"
+    write_gc_stub "$bin"
+
+    add_home "$rig" "$rigwt/views" specialists.prism      # every gate passes
+    add_home "$rig" "$rigwt/views" specialists.live       # a running session owns it
+    add_home "$rig" "$rigwt/nextlane" specialists.later   # an unfamiliar lane tree
+    add_home "$rig" "$rigwt/polecats" nux                 # the case that already worked
+
+    # Beside the trees, not inside one. Not an agent home at any depth.
+    git -C "$rig" worktree add -q "$rigwt/refinery" --detach origin/main
+
+    cat >"$sessions" <<'JSON'
+{"sessions":[
+  {"id":"gc-live","name":"rig/specialists.live","alias":"rig/specialists.live","agent_name":"rig/specialists.live","state":"active","closed":false}
+]}
+JSON
+
+    GC_RIG=rig LOG_DIR="$logdir" GC_SESSIONS_JSON="$sessions" PATH="$bin:$PATH" \
+        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out.txt" 2>&1 ||
+        fail "audit exited non-zero: $(cat "$tmp/out.txt")"
+
+    [[ ! -e "$rigwt/views/specialists.prism" ]] ||
+        fail "an unowned, childless, clean VIEW home was not removed; the gate is still keyed on the tree name"
+    [[ ! -e "$rigwt/nextlane/specialists.later" ]] ||
+        fail "a home under an unfamiliar lane tree was not removed; the gate must test the shape, not the name"
+    [[ ! -e "$rigwt/polecats/nux" ]] ||
+        fail "the polecat case regressed while the lane-tree gate was widened"
+
+    # Widening the gate must not weaken it.
+    [[ -e "$rigwt/views/specialists.live/seed.txt" ]] ||
+        fail "a view home owned by a live session was removed out from under it"
+    [[ -e "$rigwt/refinery/seed.txt" ]] ||
+        fail "the refinery worktree was removed; it sits beside the lane trees and is nobody's agent home"
+    [[ -e "$rig/seed.txt" ]] ||
+        fail "the rig root worktree was touched"
+
+    # The point of the bead: `/views/` stops being absent from the log.
+    grep -F '/views/specialists.prism"' "$log" >/dev/null ||
+        fail "the view home was decided but never recorded; pre-emission silence is the failure this closes"
+    ! grep -F '/refinery"' "$log" >/dev/null ||
+        fail "the refinery worktree was enumerated as an agent home"
+
+    rm -rf "$tmp"
+}
+
 test_removes_only_unowned_childless_clean_published_homes
 test_a_home_with_child_worktrees_is_never_removed
 test_a_home_with_children_is_still_reported_for_lost_work
@@ -724,5 +792,6 @@ test_budget_expiry_defers_rather_than_hangs
 test_a_check_that_never_ran_is_not_reported_as_a_failure
 test_git_failures_are_distinguished_from_a_short_budget
 test_every_line_is_stamped_at_the_event_not_at_the_run
+test_lane_trees_other_than_polecats_are_audited
 
 echo "polecat home audit tests passed"
