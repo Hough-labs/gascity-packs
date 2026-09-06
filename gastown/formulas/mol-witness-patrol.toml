@@ -567,10 +567,18 @@ in it. Treat the log as a report, not as a completed cleanup.
 On the ordinary one — a worktree under a bead — all four of these must
 hold:
 
-1. The path is a per-bead polecat worktree
-   (`.../polecats/<agent>/worktrees/<bead-id>`). A polecat's persistent
-   agent-home worktree has no `worktrees/` parent segment and is never a
-   candidate, nor is the rig root or the refinery's temporary merge worktree.
+1. The path is a per-bead worktree under an agent home
+   (`<city>/.gc/worktrees/<rig>/<lane-tree>/<agent>/worktrees/<bead-id>`).
+   An agent's persistent home worktree has no `worktrees/` parent segment
+   and is never a candidate, nor is the rig root, nor the refinery's merge
+   worktree, which keeps its per-bead directories one level higher at
+   `<rig>/refinery/worktrees/`. The LANE TREE is not named: `polecats` is
+   one, and a rig running view lanes has a second at `<rig>/views/`, whose
+   per-bead worktrees are byte-identical in shape. The gate used to test
+   for `polecats` and dropped every view worktree before it could emit
+   anything at all — `/views/` appeared in 0 of 1293 reap-log entries while
+   `/polecats/` accounted for all 1293 (gcp-elv3). If you see a lane tree
+   in the log you did not expect, that is the fix working, not a fault.
 2. The bead is `closed`. `open`/`in_progress` worktrees belong to a live
    polecat or to the orphan-recovery step above.
 3. `git status --porcelain` in the worktree is empty. Uncommitted work is
@@ -676,8 +684,18 @@ needs = ["reap-merged-worktrees"]
 description = """
 The two steps above cover the per-bead worktree at
 `<polecat-home>/worktrees/<bead-id>` — the crash path and the happy path.
-This step covers the OTHER worktree a polecat has: its persistent agent
-home at `<city>/.gc/worktrees/<rig>/polecats/<agent>`.
+This step covers the OTHER worktree an agent has: its persistent agent
+home at `<city>/.gc/worktrees/<rig>/<lane-tree>/<agent>`.
+
+**Read the candidate set as wider than "polecats" (gcp-elv3).** The sweep
+gates on the home SHAPE — one level under a lane tree, two under the rig's
+worktree root — and not on the tree's name, because naming `polecats` made
+it blind to every `views/<view-home>` on a rig running view lanes. Two
+consequences for you: view homes now appear, which is the point; and so do
+`crew/<slot>` homes, which have the same shape and the same respawn hazard
+but were never swept before. Removal is still opt-in, so treat the first
+few cycles of `home_removal_pending` on a crew slot as something to READ
+rather than something that happened.
 
 **Why it needs a step of its own.** A per-bead worktree is found through
 its bead. A home has NO bead, so every guard the rig owns is structurally

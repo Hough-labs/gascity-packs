@@ -18,9 +18,11 @@
 #             liveness gate below defers the reap until that polecat drains.
 #
 # Safety gates — ALL must hold before a worktree is removed:
-#   1. Path shape is a per-bead polecat worktree: .../polecats/<agent>/worktrees/<bead-id>.
-#      A polecat's persistent agent-home worktree has no `worktrees/` parent
-#      segment, so it is never a candidate.
+#   1. Path shape is a per-bead worktree: <agent-home>/worktrees/<bead-id>.
+#      An agent's persistent home worktree has no `worktrees/` parent segment,
+#      so it is never a candidate. The LANE TREE the home sits in — `polecats`,
+#      `views`, whatever gascity names next — is deliberately NOT part of the
+#      test; see THE LANE-TREE BLIND SPOT below.
 #   2. The bead is `closed`. The refinery closes only after a verified merge or
 #      a verified PR handoff, so the committed work is canonical elsewhere.
 #   3. `git status --porcelain` is empty — nothing uncommitted would be lost.
@@ -47,6 +49,27 @@
 #      --contains`) — the content exists somewhere other than this directory.
 #      Failing that is a FINDING (`worktree_unpublished_kept`), not a retry:
 #      the condition never resolves itself, so the witness is told once.
+#
+# THE LANE-TREE BLIND SPOT — why gate 1 does not name a tree (gcp-elv3):
+#   Gate 1 used to require a `*/polecats/*/worktrees/*` segment on top of the
+#   `worktrees/` parent check. gascity does not put every agent home under
+#   `polecats/`: a rig running view lanes gets a second tree at
+#   `<rig>/views/<view-home>/worktrees/<bead-id>`, whose per-bead worktrees are
+#   byte-identical in shape and differ only in the tree name. The glob dropped
+#   every one of them BEFORE the bulk bead read and before any `record`, so
+#   winnow's 16 view worktrees never produced a single log line — `/views/`
+#   appears in 0 of 1293 reap-log entries across all rigs and all time, while
+#   `/polecats/` accounts for all 1293. That is the same pre-emission silence
+#   that made gcp-ac59 a P1: a view worktree holding genuinely unpublished work
+#   emits no `worktree_unpublished_kept` and no `worktree_dirty_kept` either,
+#   so the failure mode is undetectable rather than absent.
+#
+#   The fix is to test the SHAPE and not the tree name. A second `views`
+#   literal would only move the blind spot to whatever lane gascity names next,
+#   and the tree name is not evidence about the worktree in the first place —
+#   `<home>/worktrees/<bead-id>` already says everything the gate needs. What
+#   the literal WAS carrying incidentally is the main-worktree exclusion, so
+#   that is now named outright rather than left to a path accident.
 #
 # COST MODEL — why this script is shaped the way it is (gcp-ntbf):
 #   It runs as the witness pre_start, which gascity bounds by [session]
@@ -351,18 +374,46 @@ if [ "$WT_LIST_OUTCOME" != ok ]; then
     exit 0
 fi
 
+# git lists the MAIN worktree first, and it is the canonical checkout — never a
+# candidate, whatever it is called. Gate 1 used to exclude it incidentally, via
+# a `polecats` segment no rig root carries; keyed on shape alone, a rig rooted
+# at `<anything>/worktrees/<name>` would match the per-bead shape exactly and, if
+# clean and published, clear every remaining gate. Name the exclusion instead.
+MAIN_WT=$(printf '%s\n' "$WT_LIST" | sed -n 's/^worktree //p' | head -1)
+
 CANDIDATES=$(printf '%s\n' "$WT_LIST" \
     | sed -n 's/^worktree //p' \
     | while IFS= read -r wt; do
-        # Gate 1: per-bead polecat worktree shape. The parent directory must be
-        # literally `worktrees` and the path must sit under a `polecats` tree —
-        # that excludes the polecat's own persistent agent-home worktree, the
-        # rig root, and the refinery's temporary merge worktree.
-        case "$wt" in
-            */polecats/*/worktrees/*) ;;
-            *) continue ;;
-        esac
-        [ "$(basename "$(dirname "$wt")")" = "worktrees" ] || continue
+        # Gate 1: per-bead worktree shape — `<agent-home>/worktrees/<bead-id>`,
+        # where the home is itself `<lane-tree>/<agent>` two levels under the
+        # rig's worktree root. That is the same home shape polecat-home-audit.sh
+        # gates on, so the two scripts split the tree between them with one
+        # definition rather than two.
+        #
+        # The `worktrees` parent excludes an agent's own persistent home. The
+        # home shape excludes the refinery's merge worktree, which keeps its
+        # per-bead directories one level higher, at `<rig>/refinery/worktrees/`.
+        # That depth is a pack invariant, not an observation: the two work_dir
+        # templates that produce these paths are declared in this same pack —
+        # `.gc/worktrees/{{.Rig}}/polecats/{{.AgentBase}}` for an agent home and
+        # `.gc/worktrees/{{.Rig}}/refinery` for the refinery. The LANE TREE name
+        # is not tested: naming it is what hid every view worktree from this
+        # gate, and naming a second one would only move the blind spot (see THE
+        # LANE-TREE BLIND SPOT above).
+        #
+        # Plain parameter expansion rather than a basename/dirname pipeline:
+        # this runs for every registered worktree on the rig, and the run has a
+        # wall clock to keep.
+        [ "$wt" != "$MAIN_WT" ] || continue
+        [ "$wt" != "$RIG_ROOT" ] || continue
+        wt_parent=${wt%/*}                 # <agent-home>/worktrees
+        agent_home=${wt_parent%/*}         # <agent-home>
+        lane_tree=${agent_home%/*}         # <city>/.gc/worktrees/<rig>/<tree>
+        rig_dir=${lane_tree%/*}            # <city>/.gc/worktrees/<rig>
+        worktrees_root=${rig_dir%/*}       # <city>/.gc/worktrees
+        [ "${wt_parent##*/}" = worktrees ] || continue
+        [ "${lane_tree##*/}" != worktrees ] || continue
+        [ "${worktrees_root##*/}" = worktrees ] || continue
         # The leaf is the bead id. Anything else is not ours to remove.
         #
         # The dot is IN the class because a sub-bead id carries one

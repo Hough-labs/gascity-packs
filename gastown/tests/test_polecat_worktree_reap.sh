@@ -979,6 +979,136 @@ test_an_all_missing_batch_is_not_a_store_failure() {
     rm -rf "$tmp"
 }
 
+test_lane_trees_other_than_polecats_are_enumerated() {
+    # gcp-elv3. Gate 1 used to require a `*/polecats/*/worktrees/*` segment, so
+    # every per-bead worktree under a rig's `views/` tree — byte-identical in
+    # shape, differing only in the tree name — was dropped BEFORE the bulk bead
+    # read and before any `record`. winnow ran 16 of them and `/views/` appeared
+    # in 0 of 1293 reap-log entries: the same pre-emission silence that made
+    # gcp-ac59 a P1, and one a worktree holding unpublished work cannot break.
+    #
+    # The gate is the SHAPE now, so the tree name must not matter at all — a
+    # second `views` literal would only move the blind spot to the next lane
+    # gascity names. `nextlane` is here to hold that: it is not a name anything
+    # in this repo knows, and it must be reaped exactly like `polecats`.
+    local tmp rig bin beads sessions logdir log
+    tmp=$(mktemp -d)
+    rig="$tmp/rig"
+    bin="$tmp/bin"
+    beads="$tmp/beads.json"
+    sessions="$tmp/sessions.json"
+    logdir="$tmp/logs"
+    log="$logdir/polecat-worktree-reap.log"
+    mkdir -p "$logdir"
+
+    setup_rig "$rig"
+    write_gc_stub "$bin"
+
+    local view_home="$tmp/city/.gc/worktrees/rig/views/specialists.prism"
+    local next_home="$tmp/city/.gc/worktrees/rig/nextlane/specialists.later"
+    local polecat_home="$tmp/city/.gc/worktrees/rig/polecats/nux"
+    git -C "$rig" worktree add -q "$view_home" --detach HEAD
+    git -C "$rig" worktree add -q "$next_home" --detach HEAD
+    git -C "$rig" worktree add -q "$polecat_home" --detach HEAD
+
+    add_bead_worktree "$rig" "$view_home" wt-view
+    add_bead_worktree "$rig" "$view_home" wt-view-live
+    add_bead_worktree "$rig" "$next_home" wt-next
+    add_bead_worktree "$rig" "$polecat_home" wt-polecat
+
+    cat >"$beads" <<'JSON'
+[
+  {"id":"wt-view","status":"closed","metadata":{"polecat_session":"deadsess"}},
+  {"id":"wt-view-live","status":"in_progress","metadata":{"polecat_session":"livesess"}},
+  {"id":"wt-next","status":"closed","metadata":{"polecat_session":"deadsess"}},
+  {"id":"wt-polecat","status":"closed","metadata":{"polecat_session":"deadsess"}}
+]
+JSON
+
+    cat >"$sessions" <<'JSON'
+{"sessions":[
+  {"id":"livesess","name":"livesess","state":"running","closed":false},
+  {"id":"deadsess","name":"deadsess","state":"closed","closed":true}
+]}
+JSON
+
+    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out.txt" 2>&1 ||
+        fail "reaper exited non-zero: $(cat "$tmp/out.txt")"
+
+    [[ ! -e "$view_home/worktrees/wt-view" ]] ||
+        fail "a closed, clean, unowned VIEW worktree was not reaped; the gate is still keyed on the tree name"
+    [[ ! -e "$next_home/worktrees/wt-next" ]] ||
+        fail "a per-bead worktree under an unfamiliar lane tree was not reaped; the gate must test the shape, not the name"
+    [[ ! -e "$polecat_home/worktrees/wt-polecat" ]] ||
+        fail "the polecat case regressed while the lane-tree gate was widened"
+
+    # Widening the gate must not weaken it: the ordinary gates still decide.
+    [[ -e "$view_home/worktrees/wt-view-live" ]] ||
+        fail "an in_progress view worktree was reaped; only closed beads are disposable"
+    [[ -e "$view_home/seed.txt" ]] ||
+        fail "the view agent-home worktree was reaped; only per-bead worktrees are candidates"
+
+    # The point of the bead: `/views/` stops being absent from the log. Match
+    # on the tree segment, not on a path this test composed — macOS `mktemp -d`
+    # hands back a /var path and git records the resolved /private/var form.
+    grep -F '/views/specialists.prism/worktrees/wt-view"' "$log" >/dev/null ||
+        fail "the view worktree was decided but never recorded; pre-emission silence is the failure this closes"
+
+    rm -rf "$tmp"
+}
+
+test_a_non_agent_worktree_named_like_a_bead_is_not_reaped() {
+    # The `polecats` literal gate 1 used to carry also excluded, incidentally,
+    # every path that merely LOOKS like `<something>/worktrees/<id>`. Two of
+    # those still must not be candidates once the gate is keyed on shape:
+    # the refinery, whose per-bead directories sit one level higher at
+    # `<rig>/refinery/worktrees/`, and the main worktree itself.
+    local tmp rig bin beads sessions logdir
+    tmp=$(mktemp -d)
+    # The rig root itself is placed at a path with the EXACT per-bead shape —
+    # `<root>/worktrees/<rig>/<tree>/<agent>/worktrees/<bead-id>` — and named
+    # after a bead bd will call closed, clean and published. Every gate but the
+    # main-worktree exclusion passes. `$RIG_ROOT` is not the backstop here:
+    # macOS `mktemp -d` hands back a /var path while git reports the resolved
+    # /private/var one, so the two do not even compare equal.
+    rig="$tmp/city/.gc/worktrees/rig/polecats/nux/worktrees/wt-closed"
+    bin="$tmp/bin"
+    beads="$tmp/beads.json"
+    sessions="$tmp/sessions.json"
+    logdir="$tmp/logs"
+    mkdir -p "$logdir"
+
+    setup_rig "$rig"
+    publish_rig "$rig" "$tmp/remote.git"
+    write_gc_stub "$bin"
+
+    local refinery="$tmp/city/.gc/worktrees/rig/refinery"
+    add_bead_worktree "$rig" "$refinery" wt-closed
+
+    cat >"$beads" <<'JSON'
+[
+  {"id":"wt-closed","status":"closed","metadata":{"polecat_session":"deadsess"}}
+]
+JSON
+    cat >"$sessions" <<'JSON'
+{"sessions":[
+  {"id":"deadsess","name":"deadsess","state":"closed","closed":true}
+]}
+JSON
+
+    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out.txt" 2>&1 ||
+        fail "reaper exited non-zero: $(cat "$tmp/out.txt")"
+
+    [[ -e "$rig/seed.txt" ]] ||
+        fail "the rig's own main worktree was reaped; it is the canonical checkout, never a candidate"
+    [[ -e "$refinery/worktrees/wt-closed" ]] ||
+        fail "a non-agent-home per-bead worktree was reaped; the witness owns agent-home worktrees only"
+
+    rm -rf "$tmp"
+}
+
 test_reaps_only_closed_clean_unowned_bead_worktrees
 test_real_removal_is_opt_in
 test_unreadable_session_roster_skips_the_reap
@@ -992,5 +1122,7 @@ test_git_status_failure_is_distinguished_from_a_short_budget
 test_dotted_sub_bead_worktrees_are_enumerated
 test_a_permanently_missing_bead_is_decided_not_retried
 test_an_all_missing_batch_is_not_a_store_failure
+test_lane_trees_other_than_polecats_are_enumerated
+test_a_non_agent_worktree_named_like_a_bead_is_not_reaped
 
 echo "polecat worktree reap tests passed"
