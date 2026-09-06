@@ -1,0 +1,497 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sun, 6 Sep 2026 19:07:05 -0400
+Subject: [PATCH 81/81] fix(witness): rotate the reaper's cutoff and evidence
+ the promotion criterion (gcp-schs)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The `--no-dry-run` promotion gate for polecat-worktree-reap.sh was evaluated on a
+population that structurally excluded part of the candidate set, in a biased way.
+The reaper enumerates deterministically and `break`s out of that ordered loop when
+its wall-clock budget expires, so the candidates it dropped were ALWAYS the same
+sorted tail — never a rotating or random slice. winnow's two 2026-09-06 cycles
+examined the identical prefix (2 of 12, then 8 of 11) and the tail appeared in
+neither; 50 budget_exhausted events city-wide say this is the normal case at load,
+not an outlier.
+
+That is not a fairness nicety. The criterion for flipping the staged rollout live
+is a REVIEWED would-reap set, and it silently assumed reviewed-set == candidate-set.
+Under a fixed cutoff the criterion can be satisfied in full — N cycles, no live
+worktree ever seen — while the tail has never been examined once, and the tail is
+exactly what a live reaper running with a fresh budget reaches first. Nothing is at
+risk today because the reaper stays in dry-run, but the evidence the operator's flip
+decision rests on was corrupt. This is distinct from gcp-uzq0 and gcp-ga3m, which
+are both about the budget being too small: fixing either would reduce how often this
+bites without making the criterion sound, since one slow cycle reintroduces it.
+
+The bead offered two invariants — rotate the enumeration, or require a `deferred=0`
+cycle before the flip is evidenced. This takes both halves, because each is weak
+alone: rotation makes coverage eventually complete but gives an operator nothing to
+check, and a `deferred=0` requirement is unreachable on a busy rig if every cycle
+re-walks the same prefix. So the candidate list is sorted explicitly (order becomes
+the script's, not git's), a truncated cycle persists the last candidate it DECIDED
+to a per-rig cursor beside the log, and the next cycle resumes after it and wraps —
+making the deferred remainder a moving window. A cycle that examines everything now
+says so once, as `worktree_scan_complete` with `deferred=0`, and clears the cursor
+so the next cycle starts at the head rather than being pinned mid-list. A candidate
+truncated before it was ever inspected holds the cursor back rather than advancing
+it, so it stays inside the next cycle's window.
+
+mol-witness-patrol's `reap-merged-worktrees` step now states the criterion on
+coverage instead of on a count of clean cycles, with the two jq reads an operator
+runs to check it, and the event table carries the new line plus a note that
+`worktree_budget_exhausted` is honest but is not evidence for the flip. The witness
+prompt gained the same caveat in short form.
+
+Nothing changes about what the reaper removes: the gates, the dry-run default, and
+the honest `deferred=N` reporting on a budget-limited cycle are all untouched — only
+which candidates a short cycle looks at first, and what the log lets a reader
+conclude. Every failure in the new path degrades to "no rotation": an unreadable or
+unwritable cursor costs fairness, never the witness start.
+
+Validation: new red/green test drives six truncated cycles over six candidates and
+asserts the reviewed set reaches all of them. With rotation disabled it reports the
+same three-candidate prefix six cycles running — the defect, reproduced — and passes
+with it enabled. It also holds that a truncated cycle never claims a complete scan,
+still reports its deferred count, and leaves a cursor, while a complete cycle emits
+`worktree_scan_complete` with `deferred=0` and clears it. Full gastown suite (11
+scripts) green, shellcheck clean, go vet / golangci-lint / validate_registry /
+go test ./... green.
+
+Follow-up: polecat-home-audit.sh has the identical loop shape and the identical
+promotion criterion, so it carries the same bias; filed separately rather than
+widened into this bead's scope.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ gastown/agents/witness/prompt.template.md     |   8 ++
+ .../assets/scripts/polecat-worktree-reap.sh   | 122 +++++++++++++++++-
+ gastown/formulas/mol-witness-patrol.toml      |  50 ++++++-
+ gastown/tests/test_polecat_worktree_reap.sh   | 108 ++++++++++++++++
+ 4 files changed, 279 insertions(+), 9 deletions(-)
+
+diff --git a/gastown/agents/witness/prompt.template.md b/gastown/agents/witness/prompt.template.md
+index 67d80d9..99f2095 100644
+--- a/gastown/agents/witness/prompt.template.md
++++ b/gastown/agents/witness/prompt.template.md
+@@ -141,6 +141,14 @@ published `HEAD` instead. Everything else it leaves alone and logs.
+ matching the staged rollout city.toml applies to the native gascity reaper.
+ Read the would-reap set as a report, not as a completed cleanup.
+ 
++A cycle that runs out of budget reviews only part of the candidate set and
++says so (`worktree_budget_exhausted`, `deferred=N`); the next cycle resumes
++where it stopped rather than re-walking the same prefix. So the would-reap
++set you are reading may be a window. The flip to live removal is an operator
++decision and is evidenced by a `worktree_scan_complete` cycle (`deferred=0`),
++never by a count of clean-looking cycles — the criterion is spelled out in
++the `mol-witness-patrol` `reap-merged-worktrees` step.
++
+ Your patrol job is to read
+ `$GC_CITY/.gc/runtime/logs/polecat-worktree-reap.log` and act on what is
+ not routine — a `worktree_dirty_kept` that repeats across cycles means real
+diff --git a/gastown/assets/scripts/polecat-worktree-reap.sh b/gastown/assets/scripts/polecat-worktree-reap.sh
+index 6df7e09..1bbac86 100755
+--- a/gastown/assets/scripts/polecat-worktree-reap.sh
++++ b/gastown/assets/scripts/polecat-worktree-reap.sh
+@@ -71,6 +71,35 @@
+ #   the literal WAS carrying incidentally is the main-worktree exclusion, so
+ #   that is now named outright rather than left to a path accident.
+ #
++# THE BIASED CUTOFF — why enumeration rotates (gcp-schs):
++#   The budget below is a wall clock, and the candidate loop `break`s when it
++#   expires. Enumeration is deterministic and sorted, so an unrotated loop drops
++#   the SAME sorted tail every single run — never a rotating or random slice.
++#   That is not a fairness nicety, it corrupts the evidence the staged rollout
++#   is promoted on: the criterion for adding --no-dry-run is a reviewed
++#   would-reap set, and under a fixed cutoff the reviewed set can be clean
++#   across any number of cycles while part of the candidate set has never been
++#   examined once. Those unexamined worktrees are exactly what a live reaper,
++#   running with a fresh budget, reaches first.
++#
++#   Two invariants were on the table (see the bead): rotate the enumeration so
++#   the cutoff is unbiased over time, or require a `deferred=0` cycle before the
++#   flip is considered evidenced. This script takes BOTH halves of the same
++#   idea, because each is weak alone — rotation makes coverage eventually
++#   complete but gives an operator nothing to check, and a `deferred=0`
++#   requirement is unreachable on a busy rig if every cycle re-walks the same
++#   prefix. So:
++#     - The start ROTATES. A truncated cycle persists the last candidate it
++#       decided, and the next cycle resumes after it, wrapping at the end. The
++#       remainder deferred is a moving window, not a fixed tail.
++#     - A cycle that examines every candidate says so, once, as
++#       `worktree_scan_complete` with `deferred=0`. That line is the thing
++#       mol-witness-patrol's promotion criterion is now written against, and
++#       rotation is what keeps it reachable.
++#   A budget-limited cycle stays non-fatal and still reports `deferred=N`
++#   honestly — none of this changes what the reaper removes, only which
++#   candidates it looks at first and what the log lets a reader conclude.
++#
+ # COST MODEL — why this script is shaped the way it is (gcp-ntbf):
+ #   It runs as the witness pre_start, which gascity bounds by [session]
+ #   setup_timeout (10s by default) and SIGKILLs on overrun. A killed pre_start
+@@ -98,7 +127,10 @@
+ # (city.toml, auto_reap_closed_bead_worktrees_dry_run) until gc-zxxy is
+ # answered; a second reaper must not go live while the first is held inert.
+ # Flip it by adding --no-dry-run to the pre_start in agents/witness/agent.toml
+-# once the logged would-reap set has been reviewed across several cycles.
++# once the log carries a `worktree_scan_complete` cycle (deferred=0 — the
++# reviewed set really was the whole candidate set) and no live worktree appeared
++# in the would-reap set of that cycle or the ones since. A count of clean
++# cycles is NOT the criterion; see THE BIASED CUTOFF below.
+ #
+ # The CLOSED-BEAD path is deliberately NOT gated on "every commit is on a
+ # remote": a rebase-merging refinery rewrites commit hashes and then deletes the
+@@ -209,6 +241,12 @@ else
+     LOG_DIR="${TMPDIR:-/tmp}/gc-polecat-worktree-reap"
+ fi
+ LOG_FILE="$LOG_DIR/polecat-worktree-reap.log"
++# Where the previous cycle stopped, so this one resumes there instead of
++# re-walking the same prefix. See THE BIASED CUTOFF above. One cursor per rig:
++# several rigs share the city log directory, and a shared file would have each
++# rig rotating the others' enumeration.
++CURSOR_SLUG=$(printf '%s' "${RIG_NAME:-_}" | tr -c 'A-Za-z0-9._-' '_')
++CURSOR_FILE="$LOG_DIR/polecat-worktree-reap.$CURSOR_SLUG.cursor"
+ # Housekeeping must never block the witness from starting: this script runs as
+ # the witness pre_start, so every failure below degrades to a clean exit 0.
+ if ! mkdir -p "$LOG_DIR" 2>/dev/null || ! touch "$LOG_FILE" 2>/dev/null; then
+@@ -431,7 +469,7 @@ CANDIDATES=$(printf '%s\n' "$WT_LIST" \
+             *[!a-zA-Z0-9.-]* | '' | -* | *- | .* | *. | *..*) continue ;;
+         esac
+         printf '%s\n' "$wt"
+-    done || true)
++    done | LC_ALL=C sort || true)
+ 
+ if [ -z "$CANDIDATES" ]; then
+     echo "polecat-worktree-reap: no per-bead polecat worktrees under $RIG_ROOT"
+@@ -440,6 +478,42 @@ fi
+ 
+ TOTAL=$(printf '%s\n' "$CANDIDATES" | grep -c . || true)
+ 
++# ── ROTATE THE START, so the cutoff does not always fall in the same place ────
++# (gcp-schs; see THE BIASED CUTOFF in the header.) The enumeration above is
++# sorted, and the loop below breaks out of it when the budget expires — so
++# without this, the candidates that get dropped are always the same sorted tail,
++# and a would-reap set reviewed across any number of cycles can still have never
++# contained them.
++#
++# The cursor is the last candidate the previous cycle actually DECIDED, and this
++# one starts at the first candidate after it, wrapping at the end. That makes
++# coverage a round-robin rather than a re-walk: consecutive truncated cycles
++# advance through the whole set instead of re-examining the head of it. A
++# candidate that no longer exists is fine — the comparison is ordering, not
++# membership, so the successor is still well defined. LC_ALL=C matches the sort
++# above, so "after" means the same thing in both places.
++#
++# Every failure here degrades to "no rotation", never to an error: an unreadable
++# cursor loses the fairness, an aborted run loses the witness.
++CURSOR_START=""
++if [ -r "$CURSOR_FILE" ]; then
++    CURSOR_START=$(head -n 1 "$CURSOR_FILE" 2>/dev/null || true)
++fi
++if [ -n "$CURSOR_START" ]; then
++    ROTATED=$(printf '%s\n' "$CANDIDATES" | LC_ALL=C awk -v cursor="$CURSOR_START" '
++        { lines[NR] = $0; if (start == 0 && ($0 "") > (cursor "")) start = NR }
++        END {
++            if (start == 0) start = 1
++            for (i = start; i <= NR; i++) print lines[i]
++            for (i = 1; i < start; i++) print lines[i]
++        }' 2>/dev/null || true)
++    if [ -n "$ROTATED" ] &&
++        [ "$(printf '%s\n' "$ROTATED" | grep -c . || true)" -eq "$TOTAL" ]; then
++        CANDIDATES="$ROTATED"
++    fi
++fi
++SCAN_START=$(printf '%s\n' "$CANDIDATES" | head -n 1)
++
+ # ONE bead read for the whole candidate set. `gc bd show` takes many ids and
+ # answers in a single round trip, so the cost of this step is flat in the
+ # number of worktrees instead of linear in it — the entire point of gcp-ntbf.
+@@ -669,20 +743,32 @@ BUDGET_SPENT=0
+ # Set when a candidate was skipped because a check was never attempted — the
+ # run's own clock, not the subsystem the skipped check would have talked to.
+ TRUNCATED=0
++# The last candidate this cycle reached a DECISION about — where the next cycle
++# resumes. A truncated candidate was never inspected, so it must not advance
++# this: leaving it behind the cursor is what keeps it in the next cycle's window.
++DECIDED_LAST=""
++DECIDED_PREV=""
+ 
+ while IFS=$'\037' read -r STATUS OWNER WT; do
+     [ -n "$WT" ] || continue
+ 
+     # Yield the start rather than lose a race with SIGKILL. What is left
+-    # unexamined stays a candidate for the next cycle; the work is idempotent.
++    # unexamined stays a candidate for the next cycle; the work is idempotent —
++    # and the next cycle resumes AFTER the last decision below rather than at
++    # the head of the list, so the deferred remainder is not the same worktrees
++    # every run (gcp-schs).
+     if [ "$(budget_left)" -le 0 ]; then
+         BUDGET_SPENT=1
++        RESUME_LABEL="${DECIDED_LAST##*/}"
++        [ -n "$RESUME_LABEL" ] || RESUME_LABEL="nothing (no candidate was decided)"
+         record worktree_budget_exhausted "" "" \
+-            "${BUDGET_SECONDS}s budget spent after $EXAMINED of $TOTAL candidate(s): reaped=$REAPED skipped=$SKIPPED deferred=$((TOTAL - EXAMINED)); yielding the witness start" \
++            "${BUDGET_SECONDS}s budget spent after $EXAMINED of $TOTAL candidate(s): reaped=$REAPED skipped=$SKIPPED deferred=$((TOTAL - EXAMINED)); yielding the witness start. This cycle's window began at ${SCAN_START##*/}; the next resumes after $RESUME_LABEL, so the deferred remainder rotates instead of always being the same sorted tail" \
+             budget_exhausted
+         break
+     fi
+     EXAMINED=$((EXAMINED + 1))
++    DECIDED_PREV="$DECIDED_LAST"
++    DECIDED_LAST="$WT"
+ 
+     BEAD=$(basename "$WT")
+     # Why this worktree is disposable, if it turns out to be. The two paths
+@@ -739,6 +825,10 @@ while IFS=$'\037' read -r STATUS OWNER WT; do
+                         # Nobody asked the roster anything. Saying it was unreadable
+                         # would point at a subsystem this run never touched.
+                         TRUNCATED=1
++                        # Never inspected, so it must stay in the next cycle's
++                        # window: hold the resume cursor at the last candidate
++                        # that actually got a decision.
++                        DECIDED_LAST="$DECIDED_PREV"
+                         record worktree_budget_truncated "$BEAD" "$WT" \
+                             "the ${BUDGET_SECONDS}s budget was spent before the session roster was read; liveness unchecked at candidate $EXAMINED of $TOTAL" \
+                             "$ROSTER_REASON"
+@@ -774,6 +864,9 @@ while IFS=$'\037' read -r STATUS OWNER WT; do
+         case "$STATUS_OUTCOME" in
+             skipped)
+                 TRUNCATED=1
++                # Never inspected — same reasoning as the roster truncation
++                # above: do not let the resume cursor step past it.
++                DECIDED_LAST="$DECIDED_PREV"
+                 record worktree_budget_truncated "$BEAD" "$WT" \
+                     "the ${BUDGET_SECONDS}s budget was spent before git status ran; the worktree was never inspected, at candidate $EXAMINED of $TOTAL" \
+                     budget_spent_before_git_status
+@@ -862,6 +955,27 @@ done <<EOF
+ $DECISIONS
+ EOF
+ 
++# ── COVERAGE, so the promotion criterion has something to stand on (gcp-schs) ─
++# The flip to --no-dry-run is evidenced by a REVIEWED SET, and until now the log
++# said nothing at all about a cycle that reviewed everything: only truncated
++# cycles emitted a count line, so "several clean cycles" could not be told apart
++# from "several clean PREFIXES". Say it outright, once per cycle, and keep the
++# resume cursor honest about which of the two this was.
++if [ "$BUDGET_SPENT" -eq 0 ] && [ "$TRUNCATED" -eq 0 ] && [ "$EXAMINED" -eq "$TOTAL" ]; then
++    record worktree_scan_complete "" "" \
++        "examined all $TOTAL candidate(s) in one cycle: reaped=$REAPED skipped=$SKIPPED deferred=0; the reviewed set for this cycle IS the candidate set" \
++        scan_complete
++    # A full pass has no remainder to resume from, and leaving the cursor at the
++    # tail would pin every following cycle to this same starting point — the
++    # bias again, one rotation along. Start the next one at the head.
++    rm -f "$CURSOR_FILE" 2>/dev/null || true
++elif [ -n "$DECIDED_LAST" ]; then
++    printf '%s\n' "$DECIDED_LAST" >"$CURSOR_FILE" 2>/dev/null || true
++fi
++# A partial cycle that decided NOTHING leaves the previous cursor alone: it has
++# no resume point of its own, and overwriting with an empty one would send the
++# next cycle back to the head of the list — the bias, restored for free.
++
+ # The stdout summary is what a patrol reads first, so it must not imply a clean
+ # cycle when the clock cut one short — including when the truncation landed on
+ # the LAST candidate and the loop head therefore never fired.
+diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
+index 6738dc9..4222354 100644
+--- a/gastown/formulas/mol-witness-patrol.toml
++++ b/gastown/formulas/mol-witness-patrol.toml
+@@ -558,10 +558,49 @@ is deliberate: `city.toml` holds the *native* gascity reaper
+ (`auto_reap_closed_bead_worktrees_dry_run`) to the same staged rollout
+ until `gc-zxxy` is answered, and a second reaper must not do live removals
+ while the operator's own equivalent is held inert. Do NOT flip it from a
+-patrol; the flip is an operator decision — append `--no-dry-run` to the
+-`pre_start` in `agents/witness/agent.toml` once the logged would-reap set
+-has been reviewed across several cycles and no live worktree ever appeared
+-in it. Treat the log as a report, not as a completed cleanup.
++patrol; the flip is an operator decision. Treat the log as a report, not as
++a completed cleanup.
++
++**THE PROMOTION CRITERION — coverage, not a count of clean cycles
++(gcp-schs).** The flip is evidenced by a REVIEWED SET, so it is only sound
++while the reviewed set is the whole candidate set. A budget-limited cycle
++breaks out of the candidate loop and defers the rest, so it reviews a
++PREFIX; "several clean cycles" says nothing about the candidates none of
++them reached. Under the old fixed cutoff those were always the same
++worktrees — and they are exactly what a live reaper, running with a fresh
++budget, would reach first. Partial cycles do not add up to a review of the
++set.
++
++So the criterion is stated on coverage:
++
++> Append `--no-dry-run` to the `pre_start` in `agents/witness/agent.toml`
++> once the log carries at least one **`worktree_scan_complete`** cycle
++> (`deferred=0` — every candidate examined in a single run), and no live
++> worktree appears in the `worktree_reap_pending` set of that cycle or of
++> the cycles since.
++
++Check it from the log rather than from an impression of how the cycles have
++been going:
++
++```bash
++LOG="${LOG_DIR:-$GC_CITY/.gc/runtime/logs}/polecat-worktree-reap.log"
++# Has any cycle reviewed the WHOLE candidate set? No line here means no, and
++# the criterion is not met however clean the recent cycles look.
++jq -r 'select(.event == "worktree_scan_complete") | [.ts, .rig, .detail] | @tsv' "$LOG" |
++    tail -n 5
++# The would-reap set the flip would actually act on.
++jq -r 'select(.event == "worktree_reap_pending") | [.ts, .rig, .bead] | @tsv' "$LOG" |
++    tail -n 50
++```
++
++A `worktree_budget_exhausted` cycle stays honest and non-fatal — it reports
++`deferred=N` and the rest carry to the next cycle — but it is not evidence
++for the flip. The reaper also ROTATES its enumeration: a truncated cycle
++records the last candidate it decided and the next resumes after it,
++wrapping at the end, so the deferred remainder is a moving window instead of
++a fixed tail and a complete cycle stays reachable on a busy rig. If a
++worktree appears in one cycle's would-reap set and not the next, that is the
++rotation, not a gate flapping.
+ 
+ **What it will and will not remove.** There are two removal authorities.
+ On the ordinary one — a worktree under a bead — all four of these must
+@@ -645,6 +684,7 @@ jq -r 'select(.reason != "") | [.ts, .event, .reason, .budget_remaining, .bead]
+ | Event | Meaning | Action |
+ |---|---|---|
+ | `worktree_reap_pending` | Passed every gate; dry-run, so NOT removed | Routine while the rollout is staged — this is the would-reap set to review |
++| `worktree_scan_complete` | The cycle examined every candidate: `deferred=0`, so the reviewed set IS the candidate set | The one line the promotion criterion above stands on. Routine otherwise |
+ | `worktree_reaped` | Removed. Routine, and only once `--no-dry-run` is wired. | Log only |
+ | `worktree_dirty_kept` | Closed bead, uncommitted changes on disk | Salvage per Case C/D, then re-run |
+ | `worktree_owner_live` | Closed bead, polecat still alive (PR rework) | None — expected; next cycle retries |
+@@ -657,7 +697,7 @@ jq -r 'select(.reason != "") | [.ts, .event, .reason, .budget_remaining, .bead]
+ | `worktree_reap_failed` | Directory survived removal | Investigate permissions/mounts, mail mayor |
+ | `worktree_list_failed` | `git worktree list` ran and did not answer, so no candidate was enumerated. `reason`: `worktree_list_timed_out` or `worktree_list_failed` | Timed out → budget first. Failed → the rig checkout itself is unhealthy; inspect `$RIG_ROOT` by hand |
+ | `worktree_bead_query_failed` | The one bulk bead read ran and did not answer. `reason`: `bead_query_timed_out` (slower than the seconds the run had left — the detail names them) or `bead_query_failed` (non-zero exit) | Nothing was examined this cycle. **`bead_query_timed_out` on a small remaining budget is the reaper's clock, not the store** — compare the detail's "Ns left of the Ms budget" before suspecting the endpoint. A `bead_query_failed`, or a timeout with most of the budget still unspent, is the rig's Dolt endpoint |
+-| `worktree_budget_exhausted` | The run hit its own wall-clock budget and stopped at the top of the loop. The detail carries examined/skipped/deferred counts | Routine on a rig with many candidates; the rest are deferred to the next cycle. Persistent + a growing candidate count means the store is too slow for the budget — raise `[session] setup_timeout` AND `GC_REAP_BUDGET_SECONDS` together, or investigate the endpoint |
++| `worktree_budget_exhausted` | The run hit its own wall-clock budget and stopped at the top of the loop. The detail carries examined/skipped/deferred counts, the window this cycle covered, and where the next resumes | Routine on a rig with many candidates; the rest are deferred to the next cycle. **Not evidence for the `--no-dry-run` flip** — this cycle reviewed a window, not the set. Persistent + a growing candidate count means the store is too slow for the budget — raise `[session] setup_timeout` AND `GC_REAP_BUDGET_SECONDS` together, or investigate the endpoint |
+ 
+ A `worktree_dirty_kept` that repeats across cycles means real work is
+ stranded on disk under a bead that is already closed. Mail the mayor —
+diff --git a/gastown/tests/test_polecat_worktree_reap.sh b/gastown/tests/test_polecat_worktree_reap.sh
+index 44c84f0..114be5e 100644
+--- a/gastown/tests/test_polecat_worktree_reap.sh
++++ b/gastown/tests/test_polecat_worktree_reap.sh
+@@ -1058,6 +1058,113 @@ JSON
+     rm -rf "$tmp"
+ }
+ 
++test_the_budget_cutoff_rotates_instead_of_dropping_the_same_tail() {
++    # gcp-schs. Enumeration is deterministic and the budget `break`s out of it,
++    # so an unrotated loop drops the SAME sorted tail every run. That is not a
++    # fairness nicety: the criterion for flipping the staged rollout to
++    # --no-dry-run is a REVIEWED would-reap set, and under a fixed cutoff that
++    # set can be clean across any number of cycles while part of the candidate
++    # set has never been examined once — and those are exactly the worktrees a
++    # live reaper with a fresh budget reaches first.
++    #
++    # Two things must hold, and they are two halves of one invariant: the window
++    # MOVES between truncated cycles, so coverage accumulates; and a cycle that
++    # covered everything SAYS SO, so an operator has something to check rather
++    # than a count of clean-looking prefixes.
++    local tmp rig bin home beads sessions logdir log cursor i covered
++    tmp=$(mktemp -d)
++    rig="$tmp/rig"
++    bin="$tmp/bin"
++    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
++    beads="$tmp/beads.json"
++    sessions="$tmp/sessions.json"
++    logdir="$tmp/logs"
++    log="$logdir/polecat-worktree-reap.log"
++    cursor="$logdir/polecat-worktree-reap.rig.cursor"
++    mkdir -p "$logdir"
++
++    setup_rig "$rig"
++    write_gc_stub "$bin"
++    # Every candidate costs about a second, so a short budget truncates the loop
++    # at a predictable depth without depending on how fast the host is.
++    write_git_stub "$bin"
++
++    for i in 1 2 3 4 5 6; do
++        add_bead_worktree "$rig" "$home" "wt-a$i"
++    done
++
++    cat >"$beads" <<'JSON'
++[
++  {"id":"wt-a1","status":"closed","metadata":{"polecat_session":"deadsess"}},
++  {"id":"wt-a2","status":"closed","metadata":{"polecat_session":"deadsess"}},
++  {"id":"wt-a3","status":"closed","metadata":{"polecat_session":"deadsess"}},
++  {"id":"wt-a4","status":"closed","metadata":{"polecat_session":"deadsess"}},
++  {"id":"wt-a5","status":"closed","metadata":{"polecat_session":"deadsess"}},
++  {"id":"wt-a6","status":"closed","metadata":{"polecat_session":"deadsess"}}
++]
++JSON
++    printf '{"sessions":[]}' >"$sessions"
++
++    # Dry run throughout: nothing is removed, so the candidate set is identical
++    # every cycle and any change in which candidates get examined is the cutoff
++    # moving rather than the population shrinking.
++    covered=""
++    for i in 1 2 3 4 5 6; do
++        GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
++            GIT_STATUS_DELAY=1 PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --budget 3 \
++            >"$tmp/cycle$i.txt" 2>&1 ||
++            fail "a truncated cycle exited non-zero: $(cat "$tmp/cycle$i.txt")"
++        # "Reviewed" is any candidate this cycle actually reached and recorded
++        # a decision about — not specifically the would-reap verdict. Which
++        # verdict a candidate draws depends on how much budget was left when its
++        # turn came; whether its turn came AT ALL is what the rotation decides,
++        # and that is the claim under test.
++        covered=$(jq -r 'select(.bead != "") | .bead' "$log" |
++            LC_ALL=C sort -u | paste -sd, -)
++        if [[ "$covered" == "wt-a1,wt-a2,wt-a3,wt-a4,wt-a5,wt-a6" ]]; then
++            break
++        fi
++    done
++
++    grep -F '"event":"worktree_budget_exhausted"' "$log" >/dev/null ||
++        fail "no cycle actually exhausted its budget; the fixture proves nothing about the cutoff"
++    [[ "$covered" == "wt-a1,wt-a2,wt-a3,wt-a4,wt-a5,wt-a6" ]] ||
++        fail "after six truncated cycles the reviewed set was still {$covered}; the cutoff is not rotating and the sorted tail is never examined"
++
++    # The resume cursor is what carries the rotation between runs, and it is
++    # per-rig: a shared file would have every rig rotating the others.
++    [[ -f "$cursor" ]] ||
++        fail "a truncated cycle left no resume cursor; the next cycle would re-walk the same prefix"
++
++    # A truncated cycle must not claim a complete scan — that claim is the whole
++    # evidentiary basis for the --no-dry-run flip.
++    ! grep -F '"event":"worktree_scan_complete"' "$log" >/dev/null ||
++        fail "a budget-limited cycle reported a complete scan"
++
++    # ...and it must still report what it deferred, honestly, as it always did.
++    grep -F 'deferred to the next cycle' "$tmp/cycle1.txt" >/dev/null ||
++        fail "a truncated cycle stopped reporting its deferred count"
++
++    # Now the other half: a cycle with room to examine everything says so, once,
++    # with deferred=0 — and clears the cursor, because leaving it at the tail
++    # would pin every following cycle to the same starting point.
++    : >"$log"
++    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
++        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --budget 60 >"$tmp/full.txt" 2>&1 ||
++        fail "a complete cycle exited non-zero: $(cat "$tmp/full.txt")"
++
++    grep -F '"event":"worktree_scan_complete"' "$log" >/dev/null ||
++        fail "a cycle that examined every candidate recorded nothing; the promotion criterion has nothing to check"
++    [[ "$(reason_for "$log" worktree_scan_complete)" == "scan_complete" ]] ||
++        fail "worktree_scan_complete carried reason '$(reason_for "$log" worktree_scan_complete)'"
++    [[ "$(detail_for "$log" worktree_scan_complete)" == *"deferred=0"* ]] ||
++        fail "the complete-scan line does not state deferred=0: $(detail_for "$log" worktree_scan_complete)"
++    [[ ! -f "$cursor" ]] ||
++        fail "a complete cycle left a resume cursor behind; the next cycle would start mid-list forever"
++
++    rm -rf "$tmp"
++}
++
+ test_a_non_agent_worktree_named_like_a_bead_is_not_reaped() {
+     # The `polecats` literal gate 1 used to carry also excluded, incidentally,
+     # every path that merely LOOKS like `<something>/worktrees/<id>`. Two of
+@@ -1124,5 +1231,6 @@ test_a_permanently_missing_bead_is_decided_not_retried
+ test_an_all_missing_batch_is_not_a_store_failure
+ test_lane_trees_other_than_polecats_are_enumerated
+ test_a_non_agent_worktree_named_like_a_bead_is_not_reaped
++test_the_budget_cutoff_rotates_instead_of_dropping_the_same_tail
+ 
+ echo "polecat worktree reap tests passed"
+-- 
+2.50.1 (Apple Git-155)
+
