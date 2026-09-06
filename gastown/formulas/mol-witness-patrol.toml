@@ -558,10 +558,49 @@ is deliberate: `city.toml` holds the *native* gascity reaper
 (`auto_reap_closed_bead_worktrees_dry_run`) to the same staged rollout
 until `gc-zxxy` is answered, and a second reaper must not do live removals
 while the operator's own equivalent is held inert. Do NOT flip it from a
-patrol; the flip is an operator decision — append `--no-dry-run` to the
-`pre_start` in `agents/witness/agent.toml` once the logged would-reap set
-has been reviewed across several cycles and no live worktree ever appeared
-in it. Treat the log as a report, not as a completed cleanup.
+patrol; the flip is an operator decision. Treat the log as a report, not as
+a completed cleanup.
+
+**THE PROMOTION CRITERION — coverage, not a count of clean cycles
+(gcp-schs).** The flip is evidenced by a REVIEWED SET, so it is only sound
+while the reviewed set is the whole candidate set. A budget-limited cycle
+breaks out of the candidate loop and defers the rest, so it reviews a
+PREFIX; "several clean cycles" says nothing about the candidates none of
+them reached. Under the old fixed cutoff those were always the same
+worktrees — and they are exactly what a live reaper, running with a fresh
+budget, would reach first. Partial cycles do not add up to a review of the
+set.
+
+So the criterion is stated on coverage:
+
+> Append `--no-dry-run` to the `pre_start` in `agents/witness/agent.toml`
+> once the log carries at least one **`worktree_scan_complete`** cycle
+> (`deferred=0` — every candidate examined in a single run), and no live
+> worktree appears in the `worktree_reap_pending` set of that cycle or of
+> the cycles since.
+
+Check it from the log rather than from an impression of how the cycles have
+been going:
+
+```bash
+LOG="${LOG_DIR:-$GC_CITY/.gc/runtime/logs}/polecat-worktree-reap.log"
+# Has any cycle reviewed the WHOLE candidate set? No line here means no, and
+# the criterion is not met however clean the recent cycles look.
+jq -r 'select(.event == "worktree_scan_complete") | [.ts, .rig, .detail] | @tsv' "$LOG" |
+    tail -n 5
+# The would-reap set the flip would actually act on.
+jq -r 'select(.event == "worktree_reap_pending") | [.ts, .rig, .bead] | @tsv' "$LOG" |
+    tail -n 50
+```
+
+A `worktree_budget_exhausted` cycle stays honest and non-fatal — it reports
+`deferred=N` and the rest carry to the next cycle — but it is not evidence
+for the flip. The reaper also ROTATES its enumeration: a truncated cycle
+records the last candidate it decided and the next resumes after it,
+wrapping at the end, so the deferred remainder is a moving window instead of
+a fixed tail and a complete cycle stays reachable on a busy rig. If a
+worktree appears in one cycle's would-reap set and not the next, that is the
+rotation, not a gate flapping.
 
 **What it will and will not remove.** There are two removal authorities.
 On the ordinary one — a worktree under a bead — all four of these must
@@ -645,6 +684,7 @@ jq -r 'select(.reason != "") | [.ts, .event, .reason, .budget_remaining, .bead] 
 | Event | Meaning | Action |
 |---|---|---|
 | `worktree_reap_pending` | Passed every gate; dry-run, so NOT removed | Routine while the rollout is staged — this is the would-reap set to review |
+| `worktree_scan_complete` | The cycle examined every candidate: `deferred=0`, so the reviewed set IS the candidate set | The one line the promotion criterion above stands on. Routine otherwise |
 | `worktree_reaped` | Removed. Routine, and only once `--no-dry-run` is wired. | Log only |
 | `worktree_dirty_kept` | Closed bead, uncommitted changes on disk | Salvage per Case C/D, then re-run |
 | `worktree_owner_live` | Closed bead, polecat still alive (PR rework) | None — expected; next cycle retries |
@@ -657,7 +697,7 @@ jq -r 'select(.reason != "") | [.ts, .event, .reason, .budget_remaining, .bead] 
 | `worktree_reap_failed` | Directory survived removal | Investigate permissions/mounts, mail mayor |
 | `worktree_list_failed` | `git worktree list` ran and did not answer, so no candidate was enumerated. `reason`: `worktree_list_timed_out` or `worktree_list_failed` | Timed out → budget first. Failed → the rig checkout itself is unhealthy; inspect `$RIG_ROOT` by hand |
 | `worktree_bead_query_failed` | The one bulk bead read ran and did not answer. `reason`: `bead_query_timed_out` (slower than the seconds the run had left — the detail names them) or `bead_query_failed` (non-zero exit) | Nothing was examined this cycle. **`bead_query_timed_out` on a small remaining budget is the reaper's clock, not the store** — compare the detail's "Ns left of the Ms budget" before suspecting the endpoint. A `bead_query_failed`, or a timeout with most of the budget still unspent, is the rig's Dolt endpoint |
-| `worktree_budget_exhausted` | The run hit its own wall-clock budget and stopped at the top of the loop. The detail carries examined/skipped/deferred counts | Routine on a rig with many candidates; the rest are deferred to the next cycle. Persistent + a growing candidate count means the store is too slow for the budget — raise `[session] setup_timeout` AND `GC_REAP_BUDGET_SECONDS` together, or investigate the endpoint |
+| `worktree_budget_exhausted` | The run hit its own wall-clock budget and stopped at the top of the loop. The detail carries examined/skipped/deferred counts, the window this cycle covered, and where the next resumes | Routine on a rig with many candidates; the rest are deferred to the next cycle. **Not evidence for the `--no-dry-run` flip** — this cycle reviewed a window, not the set. Persistent + a growing candidate count means the store is too slow for the budget — raise `[session] setup_timeout` AND `GC_REAP_BUDGET_SECONDS` together, or investigate the endpoint |
 
 A `worktree_dirty_kept` that repeats across cycles means real work is
 stranded on disk under a bead that is already closed. Mail the mayor —

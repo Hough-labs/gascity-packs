@@ -1058,6 +1058,113 @@ JSON
     rm -rf "$tmp"
 }
 
+test_the_budget_cutoff_rotates_instead_of_dropping_the_same_tail() {
+    # gcp-schs. Enumeration is deterministic and the budget `break`s out of it,
+    # so an unrotated loop drops the SAME sorted tail every run. That is not a
+    # fairness nicety: the criterion for flipping the staged rollout to
+    # --no-dry-run is a REVIEWED would-reap set, and under a fixed cutoff that
+    # set can be clean across any number of cycles while part of the candidate
+    # set has never been examined once — and those are exactly the worktrees a
+    # live reaper with a fresh budget reaches first.
+    #
+    # Two things must hold, and they are two halves of one invariant: the window
+    # MOVES between truncated cycles, so coverage accumulates; and a cycle that
+    # covered everything SAYS SO, so an operator has something to check rather
+    # than a count of clean-looking prefixes.
+    local tmp rig bin home beads sessions logdir log cursor i covered
+    tmp=$(mktemp -d)
+    rig="$tmp/rig"
+    bin="$tmp/bin"
+    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
+    beads="$tmp/beads.json"
+    sessions="$tmp/sessions.json"
+    logdir="$tmp/logs"
+    log="$logdir/polecat-worktree-reap.log"
+    cursor="$logdir/polecat-worktree-reap.rig.cursor"
+    mkdir -p "$logdir"
+
+    setup_rig "$rig"
+    write_gc_stub "$bin"
+    # Every candidate costs about a second, so a short budget truncates the loop
+    # at a predictable depth without depending on how fast the host is.
+    write_git_stub "$bin"
+
+    for i in 1 2 3 4 5 6; do
+        add_bead_worktree "$rig" "$home" "wt-a$i"
+    done
+
+    cat >"$beads" <<'JSON'
+[
+  {"id":"wt-a1","status":"closed","metadata":{"polecat_session":"deadsess"}},
+  {"id":"wt-a2","status":"closed","metadata":{"polecat_session":"deadsess"}},
+  {"id":"wt-a3","status":"closed","metadata":{"polecat_session":"deadsess"}},
+  {"id":"wt-a4","status":"closed","metadata":{"polecat_session":"deadsess"}},
+  {"id":"wt-a5","status":"closed","metadata":{"polecat_session":"deadsess"}},
+  {"id":"wt-a6","status":"closed","metadata":{"polecat_session":"deadsess"}}
+]
+JSON
+    printf '{"sessions":[]}' >"$sessions"
+
+    # Dry run throughout: nothing is removed, so the candidate set is identical
+    # every cycle and any change in which candidates get examined is the cutoff
+    # moving rather than the population shrinking.
+    covered=""
+    for i in 1 2 3 4 5 6; do
+        GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+            GIT_STATUS_DELAY=1 PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --budget 3 \
+            >"$tmp/cycle$i.txt" 2>&1 ||
+            fail "a truncated cycle exited non-zero: $(cat "$tmp/cycle$i.txt")"
+        # "Reviewed" is any candidate this cycle actually reached and recorded
+        # a decision about — not specifically the would-reap verdict. Which
+        # verdict a candidate draws depends on how much budget was left when its
+        # turn came; whether its turn came AT ALL is what the rotation decides,
+        # and that is the claim under test.
+        covered=$(jq -r 'select(.bead != "") | .bead' "$log" |
+            LC_ALL=C sort -u | paste -sd, -)
+        if [[ "$covered" == "wt-a1,wt-a2,wt-a3,wt-a4,wt-a5,wt-a6" ]]; then
+            break
+        fi
+    done
+
+    grep -F '"event":"worktree_budget_exhausted"' "$log" >/dev/null ||
+        fail "no cycle actually exhausted its budget; the fixture proves nothing about the cutoff"
+    [[ "$covered" == "wt-a1,wt-a2,wt-a3,wt-a4,wt-a5,wt-a6" ]] ||
+        fail "after six truncated cycles the reviewed set was still {$covered}; the cutoff is not rotating and the sorted tail is never examined"
+
+    # The resume cursor is what carries the rotation between runs, and it is
+    # per-rig: a shared file would have every rig rotating the others.
+    [[ -f "$cursor" ]] ||
+        fail "a truncated cycle left no resume cursor; the next cycle would re-walk the same prefix"
+
+    # A truncated cycle must not claim a complete scan — that claim is the whole
+    # evidentiary basis for the --no-dry-run flip.
+    ! grep -F '"event":"worktree_scan_complete"' "$log" >/dev/null ||
+        fail "a budget-limited cycle reported a complete scan"
+
+    # ...and it must still report what it deferred, honestly, as it always did.
+    grep -F 'deferred to the next cycle' "$tmp/cycle1.txt" >/dev/null ||
+        fail "a truncated cycle stopped reporting its deferred count"
+
+    # Now the other half: a cycle with room to examine everything says so, once,
+    # with deferred=0 — and clears the cursor, because leaving it at the tail
+    # would pin every following cycle to the same starting point.
+    : >"$log"
+    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --budget 60 >"$tmp/full.txt" 2>&1 ||
+        fail "a complete cycle exited non-zero: $(cat "$tmp/full.txt")"
+
+    grep -F '"event":"worktree_scan_complete"' "$log" >/dev/null ||
+        fail "a cycle that examined every candidate recorded nothing; the promotion criterion has nothing to check"
+    [[ "$(reason_for "$log" worktree_scan_complete)" == "scan_complete" ]] ||
+        fail "worktree_scan_complete carried reason '$(reason_for "$log" worktree_scan_complete)'"
+    [[ "$(detail_for "$log" worktree_scan_complete)" == *"deferred=0"* ]] ||
+        fail "the complete-scan line does not state deferred=0: $(detail_for "$log" worktree_scan_complete)"
+    [[ ! -f "$cursor" ]] ||
+        fail "a complete cycle left a resume cursor behind; the next cycle would start mid-list forever"
+
+    rm -rf "$tmp"
+}
+
 test_a_non_agent_worktree_named_like_a_bead_is_not_reaped() {
     # The `polecats` literal gate 1 used to carry also excluded, incidentally,
     # every path that merely LOOKS like `<something>/worktrees/<id>`. Two of
@@ -1124,5 +1231,6 @@ test_a_permanently_missing_bead_is_decided_not_retried
 test_an_all_missing_batch_is_not_a_store_failure
 test_lane_trees_other_than_polecats_are_enumerated
 test_a_non_agent_worktree_named_like_a_bead_is_not_reaped
+test_the_budget_cutoff_rotates_instead_of_dropping_the_same_tail
 
 echo "polecat worktree reap tests passed"

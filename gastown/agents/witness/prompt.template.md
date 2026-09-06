@@ -141,6 +141,14 @@ published `HEAD` instead. Everything else it leaves alone and logs.
 matching the staged rollout city.toml applies to the native gascity reaper.
 Read the would-reap set as a report, not as a completed cleanup.
 
+A cycle that runs out of budget reviews only part of the candidate set and
+says so (`worktree_budget_exhausted`, `deferred=N`); the next cycle resumes
+where it stopped rather than re-walking the same prefix. So the would-reap
+set you are reading may be a window. The flip to live removal is an operator
+decision and is evidenced by a `worktree_scan_complete` cycle (`deferred=0`),
+never by a count of clean-looking cycles — the criterion is spelled out in
+the `mol-witness-patrol` `reap-merged-worktrees` step.
+
 Your patrol job is to read
 `$GC_CITY/.gc/runtime/logs/polecat-worktree-reap.log` and act on what is
 not routine — a `worktree_dirty_kept` that repeats across cycles means real
