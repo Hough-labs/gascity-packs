@@ -193,6 +193,22 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event.inputs.pack_ref || github.ref }}
 
+      # gcp-oz57 (INTERIM). This fork holds no Actions configuration, so every
+      # pack job died at `Validate Manifold Claude configuration` and the
+      # nightly was permanently red -- unreadable, and indistinguishable from a
+      # run that broke for a new reason. The script decides; the two steps below
+      # gate on its `present` output, and it writes a loud step-summary notice
+      # when the config is absent so a skipped run is never a silent green. The
+      # root question (should this fork hold Manifold credentials at all) stays
+      # open on gcp-gmkx.
+      #
+      # This runs after the checkout rather than beside `Decide manual subset`
+      # for the plain reason that the script lives in the repo.
+      - name: Detect Manifold Claude configuration
+        id: manifold
+        if: steps.subset.outputs.run_gate == 'true'
+        run: .github/scripts/manifold-config-status.sh >> "$GITHUB_OUTPUT"
+
       - name: Check out Gas City CI scripts
         if: steps.subset.outputs.run_gate == 'true'
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -240,6 +256,7 @@ jobs:
 
       - name: Validate Manifold Claude configuration
         if: steps.subset.outputs.run_gate == 'true'
+          && steps.manifold.outputs.present == 'true'
         run: |
           test -n "$OLLAMA_API_KEY" || { echo "Missing OLLAMA_API_KEY GitHub secret" >&2; exit 1; }
           test -n "$ANTHROPIC_AUTH_TOKEN" || { echo "Missing MANIFOLD_AUTH_TOKEN GitHub secret" >&2; exit 1; }
@@ -258,6 +275,7 @@ jobs:
 
       - name: Run supported-pack nightly inference gate
         if: steps.subset.outputs.run_gate == 'true'
+          && steps.manifold.outputs.present == 'true'
         env:
           GATE_TIMEOUT: ${{ github.event.inputs.timeout || matrix.gate_timeout }}
         run: |

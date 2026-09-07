@@ -605,6 +605,204 @@ def test_gas_city_installer_covers_the_refs_the_workflows_pass() -> None:
         assert "--cache" in workflow, workflow_name
 
 
+MANIFOLD_CONFIG_VARS = (
+    "OLLAMA_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+)
+
+MANIFOLD_STATUS_SCRIPT = (
+    gascity_pack_inference_gate.REPO_ROOT / ".github" / "scripts" / "manifold-config-status.sh"
+)
+
+
+def run_manifold_status(tmp_path, **overrides):
+    # The script reads the env the workflow maps its secrets and variables into,
+    # so a run with the six names set is exactly the run this fork cannot
+    # currently perform live: it has no Actions configuration at all (gcp-gmkx),
+    # and inventing credentials to prove the positive branch is off the table.
+    # Setting the env here is what makes BOTH branches falsifiable rather than
+    # unfalsifiable-by-construction.
+    env = {key: value for key, value in os.environ.items() if key not in MANIFOLD_CONFIG_VARS}
+    env.update({name: value for name, value in overrides.items() if value is not None})
+    summary = tmp_path / "step-summary.md"
+    summary.touch()
+    env["GITHUB_STEP_SUMMARY"] = str(summary)
+
+    completed = subprocess.run(
+        [str(MANIFOLD_STATUS_SCRIPT)],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    outputs = dict(
+        line.split("=", 1) for line in completed.stdout.splitlines() if "=" in line
+    )
+    return completed, outputs, summary.read_text(encoding="utf-8")
+
+
+def test_manifold_config_status_script_is_executable() -> None:
+    # The workflows invoke it directly rather than through `bash <path>`.
+    assert MANIFOLD_STATUS_SCRIPT.is_file()
+    assert os.access(MANIFOLD_STATUS_SCRIPT, os.X_OK)
+
+
+def test_manifold_config_status_reports_absent_without_failing(tmp_path) -> None:
+    # The negative branch, which is the state this fork is actually in. The
+    # script DECIDES; it must never ENFORCE -- a non-zero exit here would put
+    # the permanently-red nightly straight back (gcp-oz57).
+    completed, outputs, summary = run_manifold_status(tmp_path)
+
+    assert completed.returncode == 0, completed.stderr
+    assert outputs["present"] == "false"
+    assert outputs["missing"].split() == list(MANIFOLD_CONFIG_VARS)
+    # Exactly the two machine-readable lines, so the caller can redirect stdout
+    # into $GITHUB_OUTPUT unfiltered.
+    assert len(completed.stdout.splitlines()) == 2
+
+    # A skipped run must never be a silent green: the notice names every missing
+    # value and keeps the still-open root question visible.
+    for name in MANIFOLD_CONFIG_VARS:
+        assert name in summary
+    assert "SKIPPED" in summary
+    assert "gcp-gmkx" in summary
+    assert "INTERIM" in summary
+    # And it lands in the job log too, not only in the summary tab.
+    assert "gcp-gmkx" in completed.stderr
+
+
+def test_manifold_config_status_reports_present_when_config_is_supplied(tmp_path) -> None:
+    # The positive branch: with configuration present the gate still runs, and
+    # nothing is written to the step summary.
+    completed, outputs, summary = run_manifold_status(
+        tmp_path, **{name: f"value-for-{name}" for name in MANIFOLD_CONFIG_VARS}
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert outputs["present"] == "true"
+    assert outputs["missing"] == ""
+    assert summary == ""
+
+
+def test_manifold_config_status_names_only_the_values_that_are_missing(tmp_path) -> None:
+    # A partially-configured repo is the case a blanket "any secret missing"
+    # message would report uselessly. One empty value still skips -- the
+    # validate step requires all six -- but the notice must name that one.
+    supplied = {name: f"value-for-{name}" for name in MANIFOLD_CONFIG_VARS}
+    supplied["ANTHROPIC_DEFAULT_OPUS_MODEL"] = ""
+    completed, outputs, summary = run_manifold_status(tmp_path, **supplied)
+
+    assert completed.returncode == 0, completed.stderr
+    assert outputs["present"] == "false"
+    assert outputs["missing"].split() == ["ANTHROPIC_DEFAULT_OPUS_MODEL"]
+    assert "ANTHROPIC_DEFAULT_OPUS_MODEL" in summary
+    assert "OLLAMA_API_KEY" not in summary
+
+
+def test_manifold_dependent_steps_are_gated_on_the_detection_step() -> None:
+    # gcp-oz57 (INTERIM). Four consecutive scheduled nightly runs failed on one
+    # identical signature -- "Missing OLLAMA_API_KEY GitHub secret" -- because
+    # this fork holds no Actions configuration. A job that is always red is read
+    # by nobody and is indistinguishable from a job that has gone red for a NEW
+    # reason. These assertions parse the YAML rather than grep the text so the
+    # gating expression is checked as the runner would evaluate it: a folded
+    # plain scalar that silently lost its second clause would pass a substring
+    # check and skip nothing.
+    import yaml  # installed by every job that runs this file
+
+    expected = {
+        ".github/workflows/supported-pack-nightly.yml": (
+            "inference",
+            "steps.subset.outputs.run_gate == 'true' && steps.manifold.outputs.present == 'true'",
+            ("Validate Manifold Claude configuration", "Run supported-pack nightly inference gate"),
+        ),
+        ".github/workflows/gascity-pack-inference.yml": (
+            "supported-pack-formulas",
+            "steps.manifold.outputs.present == 'true'",
+            ("Validate Manifold Claude configuration", "Run supported pack inference gates"),
+        ),
+    }
+
+    for relative_path, (job_id, gate_expression, gated_names) in expected.items():
+        workflow = yaml.safe_load(
+            (gascity_pack_inference_gate.REPO_ROOT / relative_path).read_text(encoding="utf-8")
+        )
+        steps = workflow["jobs"][job_id]["steps"]
+        by_name = {step.get("name"): step for step in steps}
+        order = [step.get("name") for step in steps]
+
+        detect = by_name["Detect Manifold Claude configuration"]
+        assert detect["id"] == "manifold", relative_path
+        assert ".github/scripts/manifold-config-status.sh" in detect["run"], relative_path
+        # Redirected into $GITHUB_OUTPUT -- the `present` output the gates below
+        # read does not exist otherwise.
+        assert '>> "$GITHUB_OUTPUT"' in detect["run"], relative_path
+
+        for gated_name in gated_names:
+            assert by_name[gated_name].get("if") == gate_expression, f"{relative_path}: {gated_name}"
+            # The detection has to have happened by the time the gate is read.
+            assert order.index("Detect Manifold Claude configuration") < order.index(gated_name), (
+                f"{relative_path}: {gated_name}"
+            )
+
+        # The script lives in the repo, so the detection cannot precede the
+        # checkout that puts it on disk.
+        assert order.index("Check out gascity-packs") < order.index(
+            "Detect Manifold Claude configuration"
+        ), relative_path
+
+    # The guard covers the six pack jobs only. `static pack flow contracts` is
+    # green today and needs no Manifold configuration -- it must not acquire a
+    # skip condition.
+    nightly = yaml.safe_load(
+        (
+            gascity_pack_inference_gate.REPO_ROOT
+            / ".github"
+            / "workflows"
+            / "supported-pack-nightly.yml"
+        ).read_text(encoding="utf-8")
+    )
+    for step in nightly["jobs"]["static-contracts"]["steps"]:
+        assert "manifold" not in str(step.get("if", "")), step.get("name")
+        assert "manifold" not in str(step.get("run", "")), step.get("name")
+
+
+def test_manifold_validation_step_bodies_are_unweakened() -> None:
+    # The mitigation changes only WHETHER the validation runs, never WHAT it
+    # checks. If configuration is ever supplied, the same eight assertions must
+    # still fire -- a skip that also quietly relaxed the checks would trade a
+    # loud red for a meaningless green.
+    required_checks = (
+        'test -n "$OLLAMA_API_KEY"',
+        'test -n "$ANTHROPIC_AUTH_TOKEN"',
+        'test "$ANTHROPIC_BASE_URL" = "https://works.gascity.com/manifold-api"',
+        'test -n "$ANTHROPIC_DEFAULT_HAIKU_MODEL"',
+        'test -n "$ANTHROPIC_DEFAULT_SONNET_MODEL"',
+        'test -n "$ANTHROPIC_DEFAULT_OPUS_MODEL"',
+        'test -n "$CLAUDE_CODE_SUBAGENT_MODEL"',
+        'test "$GC_INFERENCE_EXPECTED_MODEL" = "kimi-k2.7-code"',
+    )
+    for relative_path in (
+        ".github/workflows/supported-pack-nightly.yml",
+        ".github/workflows/gascity-pack-inference.yml",
+    ):
+        workflow = (
+            gascity_pack_inference_gate.REPO_ROOT / relative_path
+        ).read_text(encoding="utf-8")
+        for check in required_checks:
+            assert check in workflow, f"{relative_path}: {check}"
+
+    # And the script's own list stays in step with what the validation demands,
+    # so a value added to one is never silently absent from the other.
+    script = MANIFOLD_STATUS_SCRIPT.read_text(encoding="utf-8")
+    for name in MANIFOLD_CONFIG_VARS:
+        assert name in script
+
+
 def test_readme_includes_blacksmith_sponsor_badge() -> None:
     readme = (gascity_pack_inference_gate.REPO_ROOT / "README.md").read_text(encoding="utf-8")
     readme_lines = {line.strip() for line in readme.splitlines()}
