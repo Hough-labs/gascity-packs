@@ -255,7 +255,8 @@ jobs:
         run: .github/scripts/install-gascity-archive.sh "${GASCITY_REF}" --cache
 
       - name: Validate Manifold Claude configuration
-        if: steps.subset.outputs.run_gate == 'true'
+        if: >-
+          steps.subset.outputs.run_gate == 'true'
           && steps.manifold.outputs.present == 'true'
         run: |
           test -n "$OLLAMA_API_KEY" || { echo "Missing OLLAMA_API_KEY GitHub secret" >&2; exit 1; }
@@ -274,7 +275,8 @@ jobs:
           printf 'GC_INFERENCE_EXPECTED_MODEL=%s\n' "$GC_INFERENCE_EXPECTED_MODEL"
 
       - name: Run supported-pack nightly inference gate
-        if: steps.subset.outputs.run_gate == 'true'
+        if: >-
+          steps.subset.outputs.run_gate == 'true'
           && steps.manifold.outputs.present == 'true'
         env:
           GATE_TIMEOUT: ${{ github.event.inputs.timeout || matrix.gate_timeout }}
