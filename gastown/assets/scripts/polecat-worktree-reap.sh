@@ -47,8 +47,13 @@
 #   gate 3 plus:
 #   5. HEAD is reachable from a remote-tracking ref (`git branch --remotes
 #      --contains`) — the content exists somewhere other than this directory.
-#      Failing that is a FINDING (`worktree_unpublished_kept`), not a retry:
-#      the condition never resolves itself, so the witness is told once.
+#      CONFIRMED failure is a FINDING (`worktree_unpublished_kept`), not a
+#      retry: the condition never resolves itself, so the witness is told once.
+#      A probe that could not run (budget spent, timed out, git errored) is
+#      NOT that failure — it is `worktree_publication_unconfirmed` (or a
+#      `worktree_budget_truncated` when the clock is what stopped it), kept and
+#      re-checked, because an unknown reported as a definite negative sends the
+#      witness to salvage already-merged commits (gcp-9ql4).
 #
 # THE LANE-TREE BLIND SPOT — why gate 1 does not name a tree (gcp-elv3):
 #   Gate 1 used to require a `*/polecats/*/worktrees/*` segment on top of the
@@ -905,21 +910,104 @@ while IFS=$'\037' read -r STATUS OWNER WT; do
     # point of gcp-0u14 is that this condition never resolves itself, so the
     # witness is told once and the worktree is kept.
     if [ "$NO_SUCH_BEAD" -eq 1 ]; then
+        # The probe has THREE answers, not two, and only one of them is
+        # evidence. `ok` with empty output is the confirmed negative that
+        # justifies the finding; `skipped`/`timeout`/`failed` mean nobody found
+        # out. Folding the unknowns into the same empty string made a probe that
+        # NEVER RAN report "the commits here exist nowhere else" and dispatch
+        # the witness to salvage already-merged work (gcp-9ql4) — the same
+        # indeterminate-read-as-definite-negative collapse gcp-5ddt hardened in
+        # mol-witness-patrol. So carry the state explicitly.
+        PUBLISHED=unconfirmed
+        PUBLISHED_REASON=""
+        PUBLISHED_DETAIL=""
+        CONTAINS=""
+
         HEAD_LIMIT=$(budget_left)
         HEAD_RC=0
         WT_HEAD=$(run_bounded "$HEAD_LIMIT" git -C "$WT" rev-parse HEAD 2>/dev/null) || HEAD_RC=$?
-        CONTAINS=""
-        CONTAINS_RC=0
-        if [ "$(classify_outcome "$HEAD_LIMIT" "$HEAD_RC")" = ok ] && [ -n "$WT_HEAD" ]; then
+        case "$(classify_outcome "$HEAD_LIMIT" "$HEAD_RC")" in
+            ok)
+                # Answered, but with nothing: there is no commit to look for, so
+                # the publication question was never actually put to git either.
+                if [ -z "$WT_HEAD" ]; then
+                    PUBLISHED_REASON=publication_probe_failed
+                    PUBLISHED_DETAIL="git rev-parse HEAD answered with no commit, so nothing could be looked for on a remote"
+                fi
+                ;;
+            skipped)
+                PUBLISHED_REASON=budget_spent_before_publication_probe
+                PUBLISHED_DETAIL="the ${BUDGET_SECONDS}s budget was spent before HEAD was read; the publication probe never ran, at candidate $EXAMINED of $TOTAL"
+                ;;
+            timeout)
+                PUBLISHED_REASON=publication_probe_timed_out
+                PUBLISHED_DETAIL="git rev-parse HEAD did not answer within the ${HEAD_LIMIT}s left of the ${BUDGET_SECONDS}s budget"
+                ;;
+            *)
+                PUBLISHED_REASON=publication_probe_failed
+                PUBLISHED_DETAIL="git rev-parse HEAD exited $HEAD_RC in the worktree"
+                ;;
+        esac
+
+        if [ -z "$PUBLISHED_REASON" ]; then
             CONTAINS_LIMIT=$(budget_left)
+            CONTAINS_RC=0
             CONTAINS=$(run_bounded "$CONTAINS_LIMIT" \
                 git -C "$RIG_ROOT" branch --remotes --contains "$WT_HEAD" 2>/dev/null) ||
                 CONTAINS_RC=$?
-            if [ "$(classify_outcome "$CONTAINS_LIMIT" "$CONTAINS_RC")" != ok ]; then
-                CONTAINS=""
-            fi
+            case "$(classify_outcome "$CONTAINS_LIMIT" "$CONTAINS_RC")" in
+                ok)
+                    # The only two states this run is entitled to assert.
+                    if [ -n "$CONTAINS" ]; then
+                        PUBLISHED=yes
+                    else
+                        PUBLISHED=no
+                    fi
+                    ;;
+                skipped)
+                    CONTAINS=""
+                    PUBLISHED_REASON=budget_spent_before_publication_check
+                    PUBLISHED_DETAIL="the ${BUDGET_SECONDS}s budget was spent before the remote-tracking refs were searched; the publication probe never ran, at candidate $EXAMINED of $TOTAL"
+                    ;;
+                timeout)
+                    # A killed command can still have written a partial list, so
+                    # the capture is discarded rather than read as an answer.
+                    CONTAINS=""
+                    PUBLISHED_REASON=publication_probe_timed_out
+                    PUBLISHED_DETAIL="git branch --remotes --contains did not answer within the ${CONTAINS_LIMIT}s left of the ${BUDGET_SECONDS}s budget"
+                    ;;
+                *)
+                    CONTAINS=""
+                    PUBLISHED_REASON=publication_probe_failed
+                    PUBLISHED_DETAIL="git branch --remotes --contains exited $CONTAINS_RC in $RIG_ROOT"
+                    ;;
+            esac
         fi
-        if [ -z "$CONTAINS" ]; then
+
+        if [ "$PUBLISHED" = unconfirmed ]; then
+            case "$PUBLISHED_REASON" in
+                budget_spent_before_*)
+                    # Nobody asked git anything. Reporting it as a publication
+                    # finding would point the witness at a probe this run never
+                    # made — the same mistake the roster and git-status
+                    # truncations above exist to avoid.
+                    TRUNCATED=1
+                    # Never decided, so it must stay inside the next cycle's
+                    # window: hold the cursor at the last candidate that was.
+                    DECIDED_LAST="$DECIDED_PREV"
+                    record worktree_budget_truncated "$BEAD" "$WT" \
+                        "$PUBLISHED_DETAIL" "$PUBLISHED_REASON"
+                    ;;
+                *)
+                    record worktree_publication_unconfirmed "$BEAD" "$WT" \
+                        "$PUBLISHED_DETAIL; a probe that did not answer is not proof the commits exist nowhere else, so the worktree is kept and re-checked next cycle" \
+                        "$PUBLISHED_REASON"
+                    ;;
+            esac
+            SKIPPED=$((SKIPPED + 1))
+            continue
+        fi
+        if [ "$PUBLISHED" = no ]; then
             record worktree_unpublished_kept "$BEAD" "$WT" \
                 "no bead authorises this reap and HEAD is on no remote-tracking branch, so the commits here exist nowhere else; kept for the witness to salvage" \
                 no_such_bead_content_unpublished

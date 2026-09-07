@@ -105,6 +105,15 @@ write_git_stub() {
     #   GIT_PRUNE_DELAY   seconds to stall `git ... worktree prune`
     #   GIT_STATUS_DELAY  seconds to stall `git ... status`
     #   GIT_STATUS_FAIL   non-empty: `git ... status` exits 128 without running
+    #   GIT_REVPARSE_DELAY seconds to stall `git ... rev-parse HEAD` (gate 5)
+    #   GIT_REVPARSE_FAIL non-empty: that rev-parse exits 128 without running
+    #   GIT_CONTAINS_DELAY seconds to stall `git ... branch --remotes --contains`
+    #   GIT_CONTAINS_FAIL non-empty: that branch read exits 129 without running
+    #
+    # The gate-5 hooks exist for the same reason the gate-3 ones do: the
+    # difference between "the probe ran and found nothing" and "the probe never
+    # answered" is only observable from outside the script by making the probe
+    # slow or broken (gcp-9ql4).
     local bin="$1" real
     real=$(command -v git)
     mkdir -p "$bin"
@@ -119,6 +128,20 @@ case " \$* " in
         if [ -n "\${GIT_STATUS_FAIL:-}" ]; then
             echo "fatal: simulated git status failure" >&2
             exit 128
+        fi
+        ;;
+    *" rev-parse HEAD "*)
+        if [ -n "\${GIT_REVPARSE_DELAY:-}" ]; then sleep "\$GIT_REVPARSE_DELAY"; fi
+        if [ -n "\${GIT_REVPARSE_FAIL:-}" ]; then
+            echo "fatal: simulated rev-parse failure" >&2
+            exit 128
+        fi
+        ;;
+    *" --remotes --contains "*)
+        if [ -n "\${GIT_CONTAINS_DELAY:-}" ]; then sleep "\$GIT_CONTAINS_DELAY"; fi
+        if [ -n "\${GIT_CONTAINS_FAIL:-}" ]; then
+            echo "fatal: simulated remote-contains failure" >&2
+            exit 129
         fi
         ;;
 esac
@@ -940,6 +963,135 @@ JSON
     rm -rf "$tmp"
 }
 
+test_an_unanswered_publication_probe_is_not_a_lost_work_finding() {
+    # gcp-9ql4. Gate 5 blanked CONTAINS on every non-`ok` outcome, so a probe
+    # that timed out, errored, or never ran at all was byte-identical to "the
+    # probe ran and found no containing remote ref". The reaper then reported
+    # the confirmed-negative wording — "the commits here exist nowhere else;
+    # kept for the witness to salvage" — for a question nobody had asked.
+    #
+    # Acting on that means the witness force-pushing already-merged commits
+    # from a detached HEAD, and it permanently pins the worktree against
+    # reaping. Confirmed in gascity on 2026-09-06: the SAME worktree, same
+    # HEAD, no intervening change, produced `worktree_reap_pending` with
+    # "HEAD published on origin/edge-integration,..." at 21:24 and
+    # `worktree_unpublished_kept` at 23:39 — the only difference being that
+    # the second run reached the probe with the budget spent.
+    #
+    # The three answers must stay distinct: only `ok` + empty output is the
+    # finding. `timeout` and `failed` are driven here; the budget-`skipped`
+    # variant shares the same code path and is reported as truncation, and it
+    # is not driven from a test for the same reason the other
+    # `budget_spent_before_*` reasons are not — it needs the run's clock to
+    # cross a second boundary inside a bounded call that still succeeds, which
+    # no test can time deterministically.
+    local tmp rig bin home beads sessions logdir log
+    tmp=$(mktemp -d)
+    rig="$tmp/rig"
+    bin="$tmp/bin"
+    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
+    beads="$tmp/beads.json"
+    sessions="$tmp/sessions.json"
+    logdir="$tmp/logs"
+    log="$logdir/polecat-worktree-reap.log"
+    mkdir -p "$logdir"
+
+    setup_rig "$rig"
+    publish_rig "$rig" "$tmp/remote.git"
+    write_gc_stub "$bin"
+    write_git_stub "$bin"
+
+    # One no-such-bead candidate whose content IS published. Every run below
+    # must therefore either reap it or say it could not tell — and never once
+    # claim its commits exist nowhere else.
+    add_bead_worktree "$rig" "$home" wt-gone-published
+
+    printf '[]' >"$beads"
+    printf '{"sessions":[]}' >"$sessions"
+
+    # Case 1: the remote-contains read errors. The publication state is
+    # unknown, so the worktree is kept — but as an UNCONFIRMED probe, not as a
+    # finding about the worktree's contents.
+    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+        GIT_CONTAINS_FAIL=1 GC_REAP_BUDGET_SECONDS=30 PATH="$bin:$PATH" \
+        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/fail.txt" 2>&1 ||
+        fail "reaper exited non-zero on a failing publication probe: $(cat "$tmp/fail.txt")"
+
+    ! grep -F '"event":"worktree_unpublished_kept"' "$log" >/dev/null ||
+        fail "a publication probe that ERRORED was reported as proof the commits exist nowhere else"
+    [[ "$(reason_for "$log" worktree_publication_unconfirmed)" == "publication_probe_failed" ]] ||
+        fail "a failing publication probe was not recorded as unconfirmed"
+    [[ -e "$home/worktrees/wt-gone-published" ]] ||
+        fail "a worktree was reaped while its publication state was unknown"
+
+    # Case 2: the remote-contains read is cut short by the budget it was given.
+    # Same event — it did run — but the detail must point at the budget so a
+    # reader does not go looking for a broken checkout.
+    rm -f "$log"
+    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+        GIT_CONTAINS_DELAY=20 GC_REAP_BUDGET_SECONDS=3 PATH="$bin:$PATH" \
+        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/slow.txt" 2>&1 ||
+        fail "reaper exited non-zero on a slow publication probe: $(cat "$tmp/slow.txt")"
+
+    ! grep -F '"event":"worktree_unpublished_kept"' "$log" >/dev/null ||
+        fail "a publication probe cut short by the budget was reported as a lost-work finding"
+    [[ "$(reason_for "$log" worktree_publication_unconfirmed)" == "publication_probe_timed_out" ]] ||
+        fail "a publication probe cut short by the budget was not recorded as a timeout"
+    [[ "$(detail_for "$log" worktree_publication_unconfirmed)" == *"budget"* ]] ||
+        fail "the publication timeout does not point at the budget it hit"
+
+    # Case 3: the HEAD read itself fails. Gate 5 cannot even start, and that is
+    # equally not evidence about where the commits live.
+    rm -f "$log"
+    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+        GIT_REVPARSE_FAIL=1 GC_REAP_BUDGET_SECONDS=30 PATH="$bin:$PATH" \
+        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/head.txt" 2>&1 ||
+        fail "reaper exited non-zero on a failing HEAD read: $(cat "$tmp/head.txt")"
+
+    ! grep -F '"event":"worktree_unpublished_kept"' "$log" >/dev/null ||
+        fail "an unreadable HEAD was reported as proof the commits exist nowhere else"
+    [[ "$(reason_for "$log" worktree_publication_unconfirmed)" == "publication_probe_failed" ]] ||
+        fail "an unreadable HEAD was not recorded as an unconfirmed publication state"
+    [[ -e "$home/worktrees/wt-gone-published" ]] ||
+        fail "a worktree was reaped while HEAD could not be read"
+
+    # Case 4, the control: with both probes answering, the SAME worktree is
+    # reaped as published. Without this the assertions above would also pass on
+    # a reaper that had simply stopped reaping.
+    rm -f "$log"
+    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+        GC_REAP_BUDGET_SECONDS=30 PATH="$bin:$PATH" \
+        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/ok.txt" 2>&1 ||
+        fail "reaper exited non-zero on a healthy run: $(cat "$tmp/ok.txt")"
+
+    [[ ! -e "$home/worktrees/wt-gone-published" ]] ||
+        fail "a clean, published, no-such-bead worktree was not reaped once both probes answered"
+    ! grep -F '"event":"worktree_publication_unconfirmed"' "$log" >/dev/null ||
+        fail "a publication probe that answered was still recorded as unconfirmed"
+
+    # Case 5: the confirmed negative still fires. The fix must narrow
+    # `worktree_unpublished_kept` to the one state that earns it, not retire it
+    # — a worktree holding the only copy of its commits is the reason gate 5
+    # exists at all.
+    rm -f "$log"
+    add_bead_worktree "$rig" "$home" wt-gone-unpublished
+    echo local >"$home/worktrees/wt-gone-unpublished/local.txt"
+    git -C "$home/worktrees/wt-gone-unpublished" add local.txt
+    git -C "$home/worktrees/wt-gone-unpublished" commit -qm "unpublished work"
+
+    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+        GC_REAP_BUDGET_SECONDS=30 PATH="$bin:$PATH" \
+        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/neg.txt" 2>&1 ||
+        fail "reaper exited non-zero on the confirmed-negative run: $(cat "$tmp/neg.txt")"
+
+    [[ "$(reason_for "$log" worktree_unpublished_kept)" == "no_such_bead_content_unpublished" ]] ||
+        fail "a probe that ran and found no containing remote ref no longer produces the finding"
+    [[ -e "$home/worktrees/wt-gone-unpublished" ]] ||
+        fail "a worktree holding the only copy of its commits was reaped"
+
+    rm -rf "$tmp"
+}
+
 test_an_all_missing_batch_is_not_a_store_failure() {
     # bd exits 1 and prints an error OBJECT — not an array — when NO id in the
     # batch resolves. The array check read that as a dead store, so a rig whose
@@ -1229,6 +1381,7 @@ test_git_status_failure_is_distinguished_from_a_short_budget
 test_dotted_sub_bead_worktrees_are_enumerated
 test_a_permanently_missing_bead_is_decided_not_retried
 test_an_all_missing_batch_is_not_a_store_failure
+test_an_unanswered_publication_probe_is_not_a_lost_work_finding
 test_lane_trees_other_than_polecats_are_enumerated
 test_a_non_agent_worktree_named_like_a_bead_is_not_reaped
 test_the_budget_cutoff_rotates_instead_of_dropping_the_same_tail

@@ -154,8 +154,14 @@ Your patrol job is to read
 not routine — a `worktree_dirty_kept` that repeats across cycles means real
 work is stranded under an already-closed bead. Salvage it with the recipes
 above, then re-run the reaper. A `worktree_unpublished_kept` is the other
-lost-work signal, and it will not clear on its own. Full detail lives in the
-`mol-witness-patrol` `reap-merged-worktrees` step.
+lost-work signal, and it will not clear on its own.
+
+Do NOT read `worktree_publication_unconfirmed` as that signal. It means the
+probe that decides whether the commits exist elsewhere never answered — a
+spent budget, a timeout, a git error — so nothing is known about the
+worktree's contents, and the next cycle re-checks. Salvaging on it means
+force-pushing commits that are very likely already merged (`gcp-9ql4`). Full
+detail lives in the `mol-witness-patrol` `reap-merged-worktrees` step.
 
 ---
 
