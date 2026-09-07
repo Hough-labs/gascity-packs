@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 6 Sep 2026 19:07:05 -0400
-Subject: [PATCH 81/82] fix(witness): rotate the reaper's cutoff and evidence
+Subject: [PATCH 81/83] fix(witness): rotate the reaper's cutoff and evidence
  the promotion criterion (gcp-schs)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
