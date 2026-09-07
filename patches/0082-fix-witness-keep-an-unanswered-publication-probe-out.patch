@@ -1,0 +1,450 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sun, 6 Sep 2026 20:09:50 -0400
+Subject: [PATCH 82/82] fix(witness): keep an unanswered publication probe out
+ of the lost-work finding (gcp-9ql4)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Gate 5 of the polecat worktree reaper — "do these commits exist anywhere
+other than this directory" — collapsed three distinct outcomes into one.
+`CONTAINS` was blanked whenever `classify_outcome` returned anything but
+`ok`, so a probe that timed out, errored, or was never run at all because
+the budget was already spent became byte-identical to "the probe ran and
+found no containing remote ref". The `-z "$CONTAINS"` test below could not
+tell them apart and reported the confirmed-negative wording: "the commits
+here exist nowhere else; kept for the witness to salvage".
+
+That is a manufactured lost-work finding, and it fires precisely at the
+budget tail — which gcp-ac59's rotating cursor moves every cycle, so over
+successive runs it can point at a different healthy worktree each time.
+Confirmed in gascity on 2026-09-06: one worktree, same HEAD, no intervening
+change, reported `worktree_reap_pending` with "HEAD published on
+origin/edge-integration,..." at 21:24 and `worktree_unpublished_kept` at
+23:39 with `budget_remaining: 0`. Acting on it means the witness committing
+and force-pushing already-merged commits from a detached HEAD on the
+strength of a probe that never executed, and it pins the worktree against
+reaping forever the way gcp-0u14's retry loop did. Same defect class as the
+merge-base 1-vs-128 collapse gcp-5ddt hardened in mol-witness-patrol.
+
+Both halves of the probe now classify their own outcome and carry an
+explicit `PUBLISHED` state. Only `ok` with a non-empty containing-ref list
+authorises the reap, and only `ok` with an empty one earns
+`worktree_unpublished_kept`. A `timeout`/`failed` outcome (including a HEAD
+that reads back empty) records the new `worktree_publication_unconfirmed`,
+matching the existing `worktree_owner_unconfirmed` vocabulary; a `skipped`
+outcome is the run's own clock, so it records `worktree_budget_truncated`
+with `budget_spent_before_publication_probe`/`_check` and rolls the resume
+cursor back to the last candidate that actually got a decision — the same
+never-inspected handling the roster and git-status truncations already use.
+Either way the worktree is kept and the next cycle re-checks.
+
+Validation: the reap suite gains a five-case regression test driving the
+errored, budget-cut-short and unreadable-HEAD paths against a worktree whose
+content IS published, plus a control that the same worktree is still reaped
+once both probes answer and a case holding the confirmed negative. Verified
+RED against the pre-fix script ("a publication probe that ERRORED was
+reported as proof the commits exist nowhere else") and GREEN after. Full
+suite, gastown pack assets, prompt/formula drift, no-bare-bd, shellcheck -x,
+go vet, golangci-lint, validate_registry and go test all pass.
+
+The budget-`skipped` variant is handled but not driven from a test: it needs
+the run's clock to cross a second boundary inside a bounded call that still
+succeeds, which no test can time deterministically — the same reason the
+other `budget_spent_before_*` reasons have no dedicated case.
+
+The witness prompt and the mol-witness-patrol event table both documented
+`worktree_unpublished_kept` as a salvage-now signal, so both are updated to
+narrow it to the confirmed case and to say plainly that
+`worktree_publication_unconfirmed` is not one.
+---
+ gastown/agents/witness/prompt.template.md     |  10 +-
+ .../assets/scripts/polecat-worktree-reap.sh   | 106 ++++++++++--
+ gastown/formulas/mol-witness-patrol.toml      |  21 ++-
+ gastown/tests/test_polecat_worktree_reap.sh   | 153 ++++++++++++++++++
+ 4 files changed, 274 insertions(+), 16 deletions(-)
+
+diff --git a/gastown/agents/witness/prompt.template.md b/gastown/agents/witness/prompt.template.md
+index 99f2095..929bb47 100644
+--- a/gastown/agents/witness/prompt.template.md
++++ b/gastown/agents/witness/prompt.template.md
+@@ -154,8 +154,14 @@ Your patrol job is to read
+ not routine — a `worktree_dirty_kept` that repeats across cycles means real
+ work is stranded under an already-closed bead. Salvage it with the recipes
+ above, then re-run the reaper. A `worktree_unpublished_kept` is the other
+-lost-work signal, and it will not clear on its own. Full detail lives in the
+-`mol-witness-patrol` `reap-merged-worktrees` step.
++lost-work signal, and it will not clear on its own.
++
++Do NOT read `worktree_publication_unconfirmed` as that signal. It means the
++probe that decides whether the commits exist elsewhere never answered — a
++spent budget, a timeout, a git error — so nothing is known about the
++worktree's contents, and the next cycle re-checks. Salvaging on it means
++force-pushing commits that are very likely already merged (`gcp-9ql4`). Full
++detail lives in the `mol-witness-patrol` `reap-merged-worktrees` step.
+ 
+ ---
+ 
+diff --git a/gastown/assets/scripts/polecat-worktree-reap.sh b/gastown/assets/scripts/polecat-worktree-reap.sh
+index 1bbac86..5abcade 100755
+--- a/gastown/assets/scripts/polecat-worktree-reap.sh
++++ b/gastown/assets/scripts/polecat-worktree-reap.sh
+@@ -47,8 +47,13 @@
+ #   gate 3 plus:
+ #   5. HEAD is reachable from a remote-tracking ref (`git branch --remotes
+ #      --contains`) — the content exists somewhere other than this directory.
+-#      Failing that is a FINDING (`worktree_unpublished_kept`), not a retry:
+-#      the condition never resolves itself, so the witness is told once.
++#      CONFIRMED failure is a FINDING (`worktree_unpublished_kept`), not a
++#      retry: the condition never resolves itself, so the witness is told once.
++#      A probe that could not run (budget spent, timed out, git errored) is
++#      NOT that failure — it is `worktree_publication_unconfirmed` (or a
++#      `worktree_budget_truncated` when the clock is what stopped it), kept and
++#      re-checked, because an unknown reported as a definite negative sends the
++#      witness to salvage already-merged commits (gcp-9ql4).
+ #
+ # THE LANE-TREE BLIND SPOT — why gate 1 does not name a tree (gcp-elv3):
+ #   Gate 1 used to require a `*/polecats/*/worktrees/*` segment on top of the
+@@ -905,21 +910,104 @@ while IFS=$'\037' read -r STATUS OWNER WT; do
+     # point of gcp-0u14 is that this condition never resolves itself, so the
+     # witness is told once and the worktree is kept.
+     if [ "$NO_SUCH_BEAD" -eq 1 ]; then
++        # The probe has THREE answers, not two, and only one of them is
++        # evidence. `ok` with empty output is the confirmed negative that
++        # justifies the finding; `skipped`/`timeout`/`failed` mean nobody found
++        # out. Folding the unknowns into the same empty string made a probe that
++        # NEVER RAN report "the commits here exist nowhere else" and dispatch
++        # the witness to salvage already-merged work (gcp-9ql4) — the same
++        # indeterminate-read-as-definite-negative collapse gcp-5ddt hardened in
++        # mol-witness-patrol. So carry the state explicitly.
++        PUBLISHED=unconfirmed
++        PUBLISHED_REASON=""
++        PUBLISHED_DETAIL=""
++        CONTAINS=""
++
+         HEAD_LIMIT=$(budget_left)
+         HEAD_RC=0
+         WT_HEAD=$(run_bounded "$HEAD_LIMIT" git -C "$WT" rev-parse HEAD 2>/dev/null) || HEAD_RC=$?
+-        CONTAINS=""
+-        CONTAINS_RC=0
+-        if [ "$(classify_outcome "$HEAD_LIMIT" "$HEAD_RC")" = ok ] && [ -n "$WT_HEAD" ]; then
++        case "$(classify_outcome "$HEAD_LIMIT" "$HEAD_RC")" in
++            ok)
++                # Answered, but with nothing: there is no commit to look for, so
++                # the publication question was never actually put to git either.
++                if [ -z "$WT_HEAD" ]; then
++                    PUBLISHED_REASON=publication_probe_failed
++                    PUBLISHED_DETAIL="git rev-parse HEAD answered with no commit, so nothing could be looked for on a remote"
++                fi
++                ;;
++            skipped)
++                PUBLISHED_REASON=budget_spent_before_publication_probe
++                PUBLISHED_DETAIL="the ${BUDGET_SECONDS}s budget was spent before HEAD was read; the publication probe never ran, at candidate $EXAMINED of $TOTAL"
++                ;;
++            timeout)
++                PUBLISHED_REASON=publication_probe_timed_out
++                PUBLISHED_DETAIL="git rev-parse HEAD did not answer within the ${HEAD_LIMIT}s left of the ${BUDGET_SECONDS}s budget"
++                ;;
++            *)
++                PUBLISHED_REASON=publication_probe_failed
++                PUBLISHED_DETAIL="git rev-parse HEAD exited $HEAD_RC in the worktree"
++                ;;
++        esac
++
++        if [ -z "$PUBLISHED_REASON" ]; then
+             CONTAINS_LIMIT=$(budget_left)
++            CONTAINS_RC=0
+             CONTAINS=$(run_bounded "$CONTAINS_LIMIT" \
+                 git -C "$RIG_ROOT" branch --remotes --contains "$WT_HEAD" 2>/dev/null) ||
+                 CONTAINS_RC=$?
+-            if [ "$(classify_outcome "$CONTAINS_LIMIT" "$CONTAINS_RC")" != ok ]; then
+-                CONTAINS=""
+-            fi
++            case "$(classify_outcome "$CONTAINS_LIMIT" "$CONTAINS_RC")" in
++                ok)
++                    # The only two states this run is entitled to assert.
++                    if [ -n "$CONTAINS" ]; then
++                        PUBLISHED=yes
++                    else
++                        PUBLISHED=no
++                    fi
++                    ;;
++                skipped)
++                    CONTAINS=""
++                    PUBLISHED_REASON=budget_spent_before_publication_check
++                    PUBLISHED_DETAIL="the ${BUDGET_SECONDS}s budget was spent before the remote-tracking refs were searched; the publication probe never ran, at candidate $EXAMINED of $TOTAL"
++                    ;;
++                timeout)
++                    # A killed command can still have written a partial list, so
++                    # the capture is discarded rather than read as an answer.
++                    CONTAINS=""
++                    PUBLISHED_REASON=publication_probe_timed_out
++                    PUBLISHED_DETAIL="git branch --remotes --contains did not answer within the ${CONTAINS_LIMIT}s left of the ${BUDGET_SECONDS}s budget"
++                    ;;
++                *)
++                    CONTAINS=""
++                    PUBLISHED_REASON=publication_probe_failed
++                    PUBLISHED_DETAIL="git branch --remotes --contains exited $CONTAINS_RC in $RIG_ROOT"
++                    ;;
++            esac
++        fi
++
++        if [ "$PUBLISHED" = unconfirmed ]; then
++            case "$PUBLISHED_REASON" in
++                budget_spent_before_*)
++                    # Nobody asked git anything. Reporting it as a publication
++                    # finding would point the witness at a probe this run never
++                    # made — the same mistake the roster and git-status
++                    # truncations above exist to avoid.
++                    TRUNCATED=1
++                    # Never decided, so it must stay inside the next cycle's
++                    # window: hold the cursor at the last candidate that was.
++                    DECIDED_LAST="$DECIDED_PREV"
++                    record worktree_budget_truncated "$BEAD" "$WT" \
++                        "$PUBLISHED_DETAIL" "$PUBLISHED_REASON"
++                    ;;
++                *)
++                    record worktree_publication_unconfirmed "$BEAD" "$WT" \
++                        "$PUBLISHED_DETAIL; a probe that did not answer is not proof the commits exist nowhere else, so the worktree is kept and re-checked next cycle" \
++                        "$PUBLISHED_REASON"
++                    ;;
++            esac
++            SKIPPED=$((SKIPPED + 1))
++            continue
+         fi
+-        if [ -z "$CONTAINS" ]; then
++        if [ "$PUBLISHED" = no ]; then
+             record worktree_unpublished_kept "$BEAD" "$WT" \
+                 "no bead authorises this reap and HEAD is on no remote-tracking branch, so the commits here exist nowhere else; kept for the witness to salvage" \
+                 no_such_bead_content_unpublished
+diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
+index 4222354..5ff942c 100644
+--- a/gastown/formulas/mol-witness-patrol.toml
++++ b/gastown/formulas/mol-witness-patrol.toml
+@@ -647,9 +647,19 @@ own evidence: gate 3 above, plus
+ 
+ 5. `HEAD` is reachable from a remote-tracking ref, so the commits exist
+    somewhere other than that directory. This gate binds ONLY here, where there
+-   is no bead closure to stand on. A path that fails it is kept and reported as
+-   `worktree_unpublished_kept` — a finding, not a retry, because the condition
+-   never resolves itself.
++   is no bead closure to stand on. A path that CONFIRMEDLY fails it — the probe
++   ran and found no containing ref — is kept and reported as
++   `worktree_unpublished_kept`, a finding rather than a retry, because that
++   condition never resolves itself.
++
++   A probe that could not answer is a THIRD state, not that finding. Blanking
++   the probe's output on a budget-spent, timed-out or errored read made an
++   unknown byte-identical to a confirmed negative, so a cycle that never ran
++   the probe reported "the commits here exist nowhere else" for work that was
++   already merged (`gcp-9ql4`) — the same indeterminate-as-definite-negative
++   collapse `gcp-5ddt` hardened in the merge-base check. Those read as
++   `worktree_publication_unconfirmed`, or as `worktree_budget_truncated` when
++   the run's own clock is what stopped it, and the next cycle re-checks.
+ 
+ **Review the log.** Every decision lands in
+ `$GC_CITY/.gc/runtime/logs/polecat-worktree-reap.log` as one JSON line
+@@ -688,11 +698,12 @@ jq -r 'select(.reason != "") | [.ts, .event, .reason, .budget_remaining, .bead]
+ | `worktree_reaped` | Removed. Routine, and only once `--no-dry-run` is wired. | Log only |
+ | `worktree_dirty_kept` | Closed bead, uncommitted changes on disk | Salvage per Case C/D, then re-run |
+ | `worktree_owner_live` | Closed bead, polecat still alive (PR rework) | None — expected; next cycle retries |
+-| `worktree_budget_truncated` | A check was NEVER ATTEMPTED — the run's budget was already spent when it came due. Nothing external failed. `reason` names the check that did not happen (`budget_spent_before_worktree_list` / `_bead_query` / `_roster_read` / `_git_status`) | Not an outage; do not chase the named subsystem. Read it as "this cycle was too short", exactly like `worktree_budget_exhausted` below |
++| `worktree_budget_truncated` | A check was NEVER ATTEMPTED — the run's budget was already spent when it came due. Nothing external failed. `reason` names the check that did not happen (`budget_spent_before_worktree_list` / `_bead_query` / `_roster_read` / `_git_status` / `_publication_probe` / `_publication_check`) | Not an outage; do not chase the named subsystem. Read it as "this cycle was too short", exactly like `worktree_budget_exhausted` below |
+ | `worktree_owner_unconfirmed` | Liveness is unknown, so the reap was skipped. `reason`: `roster_read_timed_out` (the read did not finish in the budget left), `roster_read_failed` (`gc session list` errored), `roster_unparseable` (it answered with a shape we do not recognise) | **`roster_read_timed_out` → the budget is the suspect first**; the detail names the seconds it got. Only `roster_read_failed`/`roster_unparseable` implicate the roster itself — then check `gc doctor`. Nothing was removed either way |
+ | `worktree_bead_unreadable` | The bulk `gc bd show` answered, but echoed no row for this bead id AND did not say the id does not exist (`reason: bead_absent_from_batch`) — a fuzzy hit that echoed a different id, or a per-id read failure. TRANSIENT: retried next cycle | If it repeats across many beads, check Dolt health. An id `bd` positively reports as absent is `worktree_no_such_bead` below, not this |
+ | `worktree_no_such_bead` | `bd` answered "no issue found matching" for this leaf (`reason: no_such_bead`), so it is not a bead worktree at all — typically a scratch directory hand-made under `worktrees/`. PERMANENT, so it is decided once instead of retried forever | Log only. The gate-3 / gate-5 line for the same path is the one that says what actually happened to it |
+-| `worktree_unpublished_kept` | A no-such-bead path that is clean but whose `HEAD` is on no remote-tracking branch (`reason: no_such_bead_content_unpublished`), so its commits exist nowhere else. Nothing was removed | A real finding, and it will NOT resolve on its own — inspect the worktree by hand. If the commits matter, push them somewhere; if they do not, remove the directory yourself. Mail the mayor if you cannot tell |
++| `worktree_unpublished_kept` | A no-such-bead path that is clean, whose publication probe RAN, and whose `HEAD` was found on no remote-tracking branch (`reason: no_such_bead_content_unpublished`), so its commits exist nowhere else. Nothing was removed | A real finding, and it will NOT resolve on its own — inspect the worktree by hand. If the commits matter, push them somewhere; if they do not, remove the directory yourself. Mail the mayor if you cannot tell |
++| `worktree_publication_unconfirmed` | The publication probe did not answer, so whether the commits exist elsewhere is UNKNOWN. `reason`: `publication_probe_timed_out` (cut short by the budget left) or `publication_probe_failed` (`git rev-parse HEAD` or `git branch --remotes --contains` exited non-zero, or HEAD read back empty). Nothing was removed | **Not a lost-work signal — do not salvage on it.** `publication_probe_timed_out` → budget first; the detail names the seconds it got. `publication_probe_failed` means the rig checkout or the worktree is unhealthy: inspect by hand. Either way the next cycle re-checks (`gcp-9ql4`) |
+ | `worktree_status_unreadable` | `git status` actually ran inside the worktree and did not answer. `reason`: `git_status_timed_out` (cut short by the budget left) or `git_status_failed` (non-zero exit) | **`git_status_timed_out` → budget first.** `git_status_failed` is the real one: inspect by hand, likely a broken or moved checkout |
+ | `worktree_reap_failed` | Directory survived removal | Investigate permissions/mounts, mail mayor |
+ | `worktree_list_failed` | `git worktree list` ran and did not answer, so no candidate was enumerated. `reason`: `worktree_list_timed_out` or `worktree_list_failed` | Timed out → budget first. Failed → the rig checkout itself is unhealthy; inspect `$RIG_ROOT` by hand |
+diff --git a/gastown/tests/test_polecat_worktree_reap.sh b/gastown/tests/test_polecat_worktree_reap.sh
+index 114be5e..c0d01d8 100644
+--- a/gastown/tests/test_polecat_worktree_reap.sh
++++ b/gastown/tests/test_polecat_worktree_reap.sh
+@@ -105,6 +105,15 @@ write_git_stub() {
+     #   GIT_PRUNE_DELAY   seconds to stall `git ... worktree prune`
+     #   GIT_STATUS_DELAY  seconds to stall `git ... status`
+     #   GIT_STATUS_FAIL   non-empty: `git ... status` exits 128 without running
++    #   GIT_REVPARSE_DELAY seconds to stall `git ... rev-parse HEAD` (gate 5)
++    #   GIT_REVPARSE_FAIL non-empty: that rev-parse exits 128 without running
++    #   GIT_CONTAINS_DELAY seconds to stall `git ... branch --remotes --contains`
++    #   GIT_CONTAINS_FAIL non-empty: that branch read exits 129 without running
++    #
++    # The gate-5 hooks exist for the same reason the gate-3 ones do: the
++    # difference between "the probe ran and found nothing" and "the probe never
++    # answered" is only observable from outside the script by making the probe
++    # slow or broken (gcp-9ql4).
+     local bin="$1" real
+     real=$(command -v git)
+     mkdir -p "$bin"
+@@ -121,6 +130,20 @@ case " \$* " in
+             exit 128
+         fi
+         ;;
++    *" rev-parse HEAD "*)
++        if [ -n "\${GIT_REVPARSE_DELAY:-}" ]; then sleep "\$GIT_REVPARSE_DELAY"; fi
++        if [ -n "\${GIT_REVPARSE_FAIL:-}" ]; then
++            echo "fatal: simulated rev-parse failure" >&2
++            exit 128
++        fi
++        ;;
++    *" --remotes --contains "*)
++        if [ -n "\${GIT_CONTAINS_DELAY:-}" ]; then sleep "\$GIT_CONTAINS_DELAY"; fi
++        if [ -n "\${GIT_CONTAINS_FAIL:-}" ]; then
++            echo "fatal: simulated remote-contains failure" >&2
++            exit 129
++        fi
++        ;;
+ esac
+ exec "$real" "\$@"
+ SH
+@@ -940,6 +963,135 @@ JSON
+     rm -rf "$tmp"
+ }
+ 
++test_an_unanswered_publication_probe_is_not_a_lost_work_finding() {
++    # gcp-9ql4. Gate 5 blanked CONTAINS on every non-`ok` outcome, so a probe
++    # that timed out, errored, or never ran at all was byte-identical to "the
++    # probe ran and found no containing remote ref". The reaper then reported
++    # the confirmed-negative wording — "the commits here exist nowhere else;
++    # kept for the witness to salvage" — for a question nobody had asked.
++    #
++    # Acting on that means the witness force-pushing already-merged commits
++    # from a detached HEAD, and it permanently pins the worktree against
++    # reaping. Confirmed in gascity on 2026-09-06: the SAME worktree, same
++    # HEAD, no intervening change, produced `worktree_reap_pending` with
++    # "HEAD published on origin/edge-integration,..." at 21:24 and
++    # `worktree_unpublished_kept` at 23:39 — the only difference being that
++    # the second run reached the probe with the budget spent.
++    #
++    # The three answers must stay distinct: only `ok` + empty output is the
++    # finding. `timeout` and `failed` are driven here; the budget-`skipped`
++    # variant shares the same code path and is reported as truncation, and it
++    # is not driven from a test for the same reason the other
++    # `budget_spent_before_*` reasons are not — it needs the run's clock to
++    # cross a second boundary inside a bounded call that still succeeds, which
++    # no test can time deterministically.
++    local tmp rig bin home beads sessions logdir log
++    tmp=$(mktemp -d)
++    rig="$tmp/rig"
++    bin="$tmp/bin"
++    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
++    beads="$tmp/beads.json"
++    sessions="$tmp/sessions.json"
++    logdir="$tmp/logs"
++    log="$logdir/polecat-worktree-reap.log"
++    mkdir -p "$logdir"
++
++    setup_rig "$rig"
++    publish_rig "$rig" "$tmp/remote.git"
++    write_gc_stub "$bin"
++    write_git_stub "$bin"
++
++    # One no-such-bead candidate whose content IS published. Every run below
++    # must therefore either reap it or say it could not tell — and never once
++    # claim its commits exist nowhere else.
++    add_bead_worktree "$rig" "$home" wt-gone-published
++
++    printf '[]' >"$beads"
++    printf '{"sessions":[]}' >"$sessions"
++
++    # Case 1: the remote-contains read errors. The publication state is
++    # unknown, so the worktree is kept — but as an UNCONFIRMED probe, not as a
++    # finding about the worktree's contents.
++    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
++        GIT_CONTAINS_FAIL=1 GC_REAP_BUDGET_SECONDS=30 PATH="$bin:$PATH" \
++        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/fail.txt" 2>&1 ||
++        fail "reaper exited non-zero on a failing publication probe: $(cat "$tmp/fail.txt")"
++
++    ! grep -F '"event":"worktree_unpublished_kept"' "$log" >/dev/null ||
++        fail "a publication probe that ERRORED was reported as proof the commits exist nowhere else"
++    [[ "$(reason_for "$log" worktree_publication_unconfirmed)" == "publication_probe_failed" ]] ||
++        fail "a failing publication probe was not recorded as unconfirmed"
++    [[ -e "$home/worktrees/wt-gone-published" ]] ||
++        fail "a worktree was reaped while its publication state was unknown"
++
++    # Case 2: the remote-contains read is cut short by the budget it was given.
++    # Same event — it did run — but the detail must point at the budget so a
++    # reader does not go looking for a broken checkout.
++    rm -f "$log"
++    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
++        GIT_CONTAINS_DELAY=20 GC_REAP_BUDGET_SECONDS=3 PATH="$bin:$PATH" \
++        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/slow.txt" 2>&1 ||
++        fail "reaper exited non-zero on a slow publication probe: $(cat "$tmp/slow.txt")"
++
++    ! grep -F '"event":"worktree_unpublished_kept"' "$log" >/dev/null ||
++        fail "a publication probe cut short by the budget was reported as a lost-work finding"
++    [[ "$(reason_for "$log" worktree_publication_unconfirmed)" == "publication_probe_timed_out" ]] ||
++        fail "a publication probe cut short by the budget was not recorded as a timeout"
++    [[ "$(detail_for "$log" worktree_publication_unconfirmed)" == *"budget"* ]] ||
++        fail "the publication timeout does not point at the budget it hit"
++
++    # Case 3: the HEAD read itself fails. Gate 5 cannot even start, and that is
++    # equally not evidence about where the commits live.
++    rm -f "$log"
++    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
++        GIT_REVPARSE_FAIL=1 GC_REAP_BUDGET_SECONDS=30 PATH="$bin:$PATH" \
++        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/head.txt" 2>&1 ||
++        fail "reaper exited non-zero on a failing HEAD read: $(cat "$tmp/head.txt")"
++
++    ! grep -F '"event":"worktree_unpublished_kept"' "$log" >/dev/null ||
++        fail "an unreadable HEAD was reported as proof the commits exist nowhere else"
++    [[ "$(reason_for "$log" worktree_publication_unconfirmed)" == "publication_probe_failed" ]] ||
++        fail "an unreadable HEAD was not recorded as an unconfirmed publication state"
++    [[ -e "$home/worktrees/wt-gone-published" ]] ||
++        fail "a worktree was reaped while HEAD could not be read"
++
++    # Case 4, the control: with both probes answering, the SAME worktree is
++    # reaped as published. Without this the assertions above would also pass on
++    # a reaper that had simply stopped reaping.
++    rm -f "$log"
++    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
++        GC_REAP_BUDGET_SECONDS=30 PATH="$bin:$PATH" \
++        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/ok.txt" 2>&1 ||
++        fail "reaper exited non-zero on a healthy run: $(cat "$tmp/ok.txt")"
++
++    [[ ! -e "$home/worktrees/wt-gone-published" ]] ||
++        fail "a clean, published, no-such-bead worktree was not reaped once both probes answered"
++    ! grep -F '"event":"worktree_publication_unconfirmed"' "$log" >/dev/null ||
++        fail "a publication probe that answered was still recorded as unconfirmed"
++
++    # Case 5: the confirmed negative still fires. The fix must narrow
++    # `worktree_unpublished_kept` to the one state that earns it, not retire it
++    # — a worktree holding the only copy of its commits is the reason gate 5
++    # exists at all.
++    rm -f "$log"
++    add_bead_worktree "$rig" "$home" wt-gone-unpublished
++    echo local >"$home/worktrees/wt-gone-unpublished/local.txt"
++    git -C "$home/worktrees/wt-gone-unpublished" add local.txt
++    git -C "$home/worktrees/wt-gone-unpublished" commit -qm "unpublished work"
++
++    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
++        GC_REAP_BUDGET_SECONDS=30 PATH="$bin:$PATH" \
++        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/neg.txt" 2>&1 ||
++        fail "reaper exited non-zero on the confirmed-negative run: $(cat "$tmp/neg.txt")"
++
++    [[ "$(reason_for "$log" worktree_unpublished_kept)" == "no_such_bead_content_unpublished" ]] ||
++        fail "a probe that ran and found no containing remote ref no longer produces the finding"
++    [[ -e "$home/worktrees/wt-gone-unpublished" ]] ||
++        fail "a worktree holding the only copy of its commits was reaped"
++
++    rm -rf "$tmp"
++}
++
+ test_an_all_missing_batch_is_not_a_store_failure() {
+     # bd exits 1 and prints an error OBJECT — not an array — when NO id in the
+     # batch resolves. The array check read that as a dead store, so a rig whose
+@@ -1229,6 +1381,7 @@ test_git_status_failure_is_distinguished_from_a_short_budget
+ test_dotted_sub_bead_worktrees_are_enumerated
+ test_a_permanently_missing_bead_is_decided_not_retried
+ test_an_all_missing_batch_is_not_a_store_failure
++test_an_unanswered_publication_probe_is_not_a_lost_work_finding
+ test_lane_trees_other_than_polecats_are_enumerated
+ test_a_non_agent_worktree_named_like_a_bead_is_not_reaped
+ test_the_budget_cutoff_rotates_instead_of_dropping_the_same_tail
+-- 
+2.50.1 (Apple Git-155)
+
