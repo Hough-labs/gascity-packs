@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Mon, 7 Sep 2026 13:50:56 -0400
+Subject: [PATCH 84/84] style(ci): make the nightly's gating expression an
+ explicit folded scalar (gcp-oz57)
+
+Self-review touch-up. Both gated steps in supported-pack-nightly.yml carried
+their two-clause condition as an implicit multi-line plain scalar, with the
+continuation line starting `&&`. That parses correctly -- verified -- but it
+reads like two separate keys at a glance, and the failure mode if someone later
+edits it wrong is silent: a condition that lost its second clause still parses,
+still passes a substring check, and simply stops skipping anything.
+
+`if: >-` states the folding outright. No behavioural change; the folded value is
+byte-identical, and the YAML-parsing assertion in
+test_manifold_dependent_steps_are_gated_on_the_detection_step compares against
+that value rather than the source text, so it covers either spelling.
+
+patches/ re-exported for the amended 0083.
+---
+ .github/workflows/supported-pack-nightly.yml | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/.github/workflows/supported-pack-nightly.yml b/.github/workflows/supported-pack-nightly.yml
+index ba858f1..62d52fd 100644
+--- a/.github/workflows/supported-pack-nightly.yml
++++ b/.github/workflows/supported-pack-nightly.yml
+@@ -255,7 +255,8 @@ jobs:
+         run: .github/scripts/install-gascity-archive.sh "${GASCITY_REF}" --cache
+ 
+       - name: Validate Manifold Claude configuration
+-        if: steps.subset.outputs.run_gate == 'true'
++        if: >-
++          steps.subset.outputs.run_gate == 'true'
+           && steps.manifold.outputs.present == 'true'
+         run: |
+           test -n "$OLLAMA_API_KEY" || { echo "Missing OLLAMA_API_KEY GitHub secret" >&2; exit 1; }
+@@ -274,7 +275,8 @@ jobs:
+           printf 'GC_INFERENCE_EXPECTED_MODEL=%s\n' "$GC_INFERENCE_EXPECTED_MODEL"
+ 
+       - name: Run supported-pack nightly inference gate
+-        if: steps.subset.outputs.run_gate == 'true'
++        if: >-
++          steps.subset.outputs.run_gate == 'true'
+           && steps.manifold.outputs.present == 'true'
+         env:
+           GATE_TIMEOUT: ${{ github.event.inputs.timeout || matrix.gate_timeout }}
+-- 
+2.50.1 (Apple Git-155)
+
