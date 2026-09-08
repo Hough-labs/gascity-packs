@@ -193,6 +193,54 @@ test_polecat_startup_uses_standard_hook_claim() {
         fail "polecat propulsion fragment must not regress to an unclaimed hook/work-query choice"
 }
 
+test_claim_verify_separates_read_failure_from_unassigned() {
+    # winnow-2fj8u: SHOW_OK required a NON-EMPTY assignee, but `gc bd show` omits
+    # the field entirely when it is null. "Read fine, genuinely unassigned" and
+    # "read failed" were therefore the same observation, and a readable
+    # unassigned bead took the CLAIM_RELEASED path instead of CLAIM_REJECTED.
+    # Key read-success on the bead echoing its own id, never on the assignee.
+    local prompt="$GASTOWN/agents/polecat/prompt.template.md"
+
+    grep -F 'SHOW_ID="$(printf '"'"'%s'"'"' "$SHOW_JSON" | jq -r '"'"'.[0].id // empty'"'"' 2>/dev/null)"' "$prompt" >/dev/null ||
+        fail "claim-verify must read the bead id to prove the show succeeded"
+    grep -F 'if [ "$SHOW_CODE" -eq 0 ] && [ -n "$SHOW_ID" ] && [ -n "$STATUS" ]; then' "$prompt" >/dev/null ||
+        fail "claim-verify read-success test must not depend on a non-empty assignee"
+    ! grep -F '[ -n "$STATUS" ] && [ -n "$ASSIGNEE" ]' "$prompt" >/dev/null ||
+        fail "claim-verify regressed to conflating an unassigned bead with a failed read"
+}
+
+test_claim_refuses_a_pour_onto_a_live_owner() {
+    # gcp-mjjg: gc's ReleaseIfCurrent returns an in-flight step bead to the pool
+    # without writing a bd event, so a duplicate pour is indistinguishable from
+    # ordinary unclaimed work at claim time. The molecule's WORK bead carries no
+    # gc.routed_to and so is never released — it is the only durable record of
+    # who owns the molecule, and the guard must consult it before any work
+    # begins. Behavioural coverage lives in test_polecat_live_owner_guard.sh;
+    # this pins the guard into the startup contract so it cannot be quietly
+    # dropped from the claim block.
+    local prompt="$GASTOWN/agents/polecat/prompt.template.md"
+
+    grep -F '# GUARD_BEGIN live-owner' "$prompt" >/dev/null ||
+        fail "polecat claim block lost the live-owner guard"
+    grep -F '# GUARD_END live-owner' "$prompt" >/dev/null ||
+        fail "live-owner guard is missing its extraction sentinel"
+    grep -F 'CLAIM_DECLINED_LIVE_OWNER' "$prompt" >/dev/null ||
+        fail "live-owner guard must announce its refusal with a distinct token"
+    grep -F 'gc session list --json' "$prompt" >/dev/null ||
+        fail "live-owner guard must probe session liveness, not assume it"
+
+    # The guard runs BEFORE the step re-point and the polecat_session stamp:
+    # both mutate bead state, and a declining polecat must touch nothing.
+    local guard_line stamp_line
+    guard_line=$(grep -n '# GUARD_END live-owner' "$prompt" | head -1 | cut -d: -f1)
+    stamp_line=$(grep -n 'set-metadata polecat_session="\$EXPECTED_ASSIGNEE"' "$prompt" | head -1 | cut -d: -f1)
+    [[ -n "$guard_line" && -n "$stamp_line" && "$guard_line" -lt "$stamp_line" ]] ||
+        fail "live-owner guard must run before the claim block stamps polecat_session"
+
+    grep -F 'CLAIM_DECLINED_LIVE_OWNER`, it' "$prompt" >/dev/null ||
+        fail "the prose listing drain-acked claim outcomes must name CLAIM_DECLINED_LIVE_OWNER"
+}
+
 test_review_leg_contract_forbids_synthetic_mutation() {
     local formula prompt
     formula="$GASTOWN/formulas/mol-review-leg.toml"
@@ -907,7 +955,11 @@ text = open(sys.argv[1], encoding="utf-8").read()
 block = text[text.index("bash <<'GC_CLAIM'"): text.index("GC_CLAIM\n```")]
 if "STEP_REPOINTED" not in block:
     raise SystemExit(1)
-if block.index("STEP_REPOINTED") >= block.index('--set-metadata polecat_session='):
+# Match the STAMP precisely, not any polecat_session write: the live-owner
+# guard also writes that key when it restores a step to its owner, and that
+# write legitimately precedes the re-point (a declining polecat never reaches
+# it). The stamp is the one that names THIS session.
+if block.index("STEP_REPOINTED") >= block.index('--set-metadata polecat_session="$EXPECTED_ASSIGNEE"'):
     raise SystemExit(1)
 PY
 
@@ -938,6 +990,8 @@ test_shutdown_dance_contracts_are_executable
 test_shutdown_dance_lifecycle_and_audit_contracts
 test_composition_is_documented
 test_polecat_startup_uses_standard_hook_claim
+test_claim_verify_separates_read_failure_from_unassigned
+test_claim_refuses_a_pour_onto_a_live_owner
 test_review_leg_contract_forbids_synthetic_mutation
 test_refinery_direct_merge_is_worktree_safe_and_fail_closed
 

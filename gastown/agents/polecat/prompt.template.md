@@ -206,22 +206,37 @@ fi
 # transient) from a genuine MISMATCH (non-empty assignee that differs, or
 # status not in_progress). Retry the read before deciding; only a genuine
 # mismatch is CLAIM_REJECTED.
+#
+# The read-success test keys on the bead ECHOING ITS OWN ID, never on a
+# non-empty assignee: `gc bd show` omits `assignee` entirely when it is null, so
+# requiring it conflated "read fine, genuinely unassigned" with "read failed"
+# and sent a perfectly readable unassigned bead down the CLAIM_RELEASED path
+# instead of the CLAIM_REJECTED one it belongs in (winnow-2fj8u). An id plus a
+# status is the envelope actually arriving; the assignee is then free to be
+# empty and be judged on its merits below.
+#
+# Five tries with a rising backoff, not three at 1s: `gc` pays seconds of fixed
+# startup before any subcommand reaches Dolt, and this box has been observed at
+# load 44.91 while a polecat claimed. A budget that small turns ordinary
+# contention into a spurious release.
 STATUS=""
 ASSIGNEE=""
 SHOW_JSON=""
+SHOW_ID=""
 SHOW_OK=0
 SHOW_TRY=0
-while [ "$SHOW_TRY" -lt 3 ]; do
+while [ "$SHOW_TRY" -lt 5 ]; do
   SHOW_TRY=$((SHOW_TRY + 1))
   SHOW_JSON="$(gc bd show "$WORK_ID" --json 2>/dev/null)"
   SHOW_CODE=$?
+  SHOW_ID="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].id // empty' 2>/dev/null)"
   STATUS="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].status // empty' 2>/dev/null)"
   ASSIGNEE="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].assignee // empty' 2>/dev/null)"
-  if [ "$SHOW_CODE" -eq 0 ] && [ -n "$STATUS" ] && [ -n "$ASSIGNEE" ]; then
+  if [ "$SHOW_CODE" -eq 0 ] && [ -n "$SHOW_ID" ] && [ -n "$STATUS" ]; then
     SHOW_OK=1
     break
   fi
-  sleep 1
+  sleep "$SHOW_TRY"
 done
 if [ "$SHOW_OK" -ne 1 ]; then
   # Never leave a claimed bead stranded in_progress on an unreadable state:
@@ -243,6 +258,97 @@ if [ "$ASSIGNEE" != "$EXPECTED_ASSIGNEE" ] || [ "$STATUS" != "in_progress" ]; th
   exit 0
 fi
 
+STEP_REF="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].metadata."gc.step_ref" // empty' 2>/dev/null)"
+
+# GUARD_BEGIN live-owner
+# A clean claim is NOT proof the work is free. A formula STEP bead can be put
+# back in the pool while the session working it is alive and mid-task: gc's
+# ReleaseIfCurrent swaps status/assignee to open/'' in one Dolt transaction
+# ("gc: release bead <id> if current") and writes NO bd event, so the release is
+# invisible to every audit surface and the bead simply reappears as ordinary
+# unclaimed pool work. Observed on winnow-iaroy, released twice — 20:11:56Z and
+# 20:33:37Z on 2026-09-07 — while gastown__polecat-gc-8a4d held it and was
+# state=active, mid-sweep on a multi-minute evaluation. The pool then poured
+# gastown__polecat-gc-psfm onto it. Nothing in the machinery refused; the
+# duplicate declined by judgement, and had it not, it would have stomped a live
+# worktree. This block is that judgement made mechanical (gcp-mjjg).
+#
+# What makes the check possible is that the release only ever reaches the STEP.
+# The WORK bead carries no `gc.routed_to`, so it is not a release candidate and
+# its assignee survives as the durable record of who owns this molecule. Ask it.
+if [ -n "$STEP_REF" ]; then
+  # Same derivation the formula's own steps use: step -> molecule root ->
+  # convoy -> the convoy's single child. Never a bare or guessed id.
+  GUARD_ROOT="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].metadata."gc.root_bead_id" // empty' 2>/dev/null)"
+  GUARD_CONVOY=""
+  [ -n "$GUARD_ROOT" ] && GUARD_CONVOY="$(gc bd show "$GUARD_ROOT" --json 2>/dev/null |
+    jq -r '.[0].metadata."gc.input_convoy_id" // .[0].metadata."gc.var.convoy_id" // empty' 2>/dev/null)"
+  GUARD_WORK_BEAD=""
+  [ -n "$GUARD_CONVOY" ] && GUARD_WORK_BEAD="$(gc convoy status "$GUARD_CONVOY" --json 2>/dev/null |
+    jq -r 'if (.children | length) == 1 then .children[0].id else empty end' 2>/dev/null)"
+  GUARD_OWNER=""
+  GUARD_OWNER_SID=""
+  if [ -n "$GUARD_WORK_BEAD" ]; then
+    GUARD_WORK_JSON="$(gc bd show "$GUARD_WORK_BEAD" --json 2>/dev/null)"
+    GUARD_OWNER="$(printf '%s' "$GUARD_WORK_JSON" | jq -r '.[0].assignee // empty' 2>/dev/null)"
+    GUARD_OWNER_SID="$(printf '%s' "$GUARD_WORK_JSON" | jq -r '.[0].metadata."gc.session_id" // empty' 2>/dev/null)"
+  fi
+  if [ -z "$GUARD_WORK_BEAD" ] || [ -z "$GUARD_OWNER" ]; then
+    # An unresolvable or unowned molecule is not evidence of a duplicate pour.
+    # Proceed exactly as this block did before the guard existed.
+    echo "WARN live-owner guard could not resolve an owner for this molecule; proceeding unguarded"
+  elif [ "$GUARD_OWNER" != "$EXPECTED_ASSIGNEE" ]; then
+    # Someone else's name is on the molecule. Only a LIVE someone blocks: a pool
+    # restart mints a fresh session identity, so a DEAD prior owner on the work
+    # bead is the ordinary resume case and must not stall the engine. `gc
+    # session list` omits closed sessions by default, so a hit there is the
+    # liveness answer. asleep and draining count as alive — both still own their
+    # work and get woken back onto it.
+    GUARD_ALIVE=""
+    GUARD_LIST_OK=0
+    GUARD_TRY=0
+    while [ "$GUARD_TRY" -lt 3 ]; do
+      GUARD_TRY=$((GUARD_TRY + 1))
+      GUARD_LIST="$(gc session list --json 2>/dev/null)"
+      if printf '%s' "$GUARD_LIST" | jq -e 'has("sessions")' >/dev/null 2>&1; then
+        GUARD_LIST_OK=1
+        GUARD_ALIVE="$(printf '%s' "$GUARD_LIST" | jq -r --arg o "$GUARD_OWNER" \
+          '[.sessions[] | select(.closed != true)
+            | select(.session_name == $o or .id == $o or .name == $o or .alias == $o)]
+           | .[0].id // empty' 2>/dev/null)"
+        break
+      fi
+      sleep "$GUARD_TRY"
+    done
+    if [ "$GUARD_LIST_OK" -ne 1 ] || [ -n "$GUARD_ALIVE" ]; then
+      # Alive, or liveness unreadable. Unreadable is NOT evidence the owner is
+      # gone, and the two mistakes are not symmetric: declining costs one pool
+      # slot and the bead stays claimable, proceeding stomps a live worktree and
+      # corrupts whatever the owner is mid-write on. Fail closed.
+      echo "CLAIM_DECLINED_LIVE_OWNER $WORK_ID"
+      echo "  work bead $GUARD_WORK_BEAD is held by $GUARD_OWNER, and this session is $EXPECTED_ASSIGNEE."
+      if [ "$GUARD_LIST_OK" -ne 1 ]; then
+        echo "  session liveness was UNREADABLE after retries — declining rather than assuming the owner is gone."
+      else
+        echo "  that owner is live (session $GUARD_ALIVE). This is a duplicate pour onto an in-flight molecule."
+      fi
+      echo "  Restoring the step to its owner and draining. No code, branch, or worktree touched."
+      gc bd update "$WORK_ID" --assignee="$GUARD_OWNER" \
+        --set-metadata gc.session_name="$GUARD_OWNER" \
+        --set-metadata polecat_session="$GUARD_OWNER" \
+        ${GUARD_OWNER_SID:+--set-metadata gc.session_id="$GUARD_OWNER_SID"} \
+        || echo "WARN could not restore $WORK_ID to $GUARD_OWNER — the step is left claimed by a session that will not run it; escalate to the witness"
+      gc session nudge "${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}witness" \
+        "DUPLICATE_POUR declined: step $WORK_ID poured onto $EXPECTED_ASSIGNEE while work bead $GUARD_WORK_BEAD is held by $GUARD_OWNER. Step restored to its owner." \
+        >/dev/null 2>&1 || true
+      gc runtime drain-ack
+      exit 0
+    fi
+    echo "WARN work bead $GUARD_WORK_BEAD still names $GUARD_OWNER, but no live session holds that identity — treating this as a resume and proceeding."
+  fi
+fi
+# GUARD_END live-owner
+
 # Ownership confirmed. Now make sure this is a STEP, not the work bead itself.
 # mol-polecat-work claims the WORK bead for the whole run (status=in_progress,
 # assignee=this session) so it stops sitting in `gc bd ready` where a second sling
@@ -254,8 +360,8 @@ fi
 # skips self-review and submit-and-exit, and the branch is never pushed. When
 # the hook returns a bead carrying no `gc.step_ref`, re-point at the molecule's
 # next ready step. (gcp-tl8 is the same shape on the refinery: a held work bead
-# resumed as the patrol wisp on every restart.)
-STEP_REF="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].metadata."gc.step_ref" // empty' 2>/dev/null)"
+# resumed as the patrol wisp on every restart.) `STEP_REF` was read above, for
+# the live-owner guard.
 if [ -z "$STEP_REF" ]; then
   # An in-flight step comes first. `gc bd ready` is blocker-aware but EXCLUDES
   # in_progress, so it cannot see a step this session already claimed — and the
@@ -298,11 +404,23 @@ printf '%s' "$SHOW_JSON" | jq '.[0].metadata'
 GC_CLAIM
 ```
 
-If the block prints `NO_ROUTED_WORK`, `CLAIM_REJECTED`, or `CLAIM_RELEASED`, it
+If the block prints `NO_ROUTED_WORK`, `CLAIM_REJECTED`, `CLAIM_RELEASED`, or
+`CLAIM_DECLINED_LIVE_OWNER`, it
 has already drain-acked — stop and exit. Only after it prints `CLAIMED_BEAD_ID` do you read
 formula steps and begin. The claim checks assigned work first (session bead ID,
 runtime session name, then alias) and only falls through to unassigned pool work
 routed to `${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat`.
+
+`CLAIM_DECLINED_LIVE_OWNER` means the claim itself was clean — the step bead was
+genuinely open and unassigned when you took it — but the molecule's WORK bead is
+still held by a DIFFERENT session that is still alive. That is a duplicate pour,
+not a handoff, and a clean claim cannot distinguish the two on its own: a step
+bead released out from under a live owner is byte-identical to one that was
+never claimed. The work bead is the tiebreaker because it is never routed to the
+pool and so is never released. Declining costs one pool slot; proceeding stomps
+a live worktree, so the guard also declines when session liveness is unreadable.
+Do NOT re-run the claim to get a different answer, and do NOT work the bead
+anyway — the block has already restored the step to its owner and drained.
 
 `STEP_REPOINTED` is not a bail-out and never drain-acks. It means the assigned
 tier handed back this session's own in-flight WORK bead — which
