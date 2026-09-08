@@ -237,7 +237,7 @@ test_claim_refuses_a_pour_onto_a_live_owner() {
     [[ -n "$guard_line" && -n "$stamp_line" && "$guard_line" -lt "$stamp_line" ]] ||
         fail "live-owner guard must run before the claim block stamps polecat_session"
 
-    grep -F 'CLAIM_DECLINED_LIVE_OWNER`, it' "$prompt" >/dev/null ||
+    grep -F '`CLAIM_DECLINED_LIVE_OWNER`, it has already drain-acked' "$prompt" >/dev/null ||
         fail "the prose listing drain-acked claim outcomes must name CLAIM_DECLINED_LIVE_OWNER"
 }
 

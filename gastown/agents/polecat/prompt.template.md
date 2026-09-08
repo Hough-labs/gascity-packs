@@ -177,6 +177,10 @@ while [ "$CLAIM_TRY" -lt 3 ]; do
   rm -f "$CLAIM_ERR"
   ACTION="$(printf '%s' "$CLAIM_JSON" | jq -r '.action // empty' 2>/dev/null)"
   WORK_ID="$(printf '%s' "$CLAIM_JSON" | jq -r '.bead_id // empty' 2>/dev/null)"
+  # `claimed` means this bead was open and UNASSIGNED and we took it out of the
+  # pool. `existing_assignment` / `ready_assignment` mean it already carried our
+  # identity. The live-owner guard below only has to run in the first case.
+  CLAIM_REASON="$(printf '%s' "$CLAIM_JSON" | jq -r '.reason // empty' 2>/dev/null)"
   if [ "$ACTION" = "drain" ]; then
     echo "NO_ROUTED_WORK"
     gc runtime drain-ack
@@ -276,7 +280,14 @@ STEP_REF="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].metadata."gc.step_ref" // emp
 # What makes the check possible is that the release only ever reaches the STEP.
 # The WORK bead carries no `gc.routed_to`, so it is not a release candidate and
 # its assignee survives as the durable record of who owns this molecule. Ask it.
-if [ -n "$STEP_REF" ]; then
+#
+# Only a `claimed` reason can be a duplicate pour. `existing_assignment` and
+# `ready_assignment` mean the bead already carried this session's identity
+# before the hook ran, and the release clears the assignee — so a released bead
+# can never reach us by those tiers. Skipping them keeps three `gc` round-trips
+# off the ordinary step-to-step path, where a molecule's own preassigned steps
+# come back as `ready_assignment` every time. An unknown reason still checks.
+if [ -n "$STEP_REF" ] && { [ -z "$CLAIM_REASON" ] || [ "$CLAIM_REASON" = "claimed" ]; }; then
   # Same derivation the formula's own steps use: step -> molecule root ->
   # convoy -> the convoy's single child. Never a bare or guessed id.
   GUARD_ROOT="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].metadata."gc.root_bead_id" // empty' 2>/dev/null)"
@@ -333,10 +344,14 @@ if [ -n "$STEP_REF" ]; then
         echo "  that owner is live (session $GUARD_ALIVE). This is a duplicate pour onto an in-flight molecule."
       fi
       echo "  Restoring the step to its owner and draining. No code, branch, or worktree touched."
+      # The hook stamped OUR gc.session_id/gc.session_name onto the step during
+      # the claim. Put the owner's back. When the owner's session id cannot be
+      # read, clear the key rather than leave ours standing — a wrong binding
+      # is worse than an absent one, and the owner's next write restores it.
       gc bd update "$WORK_ID" --assignee="$GUARD_OWNER" \
         --set-metadata gc.session_name="$GUARD_OWNER" \
         --set-metadata polecat_session="$GUARD_OWNER" \
-        ${GUARD_OWNER_SID:+--set-metadata gc.session_id="$GUARD_OWNER_SID"} \
+        --set-metadata gc.session_id="$GUARD_OWNER_SID" \
         || echo "WARN could not restore $WORK_ID to $GUARD_OWNER — the step is left claimed by a session that will not run it; escalate to the witness"
       gc session nudge "${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}witness" \
         "DUPLICATE_POUR declined: step $WORK_ID poured onto $EXPECTED_ASSIGNEE while work bead $GUARD_WORK_BEAD is held by $GUARD_OWNER. Step restored to its owner." \
@@ -405,8 +420,8 @@ GC_CLAIM
 ```
 
 If the block prints `NO_ROUTED_WORK`, `CLAIM_REJECTED`, `CLAIM_RELEASED`, or
-`CLAIM_DECLINED_LIVE_OWNER`, it
-has already drain-acked — stop and exit. Only after it prints `CLAIMED_BEAD_ID` do you read
+`CLAIM_DECLINED_LIVE_OWNER`, it has already drain-acked — stop and exit.
+Only after it prints `CLAIMED_BEAD_ID` do you read
 formula steps and begin. The claim checks assigned work first (session bead ID,
 runtime session name, then alias) and only falls through to unassigned pool work
 routed to `${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat`.
