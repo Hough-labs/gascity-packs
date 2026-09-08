@@ -1,0 +1,591 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Mon, 7 Sep 2026 21:34:26 -0400
+Subject: [PATCH 85/85] fix(polecat): refuse a claim onto a molecule a live
+ session still holds (gcp-mjjg)
+
+A `mol-polecat-work` implement step can be returned to the pool while the
+session working it is alive and mid-task, and until now nothing refused the
+duplicate that followed. On 2026-09-07 winnow-iaroy was released twice --
+20:11:56.506Z and 20:33:37.970Z -- while gastown__polecat-gc-8a4d held the
+molecule and was state=active, mid-sweep over multi-minute retrieval
+evaluations. The pool then spawned gastown__polecat-gc-psfm, whose hook claim
+succeeded cleanly at 20:37:51Z. Work survived only because that second polecat
+recognised the race and backed off; had it implemented, it would have stomped a
+live worktree or corrupted a concurrent history.jsonl write.
+
+The releaser is gc's NativeDoltStore.ReleaseIfCurrent: both releases are Dolt
+commits carrying its literal transaction message, `gc: release bead
+winnow-iaroy if current`, and it is the only path in gascity@aff678389 that
+emits that string. It swaps status/assignee inside one transaction and writes
+no bd `events` row, so the release is invisible to every audit surface a
+witness reads -- which is exactly why the incident report could not name it.
+The hypothesised culprit, this prompt's own claim-verify release, is ruled out:
+that path writes via `gc bd update`, which commits as `bd: update` under the
+polecat's actor and does record an event. Neither release commit has either
+property. Full evidence is on the bead; the gc-side defect is filed separately,
+since it cannot be fixed from this pack.
+
+What makes a pack-side guard possible is the shape of the blast radius. The
+release only ever reaches the STEP bead: the work bead carries no
+`gc.routed_to` and so is never a release candidate, and the sibling steps were
+dependency-blocked and never entered a ready snapshot. The work bead's assignee
+therefore survives as the one durable record of who owns the molecule. The
+guard walks step -> molecule root -> convoy -> work bead and consults it before
+any work begins, declining when a DIFFERENT session holds it and that session
+is still live. A dead prior owner is the ordinary post-restart resume (pool
+restarts mint a new identity) and must not stall the engine, so only liveness
+blocks -- and unreadable liveness declines too, because the two mistakes are
+not symmetric: declining costs one pool slot, proceeding stomps a live
+worktree. A declining polecat restores the step to its owner, nudges the
+witness, and drains without touching code, branch, or worktree.
+
+Also fixes the read-success test the incident report flagged independently:
+SHOW_OK required a non-empty assignee, but `gc bd show` omits the field
+entirely when null, so "read fine, genuinely unassigned" and "read failed" were
+one observation and a readable unassigned bead took the CLAIM_RELEASED path
+instead of CLAIM_REJECTED. It now keys on the bead echoing its own id, and the
+retry budget goes from 3 tries at 1s to 5 with a rising backoff -- `gc` pays
+seconds of startup before reaching Dolt, and the box was at load 44.91.
+
+Validation: test_polecat_live_owner_guard.sh extracts the guard verbatim from
+the prompt and runs it against a stubbed gc over seven cases, including the
+incident replayed with its real bead and session ids. Verified RED by
+neutering the liveness decision (the live-owner case then falls through to the
+work) before confirming GREEN. Full pack suite, `go vet`, `go build`,
+`go test ./...`, validate_registry.py --require-git, and the Python pack suite
+all pass.
+
+Follow-up: the gascity-side defect -- ReleaseIfCurrent reaching a bead whose
+owner is demonstrably alive, and doing so without an audit event -- is filed
+against gascity and cross-referenced from gcp-544r, gcp-cvbs and gcp-xomt,
+which share the shape but have distinct triggers.
+---
+ gastown/agents/polecat/prompt.template.md     | 130 ++++++++-
+ gastown/tests/test_gastown_pack_assets.sh     |  56 +++-
+ .../tests/test_polecat_live_owner_guard.sh    | 252 ++++++++++++++++++
+ 3 files changed, 431 insertions(+), 7 deletions(-)
+ create mode 100755 gastown/tests/test_polecat_live_owner_guard.sh
+
+diff --git a/gastown/agents/polecat/prompt.template.md b/gastown/agents/polecat/prompt.template.md
+index b4f2679..5686adf 100644
+--- a/gastown/agents/polecat/prompt.template.md
++++ b/gastown/agents/polecat/prompt.template.md
+@@ -206,22 +206,37 @@ fi
+ # transient) from a genuine MISMATCH (non-empty assignee that differs, or
+ # status not in_progress). Retry the read before deciding; only a genuine
+ # mismatch is CLAIM_REJECTED.
++#
++# The read-success test keys on the bead ECHOING ITS OWN ID, never on a
++# non-empty assignee: `gc bd show` omits `assignee` entirely when it is null, so
++# requiring it conflated "read fine, genuinely unassigned" with "read failed"
++# and sent a perfectly readable unassigned bead down the CLAIM_RELEASED path
++# instead of the CLAIM_REJECTED one it belongs in (winnow-2fj8u). An id plus a
++# status is the envelope actually arriving; the assignee is then free to be
++# empty and be judged on its merits below.
++#
++# Five tries with a rising backoff, not three at 1s: `gc` pays seconds of fixed
++# startup before any subcommand reaches Dolt, and this box has been observed at
++# load 44.91 while a polecat claimed. A budget that small turns ordinary
++# contention into a spurious release.
+ STATUS=""
+ ASSIGNEE=""
+ SHOW_JSON=""
++SHOW_ID=""
+ SHOW_OK=0
+ SHOW_TRY=0
+-while [ "$SHOW_TRY" -lt 3 ]; do
++while [ "$SHOW_TRY" -lt 5 ]; do
+   SHOW_TRY=$((SHOW_TRY + 1))
+   SHOW_JSON="$(gc bd show "$WORK_ID" --json 2>/dev/null)"
+   SHOW_CODE=$?
++  SHOW_ID="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].id // empty' 2>/dev/null)"
+   STATUS="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].status // empty' 2>/dev/null)"
+   ASSIGNEE="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].assignee // empty' 2>/dev/null)"
+-  if [ "$SHOW_CODE" -eq 0 ] && [ -n "$STATUS" ] && [ -n "$ASSIGNEE" ]; then
++  if [ "$SHOW_CODE" -eq 0 ] && [ -n "$SHOW_ID" ] && [ -n "$STATUS" ]; then
+     SHOW_OK=1
+     break
+   fi
+-  sleep 1
++  sleep "$SHOW_TRY"
+ done
+ if [ "$SHOW_OK" -ne 1 ]; then
+   # Never leave a claimed bead stranded in_progress on an unreadable state:
+@@ -243,6 +258,97 @@ if [ "$ASSIGNEE" != "$EXPECTED_ASSIGNEE" ] || [ "$STATUS" != "in_progress" ]; th
+   exit 0
+ fi
+ 
++STEP_REF="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].metadata."gc.step_ref" // empty' 2>/dev/null)"
++
++# GUARD_BEGIN live-owner
++# A clean claim is NOT proof the work is free. A formula STEP bead can be put
++# back in the pool while the session working it is alive and mid-task: gc's
++# ReleaseIfCurrent swaps status/assignee to open/'' in one Dolt transaction
++# ("gc: release bead <id> if current") and writes NO bd event, so the release is
++# invisible to every audit surface and the bead simply reappears as ordinary
++# unclaimed pool work. Observed on winnow-iaroy, released twice — 20:11:56Z and
++# 20:33:37Z on 2026-09-07 — while gastown__polecat-gc-8a4d held it and was
++# state=active, mid-sweep on a multi-minute evaluation. The pool then poured
++# gastown__polecat-gc-psfm onto it. Nothing in the machinery refused; the
++# duplicate declined by judgement, and had it not, it would have stomped a live
++# worktree. This block is that judgement made mechanical (gcp-mjjg).
++#
++# What makes the check possible is that the release only ever reaches the STEP.
++# The WORK bead carries no `gc.routed_to`, so it is not a release candidate and
++# its assignee survives as the durable record of who owns this molecule. Ask it.
++if [ -n "$STEP_REF" ]; then
++  # Same derivation the formula's own steps use: step -> molecule root ->
++  # convoy -> the convoy's single child. Never a bare or guessed id.
++  GUARD_ROOT="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].metadata."gc.root_bead_id" // empty' 2>/dev/null)"
++  GUARD_CONVOY=""
++  [ -n "$GUARD_ROOT" ] && GUARD_CONVOY="$(gc bd show "$GUARD_ROOT" --json 2>/dev/null |
++    jq -r '.[0].metadata."gc.input_convoy_id" // .[0].metadata."gc.var.convoy_id" // empty' 2>/dev/null)"
++  GUARD_WORK_BEAD=""
++  [ -n "$GUARD_CONVOY" ] && GUARD_WORK_BEAD="$(gc convoy status "$GUARD_CONVOY" --json 2>/dev/null |
++    jq -r 'if (.children | length) == 1 then .children[0].id else empty end' 2>/dev/null)"
++  GUARD_OWNER=""
++  GUARD_OWNER_SID=""
++  if [ -n "$GUARD_WORK_BEAD" ]; then
++    GUARD_WORK_JSON="$(gc bd show "$GUARD_WORK_BEAD" --json 2>/dev/null)"
++    GUARD_OWNER="$(printf '%s' "$GUARD_WORK_JSON" | jq -r '.[0].assignee // empty' 2>/dev/null)"
++    GUARD_OWNER_SID="$(printf '%s' "$GUARD_WORK_JSON" | jq -r '.[0].metadata."gc.session_id" // empty' 2>/dev/null)"
++  fi
++  if [ -z "$GUARD_WORK_BEAD" ] || [ -z "$GUARD_OWNER" ]; then
++    # An unresolvable or unowned molecule is not evidence of a duplicate pour.
++    # Proceed exactly as this block did before the guard existed.
++    echo "WARN live-owner guard could not resolve an owner for this molecule; proceeding unguarded"
++  elif [ "$GUARD_OWNER" != "$EXPECTED_ASSIGNEE" ]; then
++    # Someone else's name is on the molecule. Only a LIVE someone blocks: a pool
++    # restart mints a fresh session identity, so a DEAD prior owner on the work
++    # bead is the ordinary resume case and must not stall the engine. `gc
++    # session list` omits closed sessions by default, so a hit there is the
++    # liveness answer. asleep and draining count as alive — both still own their
++    # work and get woken back onto it.
++    GUARD_ALIVE=""
++    GUARD_LIST_OK=0
++    GUARD_TRY=0
++    while [ "$GUARD_TRY" -lt 3 ]; do
++      GUARD_TRY=$((GUARD_TRY + 1))
++      GUARD_LIST="$(gc session list --json 2>/dev/null)"
++      if printf '%s' "$GUARD_LIST" | jq -e 'has("sessions")' >/dev/null 2>&1; then
++        GUARD_LIST_OK=1
++        GUARD_ALIVE="$(printf '%s' "$GUARD_LIST" | jq -r --arg o "$GUARD_OWNER" \
++          '[.sessions[] | select(.closed != true)
++            | select(.session_name == $o or .id == $o or .name == $o or .alias == $o)]
++           | .[0].id // empty' 2>/dev/null)"
++        break
++      fi
++      sleep "$GUARD_TRY"
++    done
++    if [ "$GUARD_LIST_OK" -ne 1 ] || [ -n "$GUARD_ALIVE" ]; then
++      # Alive, or liveness unreadable. Unreadable is NOT evidence the owner is
++      # gone, and the two mistakes are not symmetric: declining costs one pool
++      # slot and the bead stays claimable, proceeding stomps a live worktree and
++      # corrupts whatever the owner is mid-write on. Fail closed.
++      echo "CLAIM_DECLINED_LIVE_OWNER $WORK_ID"
++      echo "  work bead $GUARD_WORK_BEAD is held by $GUARD_OWNER, and this session is $EXPECTED_ASSIGNEE."
++      if [ "$GUARD_LIST_OK" -ne 1 ]; then
++        echo "  session liveness was UNREADABLE after retries — declining rather than assuming the owner is gone."
++      else
++        echo "  that owner is live (session $GUARD_ALIVE). This is a duplicate pour onto an in-flight molecule."
++      fi
++      echo "  Restoring the step to its owner and draining. No code, branch, or worktree touched."
++      gc bd update "$WORK_ID" --assignee="$GUARD_OWNER" \
++        --set-metadata gc.session_name="$GUARD_OWNER" \
++        --set-metadata polecat_session="$GUARD_OWNER" \
++        ${GUARD_OWNER_SID:+--set-metadata gc.session_id="$GUARD_OWNER_SID"} \
++        || echo "WARN could not restore $WORK_ID to $GUARD_OWNER — the step is left claimed by a session that will not run it; escalate to the witness"
++      gc session nudge "${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}witness" \
++        "DUPLICATE_POUR declined: step $WORK_ID poured onto $EXPECTED_ASSIGNEE while work bead $GUARD_WORK_BEAD is held by $GUARD_OWNER. Step restored to its owner." \
++        >/dev/null 2>&1 || true
++      gc runtime drain-ack
++      exit 0
++    fi
++    echo "WARN work bead $GUARD_WORK_BEAD still names $GUARD_OWNER, but no live session holds that identity — treating this as a resume and proceeding."
++  fi
++fi
++# GUARD_END live-owner
++
+ # Ownership confirmed. Now make sure this is a STEP, not the work bead itself.
+ # mol-polecat-work claims the WORK bead for the whole run (status=in_progress,
+ # assignee=this session) so it stops sitting in `gc bd ready` where a second sling
+@@ -254,8 +360,8 @@ fi
+ # skips self-review and submit-and-exit, and the branch is never pushed. When
+ # the hook returns a bead carrying no `gc.step_ref`, re-point at the molecule's
+ # next ready step. (gcp-tl8 is the same shape on the refinery: a held work bead
+-# resumed as the patrol wisp on every restart.)
+-STEP_REF="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].metadata."gc.step_ref" // empty' 2>/dev/null)"
++# resumed as the patrol wisp on every restart.) `STEP_REF` was read above, for
++# the live-owner guard.
+ if [ -z "$STEP_REF" ]; then
+   # An in-flight step comes first. `gc bd ready` is blocker-aware but EXCLUDES
+   # in_progress, so it cannot see a step this session already claimed — and the
+@@ -298,12 +404,24 @@ printf '%s' "$SHOW_JSON" | jq '.[0].metadata'
+ GC_CLAIM
+ ```
+ 
+-If the block prints `NO_ROUTED_WORK`, `CLAIM_REJECTED`, or `CLAIM_RELEASED`, it
++If the block prints `NO_ROUTED_WORK`, `CLAIM_REJECTED`, `CLAIM_RELEASED`, or
++`CLAIM_DECLINED_LIVE_OWNER`, it
+ has already drain-acked — stop and exit. Only after it prints `CLAIMED_BEAD_ID` do you read
+ formula steps and begin. The claim checks assigned work first (session bead ID,
+ runtime session name, then alias) and only falls through to unassigned pool work
+ routed to `${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat`.
+ 
++`CLAIM_DECLINED_LIVE_OWNER` means the claim itself was clean — the step bead was
++genuinely open and unassigned when you took it — but the molecule's WORK bead is
++still held by a DIFFERENT session that is still alive. That is a duplicate pour,
++not a handoff, and a clean claim cannot distinguish the two on its own: a step
++bead released out from under a live owner is byte-identical to one that was
++never claimed. The work bead is the tiebreaker because it is never routed to the
++pool and so is never released. Declining costs one pool slot; proceeding stomps
++a live worktree, so the guard also declines when session liveness is unreadable.
++Do NOT re-run the claim to get a different answer, and do NOT work the bead
++anyway — the block has already restored the step to its owner and drained.
++
+ `STEP_REPOINTED` is not a bail-out and never drain-acks. It means the assigned
+ tier handed back this session's own in-flight WORK bead — which
+ `mol-polecat-work` holds `in_progress` for the whole run, so a second sling
+diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
+index 430db6f..e588d4b 100755
+--- a/gastown/tests/test_gastown_pack_assets.sh
++++ b/gastown/tests/test_gastown_pack_assets.sh
+@@ -193,6 +193,54 @@ test_polecat_startup_uses_standard_hook_claim() {
+         fail "polecat propulsion fragment must not regress to an unclaimed hook/work-query choice"
+ }
+ 
++test_claim_verify_separates_read_failure_from_unassigned() {
++    # winnow-2fj8u: SHOW_OK required a NON-EMPTY assignee, but `gc bd show` omits
++    # the field entirely when it is null. "Read fine, genuinely unassigned" and
++    # "read failed" were therefore the same observation, and a readable
++    # unassigned bead took the CLAIM_RELEASED path instead of CLAIM_REJECTED.
++    # Key read-success on the bead echoing its own id, never on the assignee.
++    local prompt="$GASTOWN/agents/polecat/prompt.template.md"
++
++    grep -F 'SHOW_ID="$(printf '"'"'%s'"'"' "$SHOW_JSON" | jq -r '"'"'.[0].id // empty'"'"' 2>/dev/null)"' "$prompt" >/dev/null ||
++        fail "claim-verify must read the bead id to prove the show succeeded"
++    grep -F 'if [ "$SHOW_CODE" -eq 0 ] && [ -n "$SHOW_ID" ] && [ -n "$STATUS" ]; then' "$prompt" >/dev/null ||
++        fail "claim-verify read-success test must not depend on a non-empty assignee"
++    ! grep -F '[ -n "$STATUS" ] && [ -n "$ASSIGNEE" ]' "$prompt" >/dev/null ||
++        fail "claim-verify regressed to conflating an unassigned bead with a failed read"
++}
++
++test_claim_refuses_a_pour_onto_a_live_owner() {
++    # gcp-mjjg: gc's ReleaseIfCurrent returns an in-flight step bead to the pool
++    # without writing a bd event, so a duplicate pour is indistinguishable from
++    # ordinary unclaimed work at claim time. The molecule's WORK bead carries no
++    # gc.routed_to and so is never released — it is the only durable record of
++    # who owns the molecule, and the guard must consult it before any work
++    # begins. Behavioural coverage lives in test_polecat_live_owner_guard.sh;
++    # this pins the guard into the startup contract so it cannot be quietly
++    # dropped from the claim block.
++    local prompt="$GASTOWN/agents/polecat/prompt.template.md"
++
++    grep -F '# GUARD_BEGIN live-owner' "$prompt" >/dev/null ||
++        fail "polecat claim block lost the live-owner guard"
++    grep -F '# GUARD_END live-owner' "$prompt" >/dev/null ||
++        fail "live-owner guard is missing its extraction sentinel"
++    grep -F 'CLAIM_DECLINED_LIVE_OWNER' "$prompt" >/dev/null ||
++        fail "live-owner guard must announce its refusal with a distinct token"
++    grep -F 'gc session list --json' "$prompt" >/dev/null ||
++        fail "live-owner guard must probe session liveness, not assume it"
++
++    # The guard runs BEFORE the step re-point and the polecat_session stamp:
++    # both mutate bead state, and a declining polecat must touch nothing.
++    local guard_line stamp_line
++    guard_line=$(grep -n '# GUARD_END live-owner' "$prompt" | head -1 | cut -d: -f1)
++    stamp_line=$(grep -n 'set-metadata polecat_session="\$EXPECTED_ASSIGNEE"' "$prompt" | head -1 | cut -d: -f1)
++    [[ -n "$guard_line" && -n "$stamp_line" && "$guard_line" -lt "$stamp_line" ]] ||
++        fail "live-owner guard must run before the claim block stamps polecat_session"
++
++    grep -F 'CLAIM_DECLINED_LIVE_OWNER`, it' "$prompt" >/dev/null ||
++        fail "the prose listing drain-acked claim outcomes must name CLAIM_DECLINED_LIVE_OWNER"
++}
++
+ test_review_leg_contract_forbids_synthetic_mutation() {
+     local formula prompt
+     formula="$GASTOWN/formulas/mol-review-leg.toml"
+@@ -907,7 +955,11 @@ text = open(sys.argv[1], encoding="utf-8").read()
+ block = text[text.index("bash <<'GC_CLAIM'"): text.index("GC_CLAIM\n```")]
+ if "STEP_REPOINTED" not in block:
+     raise SystemExit(1)
+-if block.index("STEP_REPOINTED") >= block.index('--set-metadata polecat_session='):
++# Match the STAMP precisely, not any polecat_session write: the live-owner
++# guard also writes that key when it restores a step to its owner, and that
++# write legitimately precedes the re-point (a declining polecat never reaches
++# it). The stamp is the one that names THIS session.
++if block.index("STEP_REPOINTED") >= block.index('--set-metadata polecat_session="$EXPECTED_ASSIGNEE"'):
+     raise SystemExit(1)
+ PY
+ 
+@@ -938,6 +990,8 @@ test_shutdown_dance_contracts_are_executable
+ test_shutdown_dance_lifecycle_and_audit_contracts
+ test_composition_is_documented
+ test_polecat_startup_uses_standard_hook_claim
++test_claim_verify_separates_read_failure_from_unassigned
++test_claim_refuses_a_pour_onto_a_live_owner
+ test_review_leg_contract_forbids_synthetic_mutation
+ test_refinery_direct_merge_is_worktree_safe_and_fail_closed
+ 
+diff --git a/gastown/tests/test_polecat_live_owner_guard.sh b/gastown/tests/test_polecat_live_owner_guard.sh
+new file mode 100755
+index 0000000..0270565
+--- /dev/null
++++ b/gastown/tests/test_polecat_live_owner_guard.sh
+@@ -0,0 +1,252 @@
++#!/usr/bin/env bash
++# Executable reproduction of the duplicate pour in gcp-mjjg / winnow-2fj8u.
++#
++# On 2026-09-07 gc's ReleaseIfCurrent put the in-flight `mol-polecat-work`
++# implement step winnow-iaroy back in the pool TWICE (20:11:56Z and 20:33:37Z)
++# while gastown__polecat-gc-8a4d held the molecule and was state=active. The
++# release writes no bd event, so to the next polecat the bead was
++# indistinguishable from ordinary unclaimed work: gastown__polecat-gc-psfm
++# claimed it cleanly at 20:37:51Z. Nothing in the machinery refused — the
++# duplicate backed off because it happened to notice.
++#
++# These tests run the live-owner guard out of the polecat prompt's claim block
++# against a stubbed `gc` and assert that the refusal is now mechanical: a live
++# owner is declined and the step restored, a dead owner is not (that is the
++# ordinary post-restart resume, and stalling it would stall the engine).
++set -euo pipefail
++
++ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
++PROMPT="$ROOT/gastown/agents/polecat/prompt.template.md"
++
++fail() {
++    echo "FAIL: $*" >&2
++    exit 1
++}
++
++# extract_guard pulls the guard verbatim out of the prompt template, so the code
++# under test is the code that ships. A drifted or deleted guard fails here
++# rather than passing against a stale copy.
++extract_guard() {
++    local out="$1"
++    awk '/^# GUARD_BEGIN live-owner$/{f=1} /^# GUARD_END live-owner$/{f=0} f' "$PROMPT" >"$out"
++    [[ -s "$out" ]] || fail "could not extract the live-owner guard from $PROMPT"
++    grep -F 'CLAIM_DECLINED_LIVE_OWNER' "$out" >/dev/null ||
++        fail "extracted guard does not contain the decline path"
++    bash -n "$out" || fail "extracted guard is not valid shell"
++}
++
++# write_gc_stub answers only the reads and writes the guard makes, and records
++# every mutation so a test can assert on what the guard did, not just on what it
++# printed.
++write_gc_stub() {
++    local bin="$1"
++    mkdir -p "$bin"
++    cat >"$bin/gc" <<'SH'
++#!/usr/bin/env bash
++printf '%s\n' "$*" >>"$GC_CALLS"
++case "$1 $2" in
++    "bd show")
++        case "$3" in
++            "$GC_ROOT_BEAD") cat "$GC_ROOT_JSON" ;;
++            "$GC_WORK_BEAD") cat "$GC_WORK_JSON" ;;
++            *) printf '[]' ;;
++        esac
++        ;;
++    "convoy status") cat "$GC_CONVOY_JSON" ;;
++    "session list") cat "$GC_SESSIONS_JSON" ;;
++    "bd update") exit "${GC_UPDATE_EXIT:-0}" ;;
++    "session nudge") ;;
++    "runtime drain-ack") ;;
++    *) ;;
++esac
++SH
++    chmod +x "$bin/gc"
++}
++
++# run_guard executes the guard with the claim block's inputs already bound, then
++# echoes GUARD_PROCEEDED. A decline exits before that marker, so its absence is
++# the assertion that the polecat never reached the work.
++run_guard() {
++    local dir="$1" owner_assignee="$2" me="$3" step_ref="${4-mol-polecat-work.implement}"
++    local root_meta="${5-\"gc.root_bead_id\":\"winnow-5azcp\",}"
++
++    cat >"$dir/root.json" <<'JSON'
++[{"id":"winnow-5azcp","status":"in_progress","metadata":{"gc.input_convoy_id":"winnow-0inqp"}}]
++JSON
++    cat >"$dir/convoy.json" <<'JSON'
++{"children":[{"id":"winnow-pcpn6","status":"in_progress"}]}
++JSON
++    cat >"$dir/work.json" <<JSON
++[{"id":"winnow-pcpn6","status":"in_progress","assignee":"$owner_assignee","metadata":{"gc.session_id":"gc-8a4d"}}]
++JSON
++    cat >"$dir/guard-harness.sh" <<HARNESS
++WORK_ID="winnow-iaroy"
++EXPECTED_ASSIGNEE="$me"
++STEP_REF="$step_ref"
++SHOW_JSON='[{"id":"winnow-iaroy","status":"in_progress","assignee":"$me","metadata":{${root_meta}"gc.step_ref":"$step_ref"}}]'
++GC_RIG="winnow"
++HARNESS
++    cat "$dir/guard.sh" >>"$dir/guard-harness.sh"
++    echo 'echo GUARD_PROCEEDED' >>"$dir/guard-harness.sh"
++
++    GC_CALLS="$dir/calls.log" \
++        GC_ROOT_BEAD="winnow-5azcp" GC_ROOT_JSON="$dir/root.json" \
++        GC_WORK_BEAD="winnow-pcpn6" GC_WORK_JSON="$dir/work.json" \
++        GC_CONVOY_JSON="$dir/convoy.json" GC_SESSIONS_JSON="$dir/sessions.json" \
++        PATH="$dir/bin:$PATH" bash "$dir/guard-harness.sh"
++}
++
++new_case() {
++    local dir
++    dir=$(mktemp -d)
++    mkdir -p "$dir/bin"
++    write_gc_stub "$dir/bin"
++    extract_guard "$dir/guard.sh"
++    : >"$dir/calls.log"
++    printf '%s' "$dir"
++}
++
++live_sessions() {
++    cat >"$1/sessions.json" <<'JSON'
++{"sessions":[
++  {"id":"gc-8a4d","name":"winnow/gastown.furiosa","session_name":"gastown__polecat-gc-8a4d","alias":"winnow/gastown.furiosa","state":"active","closed":false},
++  {"id":"gc-psfm","name":"winnow/gastown.nux","session_name":"gastown__polecat-gc-psfm","alias":"winnow/gastown.nux","state":"active","closed":false}
++]}
++JSON
++}
++
++test_live_owner_is_declined_and_the_step_restored() {
++    local dir out
++    dir=$(new_case)
++    live_sessions "$dir"
++
++    # The incident, exactly: nux/gc-psfm holds a clean claim on the implement
++    # step while furiosa/gc-8a4d still holds the work bead and is active.
++    out=$(run_guard "$dir" "gastown__polecat-gc-8a4d" "gastown__polecat-gc-psfm")
++
++    grep -F 'CLAIM_DECLINED_LIVE_OWNER winnow-iaroy' <<<"$out" >/dev/null ||
++        fail "a duplicate pour onto a LIVE owner was not declined: $out"
++    grep -F 'that owner is live (session gc-8a4d)' <<<"$out" >/dev/null ||
++        fail "decline did not name the live owning session: $out"
++    ! grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null ||
++        fail "guard declined but still fell through to the work"
++
++    grep -F 'bd update winnow-iaroy --assignee=gastown__polecat-gc-8a4d' "$dir/calls.log" >/dev/null ||
++        fail "declining polecat did not restore the step to its owner"
++    grep -F -- '--set-metadata gc.session_id=gc-8a4d' "$dir/calls.log" >/dev/null ||
++        fail "declining polecat did not restore the owner's session binding"
++    grep -F 'runtime drain-ack' "$dir/calls.log" >/dev/null ||
++        fail "declining polecat did not drain"
++    grep -F 'session nudge winnow/{{ .BindingPrefix }}witness' "$dir/calls.log" >/dev/null ||
++        fail "declining polecat did not report the duplicate pour to the witness"
++}
++
++test_dead_owner_is_a_resume_and_proceeds() {
++    local dir out
++    dir=$(new_case)
++    # gc-8a4d is gone; `gc session list` omits closed sessions, so it is simply
++    # absent. A pool restart mints a new identity, so this is the ORDINARY
++    # resume and blocking it would stall every restarted molecule.
++    cat >"$dir/sessions.json" <<'JSON'
++{"sessions":[{"id":"gc-psfm","name":"winnow/gastown.nux","session_name":"gastown__polecat-gc-psfm","state":"active","closed":false}]}
++JSON
++
++    out=$(run_guard "$dir" "gastown__polecat-gc-8a4d" "gastown__polecat-gc-psfm")
++
++    grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null ||
++        fail "a dead prior owner stalled the resume: $out"
++    ! grep -F 'CLAIM_DECLINED_LIVE_OWNER' <<<"$out" >/dev/null ||
++        fail "a dead prior owner was wrongly treated as a live duplicate: $out"
++    ! grep -F -- '--assignee=gastown__polecat-gc-8a4d' "$dir/calls.log" >/dev/null ||
++        fail "resume path wrote the dead owner back onto the step"
++}
++
++test_closed_session_still_listed_is_not_live() {
++    local dir out
++    dir=$(new_case)
++    # `gc session list --state all` (or a racing close) can surface the owner
++    # with closed=true. Present-but-closed is dead, not alive.
++    cat >"$dir/sessions.json" <<'JSON'
++{"sessions":[{"id":"gc-8a4d","session_name":"gastown__polecat-gc-8a4d","state":"active","closed":true}]}
++JSON
++
++    out=$(run_guard "$dir" "gastown__polecat-gc-8a4d" "gastown__polecat-gc-psfm")
++
++    grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null ||
++        fail "a closed owning session was treated as live: $out"
++}
++
++test_own_molecule_proceeds_without_probing_liveness() {
++    local dir out
++    dir=$(new_case)
++    live_sessions "$dir"
++
++    out=$(run_guard "$dir" "gastown__polecat-gc-psfm" "gastown__polecat-gc-psfm")
++
++    grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null ||
++        fail "the guard blocked a session working its own molecule: $out"
++    ! grep -F 'session list' "$dir/calls.log" >/dev/null ||
++        fail "the guard probed session liveness for its own molecule"
++}
++
++test_unreadable_liveness_fails_closed() {
++    local dir out
++    dir=$(new_case)
++    # A wedged or otherwise unreadable `gc session list`. Unreadable is NOT evidence the
++    # owner is gone: declining costs a pool slot, proceeding stomps a live
++    # worktree.
++    printf 'not json at all' >"$dir/sessions.json"
++
++    out=$(run_guard "$dir" "gastown__polecat-gc-8a4d" "gastown__polecat-gc-psfm")
++
++    grep -F 'CLAIM_DECLINED_LIVE_OWNER' <<<"$out" >/dev/null ||
++        fail "unreadable session liveness did not fail closed: $out"
++    grep -F 'session liveness was UNREADABLE after retries' <<<"$out" >/dev/null ||
++        fail "decline did not distinguish unreadable liveness from a live owner: $out"
++    ! grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null ||
++        fail "guard fell through despite unreadable liveness"
++}
++
++test_unresolvable_molecule_proceeds_unguarded() {
++    local dir out
++    dir=$(new_case)
++    live_sessions "$dir"
++
++    # No gc.root_bead_id: the guard cannot reach a work bead. That is not
++    # evidence of a duplicate pour, so it must warn and proceed rather than
++    # invent a refusal.
++    out=$(run_guard "$dir" "gastown__polecat-gc-8a4d" "gastown__polecat-gc-psfm" \
++        "mol-polecat-work.implement" "")
++
++    grep -F 'WARN live-owner guard could not resolve an owner' <<<"$out" >/dev/null ||
++        fail "an unresolvable molecule did not warn: $out"
++    grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null ||
++        fail "an unresolvable molecule blocked the engine: $out"
++}
++
++test_work_bead_claim_skips_the_guard() {
++    local dir out
++    dir=$(new_case)
++    live_sessions "$dir"
++
++    # No gc.step_ref means the hook handed back the WORK bead itself, which
++    # post-claim ownership verification has already proved is ours. There is no
++    # foreign owner to find, and the convoy walk would be three wasted reads on
++    # the hot startup path.
++    out=$(run_guard "$dir" "gastown__polecat-gc-8a4d" "gastown__polecat-gc-psfm" "")
++
++    grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null ||
++        fail "a work-bead claim was blocked by the step guard: $out"
++    ! grep -F 'convoy status' "$dir/calls.log" >/dev/null ||
++        fail "the guard walked the convoy for a bead carrying no gc.step_ref"
++}
++
++test_live_owner_is_declined_and_the_step_restored
++test_dead_owner_is_a_resume_and_proceeds
++test_closed_session_still_listed_is_not_live
++test_own_molecule_proceeds_without_probing_liveness
++test_unreadable_liveness_fails_closed
++test_unresolvable_molecule_proceeds_unguarded
++test_work_bead_claim_skips_the_guard
++
++echo "polecat live-owner guard tests passed"
+-- 
+2.50.1 (Apple Git-155)
+
