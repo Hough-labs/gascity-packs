@@ -1,0 +1,236 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Mon, 7 Sep 2026 21:58:40 -0400
+Subject: [PATCH 86/86] fix(polecat): scope the live-owner guard to real pool
+ claims and restore the owner's session id (gcp-mjjg)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Three self-review findings on the guard that landed in the previous commit.
+
+Only a `claimed` hook reason can be a duplicate pour. `existing_assignment` and
+`ready_assignment` mean the bead already carried this session's identity before
+the hook ran, and the release that creates this hazard CLEARS the assignee — so
+a released bead can never reach us by those tiers. The guard now runs only on a
+fresh pool claim (or an unknown reason, which still checks). That is not just
+cheaper, it is a tighter statement of when the hazard exists: a molecule's own
+preassigned steps come back as `ready_assignment` at every step boundary, and
+paying three `gc` round-trips there was pure startup tax on the hot path.
+
+The restore now always writes `gc.session_id` rather than writing it only when
+the owner's id could be read. The hook stamps OUR session id onto the step
+during the claim, so omitting the key on an unreadable owner left our binding
+standing on a bead we had just handed back — a wrong binding, which is worse
+than an absent one. Writing the empty value clears it instead, and the owner's
+next write restores the real one. This also drops an unquoted `${var:+...}`
+whose word-splitting was load-bearing.
+
+Third, the exemption bookkeeping the new test needs: its fake `gc` dispatches on
+the wrapper's argv tail, so its case labels and the assertion on the recorded
+tail read as bare `bd` invocations to the no-bare-bd guard. Registered in that
+guard's argv-tail allowlist the same way the merge-approval and find-work pack
+tests are, with the assertion hoisted into a marked variable so the exempted
+line is the data and not the grep.
+
+Validation: the claim-reason gate verified RED (narrowing the condition to
+reason == "claimed" alone makes the unknown-reason case skip the guard) then
+GREEN. Nine guard cases pass, plus the full gastown shell suite, `go mod
+download`, `go vet ./...`, `golangci-lint run ./...`, `validate_registry.py`,
+`go build ./...`, `go test ./...`, and the Python pack suite (850 passed, 9483
+subtests).
+---
+ gastown/agents/polecat/prompt.template.md     | 23 ++++++++--
+ gastown/tests/test_gastown_pack_assets.sh     |  2 +-
+ .../tests/test_polecat_live_owner_guard.sh    | 44 +++++++++++++++++--
+ tests/test_no_bare_bd_commands.py             |  7 +++
+ 4 files changed, 68 insertions(+), 8 deletions(-)
+
+diff --git a/gastown/agents/polecat/prompt.template.md b/gastown/agents/polecat/prompt.template.md
+index 5686adf..30c147c 100644
+--- a/gastown/agents/polecat/prompt.template.md
++++ b/gastown/agents/polecat/prompt.template.md
+@@ -177,6 +177,10 @@ while [ "$CLAIM_TRY" -lt 3 ]; do
+   rm -f "$CLAIM_ERR"
+   ACTION="$(printf '%s' "$CLAIM_JSON" | jq -r '.action // empty' 2>/dev/null)"
+   WORK_ID="$(printf '%s' "$CLAIM_JSON" | jq -r '.bead_id // empty' 2>/dev/null)"
++  # `claimed` means this bead was open and UNASSIGNED and we took it out of the
++  # pool. `existing_assignment` / `ready_assignment` mean it already carried our
++  # identity. The live-owner guard below only has to run in the first case.
++  CLAIM_REASON="$(printf '%s' "$CLAIM_JSON" | jq -r '.reason // empty' 2>/dev/null)"
+   if [ "$ACTION" = "drain" ]; then
+     echo "NO_ROUTED_WORK"
+     gc runtime drain-ack
+@@ -276,7 +280,14 @@ STEP_REF="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].metadata."gc.step_ref" // emp
+ # What makes the check possible is that the release only ever reaches the STEP.
+ # The WORK bead carries no `gc.routed_to`, so it is not a release candidate and
+ # its assignee survives as the durable record of who owns this molecule. Ask it.
+-if [ -n "$STEP_REF" ]; then
++#
++# Only a `claimed` reason can be a duplicate pour. `existing_assignment` and
++# `ready_assignment` mean the bead already carried this session's identity
++# before the hook ran, and the release clears the assignee — so a released bead
++# can never reach us by those tiers. Skipping them keeps three `gc` round-trips
++# off the ordinary step-to-step path, where a molecule's own preassigned steps
++# come back as `ready_assignment` every time. An unknown reason still checks.
++if [ -n "$STEP_REF" ] && { [ -z "$CLAIM_REASON" ] || [ "$CLAIM_REASON" = "claimed" ]; }; then
+   # Same derivation the formula's own steps use: step -> molecule root ->
+   # convoy -> the convoy's single child. Never a bare or guessed id.
+   GUARD_ROOT="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].metadata."gc.root_bead_id" // empty' 2>/dev/null)"
+@@ -333,10 +344,14 @@ if [ -n "$STEP_REF" ]; then
+         echo "  that owner is live (session $GUARD_ALIVE). This is a duplicate pour onto an in-flight molecule."
+       fi
+       echo "  Restoring the step to its owner and draining. No code, branch, or worktree touched."
++      # The hook stamped OUR gc.session_id/gc.session_name onto the step during
++      # the claim. Put the owner's back. When the owner's session id cannot be
++      # read, clear the key rather than leave ours standing — a wrong binding
++      # is worse than an absent one, and the owner's next write restores it.
+       gc bd update "$WORK_ID" --assignee="$GUARD_OWNER" \
+         --set-metadata gc.session_name="$GUARD_OWNER" \
+         --set-metadata polecat_session="$GUARD_OWNER" \
+-        ${GUARD_OWNER_SID:+--set-metadata gc.session_id="$GUARD_OWNER_SID"} \
++        --set-metadata gc.session_id="$GUARD_OWNER_SID" \
+         || echo "WARN could not restore $WORK_ID to $GUARD_OWNER — the step is left claimed by a session that will not run it; escalate to the witness"
+       gc session nudge "${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}witness" \
+         "DUPLICATE_POUR declined: step $WORK_ID poured onto $EXPECTED_ASSIGNEE while work bead $GUARD_WORK_BEAD is held by $GUARD_OWNER. Step restored to its owner." \
+@@ -405,8 +420,8 @@ GC_CLAIM
+ ```
+ 
+ If the block prints `NO_ROUTED_WORK`, `CLAIM_REJECTED`, `CLAIM_RELEASED`, or
+-`CLAIM_DECLINED_LIVE_OWNER`, it
+-has already drain-acked — stop and exit. Only after it prints `CLAIMED_BEAD_ID` do you read
++`CLAIM_DECLINED_LIVE_OWNER`, it has already drain-acked — stop and exit.
++Only after it prints `CLAIMED_BEAD_ID` do you read
+ formula steps and begin. The claim checks assigned work first (session bead ID,
+ runtime session name, then alias) and only falls through to unassigned pool work
+ routed to `${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat`.
+diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
+index e588d4b..a0ed4d6 100755
+--- a/gastown/tests/test_gastown_pack_assets.sh
++++ b/gastown/tests/test_gastown_pack_assets.sh
+@@ -237,7 +237,7 @@ test_claim_refuses_a_pour_onto_a_live_owner() {
+     [[ -n "$guard_line" && -n "$stamp_line" && "$guard_line" -lt "$stamp_line" ]] ||
+         fail "live-owner guard must run before the claim block stamps polecat_session"
+ 
+-    grep -F 'CLAIM_DECLINED_LIVE_OWNER`, it' "$prompt" >/dev/null ||
++    grep -F '`CLAIM_DECLINED_LIVE_OWNER`, it has already drain-acked' "$prompt" >/dev/null ||
+         fail "the prose listing drain-acked claim outcomes must name CLAIM_DECLINED_LIVE_OWNER"
+ }
+ 
+diff --git a/gastown/tests/test_polecat_live_owner_guard.sh b/gastown/tests/test_polecat_live_owner_guard.sh
+index 0270565..9ffdf7a 100755
+--- a/gastown/tests/test_polecat_live_owner_guard.sh
++++ b/gastown/tests/test_polecat_live_owner_guard.sh
+@@ -45,7 +45,7 @@ write_gc_stub() {
+ #!/usr/bin/env bash
+ printf '%s\n' "$*" >>"$GC_CALLS"
+ case "$1 $2" in
+-    "bd show")
++    "bd show") # gc-bd-argv-tail: case label matching the fake gc's argv tail
+         case "$3" in
+             "$GC_ROOT_BEAD") cat "$GC_ROOT_JSON" ;;
+             "$GC_WORK_BEAD") cat "$GC_WORK_JSON" ;;
+@@ -54,7 +54,7 @@ case "$1 $2" in
+         ;;
+     "convoy status") cat "$GC_CONVOY_JSON" ;;
+     "session list") cat "$GC_SESSIONS_JSON" ;;
+-    "bd update") exit "${GC_UPDATE_EXIT:-0}" ;;
++    "bd update") exit "${GC_UPDATE_EXIT:-0}" ;; # gc-bd-argv-tail: case label matching the fake gc's argv tail
+     "session nudge") ;;
+     "runtime drain-ack") ;;
+     *) ;;
+@@ -69,6 +69,7 @@ SH
+ run_guard() {
+     local dir="$1" owner_assignee="$2" me="$3" step_ref="${4-mol-polecat-work.implement}"
+     local root_meta="${5-\"gc.root_bead_id\":\"winnow-5azcp\",}"
++    local claim_reason="${6-claimed}"
+ 
+     cat >"$dir/root.json" <<'JSON'
+ [{"id":"winnow-5azcp","status":"in_progress","metadata":{"gc.input_convoy_id":"winnow-0inqp"}}]
+@@ -83,6 +84,7 @@ JSON
+ WORK_ID="winnow-iaroy"
+ EXPECTED_ASSIGNEE="$me"
+ STEP_REF="$step_ref"
++CLAIM_REASON="$claim_reason"
+ SHOW_JSON='[{"id":"winnow-iaroy","status":"in_progress","assignee":"$me","metadata":{${root_meta}"gc.step_ref":"$step_ref"}}]'
+ GC_RIG="winnow"
+ HARNESS
+@@ -131,7 +133,9 @@ test_live_owner_is_declined_and_the_step_restored() {
+     ! grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null ||
+         fail "guard declined but still fell through to the work"
+ 
+-    grep -F 'bd update winnow-iaroy --assignee=gastown__polecat-gc-8a4d' "$dir/calls.log" >/dev/null ||
++    local restore_call
++    restore_call='bd update winnow-iaroy --assignee=gastown__polecat-gc-8a4d' # gc-bd-argv-tail: expected argv tail, not an invocation
++    grep -F "$restore_call" "$dir/calls.log" >/dev/null ||
+         fail "declining polecat did not restore the step to its owner"
+     grep -F -- '--set-metadata gc.session_id=gc-8a4d' "$dir/calls.log" >/dev/null ||
+         fail "declining polecat did not restore the owner's session binding"
+@@ -241,6 +245,38 @@ test_work_bead_claim_skips_the_guard() {
+         fail "the guard walked the convoy for a bead carrying no gc.step_ref"
+ }
+ 
++test_preassigned_step_skips_the_walk_entirely() {
++    local dir out
++    dir=$(new_case)
++    live_sessions "$dir"
++
++    # `ready_assignment` means the step already carried this session's identity
++    # before the hook ran. A release CLEARS the assignee, so a released bead can
++    # never arrive by that tier — there is nothing for the guard to find, and a
++    # molecule's own preassigned steps come back this way at every step
++    # boundary. Three gc round-trips on that path would be pure startup tax.
++    out=$(run_guard "$dir" "gastown__polecat-gc-8a4d" "gastown__polecat-gc-psfm" \
++        "mol-polecat-work.implement" '"gc.root_bead_id":"winnow-5azcp",' "ready_assignment")
++
++    grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null ||
++        fail "a preassigned step was blocked by the pool-claim guard: $out"
++    [[ ! -s "$dir/calls.log" ]] ||
++        fail "the guard walked the molecule for a claim that was never a pool claim: $(cat "$dir/calls.log")"
++}
++
++test_unknown_claim_reason_still_checks() {
++    local dir out
++    dir=$(new_case)
++    live_sessions "$dir"
++
++    # An absent reason is not a promise the bead was preassigned. Check it.
++    out=$(run_guard "$dir" "gastown__polecat-gc-8a4d" "gastown__polecat-gc-psfm" \
++        "mol-polecat-work.implement" '"gc.root_bead_id":"winnow-5azcp",' "")
++
++    grep -F 'CLAIM_DECLINED_LIVE_OWNER' <<<"$out" >/dev/null ||
++        fail "an unknown claim reason skipped the guard instead of checking: $out"
++}
++
+ test_live_owner_is_declined_and_the_step_restored
+ test_dead_owner_is_a_resume_and_proceeds
+ test_closed_session_still_listed_is_not_live
+@@ -248,5 +284,7 @@ test_own_molecule_proceeds_without_probing_liveness
+ test_unreadable_liveness_fails_closed
+ test_unresolvable_molecule_proceeds_unguarded
+ test_work_bead_claim_skips_the_guard
++test_preassigned_step_skips_the_walk_entirely
++test_unknown_claim_reason_still_checks
+ 
+ echo "polecat live-owner guard tests passed"
+diff --git a/tests/test_no_bare_bd_commands.py b/tests/test_no_bare_bd_commands.py
+index 28b2dff..5d39cee 100644
+--- a/tests/test_no_bare_bd_commands.py
++++ b/tests/test_no_bare_bd_commands.py
+@@ -169,6 +169,13 @@ GC_BD_ARGV_TAIL_ALLOWLIST: dict[Path, set[str]] = {
+         'fail "producer must write the whole signal in a single bd update"'
+         " # gc-bd-argv-tail: failure message, not an invocation",
+     },
++    Path("gastown/tests/test_polecat_live_owner_guard.sh"): {
++        '"bd show") # gc-bd-argv-tail: case label matching the fake gc\'s argv tail',
++        '"bd update") exit "${GC_UPDATE_EXIT:-0}" ;;'
++        " # gc-bd-argv-tail: case label matching the fake gc's argv tail",
++        "restore_call='bd update winnow-iaroy --assignee=gastown__polecat-gc-8a4d'"
++        " # gc-bd-argv-tail: expected argv tail, not an invocation",
++    },
+     Path("gastown/tests/test_refinery_find_work.sh"): {
+         "# Stub `gc` implementing just enough of `bd list` to answer the shipped"
+         " query. # gc-bd-argv-tail: prose, not an invocation",
+-- 
+2.50.1 (Apple Git-155)
+

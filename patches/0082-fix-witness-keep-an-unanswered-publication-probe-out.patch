@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 6 Sep 2026 20:09:50 -0400
-Subject: [PATCH 82/85] fix(witness): keep an unanswered publication probe out
+Subject: [PATCH 82/86] fix(witness): keep an unanswered publication probe out
  of the lost-work finding (gcp-9ql4)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
