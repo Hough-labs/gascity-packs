@@ -45,7 +45,7 @@ write_gc_stub() {
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$GC_CALLS"
 case "$1 $2" in
-    "bd show")
+    "bd show") # gc-bd-argv-tail: case label matching the fake gc's argv tail
         case "$3" in
             "$GC_ROOT_BEAD") cat "$GC_ROOT_JSON" ;;
             "$GC_WORK_BEAD") cat "$GC_WORK_JSON" ;;
@@ -54,7 +54,7 @@ case "$1 $2" in
         ;;
     "convoy status") cat "$GC_CONVOY_JSON" ;;
     "session list") cat "$GC_SESSIONS_JSON" ;;
-    "bd update") exit "${GC_UPDATE_EXIT:-0}" ;;
+    "bd update") exit "${GC_UPDATE_EXIT:-0}" ;; # gc-bd-argv-tail: case label matching the fake gc's argv tail
     "session nudge") ;;
     "runtime drain-ack") ;;
     *) ;;
@@ -69,6 +69,7 @@ SH
 run_guard() {
     local dir="$1" owner_assignee="$2" me="$3" step_ref="${4-mol-polecat-work.implement}"
     local root_meta="${5-\"gc.root_bead_id\":\"winnow-5azcp\",}"
+    local claim_reason="${6-claimed}"
 
     cat >"$dir/root.json" <<'JSON'
 [{"id":"winnow-5azcp","status":"in_progress","metadata":{"gc.input_convoy_id":"winnow-0inqp"}}]
@@ -83,6 +84,7 @@ JSON
 WORK_ID="winnow-iaroy"
 EXPECTED_ASSIGNEE="$me"
 STEP_REF="$step_ref"
+CLAIM_REASON="$claim_reason"
 SHOW_JSON='[{"id":"winnow-iaroy","status":"in_progress","assignee":"$me","metadata":{${root_meta}"gc.step_ref":"$step_ref"}}]'
 GC_RIG="winnow"
 HARNESS
@@ -131,7 +133,9 @@ test_live_owner_is_declined_and_the_step_restored() {
     ! grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null ||
         fail "guard declined but still fell through to the work"
 
-    grep -F 'bd update winnow-iaroy --assignee=gastown__polecat-gc-8a4d' "$dir/calls.log" >/dev/null ||
+    local restore_call
+    restore_call='bd update winnow-iaroy --assignee=gastown__polecat-gc-8a4d' # gc-bd-argv-tail: expected argv tail, not an invocation
+    grep -F "$restore_call" "$dir/calls.log" >/dev/null ||
         fail "declining polecat did not restore the step to its owner"
     grep -F -- '--set-metadata gc.session_id=gc-8a4d' "$dir/calls.log" >/dev/null ||
         fail "declining polecat did not restore the owner's session binding"
@@ -241,6 +245,38 @@ test_work_bead_claim_skips_the_guard() {
         fail "the guard walked the convoy for a bead carrying no gc.step_ref"
 }
 
+test_preassigned_step_skips_the_walk_entirely() {
+    local dir out
+    dir=$(new_case)
+    live_sessions "$dir"
+
+    # `ready_assignment` means the step already carried this session's identity
+    # before the hook ran. A release CLEARS the assignee, so a released bead can
+    # never arrive by that tier — there is nothing for the guard to find, and a
+    # molecule's own preassigned steps come back this way at every step
+    # boundary. Three gc round-trips on that path would be pure startup tax.
+    out=$(run_guard "$dir" "gastown__polecat-gc-8a4d" "gastown__polecat-gc-psfm" \
+        "mol-polecat-work.implement" '"gc.root_bead_id":"winnow-5azcp",' "ready_assignment")
+
+    grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null ||
+        fail "a preassigned step was blocked by the pool-claim guard: $out"
+    [[ ! -s "$dir/calls.log" ]] ||
+        fail "the guard walked the molecule for a claim that was never a pool claim: $(cat "$dir/calls.log")"
+}
+
+test_unknown_claim_reason_still_checks() {
+    local dir out
+    dir=$(new_case)
+    live_sessions "$dir"
+
+    # An absent reason is not a promise the bead was preassigned. Check it.
+    out=$(run_guard "$dir" "gastown__polecat-gc-8a4d" "gastown__polecat-gc-psfm" \
+        "mol-polecat-work.implement" '"gc.root_bead_id":"winnow-5azcp",' "")
+
+    grep -F 'CLAIM_DECLINED_LIVE_OWNER' <<<"$out" >/dev/null ||
+        fail "an unknown claim reason skipped the guard instead of checking: $out"
+}
+
 test_live_owner_is_declined_and_the_step_restored
 test_dead_owner_is_a_resume_and_proceeds
 test_closed_session_still_listed_is_not_live
@@ -248,5 +284,7 @@ test_own_molecule_proceeds_without_probing_liveness
 test_unreadable_liveness_fails_closed
 test_unresolvable_molecule_proceeds_unguarded
 test_work_bead_claim_skips_the_guard
+test_preassigned_step_skips_the_walk_entirely
+test_unknown_claim_reason_still_checks
 
 echo "polecat live-owner guard tests passed"
