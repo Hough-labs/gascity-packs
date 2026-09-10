@@ -224,6 +224,7 @@ work applied to an existing branch. Fetch the named remote branch first.
 If `origin/$BRANCH` exists, make the local branch fast-forward to that
 remote tip or stop on divergence:
 ```bash
+# --- branch-resolution:begin ---
 git fetch origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" || \
     echo "Could not fetch metadata.branch=$BRANCH from origin. Checking local refs before stopping."
 if git show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
@@ -246,6 +247,7 @@ else
     gc runtime drain-ack
     exit 1
 fi
+# --- branch-resolution:end ---
 ```
 If resuming a rejected branch, rebase onto latest base:
 ```bash

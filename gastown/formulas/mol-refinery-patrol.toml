@@ -452,8 +452,24 @@ TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_bran
        --set-metadata rejection_reason="<failure summary>" \
        --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{binding_prefix}}polecat"
      ```
-   - Delete branch: `git push origin --delete $BRANCH`
-   - Clean up: `git checkout "$TARGET" && git branch -D temp`
+   - Branch disposition and local cleanup. The rejected branch MUST survive:
+     ```bash
+     # --- reject-branch-disposition:begin ---
+     # Do NOT delete $BRANCH. The pool-return above leaves metadata.branch
+     # set, and mol-polecat-work's workspace-setup treats that value as
+     # AUTHORITATIVE: the next polecat fetches origin/$BRANCH and resumes from
+     # it. Deleting it here does not merely cost the resuming polecat its work
+     # -- it BRICKS the bead. With the remote ref gone and no local ref (that
+     # one lived in the previous polecat's worktree), the resume falls through
+     # to "STOP. Do not create a different branch." and drain-acks, so every
+     # polecat that claims the bead exits on sight until a human clears
+     # metadata.branch by hand. The same-worktree re-claim hides it: that one
+     # still has refs/heads/$BRANCH locally and resumes, which is why the
+     # symptom reads as intermittent. Only the merged path deletes a branch,
+     # and only when delete_merged_branches says to.
+     git checkout "$TARGET" && git branch -D temp
+     # --- reject-branch-disposition:end ---
+     ```
    - Pour next patrol iteration before burning:
      ```bash
      CURRENT_WISP=${GC_BEAD_ID:-}
