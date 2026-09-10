@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Mon, 7 Sep 2026 21:34:26 -0400
-Subject: [PATCH 85/88] fix(polecat): refuse a claim onto a molecule a live
+Subject: [PATCH 85/89] fix(polecat): refuse a claim onto a molecule a live
  session still holds (gcp-mjjg)
 
 A `mol-polecat-work` implement step can be returned to the pool while the
