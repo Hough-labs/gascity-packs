@@ -631,6 +631,14 @@ if [ -s "$SCAN_ROOTS_FILE" ]; then
         [ -n "$scan_root" ] && [ -d "$scan_root" ] || continue
         for entry in "$scan_root"/*; do
             [ -d "$entry" ] || continue
+            # The main-worktree exclusion is named on THIS source too. Gate 1
+            # above drops it before it can contribute a scan root, but a scan
+            # root contributed by some OTHER registered worktree can still
+            # contain it — and a rig rooted at `<home>/worktrees/<name>` matches
+            # the per-bead shape exactly. Leaving the exclusion to that path
+            # accident is what the header refuses to do.
+            [ "$entry" != "$MAIN_WT" ] || continue
+            [ "$entry" != "$RIG_ROOT" ] || continue
             per_bead_shape "$entry" || continue
             leaf=${entry##*/}
             bead_leaf_ok "${leaf%.reaping}" || continue

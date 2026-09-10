@@ -722,9 +722,16 @@ JSON
     # Budgeted through the env var so this stays a behavioural assertion — a
     # build that simply ignores the budget hangs here and fails on elapsed
     # time, rather than being let off with an unknown-flag error.
+    #
+    # The budget has to leave room for the run to REACH the bead read, or the
+    # verdict is `budget_spent_before_bead_query` — also correct, and not the
+    # one under test. Measured best-of-3 from start to first decision with 20
+    # candidates: 3s, and identical on the pre-gcp-mves script, so this is the
+    # cost of a cycle rather than anything the residue walk added. The stall is
+    # 20s, so any budget under it still produces the timeout being asserted.
     started=$SECONDS
     GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
-        GC_BD_DELAY=20 GC_REAP_BUDGET_SECONDS=2 PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run \
+        GC_BD_DELAY=20 GC_REAP_BUDGET_SECONDS=6 PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run \
         >"$tmp/slow.txt" 2>&1 || fail "a slow bead store made the reaper exit non-zero: $(cat "$tmp/slow.txt")"
     elapsed=$((SECONDS - started))
 
@@ -735,16 +742,21 @@ JSON
     grep -F '"event":"worktree_bead_query_failed"' "$logdir/polecat-worktree-reap.log" >/dev/null ||
         fail "the timed-out bead query was not recorded"
 
-    # Case 2: the budget runs out mid-loop. Remaining candidates are deferred
-    # to the next cycle and the run still exits clean.
+    # Case 2: the budget runs out MID-LOOP. Remaining candidates are deferred
+    # to the next cycle and the run still exits clean. Same headroom reasoning:
+    # too small a budget is spent before the loop is entered at all, and the run
+    # then exits early with a truncation instead of reaching the exhaustion this
+    # asserts. With room to reach the loop it is deterministic — the first
+    # candidate's roster read is bounded by whatever is left, so it consumes the
+    # remainder and the second candidate always finds the budget gone.
     started=$SECONDS
     GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
-        GC_SESSION_DELAY=20 PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run --budget 3 \
+        GC_SESSION_DELAY=20 PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run --budget 6 \
         >"$tmp/mid.txt" 2>&1 || fail "an exhausted budget made the reaper exit non-zero: $(cat "$tmp/mid.txt")"
     elapsed=$((SECONDS - started))
 
     [[ "$elapsed" -lt 15 ]] ||
-        fail "the reaper waited ${elapsed}s on a 3s budget; the roster read is not bounded"
+        fail "the reaper waited ${elapsed}s on a 6s budget; the roster read is not bounded"
     grep -F '"event":"worktree_budget_exhausted"' "$logdir/polecat-worktree-reap.log" >/dev/null ||
         fail "an exhausted budget was not recorded"
     [[ -e "$home/worktrees/wt-alpha" && -e "$home/worktrees/wt-beta" ]] ||
@@ -1511,9 +1523,22 @@ test_a_non_agent_worktree_named_like_a_bead_is_not_reaped() {
     local refinery="$tmp/city/.gc/worktrees/rig/refinery"
     add_bead_worktree "$rig" "$refinery" wt-closed
 
+    # And the exclusion must hold on the RESIDUE source too, not only on the
+    # admin list (gcp-mves). This rig root SITS INSIDE a `<home>/worktrees/`
+    # directory, so registering an ordinary per-bead worktree beside it makes
+    # that directory a scan root — and the disk walk then reaches the rig's own
+    # main worktree, which matches the per-bead shape exactly, is clean, is
+    # published, and whose bead is closed. Every gate would pass. Gate 1 drops
+    # the main worktree before it can contribute a scan root, but a scan root
+    # contributed by something ELSE still contains it, so the walk has to name
+    # the exclusion too or the reaper deletes the canonical checkout.
+    local sibling="$tmp/city/.gc/worktrees/rig/polecats/nux/worktrees/wt-sibling"
+    git -C "$rig" worktree add -q "$sibling" --detach HEAD
+
     cat >"$beads" <<'JSON'
 [
-  {"id":"wt-closed","status":"closed","metadata":{"polecat_session":"deadsess"}}
+  {"id":"wt-closed","status":"closed","metadata":{"polecat_session":"deadsess"}},
+  {"id":"wt-sibling","status":"closed","metadata":{"polecat_session":"deadsess"}}
 ]
 JSON
     cat >"$sessions" <<'JSON'
@@ -1528,6 +1553,12 @@ JSON
 
     [[ -e "$rig/seed.txt" ]] ||
         fail "the rig's own main worktree was reaped; it is the canonical checkout, never a candidate"
+    [[ ! -e "$rig.reaping" ]] ||
+        fail "the rig's own main worktree was renamed for removal by the residue walk"
+    # The sibling really was reaped, so the cycle reached the removal phase and
+    # the exclusion above was actually exercised rather than vacuously true.
+    [[ ! -e "$sibling" ]] ||
+        fail "the ordinary sibling worktree was not reaped, so this fixture never reached the removal phase"
     [[ -e "$refinery/worktrees/wt-closed" ]] ||
         fail "a non-agent-home per-bead worktree was reaped; the witness owns agent-home worktrees only"
 
