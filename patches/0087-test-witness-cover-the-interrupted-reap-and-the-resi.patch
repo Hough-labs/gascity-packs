@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 10 Sep 2026 12:42:55 -0400
-Subject: [PATCH 87/89] test(witness): cover the interrupted reap and the
+Subject: [PATCH 87/90] test(witness): cover the interrupted reap and the
  residue it strands (gcp-mves)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
