@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 10 Sep 2026 14:54:27 -0400
-Subject: [PATCH 90/90] fix(ci): absorb an edge rotation between checksum and
+Subject: [PATCH 90/91] fix(ci): absorb an edge rotation between checksum and
  download (gcp-kinb)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

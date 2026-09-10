@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 10 Sep 2026 13:43:17 -0400
-Subject: [PATCH 89/90] fix(witness): keep the residue walk off the rig's own
+Subject: [PATCH 89/91] fix(witness): keep the residue walk off the rig's own
  main worktree (gcp-mves)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
