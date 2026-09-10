@@ -242,30 +242,96 @@ install_binary_with_sudo_fallback() {
   fi
 }
 
-if $use_cache; then
-  cache_root="${RUNNER_TOOL_CACHE:-$HOME/.local}"
-  # Keyed on the checksum, not the tag alone: `edge` is a rolling pre-release
-  # whose asset is replaced whenever gascity main moves, so a tag-only key would
-  # happily serve a stale gc for the rest of the runner's life.
-  bin_dir="${cache_root}/gascity-gc/${tag}/${expected_sha:0:16}/${platform_tuple}/bin"
-else
-  bin_dir="${GASCITY_INSTALL_BIN_DIR:-/usr/local/bin}"
-fi
+# Cache path for the checksum currently resolved. A function rather than the
+# one-time assignment this used to be, because `edge` can rotate mid-install
+# (see the retry loop below): the tool-cache entry has to be keyed on the
+# checksum actually verified, never on whichever one was resolved first.
+resolve_install_paths() {
+  if $use_cache; then
+    local cache_root="${RUNNER_TOOL_CACHE:-$HOME/.local}"
+    # Keyed on the checksum, not the tag alone: `edge` is a rolling pre-release
+    # whose asset is replaced whenever gascity main moves, so a tag-only key would
+    # happily serve a stale gc for the rest of the runner's life.
+    bin_dir="${cache_root}/gascity-gc/${tag}/${expected_sha:0:16}/${platform_tuple}/bin"
+  else
+    bin_dir="${GASCITY_INSTALL_BIN_DIR:-/usr/local/bin}"
+  fi
+  target="${bin_dir}/gc"
+}
 
-target="${bin_dir}/gc"
-if $use_cache && [[ -x "$target" ]]; then
-  echo "Reusing cached Gas City ${tag} at ${target}"
-else
+# Resolving the checksum and downloading the archive are two separate requests,
+# and for `edge` they can name two different builds: goreleaser replaces that
+# pre-release's assets in place whenever gascity main moves, several times a day.
+# A job whose download straddles a rebuild verifies the bytes of build N+1
+# against the digest of build N, and the mismatch that follows is not corruption
+# -- it is the Supported Pack Nightly's bmad job on 2026-09-10, red on a pair of
+# checksums neither of which the release still published by the time anybody
+# read the log (gcp-kinb). Only a cache-missing job downloads at all, so which
+# job of the six loses this race is a function of tool-cache state, which is why
+# it presents as one arbitrary pack failing and passing on retry.
+#
+# So a mismatch is diagnosed instead of trusted: re-resolve the checksum and
+# compare. Unchanged means the bytes really are wrong -- still a loud failure.
+# Moved means the asset rotated under us: accept the download when it matches
+# what the release publishes NOW (the same server-side digest check, just against
+# build N+1), and otherwise retry against the new checksum. Retries are bounded
+# so an asset that is genuinely broken, or an `edge` rotating faster than a
+# download completes, fails rather than spinning here.
+max_download_attempts=3
+attempt=1
+while true; do
+  resolve_install_paths
+  if $use_cache && [[ -x "$target" ]]; then
+    echo "Reusing cached Gas City ${tag} at ${target}"
+    break
+  fi
+
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
   fetch -o "${tmp}/${archive}" "${download_base}/${archive}"
   actual_sha="$(sha256_file "${tmp}/${archive}")"
   if [[ "$actual_sha" != "$expected_sha" ]]; then
-    echo "Gas City checksum mismatch for ${tag}/${platform_tuple}" >&2
-    echo "expected: $expected_sha" >&2
-    echo "actual:   $actual_sha" >&2
-    exit 1
+    # `|| true` so an API that has become unreachable since the first resolve
+    # leaves the mismatch diagnosis below reachable instead of killing the
+    # script under `set -e` with no explanation of what went wrong.
+    current_sha="$(release_asset_sha || true)"
+    if [[ "$current_sha" == "$actual_sha" ]]; then
+      echo "Gas City ${tag} rotated while the archive was downloading:" >&2
+      echo "  expected (before download): $expected_sha" >&2
+      echo "  downloaded:                 $actual_sha" >&2
+      echo "  published now:              $current_sha" >&2
+      echo "The downloaded bytes are the build ${tag} points at now; installing them." >&2
+      expected_sha="$actual_sha"
+      resolve_install_paths
+    elif [[ -n "$current_sha" && "$current_sha" != "$expected_sha" ]]; then
+      rm -rf "$tmp"
+      trap - EXIT
+      if ((attempt >= max_download_attempts)); then
+        echo "Gas City ${tag}/${platform_tuple} rotated on every one of ${max_download_attempts} download attempts" >&2
+        echo "(asset ${archive}); the last attempt expected ${expected_sha} and downloaded ${actual_sha}." >&2
+        echo "Re-run once ${tag} settles, or pass a version tag instead of a rolling ref." >&2
+        exit 1
+      fi
+      attempt=$((attempt + 1))
+      echo "Gas City ${tag} rotated while the archive was downloading (${expected_sha} -> ${current_sha});" >&2
+      echo "retrying against the new checksum (attempt ${attempt}/${max_download_attempts})." >&2
+      expected_sha="$current_sha"
+      continue
+    else
+      echo "Gas City checksum mismatch for ${tag}/${platform_tuple}" >&2
+      echo "expected: $expected_sha" >&2
+      echo "actual:   $actual_sha" >&2
+      if [[ -z "$current_sha" ]]; then
+        echo "(the checksum could not be re-resolved, so a rotation of ${tag} cannot be ruled" >&2
+        echo " out; failing anyway rather than installing bytes nothing vouches for)" >&2
+      else
+        echo "(the checksum re-resolves unchanged, so this is the archive and not a rotation" >&2
+        echo " of ${tag})" >&2
+      fi
+      exit 1
+    fi
   fi
+
   tar -xzf "${tmp}/${archive}" -C "$tmp" gc
   if $use_cache; then
     install_binary "${tmp}/gc" "$target"
@@ -276,7 +342,8 @@ else
   # next step rather than at job teardown.
   rm -rf "$tmp"
   trap - EXIT
-fi
+  break
+done
 
 if $use_cache && [[ -n "${GITHUB_PATH:-}" ]]; then
   echo "$bin_dir" >> "$GITHUB_PATH"
