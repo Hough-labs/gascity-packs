@@ -570,7 +570,29 @@ test_bead_status_is_read_in_one_bulk_query() {
     # Dolt, inside a pre_start bounded at 10s. The read must be flat in the
     # number of worktrees, so assert the CALL COUNT, not the wall time —
     # a fast stub would hide a linear read on a slow store.
-    local tmp rig bin home beads sessions logdir calls
+    #
+    # FLAT, not a fixed number. A live cycle now takes two bulk reads: the one
+    # that feeds the gates, and one that renews the bead facts at the point of
+    # use before the first removal (gcp-mves). Both are for the WHOLE candidate
+    # set, taken once per cycle. Pinning the count at 1 would forbid the second
+    # read without expressing the invariant, so the fixture is run at two sizes
+    # and the counts must match: whatever the reads cost, it must not grow with
+    # the rig.
+    local four eight
+    four=$(bulk_read_calls_for 4)
+    eight=$(bulk_read_calls_for 8)
+
+    [[ "$four" == "$eight" ]] ||
+        fail "bead reads grew with the candidate set: $four call(s) for 4 worktrees, $eight for 8. The read must be flat in the number of worktrees (gcp-ntbf)"
+    (( eight <= 2 )) ||
+        fail "a live cycle issued $eight bulk bead reads; it takes at most two — one for the gates, one to renew them at the point of use"
+}
+
+bulk_read_calls_for() {
+    # bulk_read_calls_for <n> — reap <n> closed worktrees live and echo how many
+    # `gc bd show` calls that cost. One open bead is mixed in so the run also
+    # proves the join still keys statuses to the right worktree at each size.
+    local n="$1" tmp rig bin home beads sessions logdir calls i
     tmp=$(mktemp -d)
     rig="$tmp/rig"
     bin="$tmp/bin"
@@ -584,35 +606,33 @@ test_bead_status_is_read_in_one_bulk_query() {
     setup_rig "$rig"
     write_gc_stub "$bin"
 
-    add_bead_worktree "$rig" "$home" wt-one
-    add_bead_worktree "$rig" "$home" wt-two
-    add_bead_worktree "$rig" "$home" wt-three
-    add_bead_worktree "$rig" "$home" wt-four
+    local ids=()
+    for i in $(seq 1 "$n"); do
+        add_bead_worktree "$rig" "$home" "wt-$i"
+        ids+=("wt-$i")
+    done
 
-    cat >"$beads" <<'JSON'
-[
-  {"id":"wt-one","status":"closed","metadata":{"polecat_session":"deadsess"}},
-  {"id":"wt-two","status":"closed","metadata":{"polecat_session":"deadsess"}},
-  {"id":"wt-three","status":"open","metadata":{"polecat_session":"deadsess"}},
-  {"id":"wt-four","status":"closed","metadata":{"polecat_session":"deadsess"}}
-]
-JSON
+    # wt-1 stays open: an open bead's worktree must survive at every size.
+    jq -n --args '[ $ARGS.positional[] | {
+            id: .,
+            status: (if . == "wt-1" then "open" else "closed" end),
+            metadata: { polecat_session: "deadsess" }
+        } ]' "${ids[@]}" >"$beads"
     printf '{"sessions":[]}' >"$sessions"
 
     GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
-        GC_BD_CALLS="$calls" PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run \
+        GC_BD_CALLS="$calls" GC_REAP_BUDGET_SECONDS=120 PATH="$bin:$PATH" \
+        bash "$SCRIPT" "$rig" --no-dry-run \
         >"$tmp/out.txt" 2>&1 || fail "reaper exited non-zero: $(cat "$tmp/out.txt")"
 
-    local n
-    n=$(wc -c <"$calls" | tr -d ' ')
-    [[ "$n" == "1" ]] ||
-        fail "bead status was read in $n calls for 4 worktrees; it must be one bulk query"
+    for i in $(seq 2 "$n"); do
+        [[ ! -e "$home/worktrees/wt-$i" ]] ||
+            fail "the bulk read lost a closed bead at size $n: wt-$i survived"
+    done
+    [[ -e "$home/worktrees/wt-1" ]] ||
+        fail "the bulk read mixed up bead identities at size $n: an open bead's worktree was reaped"
 
-    [[ ! -e "$home/worktrees/wt-one" && ! -e "$home/worktrees/wt-two" && ! -e "$home/worktrees/wt-four" ]] ||
-        fail "the bulk read lost a closed bead: a worktree that should have been reaped survived"
-    [[ -e "$home/worktrees/wt-three" ]] ||
-        fail "the bulk read mixed up bead identities: an open bead's worktree was reaped"
-
+    wc -c <"$calls" | tr -d ' '
     rm -rf "$tmp"
 }
 
@@ -834,9 +854,15 @@ JSON
     # Case 2: the bead read RAN and overran. That is a real timeout, so it keeps
     # worktree_bead_query_failed — but it must say it timed out and name the
     # seconds it was given, not imply the store answered with garbage.
+    #
+    # The budget must leave enough room that the CLASSIFICATION decides this,
+    # not the machine. A run spends ~1s reaching the bead read (measured), so a
+    # 2s budget could land on `skipped` under load — which is a different, also
+    # correct, verdict, and not the one under test. Any budget below the 20s
+    # stall still produces the timeout, so buy the headroom.
     rm -f "$log"
     GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
-        GC_BD_DELAY=20 GC_REAP_BUDGET_SECONDS=2 PATH="$bin:$PATH" \
+        GC_BD_DELAY=20 GC_REAP_BUDGET_SECONDS=6 PATH="$bin:$PATH" \
         bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/slowbd.txt" 2>&1 ||
         fail "reaper exited non-zero on a slow bead store: $(cat "$tmp/slowbd.txt")"
 
@@ -848,10 +874,12 @@ JSON
         fail "a timed-out bead read still claims the store returned unusable JSON"
 
     # Case 3: the roster read overran. Same rule — it names the bound it hit, so
-    # a reader checks the budget before suspecting the session roster.
+    # a reader checks the budget before suspecting the session roster. Same
+    # headroom reasoning as case 2, and the roster read sits later in the run
+    # than the bead read, so it needs at least as much.
     rm -f "$log"
     GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
-        GC_SESSION_DELAY=20 GC_REAP_BUDGET_SECONDS=3 PATH="$bin:$PATH" \
+        GC_SESSION_DELAY=20 GC_REAP_BUDGET_SECONDS=6 PATH="$bin:$PATH" \
         bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/slowsess.txt" 2>&1 ||
         fail "reaper exited non-zero on a slow session roster: $(cat "$tmp/slowsess.txt")"
 

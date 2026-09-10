@@ -18,11 +18,30 @@ work_dir = ".gc/agents/{{.Rig}}/witness"
 # the rest next cycle. Raise one only alongside the other.
 #
 # STAGED ROLLOUT: no --no-dry-run here, so this reports what it WOULD reap and
-# removes nothing. That matches the city's posture for the native gascity
-# reaper, which city.toml holds in dry-run until gc-zxxy is answered; two
-# reapers must not disagree about whether removal is live. Review the logged
-# would-reap set across several patrol cycles, confirm no live worktree ever
-# appears in it, then append --no-dry-run to flip on real removal.
+# removes nothing. Reviewing the logged would-reap set until no live worktree
+# ever appears in it is NECESSARY and it is NOT SUFFICIENT, and reading it as
+# sufficient is what cost winnow 40 worktrees (gcp-mves, winnow-h0n2o):
+#
+#   - The soak evidences SELECTION. It shows which worktrees this script picks,
+#     and that no live one is among them. That is a real and useful result.
+#   - It cannot evidence REMOVAL COMPLETION. A dry run never calls the
+#     destructive path at all, so nothing the soak observes says anything about
+#     whether a removal finishes — and the removal is the half that failed.
+#     winnow's witness verified the criterion honestly (35/35 beads closed, no
+#     live worktree ever logged) and still lost every per-bead worktree on the
+#     rig to a pre_start SIGKILL landing mid-removal, silently, because the
+#     failure report is downstream of the kill.
+#
+# TWO PRECONDITIONS, BOTH, before --no-dry-run is appended anywhere:
+#   1. gcp-mves has landed — removal is resumable across the SIGKILL and the
+#      residue an earlier interrupted run left is enumerable again.
+#   2. gascity-3z7d is resolved — pre_starts are not being killed in the first
+#      place. This box starts sessions in ~218s against a 180s setup_timeout,
+#      which is why the kill happens at all.
+# This replaces the earlier hold, which cited gc-zxxy. That reason expired:
+# gc-zxxy closed 2026-08-27 and city.toml already sets
+# auto_reap_closed_bead_worktrees = true. The hold did not expire with it — a
+# stale rationale is not an argument that the hold should lift.
 pre_start = ["{{.ConfigDir}}/assets/scripts/polecat-worktree-reap.sh {{.RigRoot}} --rig {{.Rig}}"]
 nudge = "Run 'gc prime' to check worker status and begin patrol cycle."
 idle_timeout = "1h"

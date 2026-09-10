@@ -553,13 +553,9 @@ an incident.
 
 **STAGED ROLLOUT — it is in dry-run today.** Real removal is opt-in
 (`--no-dry-run`) and the `pre_start` above does not pass it, so every
-would-be reap logs as `worktree_reap_pending` and nothing is removed. That
-is deliberate: `city.toml` holds the *native* gascity reaper
-(`auto_reap_closed_bead_worktrees_dry_run`) to the same staged rollout
-until `gc-zxxy` is answered, and a second reaper must not do live removals
-while the operator's own equivalent is held inert. Do NOT flip it from a
-patrol; the flip is an operator decision. Treat the log as a report, not as
-a completed cleanup.
+would-be reap logs as `worktree_reap_pending` and nothing is removed. Do
+NOT flip it from a patrol; the flip is an operator decision. Treat the log
+as a report, not as a completed cleanup.
 
 **THE PROMOTION CRITERION — coverage, not a count of clean cycles
 (gcp-schs).** The flip is evidenced by a REVIEWED SET, so it is only sound
@@ -571,13 +567,31 @@ worktrees — and they are exactly what a live reaper, running with a fresh
 budget, would reach first. Partial cycles do not add up to a review of the
 set.
 
-So the criterion is stated on coverage:
+**AND COVERAGE IS STILL NOT SUFFICIENT (gcp-mves).** Everything above is
+about WHICH WORKTREES ARE SELECTED. A dry run never calls the destructive
+path at all, so no soak — however complete its coverage — is evidence about
+whether a removal COMPLETES. winnow's witness verified the coverage
+criterion honestly and still lost all 40 of the rig's per-bead worktrees to
+a `pre_start` SIGKILL landing mid-removal, silently, because the failure
+report is downstream of the kill (winnow-h0n2o). Selection is necessary;
+completion is a separate question the log cannot answer.
+
+So the criterion is stated on coverage AND on the two preconditions the
+soak structurally cannot cover:
 
 > Append `--no-dry-run` to the `pre_start` in `agents/witness/agent.toml`
-> once the log carries at least one **`worktree_scan_complete`** cycle
-> (`deferred=0` — every candidate examined in a single run), and no live
-> worktree appears in the `worktree_reap_pending` set of that cycle or of
-> the cycles since.
+> once ALL of the following hold:
+>
+> 1. the log carries at least one **`worktree_scan_complete`** cycle
+>    (`deferred=0` — every candidate examined in a single run), and no live
+>    worktree appears in the `worktree_reap_pending` set of that cycle or
+>    of the cycles since;
+> 2. `gcp-mves` has landed, so a removal interrupted by the SIGKILL leaves
+>    a marked, resumable state instead of an unenumerable orphan;
+> 3. `gascity-3z7d` is resolved, so `pre_start`s are not being killed in
+>    the first place.
+>
+> Any one of the three alone is the evidence winnow armed on.
 
 Check it from the log rather than from an impression of how the cycles have
 been going:
@@ -705,7 +719,11 @@ jq -r 'select(.reason != "") | [.ts, .event, .reason, .budget_remaining, .bead] 
 | `worktree_unpublished_kept` | A no-such-bead path that is clean, whose publication probe RAN, and whose `HEAD` was found on no remote-tracking branch (`reason: no_such_bead_content_unpublished`), so its commits exist nowhere else. Nothing was removed | A real finding, and it will NOT resolve on its own — inspect the worktree by hand. If the commits matter, push them somewhere; if they do not, remove the directory yourself. Mail the mayor if you cannot tell |
 | `worktree_publication_unconfirmed` | The publication probe did not answer, so whether the commits exist elsewhere is UNKNOWN. `reason`: `publication_probe_timed_out` (cut short by the budget left) or `publication_probe_failed` (`git rev-parse HEAD` or `git branch --remotes --contains` exited non-zero, or HEAD read back empty). Nothing was removed | **Not a lost-work signal — do not salvage on it.** `publication_probe_timed_out` → budget first; the detail names the seconds it got. `publication_probe_failed` means the rig checkout or the worktree is unhealthy: inspect by hand. Either way the next cycle re-checks (`gcp-9ql4`) |
 | `worktree_status_unreadable` | `git status` actually ran inside the worktree and did not answer. `reason`: `git_status_timed_out` (cut short by the budget left) or `git_status_failed` (non-zero exit) | **`git_status_timed_out` → budget first.** `git_status_failed` is the real one: inspect by hand, likely a broken or moved checkout |
-| `worktree_reap_failed` | Directory survived removal | Investigate permissions/mounts, mail mayor |
+| `worktree_reap_failed` | Directory survived removal. `reason`: `reap_rename_failed` (the worktree could not be renamed to its `.reaping` marker, so NOTHING was deleted) or `reap_incomplete` (the marked directory survived the `rm -rf`) | Investigate permissions/mounts, mail mayor. `reap_rename_failed` is the safe one — the worktree is untouched; `reap_incomplete` leaves a `.reaping` directory the next cycle will re-attempt |
+| `worktree_bead_reopened` | The bead was `closed` when this cycle enumerated it and is not closed now (`reason: bead_changed_at_point_of_use`). The closure is what authorises the reap, so nothing was removed | None — this is the re-check working. A polecat has almost certainly been slung onto the reopened bead and is using that worktree. It stops being a candidate until the bead closes again |
+| `worktree_revalidation_unconfirmed` | A gate could not be RE-CONFIRMED immediately before the removal, so the removal was refused. `reason`: `revalidation_status_unreadable` (the second `git status` did not answer), `revalidation_owner_unconfirmed` (the roster could not confirm the owner), or one of the renew-read reasons (`budget_spent_before_recheck_bead_read`, `recheck_bead_read_timed_out`, `recheck_bead_read_failed`, `recheck_bead_read_unparseable`) | Nothing was removed, which is the correct direction. Budget/timeout reasons → the cycle was too short, same reading as `worktree_budget_truncated`. A `_failed` reason means the store or the checkout is unhealthy — check `gc doctor` |
+| `worktree_residue_git_view_absent` | A residue directory the disk walk found that git cannot administer at all — no `.git`, or one pointing at an admin entry that is gone. Gate 3 is UNEVALUABLE for it, and the line says so rather than reporting a clean tree it never inspected. The reap stands on gates 2 and 4 instead | Log only, and expected on any rig that ran an armed reaper before `gcp-mves`. It is the tail of an authorised removal that was killed; the gate-2/gate-4 line for the same path says what actually happened to it |
+| `worktree_residue_no_bead_kept` | A residue directory with NO bead (`reason: residue_no_bead_unverifiable`). Gate 5 carries the no-such-bead path and needs a `git rev-parse HEAD` this directory cannot answer, so no evidence exists either way. Nothing was removed | A real finding that will not resolve on its own — inspect by hand, like `worktree_unpublished_kept`. The content is there; git's view of it is not. Mail the mayor if you cannot tell what it was |
 | `worktree_list_failed` | `git worktree list` ran and did not answer, so no candidate was enumerated. `reason`: `worktree_list_timed_out` or `worktree_list_failed` | Timed out → budget first. Failed → the rig checkout itself is unhealthy; inspect `$RIG_ROOT` by hand |
 | `worktree_bead_query_failed` | The one bulk bead read ran and did not answer. `reason`: `bead_query_timed_out` (slower than the seconds the run had left — the detail names them) or `bead_query_failed` (non-zero exit) | Nothing was examined this cycle. **`bead_query_timed_out` on a small remaining budget is the reaper's clock, not the store** — compare the detail's "Ns left of the Ms budget" before suspecting the endpoint. A `bead_query_failed`, or a timeout with most of the budget still unspent, is the rig's Dolt endpoint |
 | `worktree_budget_exhausted` | The run hit its own wall-clock budget and stopped at the top of the loop. The detail carries examined/skipped/deferred counts, the window this cycle covered, and where the next resumes | Routine on a rig with many candidates; the rest are deferred to the next cycle. **Not evidence for the `--no-dry-run` flip** — this cycle reviewed a window, not the set. Persistent + a growing candidate count means the store is too slow for the budget — raise `[session] setup_timeout` AND `GC_REAP_BUDGET_SECONDS` together, or investigate the endpoint |
