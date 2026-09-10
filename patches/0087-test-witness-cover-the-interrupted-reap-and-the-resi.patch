@@ -1,0 +1,548 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 10 Sep 2026 12:42:55 -0400
+Subject: [PATCH 87/88] test(witness): cover the interrupted reap and the
+ residue it strands (gcp-mves)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+RED first, per the bead's acceptance criteria. Seven cases that fail against
+the current polecat-worktree-reap.sh for the reason the bead names, not for a
+syntax error; the fix lands in the next commit.
+
+The reaper runs as the witness pre_start and a pre_start is SIGKILLed at
+[session] setup_timeout. `git worktree remove` drops the worktree's .git file
+and git's admin entry BEFORE it unlinks the tree, so a kill in that window
+leaves a directory that is present on disk, has no .git, has no admin entry,
+and produced no log line — the report is downstream of the kill. Gate 1
+enumerates from `git worktree list`, which cannot see such a directory, so the
+reaper can never look at it again. winnow lost 40 worktrees this way and
+reported none of them (winnow-h0n2o).
+
+No amount of dry-run soak could have caught it, which is why the cases are
+written the way they are: a dry run never calls `git worktree remove` at all,
+so the whole failure mode is outside what the staged rollout can observe. The
+fixture therefore drives the destructive path directly — it stalls `git
+worktree remove` half done (the .git file and admin entry already gone, the
+tree still there) and SIGKILLs the reaper inside that window, which reproduces
+the observed artifact exactly.
+
+Cases: an interrupted removal leaves a marked, resumable state; no unmarked
+half-removed directory survives any interruption; legacy residue is enumerated
+by walking the disk rather than the admin list; residue still honours the
+gates (one case per gate); residue with no bead is kept; the gates are
+re-checked at the point of use; and the promotion criterion says what a
+dry-run soak can and cannot demonstrate.
+
+Two test hooks are new because the states they drive are not otherwise
+observable from outside the script: GIT_REMOVE_HALFWAY_STALL /
+GIT_LATER_PRUNE_DELAY hold the process inside either removal sequence so the
+kill can land there, and GIT_DIRTY_AFTER_STATUS dirties a worktree the instant
+gate 3 answers clean, which is a gate going stale between its check and the
+removal it authorised. kill_after is hand-rolled rather than coreutils
+`timeout`, for the same reason the script's own run_bounded carries a
+fallback: coreutils is not on a stock macOS.
+
+Validation: all seven fail against the unchanged script with the expected
+messages (pasted verbatim into a bead note); the seventeen existing cases and
+test_agent_pre_start_budget.sh stay green.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ gastown/tests/test_polecat_worktree_reap.sh | 444 ++++++++++++++++++++
+ 1 file changed, 444 insertions(+)
+
+diff --git a/gastown/tests/test_polecat_worktree_reap.sh b/gastown/tests/test_polecat_worktree_reap.sh
+index c0d01d8..6df954c 100644
+--- a/gastown/tests/test_polecat_worktree_reap.sh
++++ b/gastown/tests/test_polecat_worktree_reap.sh
+@@ -109,6 +109,21 @@ write_git_stub() {
+     #   GIT_REVPARSE_FAIL non-empty: that rev-parse exits 128 without running
+     #   GIT_CONTAINS_DELAY seconds to stall `git ... branch --remotes --contains`
+     #   GIT_CONTAINS_FAIL non-empty: that branch read exits 129 without running
++    #   GIT_PRUNE_COUNT_FILE  one byte appended per `git ... worktree prune`
++    #   GIT_LATER_PRUNE_DELAY seconds to stall every prune AFTER the first. The
++    #                    reaper prunes once at startup and again between the two
++    #                    halves of a removal, so this is the only way to hold the
++    #                    process inside the removal window from outside it.
++    #   GIT_REMOVE_HALFWAY_STALL seconds to hold `git ... worktree remove` open
++    #                    HALF DONE — the `.git` file and the admin entry gone,
++    #                    the tree still on disk. That is git's documented order
++    #                    and the exact state winnow was left in (gcp-mves); the
++    #                    stall models the SIGKILL landing in that window.
++    #   GIT_DIRTY_AFTER_STATUS a worktree path to dirty immediately AFTER a
++    #                    `git ... status` answers. The first caller sees a clean
++    #                    tree and the next sees a dirty one, which is the only
++    #                    way to drive a gate going stale between its check and
++    #                    the removal it authorised.
+     #
+     # The gate-5 hooks exist for the same reason the gate-3 ones do: the
+     # difference between "the probe ran and found nothing" and "the probe never
+@@ -121,7 +136,37 @@ write_git_stub() {
+ #!/usr/bin/env sh
+ case " \$* " in
+     *" worktree prune "*)
++        if [ -n "\${GIT_PRUNE_COUNT_FILE:-}" ]; then printf 'x' >>"\$GIT_PRUNE_COUNT_FILE"; fi
+         if [ -n "\${GIT_PRUNE_DELAY:-}" ]; then sleep "\$GIT_PRUNE_DELAY"; fi
++        if [ -n "\${GIT_LATER_PRUNE_DELAY:-}" ] && [ -n "\${GIT_PRUNE_COUNT_FILE:-}" ] &&
++            [ "\$(wc -c <"\$GIT_PRUNE_COUNT_FILE" | tr -d ' ')" -gt 1 ]; then
++            "$real" "\$@"
++            sleep "\$GIT_LATER_PRUNE_DELAY"
++            exit 0
++        fi
++        ;;
++    *" worktree remove "*)
++        if [ -n "\${GIT_REMOVE_HALFWAY_STALL:-}" ]; then
++            # git drops the worktree .git file and the admin entry BEFORE it
++            # unlinks the tree. Reproduce exactly that half-state, then hold it
++            # open so the caller SIGKILL lands inside the window. The removal is
++            # never completed: a killed pre_start does not get to finish.
++            # (No backticks in here: the heredoc is unquoted so the stub can
++            # bake in the real git path, and a backtick would be run at write
++            # time rather than written out.)
++            target=""
++            repo=""
++            want_repo=0
++            for arg in "\$@"; do
++                if [ "\$want_repo" = 1 ]; then repo="\$arg"; want_repo=0; continue; fi
++                if [ "\$arg" = "-C" ]; then want_repo=1; continue; fi
++                target="\$arg"
++            done
++            rm -f "\$target/.git"
++            "$real" -C "\$repo" worktree prune
++            sleep "\$GIT_REMOVE_HALFWAY_STALL"
++            exit 0
++        fi
+         ;;
+     *" status "*)
+         if [ -n "\${GIT_STATUS_DELAY:-}" ]; then sleep "\$GIT_STATUS_DELAY"; fi
+@@ -129,6 +174,12 @@ case " \$* " in
+             echo "fatal: simulated git status failure" >&2
+             exit 128
+         fi
++        if [ -n "\${GIT_DIRTY_AFTER_STATUS:-}" ]; then
++            out=\$("$real" "\$@"); rc=\$?
++            printf '%s' "\$out"
++            echo scratch >"\$GIT_DIRTY_AFTER_STATUS/went-dirty.txt"
++            exit "\$rc"
++        fi
+         ;;
+     *" rev-parse HEAD "*)
+         if [ -n "\${GIT_REVPARSE_DELAY:-}" ]; then sleep "\$GIT_REVPARSE_DELAY"; fi
+@@ -188,6 +239,93 @@ publish_rig() {
+     git -C "$1" fetch -q origin
+ }
+ 
++strip_worktree() {
++    # strip_worktree <rig> <worktree-path> — reproduce the residue an armed reap
++    # left on winnow (gcp-mves): the directory stays on disk, its `.git` file is
++    # gone, and git's admin entry for it is pruned away. Nothing about the shape
++    # is inferred — it is what `git worktree remove` leaves when it is killed
++    # after dropping git's view and before unlinking the tree.
++    #
++    # This is the case `git worktree list` structurally CANNOT enumerate, which
++    # is why the reaper needs a second enumeration source that walks the disk.
++    rm -f "$2/.git"
++    git -C "$1" worktree prune
++}
++
++detach_worktree_admin() {
++    # detach_worktree_admin <rig> <worktree-path> <admin-name> — unregister a
++    # worktree from `git worktree list` while leaving it FULLY ADMINISTRABLE:
++    # the admin entry is moved aside (same depth, so its relative `commondir`
++    # still resolves) and the worktree's `.git` file is repointed at it.
++    #
++    # Residue git can still answer about must take the ordinary gates rather
++    # than the residue path — a `git status` is available for it, so gate 3
++    # binds exactly as it does for a registered worktree.
++    mkdir -p "$1/.git/detached"
++    mv "$1/.git/worktrees/$3" "$1/.git/detached/$3"
++    printf 'gitdir: %s\n' "$1/.git/detached/$3" >"$2/.git"
++}
++
++interrupt_a_removal() {
++    # interrupt_a_removal <tmp> <rig> <bin> <home> <beads> <sessions> <logdir>
++    # — run the reaper live against one reapable worktree and SIGKILL it in the
++    # middle of the removal.
++    #
++    # The kill is the whole of gcp-mves: pre_start is SIGKILLed at [session]
++    # setup_timeout, and there is no way for the script to catch it. Both
++    # removal sequences are held open so the kill lands inside whichever one the
++    # script uses:
++    #   GIT_REMOVE_HALFWAY_STALL   the OLD sequence — `git worktree remove` held
++    #                              half done, git's view of the tree already
++    #                              gone and the tree still on disk.
++    #   GIT_LATER_PRUNE_DELAY      the NEW sequence — the prune that sits
++    #                              between the rename and the `rm -rf`.
++    # The budget is deliberately larger than the outer kill so the script's own
++    # run_bounded does not end the stall first: what must end this process is
++    # the SIGKILL, exactly as on a real rig.
++    local tmp="$1" rig="$2" bin="$3" home="$4" beads="$5" sessions="$6" logdir="$7"
++
++    kill_after 6 env GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" \
++        GC_SESSIONS_JSON="$sessions" GIT_PRUNE_COUNT_FILE="$tmp/prunes" \
++        GIT_LATER_PRUNE_DELAY=60 GIT_REMOVE_HALFWAY_STALL=60 PATH="$bin:$PATH" \
++        bash "$SCRIPT" "$rig" --budget 45 --no-dry-run >"$tmp/interrupted.txt" 2>&1
++}
++
++kill_after() {
++    # kill_after <seconds> <cmd...> — run <cmd> and SIGKILL it after <seconds>.
++    # Not `timeout`: coreutils is not on a stock macOS, and the reaper's own
++    # run_bounded carries a hand-rolled fallback for exactly that reason, so a
++    # test of the reaper must not need it either. SIGKILL specifically — the
++    # signal the script cannot catch, which is the premise of the bead.
++    local secs="$1"
++    shift
++    "$@" &
++    local pid=$! killer
++    (
++        sleep "$secs"
++        kill -KILL "$pid" 2>/dev/null || true
++    ) &
++    killer=$!
++    wait "$pid" 2>/dev/null || true
++    kill "$killer" 2>/dev/null || true
++    wait "$killer" 2>/dev/null || true
++}
++
++# unmarked_half_removed <scan-root> — print every directory under <scan-root>
++# that is simultaneously present on disk, missing a `.git`, and NOT carrying the
++# `.reaping` marker. That set must be empty after ANY interrupted run: it is the
++# state no gate can enumerate and no log line reports, and buying its absence is
++# what this whole bead is for.
++unmarked_half_removed() {
++    local root="$1" entry
++    for entry in "$root"/*; do
++        [[ -d "$entry" ]] || continue
++        [[ "$entry" != *.reaping ]] || continue
++        [[ ! -e "$entry/.git" ]] || continue
++        printf '%s\n' "$entry"
++    done
++}
++
+ test_reaps_only_closed_clean_unowned_bead_worktrees() {
+     local tmp rig bin home beads sessions logdir
+     tmp=$(mktemp -d)
+@@ -1368,6 +1506,305 @@ JSON
+     rm -rf "$tmp"
+ }
+ 
++# ── gcp-mves: a kill inside the removal must not orphan a worktree ───────────
++# The removal is the one destructive call in this script, it runs as a witness
++# pre_start, and a pre_start is SIGKILLed at [session] setup_timeout. The old
++# sequence took that kill in the middle of `git worktree remove`, which drops
++# the `.git` file and the admin entry BEFORE it unlinks the tree — leaving a
++# directory on disk that `git worktree list` can never enumerate again, and no
++# log line, because the report is downstream of the kill. winnow lost 40
++# worktrees that way (winnow-h0n2o) and reported none of them.
++
++reapable_one_worktree_fixture() {
++    # reapable_one_worktree_fixture <tmp> — one closed, clean, unowned per-bead
++    # worktree under a registered agent home. Echoes nothing; the caller uses
++    # the fixed paths below.
++    local tmp="$1"
++    local rig="$tmp/rig" bin="$tmp/bin"
++    local home="$tmp/city/.gc/worktrees/rig/polecats/nux"
++
++    mkdir -p "$tmp/logs"
++    setup_rig "$rig"
++    write_gc_stub "$bin"
++    write_git_stub "$bin"
++    # The home is a registered worktree, as it is on a real rig. It is the
++    # handle the residue walk needs once a per-bead entry is gone from git's
++    # admin list: an agent home contributes its `worktrees/` directory as a
++    # scan root even though it is never a candidate itself.
++    git -C "$rig" worktree add -q "$home" --detach HEAD
++    add_bead_worktree "$rig" "$home" wt-closed
++
++    cat >"$tmp/beads.json" <<'JSON'
++[{"id":"wt-closed","status":"closed","metadata":{"polecat_session":"deadsess"}}]
++JSON
++    cat >"$tmp/sessions.json" <<'JSON'
++{"sessions":[{"id":"deadsess","name":"deadsess","state":"closed","closed":true}]}
++JSON
++}
++
++test_an_interrupted_removal_is_marked_and_resumable() {
++    local tmp rig bin home log
++    tmp=$(mktemp -d)
++    rig="$tmp/rig"
++    bin="$tmp/bin"
++    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
++    log="$tmp/logs/polecat-worktree-reap.log"
++
++    reapable_one_worktree_fixture "$tmp"
++    interrupt_a_removal "$tmp" "$rig" "$bin" "$home" \
++        "$tmp/beads.json" "$tmp/sessions.json" "$tmp/logs"
++
++    # The kill landed inside the removal. What survives must SAY SO on its own:
++    # the marker is the evidence, never a directory mtime or an inference.
++    [[ -d "$home/worktrees/wt-closed.reaping" ]] ||
++        fail "an interrupted removal left no \`.reaping\` marker; the surviving state is: $(ls -a "$home/worktrees" | tr '\n' ' ')"
++    ! git -C "$rig" worktree list --porcelain | grep -F "worktrees/wt-closed.reaping" >/dev/null ||
++        fail "the marked residue is registered with git; the rename must move it out of git's admin view"
++
++    # And the next cycle must FINISH it — that is what resumable means.
++    GC_RIG=rig LOG_DIR="$tmp/logs" GC_BEADS_JSON="$tmp/beads.json" \
++        GC_SESSIONS_JSON="$tmp/sessions.json" \
++        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/resume.txt" 2>&1 ||
++        fail "the resuming cycle exited non-zero: $(cat "$tmp/resume.txt")"
++
++    [[ ! -e "$home/worktrees/wt-closed.reaping" ]] ||
++        fail "the next cycle did not finish the interrupted removal: $(cat "$tmp/resume.txt")"
++    [[ ! -e "$home/worktrees/wt-closed" ]] ||
++        fail "the original worktree path came back"
++    grep -F 'wt-closed.reaping' "$log" >/dev/null ||
++        fail "the resumed removal was never recorded; silent recovery is the failure this closes"
++
++    rm -rf "$tmp"
++}
++
++test_no_unmarked_half_removed_state_survives_an_interruption() {
++    # THE invariant this bead buys. A directory that is present on disk, has no
++    # `.git`, and carries no marker is unowned by every guard: gate 1 sources
++    # candidates from `git worktree list`, which cannot see it, so it
++    # accumulates silently and forever. After ANY interrupted run the set of
++    # such directories must be empty.
++    local tmp rig bin home orphans
++    tmp=$(mktemp -d)
++    rig="$tmp/rig"
++    bin="$tmp/bin"
++    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
++
++    reapable_one_worktree_fixture "$tmp"
++    interrupt_a_removal "$tmp" "$rig" "$bin" "$home" \
++        "$tmp/beads.json" "$tmp/sessions.json" "$tmp/logs"
++
++    orphans=$(unmarked_half_removed "$home/worktrees")
++    [[ -z "$orphans" ]] ||
++        fail "an interrupted removal left an unmarked half-removed directory — present, no .git, no marker, and enumerable by nothing: $(printf '%s' "$orphans" | tr '\n' ' ')"
++
++    rm -rf "$tmp"
++}
++
++test_legacy_residue_is_enumerated_from_disk() {
++    # The ~23 directories winnow's armed run already stripped. They carry no
++    # marker and no admin entry, so the ONLY way to find them is to walk the
++    # worktree tree on disk — `git worktree list` structurally cannot.
++    local tmp rig bin home log residue
++    tmp=$(mktemp -d)
++    rig="$tmp/rig"
++    bin="$tmp/bin"
++    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
++    log="$tmp/logs/polecat-worktree-reap.log"
++    residue="$home/worktrees/wt-closed"
++
++    reapable_one_worktree_fixture "$tmp"
++    strip_worktree "$rig" "$residue"
++
++    # Precondition: the fixture really is invisible to the enumeration source
++    # the reaper used to have. If this ever stops holding the case is testing
++    # nothing.
++    ! git -C "$rig" worktree list --porcelain | grep -F "worktrees/wt-closed" >/dev/null ||
++        fail "the stripped fixture is still in git's admin list; it does not model the residue"
++
++    # DEFAULT posture first: it must be named in the log and left alone.
++    GC_RIG=rig LOG_DIR="$tmp/logs" GC_BEADS_JSON="$tmp/beads.json" \
++        GC_SESSIONS_JSON="$tmp/sessions.json" \
++        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" >"$tmp/dry.txt" 2>&1 ||
++        fail "the dry run exited non-zero: $(cat "$tmp/dry.txt")"
++
++    [[ -d "$residue" ]] ||
++        fail "the dry run removed residue; real removal must stay opt-in on this path too"
++    grep -F "$(basename "$residue")" "$log" >/dev/null ||
++        fail "the dry run did not name the residue path in the log: $(cat "$tmp/dry.txt")"
++
++    # Then the live posture: every gate passes, so it goes.
++    GC_RIG=rig LOG_DIR="$tmp/logs" GC_BEADS_JSON="$tmp/beads.json" \
++        GC_SESSIONS_JSON="$tmp/sessions.json" \
++        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/live.txt" 2>&1 ||
++        fail "the live run exited non-zero: $(cat "$tmp/live.txt")"
++
++    [[ ! -e "$residue" ]] ||
++        fail "residue that cleared every gate was not removed: $(cat "$tmp/live.txt")"
++    [[ -e "$home/seed.txt" ]] ||
++        fail "the agent home was removed while walking it for residue"
++
++    rm -rf "$tmp"
++}
++
++test_residue_still_honours_the_gates() {
++    # Widening the enumeration must not weaken the gates. Residue is not a fast
++    # path: one case per gate that can still bind on it.
++    local tmp rig bin home log
++    tmp=$(mktemp -d)
++    rig="$tmp/rig"
++    bin="$tmp/bin"
++    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
++    log="$tmp/logs/polecat-worktree-reap.log"
++
++    mkdir -p "$tmp/logs"
++    setup_rig "$rig"
++    write_gc_stub "$bin"
++    write_git_stub "$bin"
++    git -C "$rig" worktree add -q "$home" --detach HEAD
++
++    # Gate 2: the owning bead is open again.
++    add_bead_worktree "$rig" "$home" wt-open
++    strip_worktree "$rig" "$home/worktrees/wt-open"
++    # Gate 4: a live session still owns it.
++    add_bead_worktree "$rig" "$home" wt-live
++    strip_worktree "$rig" "$home/worktrees/wt-live"
++    # Gate 3: residue git CAN still administer — unregistered, but with a
++    # working `.git`. It gets the ordinary clean-tree gate, and it is dirty.
++    add_bead_worktree "$rig" "$home" wt-dirty
++    detach_worktree_admin "$rig" "$home/worktrees/wt-dirty" wt-dirty
++    echo scratch >"$home/worktrees/wt-dirty/seed.txt"
++
++    cat >"$tmp/beads.json" <<'JSON'
++[
++  {"id":"wt-open","status":"open","metadata":{"polecat_session":"deadsess"}},
++  {"id":"wt-live","status":"closed","metadata":{"polecat_session":"livesess"}},
++  {"id":"wt-dirty","status":"closed","metadata":{"polecat_session":"deadsess"}}
++]
++JSON
++    cat >"$tmp/sessions.json" <<'JSON'
++{"sessions":[
++  {"id":"livesess","name":"livesess","state":"running","closed":false},
++  {"id":"deadsess","name":"deadsess","state":"closed","closed":true}
++]}
++JSON
++
++    GC_RIG=rig LOG_DIR="$tmp/logs" GC_BEADS_JSON="$tmp/beads.json" \
++        GC_SESSIONS_JSON="$tmp/sessions.json" \
++        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out.txt" 2>&1 ||
++        fail "reaper exited non-zero: $(cat "$tmp/out.txt")"
++
++    [[ -d "$home/worktrees/wt-open" ]] ||
++        fail "residue whose bead is open again was removed; gate 2 must bind on residue too"
++    [[ -d "$home/worktrees/wt-live" ]] ||
++        fail "residue still owned by a live session was removed; gate 4 must bind on residue too"
++    grep -F '"event":"worktree_owner_live"' "$log" >/dev/null ||
++        fail "the live-owner refusal was not recorded for residue"
++    [[ -d "$home/worktrees/wt-dirty" ]] ||
++        fail "dirty residue was removed; gate 3 must bind wherever git can still answer"
++    grep -F '"event":"worktree_dirty_kept"' "$log" >/dev/null ||
++        fail "the dirty refusal was not recorded for residue"
++
++    rm -rf "$tmp"
++}
++
++test_residue_with_no_bead_is_kept() {
++    # The `g7nf-base` shape (gcp-0u14) as RESIDUE: a directory with no bead to
++    # authorise the reap and no git view to run the publication gate against.
++    # Gate 5 is what carries the no-such-bead path, and it needs a `git
++    # rev-parse HEAD` this directory cannot answer — so there is no evidence
++    # left at all. Keep it and say so.
++    local tmp rig bin home log residue
++    tmp=$(mktemp -d)
++    rig="$tmp/rig"
++    bin="$tmp/bin"
++    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
++    log="$tmp/logs/polecat-worktree-reap.log"
++    residue="$home/worktrees/hand-made"
++
++    mkdir -p "$tmp/logs"
++    setup_rig "$rig"
++    write_gc_stub "$bin"
++    write_git_stub "$bin"
++    git -C "$rig" worktree add -q "$home" --detach HEAD
++    add_bead_worktree "$rig" "$home" hand-made
++    strip_worktree "$rig" "$residue"
++
++    printf '[]' >"$tmp/beads.json"
++    printf '{"sessions":[]}' >"$tmp/sessions.json"
++
++    GC_RIG=rig LOG_DIR="$tmp/logs" GC_BEADS_JSON="$tmp/beads.json" \
++        GC_SESSIONS_JSON="$tmp/sessions.json" \
++        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out.txt" 2>&1 ||
++        fail "reaper exited non-zero: $(cat "$tmp/out.txt")"
++
++    [[ -d "$residue" ]] ||
++        fail "residue with no bead was removed; nothing authorised it and gate 5 cannot run without a git view"
++    grep -F '"worktree":"' "$log" | grep -F 'hand-made' >/dev/null ||
++        fail "residue with no bead was decided without being recorded"
++
++    rm -rf "$tmp"
++}
++
++test_gates_are_rechecked_at_the_point_of_use() {
++    # Ask 3. Everything the removal stands on was established earlier in the
++    # run: the bead status came from one bulk read at the top, the roster from
++    # a read after it, and the clean-tree check from before gate 5. The rig is
++    # live and the run is seconds long, so re-check what can change underneath
++    # it immediately before the destructive call.
++    #
++    # GIT_DIRTY_AFTER_STATUS makes the worktree go dirty the instant gate 3
++    # answers clean, which is precisely a gate going stale between its check and
++    # the removal it authorised.
++    local tmp rig bin home log wt
++    tmp=$(mktemp -d)
++    rig="$tmp/rig"
++    bin="$tmp/bin"
++    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
++    log="$tmp/logs/polecat-worktree-reap.log"
++    wt="$home/worktrees/wt-closed"
++
++    reapable_one_worktree_fixture "$tmp"
++
++    GC_RIG=rig LOG_DIR="$tmp/logs" GC_BEADS_JSON="$tmp/beads.json" \
++        GC_SESSIONS_JSON="$tmp/sessions.json" GIT_DIRTY_AFTER_STATUS="$wt" \
++        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out.txt" 2>&1 ||
++        fail "reaper exited non-zero: $(cat "$tmp/out.txt")"
++
++    [[ -d "$wt" ]] ||
++        fail "a worktree that went dirty after the gate check was removed; the gates must be re-checked at the point of use"
++    [[ -f "$wt/went-dirty.txt" ]] ||
++        fail "the fixture never dirtied the worktree, so nothing was under test"
++    grep -F '"event":"worktree_dirty_kept"' "$log" >/dev/null ||
++        fail "the point-of-use refusal was not recorded"
++
++    rm -rf "$tmp"
++}
++
++test_the_promotion_criterion_says_what_a_dry_run_cannot_show() {
++    # Ask 4. The staged-rollout criterion at agents/witness/agent.toml:20-25 was
++    # written as sufficient: "review the logged would-reap set across several
++    # cycles and confirm no live worktree ever appears in it". winnow's witness
++    # satisfied it honestly and still lost 40 worktrees, because the criterion
++    # tests WHICH WORKTREES ARE SELECTED and a dry run never calls `git worktree
++    # remove` at all — the removal path is outside everything the soak can
++    # observe. The next operator must not arm on the same incomplete evidence.
++    local toml
++    toml="$ROOT/gastown/agents/witness/agent.toml"
++
++    grep -qi 'necessary' "$toml" && grep -qi 'not sufficient' "$toml" ||
++        fail "the promotion criterion does not say the soak is necessary and NOT sufficient"
++    grep -q 'gcp-mves' "$toml" ||
++        fail "the promotion criterion does not name the removal-completion precondition (gcp-mves)"
++    grep -q 'gascity-3z7d' "$toml" ||
++        fail "the promotion criterion does not name the killed-pre_start precondition (gascity-3z7d)"
++
++    # And the flag itself must still not be wired. Every mention has to be prose.
++    local wired
++    wired=$(grep -n -- '--no-dry-run' "$toml" | grep -v '^[0-9]*:#' || true)
++    [[ -z "$wired" ]] ||
++        fail "--no-dry-run appears outside the prose: ${wired//$'\n'/ | }"
++}
++
+ test_reaps_only_closed_clean_unowned_bead_worktrees
+ test_real_removal_is_opt_in
+ test_unreadable_session_roster_skips_the_reap
+@@ -1385,5 +1822,12 @@ test_an_unanswered_publication_probe_is_not_a_lost_work_finding
+ test_lane_trees_other_than_polecats_are_enumerated
+ test_a_non_agent_worktree_named_like_a_bead_is_not_reaped
+ test_the_budget_cutoff_rotates_instead_of_dropping_the_same_tail
++test_an_interrupted_removal_is_marked_and_resumable
++test_no_unmarked_half_removed_state_survives_an_interruption
++test_legacy_residue_is_enumerated_from_disk
++test_residue_still_honours_the_gates
++test_residue_with_no_bead_is_kept
++test_gates_are_rechecked_at_the_point_of_use
++test_the_promotion_criterion_says_what_a_dry_run_cannot_show
+ 
+ echo "polecat worktree reap tests passed"
+-- 
+2.50.1 (Apple Git-155)
+

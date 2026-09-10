@@ -1,0 +1,1141 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 10 Sep 2026 13:07:49 -0400
+Subject: [PATCH 88/88] fix(witness): make the worktree reap survive its own
+ SIGKILL (gcp-mves)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The reaper runs as the witness pre_start, which gascity SIGKILLs at [session]
+setup_timeout. `git worktree remove` drops the worktree's .git file and git's
+admin entry BEFORE unlinking the tree, so a kill in that window left a
+directory that was present on disk, absent from `git worktree list`, and
+absent from the log — the failure report sits downstream of the kill. Gate 1
+enumerates from `git worktree list`, so the reaper could never look at such a
+directory again. winnow's first armed run stripped 40 worktrees that way and
+reported none of them (winnow-h0n2o), and the residue is still on this box.
+
+Removal now RENAMES FIRST: `mv <wt> <wt>.reaping` (a sibling rename, so
+rename(2), so atomic), then `git worktree prune` to drop the admin entry that
+now points nowhere, then `rm -rf`. A kill before the rename leaves the
+worktree intact and still enumerable; a kill at or after it leaves a directory
+whose suffix says what it is. The marker is the evidence — residue is never
+inferred from an mtime, which cannot tell a stripped tree from a slow one.
+`git worktree remove` is not called at all any more; it cannot be made safe
+here, because what has to be survived is the kill, not the command.
+
+Candidates are now the union of the admin list and a walk of the rig's own
+worktree tree, because a directory with no admin entry is exactly what gate 1
+structurally cannot see. Scan roots come from the admin list itself — an agent
+home stays registered even when every one of its per-bead children has been
+stripped — so the walk is a glob over known directories, never a `find`. The
+test is ABSENCE FROM THE ADMIN LIST rather than a shape inside the directory:
+keying on `.reaping` plus "no .git" would leave a third shape (a worktree git
+can still administer but has forgotten) unowned for the same reason the first
+two were. Widening what is looked at does not widen what is removed — residue
+takes the same gates.
+
+Gate 3 is the one that cannot apply unchanged, and the trap is not obvious:
+`git -C <stripped-dir> status` does NOT fail. With no .git of its own git
+walks UP and answers about the AGENT HOME (measured: `?? worktrees/`), so a
+naive residue gate would read a verdict about a directory it never inspected.
+The ceiling is pinned at the candidate's own parent and the reported toplevel
+and common-dir must be the candidate itself and this rig. Residue git can
+still administer takes the ordinary clean-tree gate; residue it cannot is
+recorded as UNEVALUABLE, naming why, and stands on gates 2 and 4. Residue with
+no bead is kept outright: gate 5 carries that path and needs a `git rev-parse
+HEAD` the directory cannot answer either, so no evidence would exist at all.
+
+The destructive call also had no re-validation at the point of use: the bead
+status came from one bulk read at the top of the run, the roster from a read
+after it, and the clean-tree check from before gate 5, all while the rig is
+live. The three gates that can change underneath a removal are re-checked
+immediately before the rename, and anything that cannot be RE-CONFIRMED is a
+refusal rather than a removal. This does not bring back the N+1 that cost
+winnow its witness for 26h (gcp-ntbf): `git status` is per-worktree and local
+as it already was, while the bead and roster renewals are one bulk pair for
+the whole cycle, taken lazily at the first removal.
+
+Finally the promotion criterion, in agents/witness/agent.toml and in
+mol-witness-patrol's copy of it. Both stated the staged-rollout soak as
+sufficient. It is not, and this is the part worth generalising: a dry run
+never calls the destructive path at all, so no soak — however complete its
+coverage — is evidence about whether a removal COMPLETES. winnow's witness
+verified the criterion honestly and still lost the rig. Both now say the soak
+evidences SELECTION only, and name the two remaining preconditions (this bead
+landed AND gascity-3z7d resolved, not either). The stale gc-zxxy rationale is
+replaced rather than deleted: that reason expired, the hold did not.
+
+Validation. RED first, recorded verbatim on the bead: seven new cases failed
+against the unchanged script for the stated reasons, including a fixture that
+reproduces winnow's artifact end to end by stalling `git worktree remove` half
+done and SIGKILLing the reaper inside that window. Green after: 24 cases in
+test_polecat_worktree_reap.sh, test_agent_pre_start_budget.sh, the whole
+gastown/tests/test_*.sh sweep, and shellcheck -S warning on both shell files.
+
+Checked read-only against the real residue on this box, which is the evidence
+that matters most: 40 stripped directories across two lane trees, of which 17
+are under `views/` — so a walk keyed on the `polecats` tree name would have
+recovered 23 and orphaned the rest, and gcp-elv3's shape-not-name rule is
+reused rather than re-derived. From winnow's real rig root the admin list
+holds 22 worktrees and ZERO per-bead ones, so today's reaper enumerates
+nothing there. The two shape predicates, extracted verbatim from the patched
+script, match all 40 with no rejections, and all 40 are reachable from the 18
+scan roots the admin list supplies. The dotted sub-bead ids survive the leaf
+whitelist, `winnow-grif7.17.2` included.
+
+Two guards outside the bead's four asks had to move with it.
+test_gastown_pack_assets.sh requires every `record worktree_*` event to have a
+row in mol-witness-patrol's log-review table, so the four new events are
+documented there. And test_bead_status_is_read_in_one_bulk_query pinned the
+bead read at exactly ONE call; a live cycle now takes two, both bulk and both
+once per cycle. Pinning the literal 1 forbids the second read without
+expressing the invariant it stands for, so the case now runs its fixture at
+two sizes and asserts the counts MATCH — flat in the number of worktrees,
+which is what gcp-ntbf actually bought — and caps them at 2, so the N+1 cannot
+return disguised as a re-check.
+
+Two budget cases were given headroom (2s/3s to 6s) after one of them failed
+under load in a full-suite run: a cycle spends ~1s reaching the bead read, so
+a 2s budget could land on `skipped`, which is a different and also correct
+verdict, not the one under test. Any budget below the 20s stall still produces
+the timeout being asserted.
+
+Follow-up, deliberately not done here: the 40 directories on winnow are not
+cleaned up by this commit. The reaper is disarmed on every rig under the
+mayor's standing ruling, so they are removed only once an operator arms it,
+which now requires gascity-3z7d as well. This makes them enumerable, gated and
+logged; it does not arm anything.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ gastown/agents/witness/agent.toml             |  29 +-
+ .../assets/scripts/polecat-worktree-reap.sh   | 674 +++++++++++++++---
+ gastown/formulas/mol-witness-patrol.toml      |  44 +-
+ gastown/tests/test_polecat_worktree_reap.sh   |  80 ++-
+ 4 files changed, 682 insertions(+), 145 deletions(-)
+
+diff --git a/gastown/agents/witness/agent.toml b/gastown/agents/witness/agent.toml
+index bb35180..c89da3b 100644
+--- a/gastown/agents/witness/agent.toml
++++ b/gastown/agents/witness/agent.toml
+@@ -18,11 +18,30 @@ work_dir = ".gc/agents/{{.Rig}}/witness"
+ # the rest next cycle. Raise one only alongside the other.
+ #
+ # STAGED ROLLOUT: no --no-dry-run here, so this reports what it WOULD reap and
+-# removes nothing. That matches the city's posture for the native gascity
+-# reaper, which city.toml holds in dry-run until gc-zxxy is answered; two
+-# reapers must not disagree about whether removal is live. Review the logged
+-# would-reap set across several patrol cycles, confirm no live worktree ever
+-# appears in it, then append --no-dry-run to flip on real removal.
++# removes nothing. Reviewing the logged would-reap set until no live worktree
++# ever appears in it is NECESSARY and it is NOT SUFFICIENT, and reading it as
++# sufficient is what cost winnow 40 worktrees (gcp-mves, winnow-h0n2o):
++#
++#   - The soak evidences SELECTION. It shows which worktrees this script picks,
++#     and that no live one is among them. That is a real and useful result.
++#   - It cannot evidence REMOVAL COMPLETION. A dry run never calls the
++#     destructive path at all, so nothing the soak observes says anything about
++#     whether a removal finishes — and the removal is the half that failed.
++#     winnow's witness verified the criterion honestly (35/35 beads closed, no
++#     live worktree ever logged) and still lost every per-bead worktree on the
++#     rig to a pre_start SIGKILL landing mid-removal, silently, because the
++#     failure report is downstream of the kill.
++#
++# TWO PRECONDITIONS, BOTH, before --no-dry-run is appended anywhere:
++#   1. gcp-mves has landed — removal is resumable across the SIGKILL and the
++#      residue an earlier interrupted run left is enumerable again.
++#   2. gascity-3z7d is resolved — pre_starts are not being killed in the first
++#      place. This box starts sessions in ~218s against a 180s setup_timeout,
++#      which is why the kill happens at all.
++# This replaces the earlier hold, which cited gc-zxxy. That reason expired:
++# gc-zxxy closed 2026-08-27 and city.toml already sets
++# auto_reap_closed_bead_worktrees = true. The hold did not expire with it — a
++# stale rationale is not an argument that the hold should lift.
+ pre_start = ["{{.ConfigDir}}/assets/scripts/polecat-worktree-reap.sh {{.RigRoot}} --rig {{.Rig}}"]
+ nudge = "Run 'gc prime' to check worker status and begin patrol cycle."
+ idle_timeout = "1h"
+diff --git a/gastown/assets/scripts/polecat-worktree-reap.sh b/gastown/assets/scripts/polecat-worktree-reap.sh
+index 5abcade..f09b5ec 100755
+--- a/gastown/assets/scripts/polecat-worktree-reap.sh
++++ b/gastown/assets/scripts/polecat-worktree-reap.sh
+@@ -105,6 +105,70 @@
+ #   honestly — none of this changes what the reaper removes, only which
+ #   candidates it looks at first and what the log lets a reader conclude.
+ #
++# THE INTERRUPTED REMOVAL — why the reap renames before it deletes (gcp-mves):
++#   This script runs as a pre_start, and a pre_start is SIGKILLed at [session]
++#   setup_timeout. That kill cannot be caught, deferred, or bounded from inside
++#   the script: run_bounded bounds the CHILDREN, never the process itself.
++#
++#   `git worktree remove` is not atomic. It drops the worktree's `.git` file and
++#   git's admin entry FIRST, then unlinks the tree. A kill in that window leaves
++#   a directory that is present on disk, has no `.git`, has no entry in
++#   `git worktree list`, and produced NO LOG LINE — the reap report is
++#   downstream of the kill. Gate 1 enumerates from `git worktree list`, so the
++#   reaper can never see that directory again: the failure is silent AND
++#   self-concealing, and the residue accumulates forever. winnow's first armed
++#   run stripped 40 worktrees that way and reported none of them (winnow-h0n2o).
++#
++#   So removal RENAMES FIRST, and every interruption point leaves a state that
++#   is either untouched or self-identifying:
++#     1. `mv <wt> <wt>.reaping` — a sibling rename inside the same directory, so
++#        it is a same-filesystem rename(2) and therefore atomic.
++#     2. `git worktree prune` — the admin entry now points at a path that is
++#        gone, so prune drops it cleanly.
++#     3. `rm -rf <wt>.reaping`.
++#   A kill before step 1 leaves the worktree fully intact and still enumerable
++#   next cycle. A kill at or after step 1 leaves a `.reaping` directory the next
++#   cycle finds and finishes. The SUFFIX is the marker: residue is never
++#   inferred from an mtime, which cannot tell a stripped tree from a slow one.
++#
++# RESIDUE — the second enumeration source (gcp-mves):
++#   `git worktree list` structurally cannot enumerate a directory with no admin
++#   entry, which is both the shape above and the ~23 directories winnow's armed
++#   run already left behind. So the candidate set is the UNION of the admin list
++#   and a walk of the rig's own worktree tree, which picks up two shapes:
++#     - `*.reaping`, left by an interrupted removal;
++#     - a per-bead directory with no `.git` inside and no admin entry — the
++#       legacy stripped shape, unmarked because nothing was there to mark it.
++#   The walk needs no `find`: every scan root is an `<agent-home>/worktrees`
++#   directory the admin list already names, because an agent's own home worktree
++#   stays registered even when every one of its per-bead children is gone.
++#
++#   Residue is not a fast path — it takes the same gates. Gates 1, 2 and 4 apply
++#   unchanged. Gate 3 cannot, and this is the trap: `git -C <stripped-dir>
++#   status` does NOT fail. With no `.git` of its own git walks UP and answers
++#   about the AGENT HOME instead (measured: `?? worktrees/`), so a naive gate
++#   would read a verdict about a directory it never looked at. The ceiling is
++#   therefore pinned at the candidate's own parent and the reported toplevel
++#   must be the candidate itself. Residue git CAN still administer then takes
++#   the ordinary clean-tree gate; residue it cannot is recorded as unevaluable
++#   and stands on gates 2 and 4. Residue with NO BEAD is kept outright: gate 5
++#   carries that path and needs a `git rev-parse HEAD` the directory cannot
++#   answer either, so no evidence would be left at all.
++#
++# THE POINT OF USE — why the gates are re-checked before the rename (gcp-mves):
++#   Everything the removal stands on is established earlier in the run: the bead
++#   status comes from one bulk read at the top, the roster from a read after it,
++#   and the clean-tree check from before gate 5. The rig is live while all of
++#   that ages, and a bead can be reopened and a polecat slung onto it inside the
++#   seconds a cycle lasts. So the gates that can change underneath the removal
++#   are re-checked immediately before the rename, and anything that cannot be
++#   RE-CONFIRMED is a refusal rather than a removal.
++#
++#   This does not reintroduce the N+1 the COST MODEL below removed. `git status`
++#   is per-worktree and local, exactly as it already was; the bead and roster
++#   re-reads are ONE bulk pair for the whole cycle, taken lazily at the first
++#   removal and reused by the rest.
++#
+ # COST MODEL — why this script is shaped the way it is (gcp-ntbf):
+ #   It runs as the witness pre_start, which gascity bounds by [session]
+ #   setup_timeout (10s by default) and SIGKILLs on overrun. A killed pre_start
+@@ -351,6 +415,83 @@ classify_outcome() {
+     fi
+ }
+ 
++# per_bead_shape <path> — true when <path> has the per-bead worktree shape
++# `<worktrees-root>/<rig>/<lane-tree>/<agent-home>/worktrees/<bead-id>`.
++#
++# ONE definition, used by gate 1 and by the residue walk both. The residue walk
++# exists precisely because git's admin list cannot see a half-removed worktree,
++# and a second copy of this predicate is how the two enumeration sources would
++# drift into disagreeing about what a candidate even is.
++#
++# The `worktrees` parent excludes an agent's own persistent home. The home shape
++# excludes the refinery's merge worktree, which keeps its per-bead directories
++# one level higher, at `<rig>/refinery/worktrees/`. That depth is a pack
++# invariant, not an observation: the two work_dir templates that produce these
++# paths are declared in this same pack — `.gc/worktrees/{{.Rig}}/polecats/
++# {{.AgentBase}}` for an agent home and `.gc/worktrees/{{.Rig}}/refinery` for
++# the refinery. The LANE TREE name is deliberately not tested: naming it is what
++# hid every view worktree from this gate, and naming a second one would only
++# move the blind spot (see THE LANE-TREE BLIND SPOT above).
++#
++# Plain parameter expansion rather than a basename/dirname pipeline: this runs
++# for every registered worktree on the rig, and the run has a wall clock to keep.
++per_bead_shape() {
++    local wt=$1 wt_parent agent_home lane_tree rig_dir worktrees_root
++    wt_parent=${wt%/*}                 # <agent-home>/worktrees
++    agent_home=${wt_parent%/*}         # <agent-home>
++    lane_tree=${agent_home%/*}         # <city>/.gc/worktrees/<rig>/<tree>
++    rig_dir=${lane_tree%/*}            # <city>/.gc/worktrees/<rig>
++    worktrees_root=${rig_dir%/*}       # <city>/.gc/worktrees
++    [ "${wt_parent##*/}" = worktrees ] || return 1
++    [ "${lane_tree##*/}" != worktrees ] || return 1
++    [ "${worktrees_root##*/}" = worktrees ] || return 1
++    return 0
++}
++
++# agent_home_shape <path> — true when <path> is an agent's own persistent home
++# worktree, `<worktrees-root>/<rig>/<lane-tree>/<agent>`.
++#
++# A home is never a candidate. It is here because it is the handle on where its
++# per-bead children live: a home stays registered with git even when every one
++# of those children has been stripped out of the admin list, which is what makes
++# the residue walk possible at all.
++agent_home_shape() {
++    local home=$1 lane_tree rig_dir worktrees_root
++    lane_tree=${home%/*}               # <city>/.gc/worktrees/<rig>/<tree>
++    rig_dir=${lane_tree%/*}            # <city>/.gc/worktrees/<rig>
++    worktrees_root=${rig_dir%/*}       # <city>/.gc/worktrees
++    [ "${worktrees_root##*/}" = worktrees ] || return 1
++    [ "${lane_tree##*/}" != worktrees ] || return 1
++    return 0
++}
++
++# THE BEAD ID A CANDIDATE PATH NAMES is `${wt##*/}` with any `.reaping` suffix
++# stripped — this script's own marker (see THE INTERRUPTED REMOVAL), so marked
++# residue answers to the same bead as the worktree it was. Written inline at each
++# call site rather than as a helper: parameter expansion costs nothing, while a
++# helper would put a subshell fork on a path that runs once per worktree on the
++# rig, inside a wall clock measured in seconds.
++
++# bead_leaf_ok <id> — true when a candidate's leaf could be a bead id. Anything
++# else is not ours to remove.
++#
++# The dot is IN the class because a sub-bead id carries one (`feryn-derh.1`),
++# and a whitelist without it dropped every split bead's worktree here — before
++# the bulk read, before any `record`, so no event was emitted at all and the log
++# read as a complete clean pass (gcp-ac59). That silence is the reason this was
++# a P1: it hid the data-at-risk case too, since a dotted worktree holding
++# stranded work could never surface as `worktree_dirty_kept` either. On winnow
++# it was half the eligible set. Admitting the dot must not admit traversal, so
++# `.` / `..` / any embedded `..` are still refused — the leading- and
++# trailing-dot guards mirror the `-*` / `*-` ones, since a bead id begins and
++# ends with neither separator.
++bead_leaf_ok() {
++    case "$1" in
++        *[!a-zA-Z0-9.-]* | '' | -* | *- | .* | *. | *..*) return 1 ;;
++    esac
++    return 0
++}
++
+ record() {
+     # record <event> <bead> <worktree> <detail> [reason]
+     #
+@@ -424,57 +565,95 @@ fi
+ # clean and published, clear every remaining gate. Name the exclusion instead.
+ MAIN_WT=$(printf '%s\n' "$WT_LIST" | sed -n 's/^worktree //p' | head -1)
+ 
+-CANDIDATES=$(printf '%s\n' "$WT_LIST" \
+-    | sed -n 's/^worktree //p' \
+-    | while IFS= read -r wt; do
+-        # Gate 1: per-bead worktree shape — `<agent-home>/worktrees/<bead-id>`,
+-        # where the home is itself `<lane-tree>/<agent>` two levels under the
+-        # rig's worktree root. That is the same home shape polecat-home-audit.sh
+-        # gates on, so the two scripts split the tree between them with one
+-        # definition rather than two.
+-        #
+-        # The `worktrees` parent excludes an agent's own persistent home. The
+-        # home shape excludes the refinery's merge worktree, which keeps its
+-        # per-bead directories one level higher, at `<rig>/refinery/worktrees/`.
+-        # That depth is a pack invariant, not an observation: the two work_dir
+-        # templates that produce these paths are declared in this same pack —
+-        # `.gc/worktrees/{{.Rig}}/polecats/{{.AgentBase}}` for an agent home and
+-        # `.gc/worktrees/{{.Rig}}/refinery` for the refinery. The LANE TREE name
+-        # is not tested: naming it is what hid every view worktree from this
+-        # gate, and naming a second one would only move the blind spot (see THE
+-        # LANE-TREE BLIND SPOT above).
+-        #
+-        # Plain parameter expansion rather than a basename/dirname pipeline:
+-        # this runs for every registered worktree on the rig, and the run has a
+-        # wall clock to keep.
+-        [ "$wt" != "$MAIN_WT" ] || continue
+-        [ "$wt" != "$RIG_ROOT" ] || continue
+-        wt_parent=${wt%/*}                 # <agent-home>/worktrees
+-        agent_home=${wt_parent%/*}         # <agent-home>
+-        lane_tree=${agent_home%/*}         # <city>/.gc/worktrees/<rig>/<tree>
+-        rig_dir=${lane_tree%/*}            # <city>/.gc/worktrees/<rig>
+-        worktrees_root=${rig_dir%/*}       # <city>/.gc/worktrees
+-        [ "${wt_parent##*/}" = worktrees ] || continue
+-        [ "${lane_tree##*/}" != worktrees ] || continue
+-        [ "${worktrees_root##*/}" = worktrees ] || continue
+-        # The leaf is the bead id. Anything else is not ours to remove.
+-        #
+-        # The dot is IN the class because a sub-bead id carries one
+-        # (`feryn-derh.1`), and a whitelist without it dropped every split
+-        # bead's worktree here — before the bulk read, before any `record`, so
+-        # no event was emitted at all and the log read as a complete clean pass
+-        # (gcp-ac59). That silence is the reason this was a P1: it hid the
+-        # data-at-risk case too, since a dotted worktree holding stranded work
+-        # could never surface as `worktree_dirty_kept` either. On winnow it was
+-        # half the eligible set. Admitting the dot must not admit traversal, so
+-        # `.` / `..` / any embedded `..` are still refused — the leading- and
+-        # trailing-dot guards mirror the `-*` / `*-` ones, since a bead id
+-        # begins and ends with neither separator.
+-        case "$(basename "$wt")" in
+-            *[!a-zA-Z0-9.-]* | '' | -* | *- | .* | *. | *..*) continue ;;
+-        esac
+-        printf '%s\n' "$wt"
+-    done | LC_ALL=C sort || true)
++# Two enumeration sources, unioned. The admin list is the first; the walk of the
++# rig's own worktree tree below is the second, and it exists because the admin
++# list structurally cannot see a half-removed worktree (see RESIDUE above).
++# These files are cleaned up by the trap that the bead-read block installs
++# further down, which lists every temp file this script makes.
++REGISTERED_FILE=$(mktemp)
++RESIDUE_FILE=$(mktemp)
++SCAN_ROOTS_FILE=$(mktemp)
++# Named here, made below, so the trap covers it even if the walk never runs.
++DISK_ENTRIES_FILE=""
++trap 'rm -f "$REGISTERED_FILE" "$RESIDUE_FILE" "$SCAN_ROOTS_FILE" "$DISK_ENTRIES_FILE"' EXIT
++
++# Gate 1: per-bead worktree shape — `<agent-home>/worktrees/<bead-id>`, where the
++# home is itself `<lane-tree>/<agent>` two levels under the rig's worktree root.
++# That is the same home shape polecat-home-audit.sh gates on, so the two scripts
++# split the tree between them with one definition rather than two.
++#
++# An agent HOME is never a candidate, but it is kept as a SCAN ROOT: it is the
++# handle on the directory its per-bead children live in, and it stays registered
++# with git even when every one of those children has been stripped out of the
++# admin list.
++while IFS= read -r wt; do
++    [ -n "$wt" ] || continue
++    [ "$wt" != "$MAIN_WT" ] || continue
++    [ "$wt" != "$RIG_ROOT" ] || continue
++    if agent_home_shape "$wt"; then
++        printf '%s\n' "$wt/worktrees" >>"$SCAN_ROOTS_FILE"
++        continue
++    fi
++    per_bead_shape "$wt" || continue
++    printf '%s\n' "${wt%/*}" >>"$SCAN_ROOTS_FILE"
++    leaf=${wt##*/}
++    bead_leaf_ok "${leaf%.reaping}" || continue
++    printf '%s\n' "$wt" >>"$REGISTERED_FILE"
++done <<EOF
++$(printf '%s\n' "$WT_LIST" | sed -n 's/^worktree //p')
++EOF
++
++# ── THE SECOND ENUMERATION SOURCE — residue (gcp-mves) ────────────────────────
++# A `git worktree remove` killed mid-flight, and every one of the ~23 directories
++# winnow's armed run already left behind, is present on disk with no admin entry
++# at all. Gate 1 above can never enumerate one, so it would accumulate silently
++# forever. Walk the same worktree directories the admin list named and pick up
++# anything on disk that is not in it.
++#
++# The test is ABSENCE FROM THE ADMIN LIST, not a shape inside the directory.
++# Two shapes have to be recovered and neither can be keyed on:
++#   - `*.reaping`, left by an interrupted removal — self-identifying;
++#   - the legacy stripped shape, a directory with no `.git` at all, carrying no
++#     marker because nothing was left running to write one.
++# Keying on those two would leave a third — a worktree git can still administer
++# but has forgotten — unowned by every guard for the same reason the first two
++# were. Everything enumerated here takes the same gates, so widening what is
++# LOOKED AT does not widen what is removed.
++#
++# A glob, never `find`: this walk has to fit inside the same 8s budget as the
++# rest of the run, and a wide traversal is both slow and a TCC prompt away from
++# blocking the witness start on macOS.
++if [ -s "$SCAN_ROOTS_FILE" ]; then
++    LC_ALL=C sort -u "$SCAN_ROOTS_FILE" -o "$SCAN_ROOTS_FILE" 2>/dev/null || true
++    LC_ALL=C sort -u "$REGISTERED_FILE" -o "$REGISTERED_FILE" 2>/dev/null || true
++    DISK_ENTRIES_FILE=$(mktemp)
++    while IFS= read -r scan_root; do
++        [ -n "$scan_root" ] && [ -d "$scan_root" ] || continue
++        for entry in "$scan_root"/*; do
++            [ -d "$entry" ] || continue
++            per_bead_shape "$entry" || continue
++            leaf=${entry##*/}
++            bead_leaf_ok "${leaf%.reaping}" || continue
++            printf '%s\n' "$entry"
++        done
++    done <"$SCAN_ROOTS_FILE" | LC_ALL=C sort -u >"$DISK_ENTRIES_FILE"
++    # The set difference in ONE process. A membership test per entry would put a
++    # fork on every worktree on the rig, which is the shape of cost this script
++    # spends its whole design avoiding.
++    if [ -s "$REGISTERED_FILE" ]; then
++        LC_ALL=C grep -Fxv -f "$REGISTERED_FILE" "$DISK_ENTRIES_FILE" \
++            >"$RESIDUE_FILE" 2>/dev/null || true
++    else
++        # An empty pattern file is not portably "match nothing" — some greps
++        # read it as matching everything, which would invert the difference and
++        # hide every residue path. Nothing is registered here, so every entry on
++        # disk is residue by definition; say that outright.
++        cat "$DISK_ENTRIES_FILE" >"$RESIDUE_FILE" 2>/dev/null || true
++    fi
++    rm -f "$DISK_ENTRIES_FILE"
++fi
++
++CANDIDATES=$(cat "$REGISTERED_FILE" "$RESIDUE_FILE" 2>/dev/null | LC_ALL=C sort -u || true)
+ 
+ if [ -z "$CANDIDATES" ]; then
+     echo "polecat-worktree-reap: no per-bead polecat worktrees under $RIG_ROOT"
+@@ -535,7 +714,10 @@ while IFS= read -r bead_id; do
+     fi
+ done <<EOF
+ $(printf '%s\n' "$CANDIDATES" | while IFS= read -r wt; do
+-    if [ -n "$wt" ]; then basename "$wt"; fi
++    if [ -n "$wt" ]; then
++        wt=${wt##*/}
++        printf '%s\n' "${wt%.reaping}"
++    fi
+ done | sort -u)
+ EOF
+ 
+@@ -553,8 +735,16 @@ SESSIONS_FILE=$(mktemp)
+ # transient.
+ BEAD_ERR_FILE=$(mktemp)
+ NOT_FOUND_FILE=$(mktemp)
++# The bead facts re-read at the point of use, before the first removal of the
++# cycle. A second file rather than an overwrite of BEADS_FILE: the gate pass and
++# the re-check are different observations, taken at different moments, and
++# collapsing them would leave nothing to compare a reopened bead against.
++RECHECK_BEADS_FILE=$(mktemp)
+ : >"$NOT_FOUND_FILE"
+-trap 'rm -f "$BEADS_FILE" "$SESSIONS_FILE" "$BEAD_ERR_FILE" "$NOT_FOUND_FILE"' EXIT
++# Replaces the enumeration trap above with one that names every temp file.
++trap 'rm -f "$BEADS_FILE" "$SESSIONS_FILE" "$BEAD_ERR_FILE" "$NOT_FOUND_FILE" \
++    "$RECHECK_BEADS_FILE" "$REGISTERED_FILE" "$RESIDUE_FILE" "$SCAN_ROOTS_FILE" \
++    "$DISK_ENTRIES_FILE"' EXIT
+ 
+ BEAD_QUERY_LIMIT=$(budget_left)
+ BEAD_QUERY_RC=0
+@@ -634,24 +824,31 @@ if ! jq -e 'type == "array"' "$BEADS_FILE" >/dev/null 2>&1; then
+ fi
+ 
+ # Join the candidate paths to their bead facts once, in jq, so the loop below
+-# does no per-worktree querying at all: <status>US<owner>US<worktree>, where US
++# does no per-worktree querying at all: <status>US<owner>US<kind>US<worktree>, US
+ # is the ASCII unit separator. Deliberately not @tsv: tab is an IFS WHITESPACE
+ # character, so `read` silently collapses the empty leading fields an unreadable
+ # bead produces and shifts the path into $STATUS. US is neither whitespace nor
+ # legal in a bead id or a path, so every field survives, empty or not.
+-DECISIONS=$(printf '%s\n' "$CANDIDATES" | jq -R -r -s --slurpfile bead_docs "$BEADS_FILE" '
++#
++# The `kind` field carries which ENUMERATION SOURCE found the path, so the loop
++# never has to ask per candidate. A membership test in the loop would be one fork
++# per worktree on the rig — the cost shape this script exists to avoid.
++DECISIONS=$(printf '%s\n' "$CANDIDATES" | jq -R -r -s \
++    --slurpfile bead_docs "$BEADS_FILE" --rawfile residue_paths "$RESIDUE_FILE" '
+     ( ($bead_docs[0] // [])
+       | map(select(type == "object"))
+       | map({ key:   (.id // "" | tostring),
+               value: { status: (.status // "" | tostring),
+                        owner:  (.metadata.polecat_session? // "" | tostring) } })
+       | from_entries ) as $by
++    | ($residue_paths | split("\n") | map(select(length > 0))) as $residue
+     | split("\n")
+     | map(select(length > 0))
+     | .[]
+     | . as $wt
+-    | ($by[($wt | split("/") | last)] // { status: "", owner: "" }) as $bead
+-    | [ $bead.status, $bead.owner, $wt ] | join("\u001f")
++    | ($by[($wt | split("/") | last | sub("\\.reaping$"; ""))] // { status: "", owner: "" }) as $bead
++    | (if ($residue | index($wt)) then "residue" else "registered" end) as $kind
++    | [ $bead.status, $bead.owner, $kind, $wt ] | join("\u001f")
+ ' 2>/dev/null || true)
+ 
+ # Session roster, fetched at most once and only when a closed bead actually
+@@ -741,6 +938,172 @@ session_state() {
+     esac
+ }
+ 
++# ── THE POINT OF USE — facts renewed for the removal phase (gcp-mves) ────────
++# Taken ONCE per cycle, lazily at the first removal, and reused by every removal
++# after it. One bulk bead read and one roster read for the whole candidate set,
++# never one pair per worktree: the N+1 that cost winnow its witness for 26h
++# (gcp-ntbf) must not come back through the re-check.
++#
++# `unconfirmed` until BOTH actually answer, and while it stays that way every
++# removal this cycle is refused. A re-check that could not be taken is not a
++# re-check that passed.
++RECHECK_STATE="unconfirmed"
++RECHECK_REASON="recheck_not_taken"
++RECHECK_TAKEN=0
++
++refresh_removal_snapshot() {
++    if [ "$RECHECK_TAKEN" -eq 1 ]; then
++        return
++    fi
++    RECHECK_TAKEN=1
++    local limit rc=0
++    limit=$(budget_left)
++    run_bounded "$limit" "${GC_BD[@]}" show "${BEAD_IDS_ARGV[@]}" --json \
++        >"$RECHECK_BEADS_FILE" 2>/dev/null || rc=$?
++    case "$(classify_outcome "$limit" "$rc")" in
++        skipped)
++            RECHECK_REASON="budget_spent_before_recheck_bead_read"
++            return
++            ;;
++        timeout)
++            RECHECK_REASON="recheck_bead_read_timed_out"
++            return
++            ;;
++    esac
++    if ! jq -e 'type == "array"' "$RECHECK_BEADS_FILE" >/dev/null 2>&1; then
++        if [ "$rc" -ne 0 ]; then
++            RECHECK_REASON="recheck_bead_read_failed"
++        else
++            RECHECK_REASON="recheck_bead_read_unparseable"
++        fi
++        return
++    fi
++    # The roster is renewed too. Gate 4's whole job is to defer a reap while a
++    # polecat is still reworking, and the window this re-check exists to close
++    # is exactly the one where a bead reopens and a polecat is slung onto it.
++    ROSTER_FETCHED=0
++    ROSTER_STATE="unconfirmed"
++    ROSTER_REASON="roster_read_failed"
++    ensure_roster
++    if [ "$ROSTER_STATE" != readable ]; then
++        RECHECK_REASON="$ROSTER_REASON"
++        return
++    fi
++    RECHECK_STATE="readable"
++    RECHECK_REASON=""
++}
++
++# The rig's own git directory, as GIT resolves it. Read from git rather than
++# composed as "$RIG_ROOT/.git" so it is comparable with what a candidate reports:
++# on macOS a $TMPDIR path and its resolved /private form are the same directory
++# and never compare equal as strings. Used to refuse a residue directory that is
++# administrable but belongs to some OTHER repository — its bead id would be this
++# rig's, and its content would not.
++RIG_GIT_DIR=""
++RIG_GIT_DIR_FETCHED=0
++
++ensure_rig_git_dir() {
++    if [ "$RIG_GIT_DIR_FETCHED" -eq 1 ]; then
++        return
++    fi
++    RIG_GIT_DIR_FETCHED=1
++    local limit rc=0 out
++    limit=$(budget_left)
++    # `--path-format=absolute` is not decoration: run from a repo root, a bare
++    # `--git-common-dir` answers the relative `.git`, which compares equal to
++    # nothing a candidate ever reports.
++    out=$(run_bounded "$limit" git -C "$RIG_ROOT" rev-parse \
++        --path-format=absolute --git-common-dir 2>/dev/null) || rc=$?
++    if [ "$(classify_outcome "$limit" "$rc")" = ok ]; then
++        RIG_GIT_DIR="$out"
++    fi
++}
++
++# revalidate_gates <bead> <worktree> <administrable> <no-such-bead>
++#
++# Re-check, immediately before the destructive call, the gates that can have
++# changed since they were evaluated: the tree can go dirty, the bead can be
++# reopened, and a polecat can be slung onto it. Everything above was established
++# earlier in the run — the bead status by one bulk read at the top, the roster by
++# a read after it, the clean-tree check by gate 3 — and the rig is live the whole
++# time. This was the one destructive call in the script with no re-validation at
++# the point of use (gcp-mves).
++#
++# Anything that cannot be RE-CONFIRMED is a refusal: the run is not entitled to
++# remove on evidence it could not renew. Records its own refusal, and returns 1
++# for the caller to skip on.
++revalidate_gates() {
++    local bead=$1 wt=$2 administrable=$3 no_bead=$4
++    local limit rc dirty status owner
++
++    if [ "$administrable" -eq 1 ]; then
++        limit=$(budget_left)
++        rc=0
++        dirty=$(run_bounded "$limit" git -C "$wt" status --porcelain 2>/dev/null) || rc=$?
++        if [ "$(classify_outcome "$limit" "$rc")" != ok ]; then
++            record worktree_revalidation_unconfirmed "$bead" "$wt" \
++                "git status could not be re-read immediately before the removal; a gate that cannot be re-confirmed is a refusal, not a removal" \
++                revalidation_status_unreadable
++            return 1
++        fi
++        if [ -n "$dirty" ]; then
++            record worktree_dirty_kept "$bead" "$wt" \
++                "the worktree went dirty between the gate check and the removal: $(printf '%s\n' "$dirty" | wc -l | tr -d ' ') uncommitted path(s)" \
++                dirty_at_point_of_use
++            return 1
++        fi
++    fi
++
++    # The no-such-bead path has no bead to re-read and no owner to confirm — its
++    # gates are 3 above and 5, and gate 5's evidence was taken from this same
++    # worktree moments ago.
++    if [ "$no_bead" -eq 1 ]; then
++        return 0
++    fi
++
++    refresh_removal_snapshot
++    if [ "$RECHECK_STATE" != readable ]; then
++        record worktree_revalidation_unconfirmed "$bead" "$wt" \
++            "the bead status and session roster could not be renewed before the removal ($RECHECK_REASON); the gates were last confirmed earlier in this run, so the worktree is kept and re-checked next cycle" \
++            "$RECHECK_REASON"
++        return 1
++    fi
++
++    # Keyed on the id the store ECHOED, exactly as the bulk join is: a fuzzy hit
++    # must not let one worktree inherit another bead's status here either.
++    status=$(jq -r --arg id "$bead" '
++        [ .[] | select(type == "object") | select((.id // "" | tostring) == $id) ]
++        | .[0].status // "" | tostring
++    ' "$RECHECK_BEADS_FILE" 2>/dev/null || true)
++    if [ "$status" != closed ]; then
++        record worktree_bead_reopened "$bead" "$wt" \
++            "the bead was closed when this cycle enumerated it and reads ${status:-unreadable} now; the closure is what authorises the reap, so it is not removed" \
++            bead_changed_at_point_of_use
++        return 1
++    fi
++
++    owner=$(jq -r --arg id "$bead" '
++        [ .[] | select(type == "object") | select((.id // "" | tostring) == $id) ]
++        | .[0].metadata.polecat_session? // "" | tostring
++    ' "$RECHECK_BEADS_FILE" 2>/dev/null || true)
++    case "$(session_state "$owner")" in
++        absent) ;;
++        live)
++            record worktree_owner_live "$bead" "$wt" \
++                "session $owner became live between the gate check and the removal" \
++                owner_live_at_point_of_use
++            return 1
++            ;;
++        *)
++            record worktree_owner_unconfirmed "$bead" "$wt" \
++                "the session roster could not confirm the owner immediately before the removal; a read that did not answer is not proof of absence" \
++                revalidation_owner_unconfirmed
++            return 1
++            ;;
++    esac
++    return 0
++}
++
+ REAPED=0
+ SKIPPED=0
+ EXAMINED=0
+@@ -754,7 +1117,7 @@ TRUNCATED=0
+ DECIDED_LAST=""
+ DECIDED_PREV=""
+ 
+-while IFS=$'\037' read -r STATUS OWNER WT; do
++while IFS=$'\037' read -r STATUS OWNER KIND WT; do
+     [ -n "$WT" ] || continue
+ 
+     # Yield the start rather than lose a race with SIGKILL. What is left
+@@ -775,12 +1138,21 @@ while IFS=$'\037' read -r STATUS OWNER WT; do
+     DECIDED_PREV="$DECIDED_LAST"
+     DECIDED_LAST="$WT"
+ 
+-    BEAD=$(basename "$WT")
++    BEAD=${WT##*/}
++    BEAD=${BEAD%.reaping}
+     # Why this worktree is disposable, if it turns out to be. The two paths
+     # reach the same removal through different evidence, and `worktree_reaped`
+     # must not report the closed-bead one for a path that never had a bead.
+     REAP_DETAIL="bead closed"
+     NO_SUCH_BEAD=0
++    # Residue — a directory the admin list cannot see, found by the disk walk
++    # above. It takes the same gates; only gate 3 is evaluated differently,
++    # because git may have no view of it to answer with (see RESIDUE).
++    IS_RESIDUE=0
++    if [ "$KIND" = residue ]; then
++        IS_RESIDUE=1
++        REAP_DETAIL="residue of an interrupted removal; bead closed"
++    fi
+ 
+     if [ -z "$STATUS" ]; then
+         if ! bead_is_absent "$BEAD"; then
+@@ -794,6 +1166,19 @@ while IFS=$'\037' read -r STATUS OWNER WT; do
+             SKIPPED=$((SKIPPED + 1))
+             continue
+         fi
++        if [ "$IS_RESIDUE" -eq 1 ]; then
++            # The no-such-bead path is carried entirely by gate 5, and gate 5
++            # needs a `git rev-parse HEAD` that residue cannot answer: git has
++            # no view of it. With no bead closure to authorise the reap and no
++            # way to ask whether the content exists anywhere else, there is no
++            # evidence at all — so keep it, and say exactly that rather than
++            # implying a probe was made.
++            record worktree_residue_no_bead_kept "$BEAD" "$WT" \
++                "no bead authorises this reap and the directory has no git view to run the publication probe against, so nothing could be established about it; kept for the witness" \
++                residue_no_bead_unverifiable
++            SKIPPED=$((SKIPPED + 1))
++            continue
++        fi
+         # bd answered, and the answer was that this id resolves to no bead —
+         # `g7nf-base`, a hand-made scratch worktree under `worktrees/`, is the
+         # shape. That is PERMANENT: treating it as a transient store failure
+@@ -858,43 +1243,89 @@ while IFS=$'\037' read -r STATUS OWNER WT; do
+     # Gate 3: never discard uncommitted work. Ignored files are artifacts and
+     # are excluded by `git status --porcelain`; untracked non-ignored files are
+     # reported and block the reap so the witness can salvage them.
+-    STATUS_LIMIT=$(budget_left)
+-    STATUS_RC=0
+-    DIRTY=$(run_bounded "$STATUS_LIMIT" git -C "$WT" status --porcelain 2>/dev/null) || STATUS_RC=$?
+-    STATUS_OUTCOME=$(classify_outcome "$STATUS_LIMIT" "$STATUS_RC")
+-    if [ "$STATUS_OUTCOME" != ok ]; then
+-        # A worktree git cannot read is not one to delete on a guess — and
+-        # neither is one git was never asked about. Those are different
+-        # incidents with different owners, so they get different events.
+-        case "$STATUS_OUTCOME" in
+-            skipped)
+-                TRUNCATED=1
+-                # Never inspected — same reasoning as the roster truncation
+-                # above: do not let the resume cursor step past it.
+-                DECIDED_LAST="$DECIDED_PREV"
+-                record worktree_budget_truncated "$BEAD" "$WT" \
+-                    "the ${BUDGET_SECONDS}s budget was spent before git status ran; the worktree was never inspected, at candidate $EXAMINED of $TOTAL" \
+-                    budget_spent_before_git_status
+-                ;;
+-            timeout)
+-                record worktree_status_unreadable "$BEAD" "$WT" \
+-                    "git status did not answer within the ${STATUS_LIMIT}s left of the ${BUDGET_SECONDS}s budget" \
+-                    git_status_timed_out
+-                ;;
+-            *)
+-                record worktree_status_unreadable "$BEAD" "$WT" \
+-                    "git status exited $STATUS_RC in the worktree" \
+-                    git_status_failed
+-                ;;
+-        esac
+-        SKIPPED=$((SKIPPED + 1))
+-        continue
++    #
++    # A REGISTERED candidate is by definition one git can answer about. Residue
++    # may not be, and the failure mode is not an error: `git -C <stripped-dir>
++    # status` does NOT fail, it walks UP and answers about the AGENT HOME
++    # instead (measured: `?? worktrees/`). Taking that as gate 3 would be a
++    # verdict about a directory this run never looked at — the same
++    # read-something-else-as-the-answer collapse that `worktree_owner_absent`
++    # and `worktree_publication_unconfirmed` exist to prevent elsewhere. So
++    # residue is asked FIRST whether it is administrable, with the ceiling
++    # pinned at its own parent, and only a directory that reports ITSELF as the
++    # worktree root goes on to the ordinary clean-tree gate.
++    ADMINISTRABLE=1
++    if [ "$IS_RESIDUE" -eq 1 ]; then
++        ADMINISTRABLE=0
++        TOP_LIMIT=$(budget_left)
++        TOP_RC=0
++        WT_TOP=$(run_bounded "$TOP_LIMIT" \
++            env "GIT_CEILING_DIRECTORIES=${WT%/*}" \
++            git -C "$WT" rev-parse --path-format=absolute \
++                --show-toplevel --git-common-dir 2>/dev/null) || TOP_RC=$?
++        if [ "$(classify_outcome "$TOP_LIMIT" "$TOP_RC")" = ok ]; then
++            WT_TOP_PATH=$(printf '%s\n' "$WT_TOP" | sed -n 1p)
++            WT_COMMON_DIR=$(printf '%s\n' "$WT_TOP" | sed -n 2p)
++            ensure_rig_git_dir
++            # Its own root, and THIS rig's repository. A directory that answers
++            # about something else — the agent home it sits in, or another
++            # repository entirely — has not told us anything about itself.
++            if [ -n "$WT_TOP_PATH" ] && [ "$WT_TOP_PATH" = "$WT" ] &&
++                [ -n "$RIG_GIT_DIR" ] && [ "$WT_COMMON_DIR" = "$RIG_GIT_DIR" ]; then
++                ADMINISTRABLE=1
++            fi
++        fi
+     fi
+-    if [ -n "$DIRTY" ]; then
+-        record worktree_dirty_kept "$BEAD" "$WT" \
+-            "$(printf '%s\n' "$DIRTY" | wc -l | tr -d ' ') uncommitted path(s)"
+-        SKIPPED=$((SKIPPED + 1))
+-        continue
++
++    if [ "$ADMINISTRABLE" -eq 0 ]; then
++        # Gate 3 is not skipped here, it is UNEVALUABLE, and the log says which.
++        # What authorises the removal instead is gate 2 — the refinery closes a
++        # bead only after a verified merge or PR handoff — plus the shape: this
++        # directory is what an authorised removal that was killed mid-flight
++        # leaves behind, and a residue path with no closed bead never reaches
++        # this point at all.
++        record worktree_residue_git_view_absent "$BEAD" "$WT" \
++            "git has no view of this directory, so no git status can answer about it; the reap stands on the bead's closure and the owning session's absence, which are the gates that could still be evaluated" \
++            residue_git_view_absent
++    else
++        STATUS_LIMIT=$(budget_left)
++        STATUS_RC=0
++        DIRTY=$(run_bounded "$STATUS_LIMIT" git -C "$WT" status --porcelain 2>/dev/null) || STATUS_RC=$?
++        STATUS_OUTCOME=$(classify_outcome "$STATUS_LIMIT" "$STATUS_RC")
++        if [ "$STATUS_OUTCOME" != ok ]; then
++            # A worktree git cannot read is not one to delete on a guess — and
++            # neither is one git was never asked about. Those are different
++            # incidents with different owners, so they get different events.
++            case "$STATUS_OUTCOME" in
++                skipped)
++                    TRUNCATED=1
++                    # Never inspected — same reasoning as the roster truncation
++                    # above: do not let the resume cursor step past it.
++                    DECIDED_LAST="$DECIDED_PREV"
++                    record worktree_budget_truncated "$BEAD" "$WT" \
++                        "the ${BUDGET_SECONDS}s budget was spent before git status ran; the worktree was never inspected, at candidate $EXAMINED of $TOTAL" \
++                        budget_spent_before_git_status
++                    ;;
++                timeout)
++                    record worktree_status_unreadable "$BEAD" "$WT" \
++                        "git status did not answer within the ${STATUS_LIMIT}s left of the ${BUDGET_SECONDS}s budget" \
++                        git_status_timed_out
++                    ;;
++                *)
++                    record worktree_status_unreadable "$BEAD" "$WT" \
++                        "git status exited $STATUS_RC in the worktree" \
++                        git_status_failed
++                    ;;
++            esac
++            SKIPPED=$((SKIPPED + 1))
++            continue
++        fi
++        if [ -n "$DIRTY" ]; then
++            record worktree_dirty_kept "$BEAD" "$WT" \
++                "$(printf '%s\n' "$DIRTY" | wc -l | tr -d ' ') uncommitted path(s)"
++            SKIPPED=$((SKIPPED + 1))
++            continue
++        fi
+     fi
+ 
+     # Gate 5: for a no-such-bead path ONLY, the committed content must already
+@@ -1024,15 +1455,56 @@ while IFS=$'\037' read -r STATUS OWNER WT; do
+         continue
+     fi
+ 
+-    if ! run_bounded "$(budget_left)" git -C "$RIG_ROOT" worktree remove --force "$WT" >/dev/null 2>&1; then
+-        # Fallback for a worktree git refuses to administer (moved, partially
+-        # deleted). Removing the directory then pruning restores consistency.
+-        rm -rf "$WT"
++    # ── Re-validate at the POINT OF USE, then remove (gcp-mves) ──────────────
++    if ! revalidate_gates "$BEAD" "$WT" "$ADMINISTRABLE" "$NO_SUCH_BEAD"; then
++        SKIPPED=$((SKIPPED + 1))
++        continue
+     fi
++
++    # RENAME, PRUNE, DELETE — never `git worktree remove`. That call drops the
++    # worktree's `.git` file and git's admin entry BEFORE unlinking the tree, and
++    # this script cannot survive the SIGKILL its caller delivers at [session]
++    # setup_timeout, so a kill inside that window leaves a directory no
++    # enumeration can ever find again and no log line to say so. See THE
++    # INTERRUPTED REMOVAL in the header. Every step below leaves a state that is
++    # either untouched or self-identifying.
++    REAPING="$WT"
++    case "$WT" in
++        *.reaping)
++            # Already marked by an interrupted cycle. The rename is behind us;
++            # finishing the job is all that is left.
++            ;;
++        *)
++            if [ -e "$WT.reaping" ]; then
++                # A marker for THIS worktree, left by an interrupted cycle.
++                # Nothing but this script writes the suffix, so it is condemned
++                # by construction — and leaving it would make the rename below
++                # nest the tree INSIDE it rather than replace it.
++                rm -rf "$WT.reaping"
++            fi
++            REAPING="$WT.reaping"
++            # A sibling rename inside the same directory: same filesystem, so
++            # rename(2), so atomic. There is no interruption point between "the
++            # worktree is intact" and "the residue is marked".
++            if ! mv "$WT" "$REAPING" 2>/dev/null; then
++                record worktree_reap_failed "$BEAD" "$WT" \
++                    "the worktree could not be renamed to $REAPING, so nothing was removed" \
++                    reap_rename_failed
++                SKIPPED=$((SKIPPED + 1))
++                continue
++            fi
++            ;;
++    esac
++    # The admin entry now points at a path that is gone, so prune drops it
++    # cleanly. Non-fatal: a prune that does not run leaves a `prunable` entry
++    # the next cycle's opening prune clears, and the marked directory is removed
++    # below either way.
+     run_bounded "$(budget_left)" git -C "$RIG_ROOT" worktree prune >/dev/null 2>&1 || true
++    rm -rf "$REAPING"
+ 
+-    if [ -e "$WT" ]; then
+-        record worktree_reap_failed "$BEAD" "$WT" "directory still present after removal"
++    if [ -e "$REAPING" ] || [ -e "$WT" ]; then
++        record worktree_reap_failed "$BEAD" "$WT" "directory still present after removal" \
++            reap_incomplete
+         SKIPPED=$((SKIPPED + 1))
+         continue
+     fi
+diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
+index 5ff942c..4536b2b 100644
+--- a/gastown/formulas/mol-witness-patrol.toml
++++ b/gastown/formulas/mol-witness-patrol.toml
+@@ -553,13 +553,9 @@ an incident.
+ 
+ **STAGED ROLLOUT — it is in dry-run today.** Real removal is opt-in
+ (`--no-dry-run`) and the `pre_start` above does not pass it, so every
+-would-be reap logs as `worktree_reap_pending` and nothing is removed. That
+-is deliberate: `city.toml` holds the *native* gascity reaper
+-(`auto_reap_closed_bead_worktrees_dry_run`) to the same staged rollout
+-until `gc-zxxy` is answered, and a second reaper must not do live removals
+-while the operator's own equivalent is held inert. Do NOT flip it from a
+-patrol; the flip is an operator decision. Treat the log as a report, not as
+-a completed cleanup.
++would-be reap logs as `worktree_reap_pending` and nothing is removed. Do
++NOT flip it from a patrol; the flip is an operator decision. Treat the log
++as a report, not as a completed cleanup.
+ 
+ **THE PROMOTION CRITERION — coverage, not a count of clean cycles
+ (gcp-schs).** The flip is evidenced by a REVIEWED SET, so it is only sound
+@@ -571,13 +567,31 @@ worktrees — and they are exactly what a live reaper, running with a fresh
+ budget, would reach first. Partial cycles do not add up to a review of the
+ set.
+ 
+-So the criterion is stated on coverage:
++**AND COVERAGE IS STILL NOT SUFFICIENT (gcp-mves).** Everything above is
++about WHICH WORKTREES ARE SELECTED. A dry run never calls the destructive
++path at all, so no soak — however complete its coverage — is evidence about
++whether a removal COMPLETES. winnow's witness verified the coverage
++criterion honestly and still lost all 40 of the rig's per-bead worktrees to
++a `pre_start` SIGKILL landing mid-removal, silently, because the failure
++report is downstream of the kill (winnow-h0n2o). Selection is necessary;
++completion is a separate question the log cannot answer.
++
++So the criterion is stated on coverage AND on the two preconditions the
++soak structurally cannot cover:
+ 
+ > Append `--no-dry-run` to the `pre_start` in `agents/witness/agent.toml`
+-> once the log carries at least one **`worktree_scan_complete`** cycle
+-> (`deferred=0` — every candidate examined in a single run), and no live
+-> worktree appears in the `worktree_reap_pending` set of that cycle or of
+-> the cycles since.
++> once ALL of the following hold:
++>
++> 1. the log carries at least one **`worktree_scan_complete`** cycle
++>    (`deferred=0` — every candidate examined in a single run), and no live
++>    worktree appears in the `worktree_reap_pending` set of that cycle or
++>    of the cycles since;
++> 2. `gcp-mves` has landed, so a removal interrupted by the SIGKILL leaves
++>    a marked, resumable state instead of an unenumerable orphan;
++> 3. `gascity-3z7d` is resolved, so `pre_start`s are not being killed in
++>    the first place.
++>
++> Any one of the three alone is the evidence winnow armed on.
+ 
+ Check it from the log rather than from an impression of how the cycles have
+ been going:
+@@ -705,7 +719,11 @@ jq -r 'select(.reason != "") | [.ts, .event, .reason, .budget_remaining, .bead]
+ | `worktree_unpublished_kept` | A no-such-bead path that is clean, whose publication probe RAN, and whose `HEAD` was found on no remote-tracking branch (`reason: no_such_bead_content_unpublished`), so its commits exist nowhere else. Nothing was removed | A real finding, and it will NOT resolve on its own — inspect the worktree by hand. If the commits matter, push them somewhere; if they do not, remove the directory yourself. Mail the mayor if you cannot tell |
+ | `worktree_publication_unconfirmed` | The publication probe did not answer, so whether the commits exist elsewhere is UNKNOWN. `reason`: `publication_probe_timed_out` (cut short by the budget left) or `publication_probe_failed` (`git rev-parse HEAD` or `git branch --remotes --contains` exited non-zero, or HEAD read back empty). Nothing was removed | **Not a lost-work signal — do not salvage on it.** `publication_probe_timed_out` → budget first; the detail names the seconds it got. `publication_probe_failed` means the rig checkout or the worktree is unhealthy: inspect by hand. Either way the next cycle re-checks (`gcp-9ql4`) |
+ | `worktree_status_unreadable` | `git status` actually ran inside the worktree and did not answer. `reason`: `git_status_timed_out` (cut short by the budget left) or `git_status_failed` (non-zero exit) | **`git_status_timed_out` → budget first.** `git_status_failed` is the real one: inspect by hand, likely a broken or moved checkout |
+-| `worktree_reap_failed` | Directory survived removal | Investigate permissions/mounts, mail mayor |
++| `worktree_reap_failed` | Directory survived removal. `reason`: `reap_rename_failed` (the worktree could not be renamed to its `.reaping` marker, so NOTHING was deleted) or `reap_incomplete` (the marked directory survived the `rm -rf`) | Investigate permissions/mounts, mail mayor. `reap_rename_failed` is the safe one — the worktree is untouched; `reap_incomplete` leaves a `.reaping` directory the next cycle will re-attempt |
++| `worktree_bead_reopened` | The bead was `closed` when this cycle enumerated it and is not closed now (`reason: bead_changed_at_point_of_use`). The closure is what authorises the reap, so nothing was removed | None — this is the re-check working. A polecat has almost certainly been slung onto the reopened bead and is using that worktree. It stops being a candidate until the bead closes again |
++| `worktree_revalidation_unconfirmed` | A gate could not be RE-CONFIRMED immediately before the removal, so the removal was refused. `reason`: `revalidation_status_unreadable` (the second `git status` did not answer), `revalidation_owner_unconfirmed` (the roster could not confirm the owner), or one of the renew-read reasons (`budget_spent_before_recheck_bead_read`, `recheck_bead_read_timed_out`, `recheck_bead_read_failed`, `recheck_bead_read_unparseable`) | Nothing was removed, which is the correct direction. Budget/timeout reasons → the cycle was too short, same reading as `worktree_budget_truncated`. A `_failed` reason means the store or the checkout is unhealthy — check `gc doctor` |
++| `worktree_residue_git_view_absent` | A residue directory the disk walk found that git cannot administer at all — no `.git`, or one pointing at an admin entry that is gone. Gate 3 is UNEVALUABLE for it, and the line says so rather than reporting a clean tree it never inspected. The reap stands on gates 2 and 4 instead | Log only, and expected on any rig that ran an armed reaper before `gcp-mves`. It is the tail of an authorised removal that was killed; the gate-2/gate-4 line for the same path says what actually happened to it |
++| `worktree_residue_no_bead_kept` | A residue directory with NO bead (`reason: residue_no_bead_unverifiable`). Gate 5 carries the no-such-bead path and needs a `git rev-parse HEAD` this directory cannot answer, so no evidence exists either way. Nothing was removed | A real finding that will not resolve on its own — inspect by hand, like `worktree_unpublished_kept`. The content is there; git's view of it is not. Mail the mayor if you cannot tell what it was |
+ | `worktree_list_failed` | `git worktree list` ran and did not answer, so no candidate was enumerated. `reason`: `worktree_list_timed_out` or `worktree_list_failed` | Timed out → budget first. Failed → the rig checkout itself is unhealthy; inspect `$RIG_ROOT` by hand |
+ | `worktree_bead_query_failed` | The one bulk bead read ran and did not answer. `reason`: `bead_query_timed_out` (slower than the seconds the run had left — the detail names them) or `bead_query_failed` (non-zero exit) | Nothing was examined this cycle. **`bead_query_timed_out` on a small remaining budget is the reaper's clock, not the store** — compare the detail's "Ns left of the Ms budget" before suspecting the endpoint. A `bead_query_failed`, or a timeout with most of the budget still unspent, is the rig's Dolt endpoint |
+ | `worktree_budget_exhausted` | The run hit its own wall-clock budget and stopped at the top of the loop. The detail carries examined/skipped/deferred counts, the window this cycle covered, and where the next resumes | Routine on a rig with many candidates; the rest are deferred to the next cycle. **Not evidence for the `--no-dry-run` flip** — this cycle reviewed a window, not the set. Persistent + a growing candidate count means the store is too slow for the budget — raise `[session] setup_timeout` AND `GC_REAP_BUDGET_SECONDS` together, or investigate the endpoint |
+diff --git a/gastown/tests/test_polecat_worktree_reap.sh b/gastown/tests/test_polecat_worktree_reap.sh
+index 6df954c..e4b2698 100644
+--- a/gastown/tests/test_polecat_worktree_reap.sh
++++ b/gastown/tests/test_polecat_worktree_reap.sh
+@@ -570,7 +570,29 @@ test_bead_status_is_read_in_one_bulk_query() {
+     # Dolt, inside a pre_start bounded at 10s. The read must be flat in the
+     # number of worktrees, so assert the CALL COUNT, not the wall time —
+     # a fast stub would hide a linear read on a slow store.
+-    local tmp rig bin home beads sessions logdir calls
++    #
++    # FLAT, not a fixed number. A live cycle now takes two bulk reads: the one
++    # that feeds the gates, and one that renews the bead facts at the point of
++    # use before the first removal (gcp-mves). Both are for the WHOLE candidate
++    # set, taken once per cycle. Pinning the count at 1 would forbid the second
++    # read without expressing the invariant, so the fixture is run at two sizes
++    # and the counts must match: whatever the reads cost, it must not grow with
++    # the rig.
++    local four eight
++    four=$(bulk_read_calls_for 4)
++    eight=$(bulk_read_calls_for 8)
++
++    [[ "$four" == "$eight" ]] ||
++        fail "bead reads grew with the candidate set: $four call(s) for 4 worktrees, $eight for 8. The read must be flat in the number of worktrees (gcp-ntbf)"
++    (( eight <= 2 )) ||
++        fail "a live cycle issued $eight bulk bead reads; it takes at most two — one for the gates, one to renew them at the point of use"
++}
++
++bulk_read_calls_for() {
++    # bulk_read_calls_for <n> — reap <n> closed worktrees live and echo how many
++    # `gc bd show` calls that cost. One open bead is mixed in so the run also
++    # proves the join still keys statuses to the right worktree at each size.
++    local n="$1" tmp rig bin home beads sessions logdir calls i
+     tmp=$(mktemp -d)
+     rig="$tmp/rig"
+     bin="$tmp/bin"
+@@ -584,35 +606,33 @@ test_bead_status_is_read_in_one_bulk_query() {
+     setup_rig "$rig"
+     write_gc_stub "$bin"
+ 
+-    add_bead_worktree "$rig" "$home" wt-one
+-    add_bead_worktree "$rig" "$home" wt-two
+-    add_bead_worktree "$rig" "$home" wt-three
+-    add_bead_worktree "$rig" "$home" wt-four
++    local ids=()
++    for i in $(seq 1 "$n"); do
++        add_bead_worktree "$rig" "$home" "wt-$i"
++        ids+=("wt-$i")
++    done
+ 
+-    cat >"$beads" <<'JSON'
+-[
+-  {"id":"wt-one","status":"closed","metadata":{"polecat_session":"deadsess"}},
+-  {"id":"wt-two","status":"closed","metadata":{"polecat_session":"deadsess"}},
+-  {"id":"wt-three","status":"open","metadata":{"polecat_session":"deadsess"}},
+-  {"id":"wt-four","status":"closed","metadata":{"polecat_session":"deadsess"}}
+-]
+-JSON
++    # wt-1 stays open: an open bead's worktree must survive at every size.
++    jq -n --args '[ $ARGS.positional[] | {
++            id: .,
++            status: (if . == "wt-1" then "open" else "closed" end),
++            metadata: { polecat_session: "deadsess" }
++        } ]' "${ids[@]}" >"$beads"
+     printf '{"sessions":[]}' >"$sessions"
+ 
+     GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+-        GC_BD_CALLS="$calls" PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run \
++        GC_BD_CALLS="$calls" GC_REAP_BUDGET_SECONDS=120 PATH="$bin:$PATH" \
++        bash "$SCRIPT" "$rig" --no-dry-run \
+         >"$tmp/out.txt" 2>&1 || fail "reaper exited non-zero: $(cat "$tmp/out.txt")"
+ 
+-    local n
+-    n=$(wc -c <"$calls" | tr -d ' ')
+-    [[ "$n" == "1" ]] ||
+-        fail "bead status was read in $n calls for 4 worktrees; it must be one bulk query"
+-
+-    [[ ! -e "$home/worktrees/wt-one" && ! -e "$home/worktrees/wt-two" && ! -e "$home/worktrees/wt-four" ]] ||
+-        fail "the bulk read lost a closed bead: a worktree that should have been reaped survived"
+-    [[ -e "$home/worktrees/wt-three" ]] ||
+-        fail "the bulk read mixed up bead identities: an open bead's worktree was reaped"
++    for i in $(seq 2 "$n"); do
++        [[ ! -e "$home/worktrees/wt-$i" ]] ||
++            fail "the bulk read lost a closed bead at size $n: wt-$i survived"
++    done
++    [[ -e "$home/worktrees/wt-1" ]] ||
++        fail "the bulk read mixed up bead identities at size $n: an open bead's worktree was reaped"
+ 
++    wc -c <"$calls" | tr -d ' '
+     rm -rf "$tmp"
+ }
+ 
+@@ -834,9 +854,15 @@ JSON
+     # Case 2: the bead read RAN and overran. That is a real timeout, so it keeps
+     # worktree_bead_query_failed — but it must say it timed out and name the
+     # seconds it was given, not imply the store answered with garbage.
++    #
++    # The budget must leave enough room that the CLASSIFICATION decides this,
++    # not the machine. A run spends ~1s reaching the bead read (measured), so a
++    # 2s budget could land on `skipped` under load — which is a different, also
++    # correct, verdict, and not the one under test. Any budget below the 20s
++    # stall still produces the timeout, so buy the headroom.
+     rm -f "$log"
+     GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+-        GC_BD_DELAY=20 GC_REAP_BUDGET_SECONDS=2 PATH="$bin:$PATH" \
++        GC_BD_DELAY=20 GC_REAP_BUDGET_SECONDS=6 PATH="$bin:$PATH" \
+         bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/slowbd.txt" 2>&1 ||
+         fail "reaper exited non-zero on a slow bead store: $(cat "$tmp/slowbd.txt")"
+ 
+@@ -848,10 +874,12 @@ JSON
+         fail "a timed-out bead read still claims the store returned unusable JSON"
+ 
+     # Case 3: the roster read overran. Same rule — it names the bound it hit, so
+-    # a reader checks the budget before suspecting the session roster.
++    # a reader checks the budget before suspecting the session roster. Same
++    # headroom reasoning as case 2, and the roster read sits later in the run
++    # than the bead read, so it needs at least as much.
+     rm -f "$log"
+     GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+-        GC_SESSION_DELAY=20 GC_REAP_BUDGET_SECONDS=3 PATH="$bin:$PATH" \
++        GC_SESSION_DELAY=20 GC_REAP_BUDGET_SECONDS=6 PATH="$bin:$PATH" \
+         bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/slowsess.txt" 2>&1 ||
+         fail "reaper exited non-zero on a slow session roster: $(cat "$tmp/slowsess.txt")"
+ 
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Mon, 7 Sep 2026 13:50:56 -0400
-Subject: [PATCH 84/86] style(ci): make the nightly's gating expression an
+Subject: [PATCH 84/88] style(ci): make the nightly's gating expression an
  explicit folded scalar (gcp-oz57)
 
 Self-review touch-up. Both gated steps in supported-pack-nightly.yml carried
