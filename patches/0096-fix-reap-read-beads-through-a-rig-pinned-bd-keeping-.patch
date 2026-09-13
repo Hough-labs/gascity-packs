@@ -1,0 +1,801 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sun, 13 Sep 2026 18:06:10 -0400
+Subject: [PATCH 96/96] fix(reap): read beads through a rig-pinned bd, keeping
+ gc bd as the fallback
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The witness reaper starts and examines nothing. One `gc bd` call costs ~5.4s on
+a rig with an external Dolt (0.5s here), and a cycle makes two bead reads inside
+an 8s self-budget — so the budget is routinely gone before the first `git
+status` runs. That is the 17 `budget_spent_before_git_status` lines in the reap
+log, and it is why a rig with more candidates than seconds examines NOTHING
+rather than examining fewer.
+
+Both bead reads now go through one helper, `bead_read`, which prefers a
+`-C`-pinned read-only `bd` rooted at $RIG_ROOT and keeps `gc bd` as the
+fallback. The budget model, `run_bounded`, `classify_outcome` and every reason
+code are untouched: this substitutes the transport, nothing else. Routing both
+reads through one helper also stops the gate read and the point-of-use re-check
+from ever landing on different ledgers.
+
+Measured on gascity-packs, 12 candidates, dry-run:
+
+    budget 8s   before: scan_complete, 4s left   after: scan_complete, 5s left
+    budget 3s   before: budget_exhausted, 1 of 12   after: scan_complete, 12/12
+    budget 2s   before: budget_exhausted, 1 of 12   after: unchanged
+
+The 2s row is the honest bound. The roster read is still `gc session list`,
+which has no pinned equivalent, so this buys back roughly two fixed-overhead
+units — decisive on a winnow-class rig, not a guarantee that every cycle now
+completes.
+
+The pinned answer is trusted only when it resolves at least one of the exact
+ids asked for. A store that knows none of them is likelier the wrong store than
+a rig where every worktree is a non-bead, and guessing wrong there is not a slow
+cycle: an all-absent batch pushes every candidate onto the no-such-bead route,
+which decides on the worktree's own evidence.
+
+On the bare-bd guard: `tests/test_no_bare_bd_commands.py` is about routing, not
+about the binary — it forbids a pack asset reading whichever store it is
+standing in. `-C` pins the project to a named directory and fails closed on a
+directory with no beads project rather than walking up to $PWD, so the guard was
+amended narrowly rather than worked around. The new allowlist is triple-locked
+like the one already there (exact path, literal marker, byte-exact line) and
+holds exactly one entry; new tests assert that a copy elsewhere, an edit in
+place, the marker on any other bd call, and a bare `--dir` form all still fail,
+and that `gc bd` is still built and reachable.
+
+Transport equivalence verified on every endpoint origin in this city —
+inherited_city, managed_city, and explicit (winnow's external Dolt on
+127.0.0.1:3307) — all returning identical {id,status,assignee}. That closes the
+acceptance item the dispatch recorded as unsatisfiable: a suspended rig is not
+an unreachable endpoint.
+
+The reap-log failure lines said "bulk gc bd show" unconditionally. With two
+possible transports that becomes a gcp-mqu9 repeat, so the detail now names the
+transport that actually failed, and the mol-witness-patrol log-review table was
+corrected with it: its "a timeout with most of the budget unspent is the rig's
+Dolt endpoint" branch is the misdirection two witnesses already flagged on the
+bead, and one wrapped call is most of an 8s budget on its own.
+
+gcp-uzq0
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ docs/design/reaper-budget-starvation.md       |  84 +++++
+ .../assets/scripts/polecat-worktree-reap.sh   | 142 ++++++++-
+ gastown/formulas/mol-witness-patrol.toml      |   2 +-
+ gastown/tests/test_polecat_worktree_reap.sh   | 290 ++++++++++++++++++
+ tests/test_no_bare_bd_commands.py             |  87 ++++++
+ 5 files changed, 592 insertions(+), 13 deletions(-)
+
+diff --git a/docs/design/reaper-budget-starvation.md b/docs/design/reaper-budget-starvation.md
+index 581c592..ab06b64 100644
+--- a/docs/design/reaper-budget-starvation.md
++++ b/docs/design/reaper-budget-starvation.md
+@@ -278,3 +278,87 @@ remaining budget, and assert the cursor still advances.
+ **Bead C re-confirmed.** `gastown/formulas/mol-witness-patrol.toml` still
+ contains zero occurrences of `cursor`. The home audit has no rotation to this
+ day, so Bead C stands exactly as written.
++
++---
++
++## 10. Bead A — delivered (2026-09-13, `gastown.furiosa`)
++
++Both bead reads (`:813` gate read, `:1023` point-of-use re-check) now go through
++one helper, `bead_read`, which prefers a `-C`-pinned read-only `bd` rooted at
++`$RIG_ROOT` and keeps
++`gc bd` as the fallback. The budget model, `run_bounded`, `classify_outcome` and
++every reason code are untouched — this is a transport substitution, as §5 asked.
++
++### The policy question §5 flagged, resolved rather than sidestepped
++
++§5 says "a bare `bd` invocation rooted at `$RIG_ROOT`", and the bead's own notes
++say bare `bd` is what `tests/test_no_bare_bd_commands.py` (gcp-mvsm) exists to
++forbid. Both are right, and they are not in conflict once the guard's actual
++subject is named: the guard is about **routing**, not about the binary. What it
++forbids is a pack asset reading whichever store it is standing in.
++
++A `-C`-pinned `bd` is not that call. It pins the project to a named directory and
++**fails closed** on a directory with no beads project rather than walking up to
++`$PWD`:
++
++    bd, given -C /tmp/empty (a directory holding no beads project):
++    Error: cannot use -C directory "/tmp/empty": no beads project found   (exit 1)
++
++So the guard was amended, narrowly and visibly, rather than worked around. The
++new `PINNED_STORE_BD_ALLOWLIST` is triple-locked exactly like the allowlist
++already in that file — exact tracked path, literal marker, byte-exact line — so
++a copy of the line elsewhere, an edit in place, or the marker attached to any
++other `bd` call all still fail. Two new tests assert each of those, and one
++asserts `gc bd` is still built and still reachable as the fallback. Nothing was
++suppressed and no `--no-verify` was used.
++
++### Equivalence: the contract, per §6.3, on all three endpoint origins
++
++Same id list, back to back, `{id,status,assignee}` compared:
++
++| `gc.endpoint_origin` | rig | result |
++|---|---|---|
++| `inherited_city` | gascity-packs | identical, 8 ids |
++| `managed_city` | the town ledger | identical, 3 ids |
++| `explicit` (external Dolt :3307) | winnow | identical, 3 ids |
++
++**This closes A4b, which the dispatch note recorded as unsatisfiable today.**
++That note reasoned from every explicit rig being SUSPENDED. A suspended rig is
++not an unreachable endpoint: winnow's `127.0.0.1:3307` answers, and both
++transports agree on it. The check that could not be run, ran.
++
++### Effect, measured on gascity-packs (12 candidates, dry-run, scratch log)
++
++| budget | pre-change | post-change |
++|---|---|---|
++| 8s | `scan_complete` 12/12, 4s remaining | `scan_complete` 12/12, **5s** remaining |
++| 3s | `budget_exhausted` — **1 of 12**, deferred 11 | **`scan_complete` 12/12** |
++| 2s | `budget_exhausted` — 1 of 12 | `budget_exhausted` — 1 of 12 |
++
++The 3s row is this bead's symptom and its fix in one line: the same rig, the same
++candidates, the same gates, starving before and complete after. Decisions are
++byte-identical at every budget where both finish (reaped=9 skipped=3 of 12).
++
++The 2s row is the honest bound and matches §9: this buys back roughly two
++fixed-overhead units, not the whole budget. The roster read at `:945` is still
++`gc session list`, still gc-class, still in the budget. **Nobody should read this
++as "the reaper now always completes."**
++
++### One thing this change had to fix on the way past
++
++The log lines for a failed bead read said "bulk gc bd show ..." unconditionally.
++With two possible transports that sentence becomes a gcp-mqu9 repeat — a
++diagnostic asserting a cause it did not observe. The detail now names the
++transport that actually failed, and the `reap-merged-worktrees` table in
++`mol-witness-patrol.toml` was corrected with it: its "a timeout with most of the
++budget still unspent is the rig's Dolt endpoint" branch is the misdirection two
++witnesses already flagged in the bead, and a 5.4s wrapped call is most of an 8s
++budget on its own. It now tells the reader to time the named transport against
++the rig's own endpoint first.
++
++### Still open, unchanged by this
++
++Bead B (cursor advance under starvation) still wants the §8 nod, and §9's
++observation stands: `gcp-jxtc`'s fourth rollback site makes `DECIDED_LAST`
++advance least exactly when the budget is tightest. Bead C (`gcp-7fgg`) is
++untouched — still zero occurrences of `cursor` in `mol-witness-patrol.toml`.
+diff --git a/gastown/assets/scripts/polecat-worktree-reap.sh b/gastown/assets/scripts/polecat-worktree-reap.sh
+index 18febd5..490cb0c 100755
+--- a/gastown/assets/scripts/polecat-worktree-reap.sh
++++ b/gastown/assets/scripts/polecat-worktree-reap.sh
+@@ -210,6 +210,13 @@
+ #       not slow, impossible. Candidate sets only grow (the reaper is staged at
+ #       dry-run and the native gascity reaper is a documented macOS no-op,
+ #       gc-zxxy), so a per-item round trip is a cliff every rig walks toward.
++#     - Both bead reads go through a `-C`-pinned `bd` rooted at `$RIG_ROOT` when
++#       that root holds a beads project, falling back to `gc bd` otherwise and
++#       whenever the pinned answer cannot be trusted. Same store, same rows,
++#       ~2.4x less wall clock here and ~5x on a rig with an external Dolt — see
++#       THE PINNED READ below for the measurements, and for why this is not the
++#       bare call the repo's guard forbids. One wrapped call has been measured
++#       at 5.4s — most of an 8s budget, spent before the first `git status`.
+ #     - The script enforces its OWN wall-clock budget, well inside the caller's,
+ #       and every external command is bounded by the time remaining in it. When
+ #       the budget expires the script reports what it examined and exits 0. A
+@@ -448,6 +455,51 @@ else
+     GC_BD=(gc bd)
+ fi
+ 
++# ── THE PINNED READ — the same store, without the wrapper (gcp-uzq0) ─────────
++# `gc bd --rig <name>` is, in gc's own words, "run bd in the correct rig
++# directory". The routing is the whole value; the seconds are pure tax, and the
++# tax is what this script cannot afford. Measured back to back on gascity-packs,
++# same ledger, same server, 8 ids:
++#
++#     bd, pinned with -C <rig root>          0.65 / 0.70 / 1.04 s
++#     gc bd --rig <rig> show <ids> --json   1.53 / 1.78 / 1.99 s
++#
++# and the gap is wider the slower the endpoint — the bead records ~5.4s for a
++# single wrapped call on winnow against an external Dolt. Two of this cycle's
++# reads are bead reads, so the wrapper alone can spend the entire 8s budget
++# before the first `git status` runs. That is the 17 `budget_spent_before_git_status`
++# lines in the log, and it is why a rig with more candidates than seconds
++# examines NOTHING rather than examining fewer.
++#
++# THE POLICY THIS IS THREADING. `bd` invoked bare resolves its ledger from the
++# CURRENT DIRECTORY, which is exactly what the repo's bare-bd guard
++# (tests/test_no_bare_bd_commands.py, gcp-mvsm) exists to stop: a pack asset
++# that reads whichever store it happens to be standing in is a correctness bug
++# wearing a speed costume. `-C "$RIG_ROOT"` is not that call. It PINS the
++# project to the same rig checkout this whole script is already reasoning about
++# — the directory it enumerates worktrees under, reads git status in, and asks
++# `gc bd --rig` about — and it FAILS CLOSED when that directory holds no beads
++# project ("cannot use -C directory ...: no beads project found", exit 1)
++# rather than walking up to $PWD. Verified equal to the wrapped read on every
++# endpoint origin reachable from this city: `inherited_city` (gascity-packs),
++# `managed_city` (the town ledger) and `explicit` (winnow, external Dolt on
++# 127.0.0.1:3307) all returned byte-identical {id,status,assignee} sets.
++# `--readonly` is belt and braces: this script has no business writing a bead,
++# and the flag makes that structural rather than a promise.
++#
++# TRUST, NOT HOPE. The pinned answer is used only when it resolves at least one
++# of the exact ids asked for (see `bead_read`). A store that knows none of them
++# is likelier the wrong store than a rig where every worktree is a non-bead, and
++# guessing wrong there is not a slow cycle — an all-absent batch pushes every
++# candidate onto the no-such-bead route, which decides on the worktree's own
++# evidence. So that answer is discarded and `gc bd` re-asked, at the cost of the
++# call this was trying to save. The budget model, the bounded calls and every
++# reason code below are untouched: this substitutes the transport, nothing else.
++PINNED_BD=()
++if [ -f "$RIG_ROOT/.beads/config.yaml" ]; then
++    PINNED_BD=(bd -C "$RIG_ROOT" --readonly) # bd-pinned-store: -C pins the rig checkout, never $PWD
++fi
++
+ # classify_outcome <limit-given> <exit-code> — name what actually happened to a
+ # bounded call: `skipped` (the budget was already spent, so the command never
+ # ran), `timeout` (it ran and was killed at the limit), `failed` (it ran and
+@@ -469,6 +521,73 @@ classify_outcome() {
+     fi
+ }
+ 
++# read_resolved_an_asked_id <json-file> <id>... — did the store echo at least
++# one of the EXACT ids handed to it? The lookup fuzzy-matches, so "answered
++# with rows" is not the same question; this asks whether any row's id is one we
++# named. Used to decide whether a pinned answer is the rig's own store talking.
++read_resolved_an_asked_id() {
++    local file="$1"
++    shift
++    jq -e --args '
++        type == "array"
++        and ([.[] | .id // empty] as $echoed
++            | ($echoed | length) > (($echoed - $ARGS.positional) | length))
++    ' "$@" <"$file" >/dev/null 2>&1
++}
++
++# bead_read <out-file> <err-file> — the cycle's bulk bead read, cheapest correct
++# transport first. Sets BEAD_READ_LIMIT / BEAD_READ_RC / BEAD_READ_OUTCOME (the
++# verdict the caller's own case statements already speak) and BEAD_READ_VIA, the
++# human name of the transport that produced the answer.
++#
++# BEAD_READ_VIA exists because of gcp-mqu9: this log's failure lines used to
++# assert a cause they had not observed, and two separate investigations went at
++# a healthy Dolt server on the strength of them. Now that the read has two
++# possible transports, a line saying "the bead read failed" without saying WHICH
++# read would repeat that mistake at one remove.
++#
++# Both call sites go through here so the two reads cannot drift into using
++# different stores — a gate read and a point-of-use re-check that disagreed
++# about which ledger they were reading would be worse than either being slow.
++bead_read() {
++    local out_file="$1" err_file="$2"
++    local limit rc=0
++
++    if [ "${#PINNED_BD[@]}" -gt 0 ]; then
++        limit=$(budget_left)
++        run_bounded "$limit" "${PINNED_BD[@]}" show "${BEAD_IDS_ARGV[@]}" --json \
++            >"$out_file" 2>"$err_file" || rc=$?
++        BEAD_READ_LIMIT="$limit"
++        BEAD_READ_RC="$rc"
++        BEAD_READ_OUTCOME=$(classify_outcome "$limit" "$rc")
++        BEAD_READ_VIA="bd pinned to $RIG_ROOT"
++        case "$BEAD_READ_OUTCOME" in
++            skipped | timeout)
++                # Out of clock, not out of transport. Re-asking through the
++                # slower wrapper cannot fit where the faster one did not, and
++                # the reason codes the caller emits for these two are about the
++                # budget — which is exactly what happened.
++                return
++                ;;
++        esac
++        if read_resolved_an_asked_id "$out_file" "${BEAD_IDS_ARGV[@]}"; then
++            return
++        fi
++        # The pinned store answered and knew none of these ids. Could be a rig
++        # whose candidates are genuinely all non-beads; could be the wrong
++        # store. Only one of those is safe to act on, so pay for the wrapper.
++        rc=0
++    fi
++
++    limit=$(budget_left)
++    run_bounded "$limit" "${GC_BD[@]}" show "${BEAD_IDS_ARGV[@]}" --json \
++        >"$out_file" 2>"$err_file" || rc=$?
++    BEAD_READ_LIMIT="$limit"
++    BEAD_READ_RC="$rc"
++    BEAD_READ_OUTCOME=$(classify_outcome "$limit" "$rc")
++    BEAD_READ_VIA="${GC_BD[*]}"
++}
++
+ # per_bead_shape <path> — true when <path> has the per-bead worktree shape
+ # `<worktrees-root>/<rig>/<lane-tree>/<agent-home>/worktrees/<bead-id>`.
+ #
+@@ -808,11 +927,11 @@ trap 'rm -f "$BEADS_FILE" "$SESSIONS_FILE" "$BEAD_ERR_FILE" "$NOT_FOUND_FILE" \
+     "$RECHECK_BEADS_FILE" "$REGISTERED_FILE" "$RESIDUE_FILE" "$SCAN_ROOTS_FILE" \
+     "$DISK_ENTRIES_FILE"' EXIT
+ 
+-BEAD_QUERY_LIMIT=$(budget_left)
+-BEAD_QUERY_RC=0
+-run_bounded "$BEAD_QUERY_LIMIT" "${GC_BD[@]}" show "${BEAD_IDS_ARGV[@]}" --json \
+-    >"$BEADS_FILE" 2>"$BEAD_ERR_FILE" || BEAD_QUERY_RC=$?
+-BEAD_QUERY_OUTCOME=$(classify_outcome "$BEAD_QUERY_LIMIT" "$BEAD_QUERY_RC")
++bead_read "$BEADS_FILE" "$BEAD_ERR_FILE"
++BEAD_QUERY_LIMIT="$BEAD_READ_LIMIT"
++BEAD_QUERY_RC="$BEAD_READ_RC"
++BEAD_QUERY_OUTCOME="$BEAD_READ_OUTCOME"
++BEAD_QUERY_VIA="$BEAD_READ_VIA"
+ 
+ # The ids bd itself declared absent, keyed on bd's OWN error class rather than
+ # on a regex guess at what a bead id looks like. bd writes one line per missing
+@@ -871,13 +990,13 @@ if ! jq -e 'type == "array"' "$BEADS_FILE" >/dev/null 2>&1; then
+             ;;
+         timeout)
+             record worktree_bead_query_failed "" "" \
+-                "bulk gc bd show for ${#BEAD_IDS_ARGV[@]} bead(s) did not answer within the ${BEAD_QUERY_LIMIT}s left of the ${BUDGET_SECONDS}s budget" \
++                "bulk bead read via '$BEAD_QUERY_VIA' for ${#BEAD_IDS_ARGV[@]} bead(s) did not answer within the ${BEAD_QUERY_LIMIT}s left of the ${BUDGET_SECONDS}s budget" \
+                 bead_query_timed_out
+             echo "polecat-worktree-reap: bead read timed out after ${BEAD_QUERY_LIMIT}s of the ${BUDGET_SECONDS}s budget; reaped=0 skipped=$TOTAL (log: $LOG_FILE)"
+             ;;
+         *)
+             record worktree_bead_query_failed "" "" \
+-                "bulk gc bd show for ${#BEAD_IDS_ARGV[@]} bead(s) exited $BEAD_QUERY_RC and returned no usable JSON" \
++                "bulk bead read via '$BEAD_QUERY_VIA' for ${#BEAD_IDS_ARGV[@]} bead(s) exited $BEAD_QUERY_RC and returned no usable JSON" \
+                 bead_query_failed
+             echo "polecat-worktree-reap: bead read failed (exit $BEAD_QUERY_RC); reaped=0 skipped=$TOTAL (log: $LOG_FILE)"
+             ;;
+@@ -1018,11 +1137,10 @@ refresh_removal_snapshot() {
+         return
+     fi
+     RECHECK_TAKEN=1
+-    local limit rc=0
+-    limit=$(budget_left)
+-    run_bounded "$limit" "${GC_BD[@]}" show "${BEAD_IDS_ARGV[@]}" --json \
+-        >"$RECHECK_BEADS_FILE" 2>/dev/null || rc=$?
+-    case "$(classify_outcome "$limit" "$rc")" in
++    local rc=0
++    bead_read "$RECHECK_BEADS_FILE" /dev/null
++    rc="$BEAD_READ_RC"
++    case "$BEAD_READ_OUTCOME" in
+         skipped)
+             RECHECK_REASON="budget_spent_before_recheck_bead_read"
+             return
+diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
+index d1bdc3f..140c81a 100644
+--- a/gastown/formulas/mol-witness-patrol.toml
++++ b/gastown/formulas/mol-witness-patrol.toml
+@@ -726,7 +726,7 @@ jq -r 'select(.reason != "") | [.ts, .event, .reason, .budget_remaining, .bead]
+ | `worktree_residue_git_view_absent` | A residue directory the disk walk found that git cannot administer at all — no `.git`, or one pointing at an admin entry that is gone. Gate 3 is UNEVALUABLE for it, and the line says so rather than reporting a clean tree it never inspected. The reap stands on gates 2 and 4 instead | Log only, and expected on any rig that ran an armed reaper before `gcp-mves`. It is the tail of an authorised removal that was killed; the gate-2/gate-4 line for the same path says what actually happened to it |
+ | `worktree_residue_no_bead_kept` | A residue directory with NO bead (`reason: residue_no_bead_unverifiable`). Gate 5 carries the no-such-bead path and needs a `git rev-parse HEAD` this directory cannot answer, so no evidence exists either way. Nothing was removed | A real finding that will not resolve on its own — inspect by hand, like `worktree_unpublished_kept`. The content is there; git's view of it is not. Mail the mayor if you cannot tell what it was |
+ | `worktree_list_failed` | `git worktree list` ran and did not answer, so no candidate was enumerated. `reason`: `worktree_list_timed_out` or `worktree_list_failed` | Timed out → budget first. Failed → the rig checkout itself is unhealthy; inspect `$RIG_ROOT` by hand |
+-| `worktree_bead_query_failed` | The one bulk bead read ran and did not answer. `reason`: `bead_query_timed_out` (slower than the seconds the run had left — the detail names them) or `bead_query_failed` (non-zero exit) | Nothing was examined this cycle. **`bead_query_timed_out` on a small remaining budget is the reaper's clock, not the store** — compare the detail's "Ns left of the Ms budget" before suspecting the endpoint. A `bead_query_failed`, or a timeout with most of the budget still unspent, is the rig's Dolt endpoint |
++| `worktree_bead_query_failed` | The one bulk bead read ran and did not answer. `reason`: `bead_query_timed_out` (slower than the seconds the run had left — the detail names them) or `bead_query_failed` (non-zero exit). The detail also names the TRANSPORT it used: `bd pinned to <rig root>` (the cheap read) or `gc bd --rig <rig>` (the wrapper) | Nothing was examined this cycle. **`bead_query_timed_out` on a small remaining budget is the reaper's clock, not the store** — compare the detail's "Ns left of the Ms budget" before suspecting the endpoint. **A timeout with most of the budget unspent is NOT automatically the endpoint either** — a single wrapped call has been measured at 5.4s on this city, which is most of an 8s budget on its own (gcp-uzq0). Before suspecting the store, time the transport the detail names against the rig's own endpoint: if the pinned read answers fast and only the wrapper is slow, the store is healthy and the cost is gc's. Chasing Dolt on this line has produced two wrong diagnoses already |
+ | `worktree_budget_exhausted` | The run hit its own wall-clock budget and stopped at the top of the loop. The detail carries examined/skipped/deferred counts, the window this cycle covered, and where the next resumes | Routine on a rig with many candidates; the rest are deferred to the next cycle. **Not evidence for the `--no-dry-run` flip** — this cycle reviewed a window, not the set. Persistent + a growing candidate count means the store is too slow for the budget — raise `[session] setup_timeout` AND `GC_REAP_BUDGET_SECONDS` together, or investigate the endpoint |
+ 
+ A `worktree_dirty_kept` that repeats across cycles means real work is
+diff --git a/gastown/tests/test_polecat_worktree_reap.sh b/gastown/tests/test_polecat_worktree_reap.sh
+index d2e18e8..cf3ada9 100644
+--- a/gastown/tests/test_polecat_worktree_reap.sh
++++ b/gastown/tests/test_polecat_worktree_reap.sh
+@@ -269,6 +269,71 @@ add_bead_worktree() {
+     git -C "$1" worktree add -q "$2/worktrees/$3" --detach HEAD
+ }
+ 
++arm_pinned_store() {
++    # arm_pinned_store <rig> — give the rig a `.beads/config.yaml`, which is the
++    # only thing that arms the reaper's pinned read (gcp-uzq0). Every test that
++    # does NOT call this keeps exercising the `gc bd` transport, which is why
++    # the suite's existing expectations are untouched by that change.
++    mkdir -p "$1/.beads"
++    printf 'issue_prefix: wt\n' >"$1/.beads/config.yaml"
++}
++
++write_bd_stub() {
++    # The pinned transport, modelled on the ONE call the reaper makes through
++    # it: `bd`, given `-C <rig root> --readonly show <ids> --json`.
++    #
++    # Deliberately NOT a copy of the gc stub's bead logic. This stub asserts the
++    # shape of the invocation — that `-C` names the rig root the reaper was
++    # handed, so a regression to a CWD-resolved read fails here rather than in
++    # production — and then answers from the same fixture the gc stub reads. A
++    # stub that accepted any argv would pass for a call that read the wrong
++    # store, which is the entire risk this transport carries.
++    #
++    # Test hooks:
++    #   BD_CALLS        append one byte per `show`, to tell the two transports
++    #                   apart and to count the gate read vs the re-check
++    #   BD_DELAY        seconds to stall, for budget tests
++    #   BD_KNOWS_NOTHING non-empty: answer a well-formed but EMPTY array, the
++    #                   "this store knows none of these ids" case the reaper
++    #                   must refuse to act on
++    #   BD_ABSENT       non-empty: exit non-zero without answering
++    local bin="$1"
++    mkdir -p "$bin"
++    cat >"$bin/bd" <<'SH'
++#!/usr/bin/env sh
++if [ -n "${BD_ABSENT:-}" ]; then
++    echo "bd: simulated missing transport" >&2
++    exit 127
++fi
++[ "$1" = "-C" ] || { echo "bd stub: expected -C, got $1" >&2; exit 64; }
++shift
++dir="$1"
++shift
++[ "$dir" = "$BD_EXPECT_RIG_ROOT" ] ||
++    { echo "bd stub: -C $dir is not the rig root $BD_EXPECT_RIG_ROOT" >&2; exit 64; }
++[ "$1" = "--readonly" ] || { echo "bd stub: expected --readonly, got $1" >&2; exit 64; }
++shift
++[ "$1" = "show" ] || { echo "bd stub: expected show, got $1" >&2; exit 64; }
++shift
++if [ -n "${BD_CALLS:-}" ]; then printf 'x' >>"$BD_CALLS"; fi
++if [ -n "${BD_DELAY:-}" ]; then sleep "$BD_DELAY"; fi
++if [ -n "${BD_KNOWS_NOTHING:-}" ]; then printf '[]'; exit 0; fi
++ids=""
++for a in "$@"; do
++    case "$a" in
++        -*) continue ;;
++    esac
++    ids="$ids$a
++"
++done
++jq -c --arg ids "$ids" '
++    ($ids | split("\n") | map(select(length > 0))) as $want
++    | [ .[] | select(.id as $i | $want | index($i)) ]
++' "$GC_BEADS_JSON"
++SH
++    chmod +x "$bin/bd"
++}
++
+ 
+ publish_rig() {
+     # publish_rig <rig> <bare-remote> — give the rig a remote-tracking ref, so
+@@ -2090,8 +2155,233 @@ test_the_promotion_criterion_says_what_a_dry_run_cannot_show() {
+         fail "--no-dry-run appears outside the prose: ${wired//$'\n'/ | }"
+ }
+ 
++test_the_pinned_read_serves_both_bead_reads_and_gc_bd_is_not_called() {
++    # gcp-uzq0. The wrapper costs ~2.4x the pinned call for the same answer, and
++    # this cycle makes two bead reads — enough, on a slow endpoint, to spend the
++    # whole 8s budget before the first `git status`. So when the rig root holds a
++    # beads project, BOTH reads must go through the pinned transport and the
++    # wrapper must not be paid at all.
++    local tmp rig bin home beads sessions logdir bdcalls gccalls
++    tmp=$(mktemp -d)
++    rig="$tmp/rig"
++    bin="$tmp/bin"
++    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
++    beads="$tmp/beads.json"
++    sessions="$tmp/sessions.json"
++    logdir="$tmp/logs"
++    bdcalls="$tmp/bd-calls"
++    gccalls="$tmp/gc-calls"
++    mkdir -p "$logdir"
++
++    setup_rig "$rig"
++    arm_pinned_store "$rig"
++    write_gc_stub "$bin"
++    write_bd_stub "$bin"
++    add_bead_worktree "$rig" "$home" "wt-closed"
++    add_bead_worktree "$rig" "$home" "wt-open"
++
++    jq -n '[
++        {id:"wt-closed", status:"closed", metadata:{polecat_session:"deadsess"}},
++        {id:"wt-open",   status:"open",   metadata:{polecat_session:"deadsess"}}
++    ]' >"$beads"
++    printf '{"sessions":[]}' >"$sessions"
++
++    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
++        BD_EXPECT_RIG_ROOT="$rig" BD_CALLS="$bdcalls" GC_BD_CALLS="$gccalls" \
++        GC_REAP_BUDGET_SECONDS=120 PATH="$bin:$PATH" \
++        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out.txt" 2>&1 ||
++        fail "reaper exited non-zero: $(cat "$tmp/out.txt")"
++
++    # The decisions must be exactly what the wrapper would have produced. A fast
++    # read that reaps differently is not a transport change, it is a bug.
++    [[ ! -e "$home/worktrees/wt-closed" ]] ||
++        fail "the pinned read did not reap a closed, clean, unowned worktree"
++    [[ -e "$home/worktrees/wt-open" ]] ||
++        fail "the pinned read reaped an OPEN bead's worktree"
++
++    [[ -s "$bdcalls" ]] || fail "the pinned transport was never used"
++    [[ ! -s "$gccalls" ]] ||
++        fail "gc bd was still paid $(wc -c <"$gccalls" | tr -d ' ') time(s) despite the pinned read answering"
++    # Gate read plus the point-of-use re-check, both on the pinned store: the two
++    # reads must never end up on different ledgers.
++    [[ "$(wc -c <"$bdcalls" | tr -d ' ')" == "2" ]] ||
++        fail "expected 2 pinned reads (gate + re-check), got $(wc -c <"$bdcalls" | tr -d ' ')"
++
++    rm -rf "$tmp"
++}
++
++test_a_rig_with_no_beads_project_still_reads_through_gc() {
++    # `-C` fails closed on a directory with no beads project rather than walking
++    # up to $PWD, so the reaper only arms the pinned read when the rig root
++    # actually holds one. Without that config the wrapper stays the transport —
++    # which is what keeps every other test in this file honest.
++    local tmp rig bin home beads sessions logdir bdcalls gccalls
++    tmp=$(mktemp -d)
++    rig="$tmp/rig"
++    bin="$tmp/bin"
++    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
++    beads="$tmp/beads.json"
++    sessions="$tmp/sessions.json"
++    logdir="$tmp/logs"
++    bdcalls="$tmp/bd-calls"
++    gccalls="$tmp/gc-calls"
++    mkdir -p "$logdir"
++
++    setup_rig "$rig"
++    write_gc_stub "$bin"
++    write_bd_stub "$bin"
++    add_bead_worktree "$rig" "$home" "wt-closed"
++
++    jq -n '[{id:"wt-closed", status:"closed", metadata:{polecat_session:"deadsess"}}]' >"$beads"
++    printf '{"sessions":[]}' >"$sessions"
++
++    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
++        BD_EXPECT_RIG_ROOT="$rig" BD_CALLS="$bdcalls" GC_BD_CALLS="$gccalls" \
++        GC_REAP_BUDGET_SECONDS=120 PATH="$bin:$PATH" \
++        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out.txt" 2>&1 ||
++        fail "reaper exited non-zero: $(cat "$tmp/out.txt")"
++
++    [[ ! -s "$bdcalls" ]] ||
++        fail "the pinned read was armed on a rig root with no .beads/config.yaml"
++    [[ -s "$gccalls" ]] || fail "no bead read happened at all"
++    [[ ! -e "$home/worktrees/wt-closed" ]] ||
++        fail "the gc transport stopped reaping when the pinned path was added"
++
++    rm -rf "$tmp"
++}
++
++test_a_pinned_store_that_knows_no_asked_id_is_not_acted_on() {
++    # The dangerous failure is not a slow pinned read, it is a WRONG one. A store
++    # that resolves none of the ids would push every candidate onto the
++    # no-such-bead route, which decides on the worktree's own evidence — so an
++    # answer with no asked-for id in it is discarded and the wrapper re-asked,
++    # paying back the call this was trying to save.
++    local tmp rig bin home beads sessions logdir bdcalls gccalls
++    tmp=$(mktemp -d)
++    rig="$tmp/rig"
++    bin="$tmp/bin"
++    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
++    beads="$tmp/beads.json"
++    sessions="$tmp/sessions.json"
++    logdir="$tmp/logs"
++    bdcalls="$tmp/bd-calls"
++    gccalls="$tmp/gc-calls"
++    mkdir -p "$logdir"
++
++    setup_rig "$rig"
++    arm_pinned_store "$rig"
++    write_gc_stub "$bin"
++    write_bd_stub "$bin"
++    add_bead_worktree "$rig" "$home" "wt-open"
++
++    # The bead is OPEN. If the empty pinned answer were trusted, the id would
++    # look absent, the no-such-bead route would take over, and gate 2's
++    # protection for in-flight work would never run.
++    jq -n '[{id:"wt-open", status:"open", metadata:{polecat_session:"deadsess"}}]' >"$beads"
++    printf '{"sessions":[]}' >"$sessions"
++
++    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
++        BD_EXPECT_RIG_ROOT="$rig" BD_CALLS="$bdcalls" GC_BD_CALLS="$gccalls" \
++        BD_KNOWS_NOTHING=1 GC_REAP_BUDGET_SECONDS=120 PATH="$bin:$PATH" \
++        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out.txt" 2>&1 ||
++        fail "reaper exited non-zero: $(cat "$tmp/out.txt")"
++
++    [[ -s "$bdcalls" ]] || fail "the pinned transport was never tried"
++    [[ -s "$gccalls" ]] ||
++        fail "an all-absent pinned answer was acted on instead of falling back to gc bd"
++    [[ -e "$home/worktrees/wt-open" ]] ||
++        fail "an open bead's worktree was reaped after a pinned store answered about nothing"
++
++    rm -rf "$tmp"
++}
++
++test_a_missing_pinned_transport_falls_back_instead_of_failing_the_cycle() {
++    # `bd` not being on PATH is a deployment fact, not a reason to lose the
++    # cycle. The wrapper is still there; use it.
++    local tmp rig bin home beads sessions logdir gccalls
++    tmp=$(mktemp -d)
++    rig="$tmp/rig"
++    bin="$tmp/bin"
++    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
++    beads="$tmp/beads.json"
++    sessions="$tmp/sessions.json"
++    logdir="$tmp/logs"
++    gccalls="$tmp/gc-calls"
++    mkdir -p "$logdir"
++
++    setup_rig "$rig"
++    arm_pinned_store "$rig"
++    write_gc_stub "$bin"
++    write_bd_stub "$bin"
++    add_bead_worktree "$rig" "$home" "wt-closed"
++
++    jq -n '[{id:"wt-closed", status:"closed", metadata:{polecat_session:"deadsess"}}]' >"$beads"
++    printf '{"sessions":[]}' >"$sessions"
++
++    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
++        BD_EXPECT_RIG_ROOT="$rig" BD_ABSENT=1 GC_BD_CALLS="$gccalls" \
++        GC_REAP_BUDGET_SECONDS=120 PATH="$bin:$PATH" \
++        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out.txt" 2>&1 ||
++        fail "reaper exited non-zero: $(cat "$tmp/out.txt")"
++
++    [[ -s "$gccalls" ]] || fail "a failed pinned read did not fall back to gc bd"
++    [[ ! -e "$home/worktrees/wt-closed" ]] ||
++        fail "the cycle was lost when the pinned transport was unavailable"
++
++    rm -rf "$tmp"
++}
++
++test_a_pinned_read_that_times_out_names_its_own_transport() {
++    # gcp-mqu9's lesson, applied to the new fork in the road: a log line that
++    # says "the bead read timed out" without saying WHICH read sends the next
++    # reader at the wrong thing. It also must NOT be retried through the slower
++    # wrapper — re-asking cannot fit where the faster call did not, and burning
++    # the remainder of the budget on it is how a yield becomes a SIGKILL.
++    local tmp rig bin home beads sessions logdir gccalls
++    tmp=$(mktemp -d)
++    rig="$tmp/rig"
++    bin="$tmp/bin"
++    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
++    beads="$tmp/beads.json"
++    sessions="$tmp/sessions.json"
++    logdir="$tmp/logs"
++    gccalls="$tmp/gc-calls"
++    mkdir -p "$logdir"
++
++    setup_rig "$rig"
++    arm_pinned_store "$rig"
++    write_gc_stub "$bin"
++    write_bd_stub "$bin"
++    add_bead_worktree "$rig" "$home" "wt-closed"
++
++    jq -n '[{id:"wt-closed", status:"closed", metadata:{polecat_session:"deadsess"}}]' >"$beads"
++    printf '{"sessions":[]}' >"$sessions"
++
++    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
++        BD_EXPECT_RIG_ROOT="$rig" BD_DELAY=20 GC_BD_CALLS="$gccalls" \
++        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run --budget 4 \
++        >"$tmp/out.txt" 2>&1 ||
++        fail "a pinned read that outlives the budget must still yield cleanly: $(cat "$tmp/out.txt")"
++
++    local log
++    log=$(cat "$logdir"/polecat-worktree-reap.log)
++    grep -q 'bead_query_timed_out' <<<"$log" ||
++        fail "a pinned read that outran the budget was not recorded as a timeout: $log"
++    grep -q "bd pinned to $rig" <<<"$log" ||
++        fail "the timeout line does not name the transport that actually timed out: $log"
++    [[ ! -s "$gccalls" ]] ||
++        fail "a pinned timeout was retried through gc bd, spending budget the cycle did not have"
++
++    rm -rf "$tmp"
++}
++
+ test_reaps_only_closed_clean_unowned_bead_worktrees
+ test_real_removal_is_opt_in
++test_the_pinned_read_serves_both_bead_reads_and_gc_bd_is_not_called
++test_a_rig_with_no_beads_project_still_reads_through_gc
++test_a_pinned_store_that_knows_no_asked_id_is_not_acted_on
++test_a_missing_pinned_transport_falls_back_instead_of_failing_the_cycle
++test_a_pinned_read_that_times_out_names_its_own_transport
+ test_unreadable_session_roster_skips_the_reap
+ test_dry_run_removes_nothing_and_rerun_is_idempotent
+ test_bead_status_is_read_in_one_bulk_query
+diff --git a/tests/test_no_bare_bd_commands.py b/tests/test_no_bare_bd_commands.py
+index 5d39cee..f6f8da9 100644
+--- a/tests/test_no_bare_bd_commands.py
++++ b/tests/test_no_bare_bd_commands.py
+@@ -185,6 +185,40 @@ GC_BD_ARGV_TAIL_ALLOWLIST: dict[Path, set[str]] = {
+ }
+ 
+ 
++PINNED_STORE_BD_MARKER = "bd-pinned-store"
++# The ONE shape of `bd` invocation this guard permits, and only at the exact
++# lines named below.
++#
++# The rule this guard enforces is really about ROUTING, not about the binary: a
++# pack asset must never read whichever store it happens to be standing in. A
++# `bd -C <explicitly resolved rig root>` call does not do that -- `-C` pins the
++# project to a named directory and FAILS CLOSED ("no beads project found",
++# exit 1) rather than walking up to $PWD, which is the CWD resolution the guard
++# exists to stop. `bd --dir /tmp/rig` stays a violation and is asserted as one
++# below: an exemption that keyed on "has a directory flag" would let any path in,
++# including one composed from ambient state.
++#
++# Why it is allowed HERE and nowhere else: polecat-worktree-reap.sh runs as the
++# witness pre_start inside an 8s self-budget, and the `gc` wrapper costs ~2.4x
++# the pinned call for the identical answer (~5x on a rig with an external Dolt).
++# Two bead reads through the wrapper can spend the whole budget before the first
++# `git status`, which is gcp-uzq0: the reaper starts, examines nothing, and
++# reports a clean cycle. The script keeps `gc bd` as the fallback and discards
++# any pinned answer that resolves none of the ids it asked for, so a wrong store
++# cannot be acted on.
++#
++# Triple-locked exactly like GC_BD_ARGV_TAIL_ALLOWLIST above -- exact tracked
++# path, the literal marker on the line, and an exact-line match -- so editing an
++# exempted line re-fires the guard and a human re-confirms the call is still
++# pinned.
++PINNED_STORE_BD_ALLOWLIST: dict[Path, set[str]] = {
++    Path("gastown/assets/scripts/polecat-worktree-reap.sh"): {
++        'PINNED_BD=(bd -C "$RIG_ROOT" --readonly)'
++        " # bd-pinned-store: -C pins the rig checkout, never $PWD",
++    },
++}
++
++
+ def tracked_files() -> list[Path]:
+     result = subprocess.run(
+         ["git", "ls-files", "-z"],
+@@ -250,6 +284,15 @@ def intentional_gc_bd_argv_tail(relative: Path, line: str) -> bool:
+     )
+ 
+ 
++def intentional_pinned_store_bd(relative: Path, line: str) -> bool:
++    allowed = PINNED_STORE_BD_ALLOWLIST.get(relative)
++    return (
++        allowed is not None
++        and PINNED_STORE_BD_MARKER in line
++        and line.strip() in allowed
++    )
++
++
+ def bare_bd_violations(path: Path, text: str) -> list[str]:
+     violations = []
+     relative = path.relative_to(REPO_ROOT)
+@@ -260,6 +303,8 @@ def bare_bd_violations(path: Path, text: str) -> list[str]:
+                     continue
+                 if intentional_gc_bd_argv_tail(relative, line):
+                     continue
++                if intentional_pinned_store_bd(relative, line):
++                    continue
+                 violations.append(f"{relative}:{line_number}: {line.strip()}")
+         if BARE_BD_GO_EXEC.search(line):
+             violations.append(f"{relative}:{line_number}: direct bd argv")
+@@ -309,3 +354,45 @@ def test_detector_covers_shell_multiline_and_serialized_argv_forms() -> None:
+     assert not bare_bd_violations(fixture, 'command = ["gc", "bd", "show"]')
+     assert not bare_bd_violations(fixture, "gc --city /tmp/city bd list --json")
+     assert not bare_bd_violations(fixture, "gc --rig demo bd show demo-1")
++
++
++def test_pinned_store_exemption_is_locked_to_its_exact_lines() -> None:
++    # The reaper's pinned read is the only permitted `bd` invocation. Prove the
++    # exemption cannot be reused: it needs the right FILE, the marker, and the
++    # byte-exact line, so neither a copy elsewhere nor an edit in place inherits
++    # it. Without all three locks this allowlist would be a general licence to
++    # write bare `bd` with a comment attached.
++    reaper = REPO_ROOT / "gastown/assets/scripts/polecat-worktree-reap.sh"
++    exempt = 'PINNED_BD=(bd -C "$RIG_ROOT" --readonly)' \
++        " # bd-pinned-store: -C pins the rig checkout, never $PWD"
++
++    assert not bare_bd_violations(reaper, exempt)
++    # Same line, wrong file.
++    assert bare_bd_violations(REPO_ROOT / "fixture.sh", exempt)
++    # Right file, marker removed.
++    assert bare_bd_violations(reaper, 'PINNED_BD=(bd -C "$RIG_ROOT" --readonly)')
++    # Right file and marker, but the line was edited -- a human re-confirms.
++    assert bare_bd_violations(
++        reaper,
++        'PINNED_BD=(bd -C "$SOME_OTHER_DIR" --readonly) # bd-pinned-store',
++    )
++    # The marker never launders a DIFFERENT bare call in the same file.
++    assert bare_bd_violations(reaper, "bd show gcp-1 --json # bd-pinned-store")
++    # A directory flag alone is not the exemption; only the allowlisted line is.
++    assert bare_bd_violations(reaper, "bd --dir /tmp/rig list --json")
++
++
++def test_reaper_keeps_gc_bd_as_the_fallback_transport() -> None:
++    # The exemption is justified by the pinned read being a FAST PATH, not a
++    # replacement: `gc bd` must still be built and still be reachable, or a rig
++    # the pinned read cannot serve loses its bead read entirely.
++    reaper = (REPO_ROOT / "gastown/assets/scripts/polecat-worktree-reap.sh").read_text(
++        encoding="utf-8"
++    )
++
++    assert 'GC_BD=(gc bd --rig "$RIG_NAME")' in reaper
++    assert '"${GC_BD[@]}" show "${BEAD_IDS_ARGV[@]}" --json' in reaper
++    # Every bead read goes through the one helper, so the gate read and the
++    # point-of-use re-check cannot end up on different stores.
++    assert reaper.count('"${PINNED_BD[@]}" show') == 1
++    assert reaper.count('"${GC_BD[@]}" show') == 1
+-- 
+2.50.1 (Apple Git-155)
+
