@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 13 Sep 2026 17:38:30 -0400
-Subject: [PATCH 99/99] test(polecat): register the claim-guard test with the
+Subject: [PATCH 099/101] test(polecat): register the claim-guard test with the
  bare-bd drift guard (gcp-cvbs)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

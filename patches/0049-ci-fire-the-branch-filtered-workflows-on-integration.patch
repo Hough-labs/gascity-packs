@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 28 Aug 2026 17:17:44 -0400
-Subject: [PATCH 49/99] ci: fire the branch-filtered workflows on integration,
- not main (gcp-75ed)
+Subject: [PATCH 049/101] ci: fire the branch-filtered workflows on
+ integration, not main (gcp-75ed)
 
 Every workflow that carries a branch filter on this fork was scoped
 `branches: [main]`, but no work on this rig ever touches main. Polecats

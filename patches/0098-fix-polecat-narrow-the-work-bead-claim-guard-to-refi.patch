@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 13 Sep 2026 16:53:12 -0400
-Subject: [PATCH 98/99] fix(polecat): narrow the work-bead claim guard to
+Subject: [PATCH 098/101] fix(polecat): narrow the work-bead claim guard to
  refinery and escalation (gcp-cvbs)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

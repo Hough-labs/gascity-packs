@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 13 Sep 2026 17:05:36 -0400
-Subject: [PATCH 95/99] docs(design): re-verify the reaper plan against jxtc's
- result (gcp-uzq0)
+Subject: [PATCH 095/101] docs(design): re-verify the reaper plan against
+ jxtc's result (gcp-uzq0)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
