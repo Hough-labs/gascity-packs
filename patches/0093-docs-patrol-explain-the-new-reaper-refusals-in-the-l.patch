@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sun, 13 Sep 2026 16:31:01 -0400
+Subject: [PATCH 93/93] docs(patrol): explain the new reaper refusals in the
+ log-review table (gcp-jxtc)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+test_gastown_pack_assets.sh enforces that every `record worktree_*` event
+the reaper can emit has a row in mol-witness-patrol's log-review table —
+the witness reads that table to decide whether a line needs action, and an
+undocumented event is one it cannot triage. Self-review caught the new
+`worktree_shape_unconfirmed` failing that gate.
+
+Adds the missing row and extends three existing ones with the reasons this
+branch introduces:
+
+- `worktree_shape_unconfirmed` — the path stopped re-confirming as that
+  bead's own worktree directory. Triage is "one-off is the re-check
+  working; repeating means two things are managing one worktree", which is
+  the finding an operator would otherwise have to reconstruct.
+- `worktree_reap_failed` gains `reap_budget_insufficient`, and the row now
+  leads with what separates it from the other two reasons: nothing was
+  entered, so it needs no action and reads like `worktree_budget_exhausted`.
+- `worktree_publication_unconfirmed` gains the four `recheck_`-prefixed
+  reasons, and `worktree_unpublished_kept` gains
+  `unpublished_at_point_of_use` — both name the renewing probe rather than
+  the deciding one, so a reader can tell which of the two probes failed.
+
+Validation: `bash gastown/tests/test_gastown_pack_assets.sh` green.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ gastown/formulas/mol-witness-patrol.toml | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
+index 4536b2b..d1bdc3f 100644
+--- a/gastown/formulas/mol-witness-patrol.toml
++++ b/gastown/formulas/mol-witness-patrol.toml
+@@ -716,11 +716,12 @@ jq -r 'select(.reason != "") | [.ts, .event, .reason, .budget_remaining, .bead]
+ | `worktree_owner_unconfirmed` | Liveness is unknown, so the reap was skipped. `reason`: `roster_read_timed_out` (the read did not finish in the budget left), `roster_read_failed` (`gc session list` errored), `roster_unparseable` (it answered with a shape we do not recognise) | **`roster_read_timed_out` → the budget is the suspect first**; the detail names the seconds it got. Only `roster_read_failed`/`roster_unparseable` implicate the roster itself — then check `gc doctor`. Nothing was removed either way |
+ | `worktree_bead_unreadable` | The bulk `gc bd show` answered, but echoed no row for this bead id AND did not say the id does not exist (`reason: bead_absent_from_batch`) — a fuzzy hit that echoed a different id, or a per-id read failure. TRANSIENT: retried next cycle | If it repeats across many beads, check Dolt health. An id `bd` positively reports as absent is `worktree_no_such_bead` below, not this |
+ | `worktree_no_such_bead` | `bd` answered "no issue found matching" for this leaf (`reason: no_such_bead`), so it is not a bead worktree at all — typically a scratch directory hand-made under `worktrees/`. PERMANENT, so it is decided once instead of retried forever | Log only. The gate-3 / gate-5 line for the same path is the one that says what actually happened to it |
+-| `worktree_unpublished_kept` | A no-such-bead path that is clean, whose publication probe RAN, and whose `HEAD` was found on no remote-tracking branch (`reason: no_such_bead_content_unpublished`), so its commits exist nowhere else. Nothing was removed | A real finding, and it will NOT resolve on its own — inspect the worktree by hand. If the commits matter, push them somewhere; if they do not, remove the directory yourself. Mail the mayor if you cannot tell |
+-| `worktree_publication_unconfirmed` | The publication probe did not answer, so whether the commits exist elsewhere is UNKNOWN. `reason`: `publication_probe_timed_out` (cut short by the budget left) or `publication_probe_failed` (`git rev-parse HEAD` or `git branch --remotes --contains` exited non-zero, or HEAD read back empty). Nothing was removed | **Not a lost-work signal — do not salvage on it.** `publication_probe_timed_out` → budget first; the detail names the seconds it got. `publication_probe_failed` means the rig checkout or the worktree is unhealthy: inspect by hand. Either way the next cycle re-checks (`gcp-9ql4`) |
++| `worktree_unpublished_kept` | A no-such-bead path that is clean, whose publication probe RAN, and whose `HEAD` was found on no remote-tracking branch, so its commits exist nowhere else. Nothing was removed. `reason`: `no_such_bead_content_unpublished` (the deciding probe) or `unpublished_at_point_of_use` (it was published when the cycle decided and is not when the removal re-checked — a branch was deleted from the remote inside the cycle) | A real finding, and it will NOT resolve on its own — inspect the worktree by hand. If the commits matter, push them somewhere; if they do not, remove the directory yourself. Mail the mayor if you cannot tell |
++| `worktree_publication_unconfirmed` | The publication probe did not answer, so whether the commits exist elsewhere is UNKNOWN. `reason`: `publication_probe_timed_out` (cut short by the budget left) or `publication_probe_failed` (`git rev-parse HEAD` or `git branch --remotes --contains` exited non-zero, or HEAD read back empty). The same two probes are RE-RUN immediately before a removal on this route, and their unknowns carry the `recheck_` prefix — `recheck_publication_probe_timed_out`, `recheck_publication_probe_failed`, `budget_spent_before_recheck_publication_probe`, `budget_spent_before_recheck_publication_check` — because gate 5 is the whole safety case there and is not allowed to age (`gcp-jxtc`). Nothing was removed | **Not a lost-work signal — do not salvage on it.** `publication_probe_timed_out` → budget first; the detail names the seconds it got. `publication_probe_failed` means the rig checkout or the worktree is unhealthy: inspect by hand. Either way the next cycle re-checks (`gcp-9ql4`) |
+ | `worktree_status_unreadable` | `git status` actually ran inside the worktree and did not answer. `reason`: `git_status_timed_out` (cut short by the budget left) or `git_status_failed` (non-zero exit) | **`git_status_timed_out` → budget first.** `git_status_failed` is the real one: inspect by hand, likely a broken or moved checkout |
+-| `worktree_reap_failed` | Directory survived removal. `reason`: `reap_rename_failed` (the worktree could not be renamed to its `.reaping` marker, so NOTHING was deleted) or `reap_incomplete` (the marked directory survived the `rm -rf`) | Investigate permissions/mounts, mail mayor. `reap_rename_failed` is the safe one — the worktree is untouched; `reap_incomplete` leaves a `.reaping` directory the next cycle will re-attempt |
++| `worktree_reap_failed` | An authorised reap did not happen. `reason`: `reap_budget_insufficient` (less than `--removal-reserve` seconds of budget remained, so the removal was never ENTERED — nothing renamed, nothing deleted), `reap_rename_failed` (the worktree could not be renamed to its `.reaping` marker, so NOTHING was deleted) or `reap_incomplete` (the marked directory survived the `rm -rf`) | `reap_budget_insufficient` is routine on a busy rig and needs no action — read it like `worktree_budget_exhausted`; the candidate returns next cycle with a fresh budget, and persistent ones mean the budget is too small for the candidate set. The other two: investigate permissions/mounts, mail mayor. `reap_rename_failed` is the safe one — the worktree is untouched; `reap_incomplete` leaves a `.reaping` directory the next cycle will re-attempt |
+ | `worktree_bead_reopened` | The bead was `closed` when this cycle enumerated it and is not closed now (`reason: bead_changed_at_point_of_use`). The closure is what authorises the reap, so nothing was removed | None — this is the re-check working. A polecat has almost certainly been slung onto the reopened bead and is using that worktree. It stops being a candidate until the bead closes again |
++| `worktree_shape_unconfirmed` | The PATH stopped re-confirming as that bead's own per-bead worktree directory immediately before the removal (`reason: shape_changed_at_point_of_use`) — it was moved or removed mid-cycle, or a symlink is standing where the directory was. The removal is addressed by the path, so it was not entered and nothing was removed | None if it is a one-off: something else (a witness salvage, an operator, a second housekeeping pass) got to the directory first, which is the re-check working. Repeating on the same bead means two things are managing one worktree — find the other one before arming anything |
+ | `worktree_revalidation_unconfirmed` | A gate could not be RE-CONFIRMED immediately before the removal, so the removal was refused. `reason`: `revalidation_status_unreadable` (the second `git status` did not answer), `revalidation_owner_unconfirmed` (the roster could not confirm the owner), or one of the renew-read reasons (`budget_spent_before_recheck_bead_read`, `recheck_bead_read_timed_out`, `recheck_bead_read_failed`, `recheck_bead_read_unparseable`) | Nothing was removed, which is the correct direction. Budget/timeout reasons → the cycle was too short, same reading as `worktree_budget_truncated`. A `_failed` reason means the store or the checkout is unhealthy — check `gc doctor` |
+ | `worktree_residue_git_view_absent` | A residue directory the disk walk found that git cannot administer at all — no `.git`, or one pointing at an admin entry that is gone. Gate 3 is UNEVALUABLE for it, and the line says so rather than reporting a clean tree it never inspected. The reap stands on gates 2 and 4 instead | Log only, and expected on any rig that ran an armed reaper before `gcp-mves`. It is the tail of an authorised removal that was killed; the gate-2/gate-4 line for the same path says what actually happened to it |
+ | `worktree_residue_no_bead_kept` | A residue directory with NO bead (`reason: residue_no_bead_unverifiable`). Gate 5 carries the no-such-bead path and needs a `git rev-parse HEAD` this directory cannot answer, so no evidence exists either way. Nothing was removed | A real finding that will not resolve on its own — inspect by hand, like `worktree_unpublished_kept`. The content is there; git's view of it is not. Mail the mayor if you cannot tell what it was |
+-- 
+2.50.1 (Apple Git-155)
+
