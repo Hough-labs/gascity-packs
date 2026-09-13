@@ -99,13 +99,32 @@ discarded. Observed live on winnow-x32.4, winnow-x32.5 and winnow-48fm, and
 reproduced first-party on this rig by the sling that dispatched gcp-5gir.
 
 ```bash
+# CLAIM_GUARD_BEGIN work-bead
 POLECAT_SESSION="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
+# Resolved with the exact expression submit-and-exit writes, so "the refinery
+# owns this bead" means the same thing at both ends of the run.
+REFINERY_TARGET="${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery"
 CLAIM_JSON=$(gc bd show "$WORK_BEAD_ID" --json 2>/dev/null)
 CURRENT_ASSIGNEE=$(printf '%s' "$CLAIM_JSON" | jq -r '.[0].assignee // empty' 2>/dev/null)
-if [ -n "$CURRENT_ASSIGNEE" ] && [ "$CURRENT_ASSIGNEE" != "$POLECAT_SESSION" ]; then
-    echo "WARN $WORK_BEAD_ID is assigned to $CURRENT_ASSIGNEE, not this session; leaving the assignee alone."
+CURRENT_ROUTED_TO=$(printf '%s' "$CLAIM_JSON" | jq -r '.[0].metadata."gc.routed_to" // empty' 2>/dev/null)
+# Skip the claim for the two owners this session must not displace, each NAMED
+# rather than inferred from "somebody else's name is on it":
+#   - the refinery, which owns a bead it is landing;
+#   - `gc.routed_to=human`, the operator escalation the refinery writes when it
+#     REFUSES to land one. Step 8 halts the handoff on that same marker.
+# Everything else is claimed: unassigned, this session already, or the crew
+# seat that authored the bead.
+if [ "$CURRENT_ASSIGNEE" != "$POLECAT_SESSION" ] &&
+   { [ "$CURRENT_ASSIGNEE" = "$REFINERY_TARGET" ] || [ "$CURRENT_ROUTED_TO" = "human" ]; }; then
+    echo "WARN $WORK_BEAD_ID is held by ${CURRENT_ASSIGNEE:-nobody} (gc.routed_to=${CURRENT_ROUTED_TO:-none}); leaving the assignee alone."
     echo "WARN a refinery-owned or operator-escalated work bead is not yours to re-claim. Continue; submit-and-exit's guards decide the handoff."
 else
+    # A foreign, non-refinery, non-escalated assignee is claimed rather than
+    # deferred to — but say so, so a duplicate pour leaves a trace instead of
+    # passing silently. Reaching here means the startup claim block's
+    # live-owner guard already found no LIVE session behind that name.
+    [ -z "$CURRENT_ASSIGNEE" ] || [ "$CURRENT_ASSIGNEE" = "$POLECAT_SESSION" ] ||
+        echo "WARN $WORK_BEAD_ID was assigned to $CURRENT_ASSIGNEE (not the refinery, not an escalation); claiming it for this session."
     gc bd update "$WORK_BEAD_ID" --status=in_progress --assignee="$POLECAT_SESSION" --set-metadata polecat_session="$POLECAT_SESSION"
     # Read the claim back. `--status` on this bead has been observed not to
     # stick (gcp-s14g), and a status that stays `open` leaves the bead sitting
@@ -127,7 +146,33 @@ else
     [ "$CLAIMED_STATUS" = "in_progress" ] && [ "$CLAIMED_ASSIGNEE" = "$POLECAT_SESSION" ] ||
         echo "WARN $WORK_BEAD_ID reads status=${CLAIMED_STATUS:-unreadable} assignee=${CLAIMED_ASSIGNEE:-none} after the claim; it may still be re-slung out from under you. Proceeding — the implementation is not blocked on this."
 fi
+# CLAIM_GUARD_END work-bead
 ```
+
+The skip condition names its two owners instead of testing "is there an
+assignee at all". It used to be `[ -n "$CURRENT_ASSIGNEE" ] && [
+"$CURRENT_ASSIGNEE" != "$POLECAT_SESSION" ]`, whose prose already claimed the
+narrow intent — protect a refinery-owned or operator-escalated bead — while its
+condition matched **every** assignee. Planned work normally arrives already
+assigned to the crew seat that filed it, so the guard fired on the ordinary
+case: the claim was skipped, the bead stayed `status=open` for the whole run,
+and it sat in `gc bd ready` looking untouched — the exact window the claim
+exists to close. The protection was therefore void for every crew-authored
+bead and only ever fired on beads that were already unassigned. Observed on
+gauntlet `gaunt-m58w` (assignee `gauntlet/crew.valkyrie`; two `mol-polecat-work`
+molecules poured on one bead) and again live on `gcp-jxtc`, where the duplicate
+carried its own `submit-and-exit` and came within one step of pushing a second
+branch over two finished commits (gcp-cvbs).
+
+The invariant to hold onto: **a work bead being actively implemented must not
+remain `status=open`**, because that is the only thing standing between a live
+polecat and a second one dispatched on top of it. A guard that protects the
+assignee field at the cost of that invariant protects nothing.
+
+Reading `gc.routed_to` is not the same as stamping it. The read is how the
+escalation marker is recognised; nothing in this step writes or clears the key,
+and the "Do NOT reach for `gc.routed_to`" note further down still stands as
+written — it is about the write.
 
 `polecat_session` rides along with the assignee so the two can never disagree.
 Downstream readers — the witness's worktree reaper and the resume re-verify —

@@ -903,15 +903,28 @@ PY
     [[ "$setup_block" == *'--assignee="$POLECAT_SESSION" --set-metadata polecat_session="$POLECAT_SESSION"'* ]] ||
         fail "the work-bead claim must stamp polecat_session together with the assignee"
 
-    # Never steal a bead the refinery or an operator escalation already owns.
-    [[ "$setup_block" == *'[ "$CURRENT_ASSIGNEE" != "$POLECAT_SESSION" ]'* ]] ||
-        fail "the claim must leave a foreign assignee alone rather than overwrite it"
+    # Never steal a bead the refinery or an operator escalation already owns —
+    # and never mistake "any assignee" for that. gcp-cvbs: the guard used to
+    # skip the claim for every non-empty assignee, which is the ordinary shape
+    # of planned work (the crew seat that filed it), so the bead stayed open in
+    # `gc bd ready` all run and a second molecule was poured on it. The skip
+    # must name its two owners. Behaviour is covered end-to-end in
+    # test_polecat_work_bead_claim_guard.sh; these pin the condition itself.
+    [[ "$setup_block" == *'[ "$CURRENT_ASSIGNEE" = "$REFINERY_TARGET" ]'* ]] ||
+        fail "the claim must identify a refinery-held bead by identity, not by 'somebody else holds it'"
+    [[ "$setup_block" == *'[ "$CURRENT_ROUTED_TO" = "human" ]'* ]] ||
+        fail "the claim must recognise the gc.routed_to=human operator escalation"
+    [[ "$setup_block" != *'if [ -n "$CURRENT_ASSIGNEE" ] && [ "$CURRENT_ASSIGNEE" != "$POLECAT_SESSION" ]'* ]] ||
+        fail "the claim skip is back to 'any assignee that is not me', which voids it on every crew-authored bead"
 
     # The bead's own note: pool dispatch leaves gc.routed_to blank on the work
     # bead on purpose so scale_check can see pool demand. Stamping it here
-    # breaks spawn accounting instead of fixing visibility.
-    [[ "$setup_block" != *'gc.routed_to='* ]] ||
+    # breaks spawn accounting instead of fixing visibility. READING the key is
+    # how the escalation above is recognised, so the ban is on the write.
+    [[ "$setup_block" != *'set-metadata gc.routed_to'* ]] ||
         fail "the work-bead claim must not stamp gc.routed_to; routing lives on the molecule root"
+    [[ "$setup_block" != *'unset-metadata gc.routed_to'* ]] ||
+        fail "the work-bead claim must not clear gc.routed_to; submit-and-exit is the single release point"
 
     # Release is a single assignee move, session -> refinery. A release that
     # passed through unassigned would re-open the very window this closes.
