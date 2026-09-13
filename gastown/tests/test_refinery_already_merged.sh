@@ -88,17 +88,18 @@ git_quiet() {
         "$@"
 }
 
-# A `gc` that answers exactly what the shipped blocks call. `bd show --json`
-# serves the work bead's metadata (the gate reads `fork_sha` from it); every
-# other call is recorded so a test can read back what the gate decided.
+# A `gc` that answers exactly what the shipped blocks call. The `gc bd show
+# --json` call serves the work bead's metadata (the gate reads `fork_sha` from
+# it); every other call is recorded so a test can read back what the gate
+# decided.
 make_gc_stub() {
     local dir="$1"
     mkdir -p "$dir"
     cat > "$dir/gc" <<'STUB'
 #!/usr/bin/env bash
-printf '%s\n' "$*" >> "${GC_STUB_LOG:?GC_STUB_LOG unset}"
-case "$*" in
-    *"bd show"*--json*) printf '[{"metadata":{"fork_sha":"%s"}}]\n' "${GC_STUB_FORK_SHA:-}" ;;
+printf 'gc %s\n' "$*" >> "${GC_STUB_LOG:?GC_STUB_LOG unset}"
+case "gc $*" in
+    *"gc bd show"*--json*) printf '[{"metadata":{"fork_sha":"%s"}}]\n' "${GC_STUB_FORK_SHA:-}" ;;
 esac
 exit 0
 STUB
@@ -241,7 +242,7 @@ test_crash_after_a_rebasing_merge_closes_as_already_merged() {
 
     [ "$status" -eq 0 ] ||
         fail "rebased already-merged branch exited $status, want 0 (close as merged, do not halt)"
-    logged "bd close test-bead" ||
+    logged "gc bd close test-bead" ||
         fail "rebased already-merged branch never closed the bead — the merged work is stranded"
     logged "--set-metadata merge_result=already_merged" ||
         fail "rebased already-merged branch did not record merge_result=already_merged"
@@ -288,7 +289,7 @@ test_starved_zero_commit_branch_still_halts() {
         fail "empty branch exited 0 — a branch with no commits must halt, never close"
     logged "--set-metadata merge_result=refused_false_completion" ||
         fail "empty branch did not halt as a false completion"
-    ! logged "bd close test-bead" ||
+    ! logged "gc bd close test-bead" ||
         fail "empty branch was closed as merged — the content arm swallowed a false completion"
     rm -rf "$TMP"
 }
@@ -347,7 +348,7 @@ test_unmerged_branch_falls_through_to_the_merge() {
 
     [ "$status" -eq 0 ] ||
         fail "ordinary merge candidate exited $status, want 0 (fall through to the merge script)"
-    ! logged "bd close test-bead" ||
+    ! logged "gc bd close test-bead" ||
         fail "ordinary merge candidate was closed by the gate instead of being merged"
     ! logged "merge_result=refused_false_completion" ||
         fail "ordinary merge candidate was halted as a false completion"
