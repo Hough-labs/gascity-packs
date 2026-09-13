@@ -1,0 +1,190 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sun, 13 Sep 2026 17:05:36 -0400
+Subject: [PATCH 95/95] docs(design): re-verify the reaper plan against jxtc's
+ result (gcp-uzq0)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+gcp-jxtc landed as 16f92c8 (1559 -> 1748 lines). Re-checked both findings
+against the merged tree instead of carrying them forward on assumption; all
+line references updated.
+
+Both hold, and one is strengthened: jxtc added a FOURTH DECIDED_LAST rollback
+site (:1653, the removal-reserve refusal). Correct per candidate, but the
+cross-cycle effect runs the wrong way — the tighter the budget, the more
+candidates roll back, so the cursor advances least exactly when starvation is
+worst. Bead B's advance must key on what a cycle ENUMERATED, not what it
+disposed of.
+
+Also bounds Bead A honestly: the roster read at :945 is a direct
+gc session list with no bare-bd equivalent, so only the two bead reads can be
+cheapened. Expected recovery ~2 fixed-overhead units, not the whole budget.
+
+Records the pin caveat: the city still pins 2583963 (1079-line reaper, 23
+commits back), so every operational number in the doc came from a different
+script than the one being patched. Do not validate against live reaper logs.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ docs/design/reaper-budget-starvation.md | 91 +++++++++++++++++++++----
+ 1 file changed, 77 insertions(+), 14 deletions(-)
+
+diff --git a/docs/design/reaper-budget-starvation.md b/docs/design/reaper-budget-starvation.md
+index 3d0722c..581c592 100644
+--- a/docs/design/reaper-budget-starvation.md
++++ b/docs/design/reaper-budget-starvation.md
+@@ -1,9 +1,14 @@
+ # Reaper budget starvation — analysis and plan (gcp-uzq0)
+ 
+-Status: **plan only, not dispatchable yet.** `gcp-jxtc` is in flight on
+-`polecat-worktree-reap.sh` (polecat `gastown__polecat-gc-yhsv`, branch
+-`polecat/gcp-jxtc`). The patch described here is cut *against jxtc's result*,
+-not against today's HEAD. Nothing below authorises an edit to that script now.
++Status: **unblocked, dispatchable after the Bead B question in §8.**
++`gcp-jxtc` LANDED 2026-09-13T20:59Z — `16f92c8` verified on `origin/integration`.
++Every line reference below was re-verified against that result (1748 lines); see
++§9 for what changed and the one finding it strengthens.
++
++**Do not validate against live reaper logs.** The city's import pin is still
++`2583963` (2026-09-06), where the reaper is **1079 lines** — 23 commits behind
++`integration`. Every operational number in §1 was produced by that pinned script,
++not by the one this plan patches.
+ 
+ Author: `gascity-packs/crew.pacman`, 2026-09-13. Written at the mayor's request
+ (analysis + plan + test approach) after they assigned `gcp-uzq0` with measured
+@@ -28,8 +33,8 @@ and a reaper that would actually reap once `gcp-jxtc` lands.
+ ## 2. What is already fixed, and must not be re-built
+ 
+ **The reaper already rotates its window.** `gcp-schs` shipped a cursor:
+-`polecat-worktree-reap.sh:673-706` rotates the sorted candidate list to start
+-after the last-decided candidate, and `:1533-1546` persists it. A full pass
++`polecat-worktree-reap.sh:727-766` rotates the sorted candidate list to start
++after the last-decided candidate, and `:1720-1731` persists it. A full pass
+ deletes the cursor so the next cycle starts at the head.
+ 
+ This matters because the mayor's scoping note says of `gcp-7fgg`:
+@@ -44,7 +49,7 @@ prevent. See `gcp-5u8u` for the same trap caught in the same family of beads.
+ 
+ ## 3. The actual defect — rotation is inert exactly when it is needed
+ 
+-The cursor advances **only when a candidate is decided**. From `:1540`:
++The cursor advances **only when a candidate is decided**. From `:1729`:
+ 
+ ```sh
+ elif [ -n "$DECIDED_LAST" ]; then
+@@ -61,7 +66,7 @@ and the comment immediately below it, verbatim:
+ That reasoning is correct about writing an *empty* cursor. But combine it with
+ `gcp-uzq0`'s defect and the two compose into a hard stall:
+ 
+-1. The bulk bead read at `:759` consumes what is left of the 8s budget.
++1. The bulk bead read at `:813` consumes what is left of the 8s budget.
+ 2. The candidate loop therefore never runs — `examined=0`, zero decisions.
+ 3. `DECIDED_LAST` is empty, so the cursor is left untouched.
+ 4. The next cycle rotates to **the same start point** and repeats.
+@@ -78,9 +83,9 @@ The cycle makes **three `gc`-class calls** before the per-candidate git work:
+ 
+ | Site | Call |
+ |---|---|
+-| `:759` | bulk `gc bd show <ids> --json` — the gate read |
+-| `:~890` | `gc session list` — the roster/liveness read |
+-| `:969` | bulk `gc bd show <ids> --json` — the pre-removal recheck read |
++| `:813` | bulk `bd`/`gc bd show <ids> --json` — the gate read |
++| `:945` | `gc session list --state=all --json` — the roster read |
++| `:1023` | bulk `bd`/`gc bd show <ids> --json` — the pre-removal recheck read |
+ 
+ Each pays full `gc` process startup. Measured on **gascity-packs**
+ (`inherited_city` endpoint) at load 18.68, 2026-09-13:
+@@ -117,7 +122,7 @@ Three beads, sequenced. **All land behind `gcp-jxtc`.**
+ Replace the three `gc`-class invocations with the cheapest form that is still
+ correct, keeping every existing budget/yield semantic untouched.
+ 
+-- `GC_BD=(gc bd --rig "$RIG_NAME")` at `:392` becomes a bare `bd` invocation
++- `GC_BD=(gc bd --rig "$RIG_NAME")` at `:446` becomes a bare `bd` invocation
+   rooted at `$RIG_ROOT`, with the current `gc bd` form retained as a fallback
+   when bare `bd` is absent or cannot resolve the store.
+ - The `run_bounded` wrapper, the `budget_left` accounting, the `classify_outcome`
+@@ -163,7 +168,7 @@ does not apply: the home audit lives in `gastown/formulas/mol-witness-patrol.tom
+ (`audit-polecat-homes`), a different file from `polecat-worktree-reap.sh`. Its
+ bias claim is genuinely true, because unlike the reaper it has **no cursor at
+ all** — `home_budget_exhausted` defers the remainder with nothing to rotate it
+-(`mol-witness-patrol.toml:862`).
++(`mol-witness-patrol.toml:863`).
+ 
+ So: `gcp-uzq0` + `gcp-ga3m` + `gcp-co29` are one fix (Beads A/B, one script).
+ `gcp-7fgg` is its sibling in a second file, and wants `gcp-schs`'s cursor
+@@ -176,7 +181,7 @@ gauntlet data shows a *lower*-load run producing worse coverage than a
+ higher-load one, so wall-clock A/B on a live rig proves nothing.
+ 
+ 1. **Deterministic budget tests, not timing tests.** Drive the script with
+-   `--budget` (a plain flag, `:243`) and `GC_REAP_BUDGET_SECONDS` (`:136`) at
++   `--budget` (a plain flag, `:311`) and `GC_REAP_BUDGET_SECONDS` (`:293`) at
+    values chosen to land the cut at a known point. Assert on emitted *reason
+    codes*, which are already a closed vocabulary (`budget_spent_before_bead_query`,
+    `bead_query_timed_out`, `worktree_budget_exhausted`, `scan_complete`), not on
+@@ -215,3 +220,61 @@ Bead B changes what the cursor *means* on a zero-decision cycle, and the current
+ behaviour is deliberate and commented. I am confident the change is right —
+ today's behaviour is a hard stall — but it reverses a documented decision, so it
+ is worth one explicit nod before dispatch rather than after.
++
++---
++
++## 9. Re-verification against jxtc's result (2026-09-13T21:00Z)
++
++`gcp-jxtc` landed as `16f92c8` (+194/-5 on the reaper, 1559 → 1748 lines).
++Both findings above were derived from the pre-jxtc tree and were re-checked
++against the merged result rather than assumed forward. Both hold.
++
++**Finding 1 (rotation already exists) — unchanged.** The cursor block is intact
++at `:727-766`, and the write at `:1720-1731` is structurally identical.
++
++**Finding 2 (cursor frozen under starvation) — HOLDS, AND jxtc MADE IT WORSE.**
++This is the one thing that changed, and it strengthens Bead B rather than
++weakening it.
++
++jxtc added a fourth `DECIDED_LAST="$DECIDED_PREV"` rollback site. There were
++three (now `:1392`, `:1475`, `:1599`); the new one is `:1653`, the removal-reserve
++refusal:
++
++```sh
++if [ "$(budget_left)" -lt "$REMOVAL_RESERVE_SECONDS" ]; then
++    TRUNCATED=1
++    DECIDED_LAST="$DECIDED_PREV"
++    record worktree_reap_failed "$BEAD" "$WT" ... reap_budget_insufficient
++```
++
++Its comment is correct per candidate — a reap that never happened must stay
++inside the next cycle's window rather than be rotated past. But the *cross-cycle*
++consequence runs the wrong way: the fewer seconds the cycle has, the more
++candidates take a rollback path, so `DECIDED_LAST` advances less precisely when
++the budget is tightest. In the limit where the first candidate cannot afford the
++reserve, `DECIDED_LAST` is never set at all and the cursor does not move.
++
++So jxtc improved per-candidate safety and worsened cross-cycle fairness under
++exactly the budget pressure this bead describes. The two changes are not in
++conflict — Bead B's advance must simply be driven by what the cycle
++**enumerated**, not by what it **disposed of**, which is the distinction the new
++rollback site makes unavoidable.
++
++**A constraint on Bead A's expected saving, found during re-verification.** The
++roster read at `:945` is a direct `gc session list --state=all --json` — it does
++not go through the `GC_BD` array, and `gc session list` is a gc-native concept
++with no bare-`bd` equivalent. So Bead A can only cheapen the *two bead reads*
++(`:813`, `:1023`). The 1.4–3.3s roster read stays gc-class and stays in the
++budget. Expected recovery is therefore bounded at roughly two fixed-overhead
++units (~0.8s here, ~8s on a winnow-class rig) — real, and on winnow decisive,
++but not the whole budget. Do not promise more than that.
++
++**New test knob.** jxtc added `REMOVAL_RESERVE_SECONDS` (`:300`, env
++`GC_REAP_REMOVAL_RESERVE_SECONDS`, flag at `:319`). Together with `--budget`
++(`:311`) it gives the Bead B cursor test a second dial: force
++`reap_budget_insufficient` deterministically by setting a reserve larger than the
++remaining budget, and assert the cursor still advances.
++
++**Bead C re-confirmed.** `gastown/formulas/mol-witness-patrol.toml` still
++contains zero occurrences of `cursor`. The home audit has no rotation to this
++day, so Bead C stands exactly as written.
+-- 
+2.50.1 (Apple Git-155)
+
