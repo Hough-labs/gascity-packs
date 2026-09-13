@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sun, 13 Sep 2026 18:18:26 -0400
+Subject: [PATCH 97/97] docs(design): report the reaper read-transport result
+ at the shipped budget
+
+The first write-up measured forced budgets (3s/2s), which showed the mechanism
+but not the everyday case. Twelve interleaved samples of each script at the
+SHIPPED 8s budget, same contention, same 12 candidates: 6 of 12 complete scans
+before, 11 of 12 after. That reproduces this bead's own 63%-of-cycles-unfinished
+tally on demand, and the remaining 1 in 12 is the stated bound showing up rather
+than a surprise.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ docs/design/reaper-budget-starvation.md | 37 +++++++++++++++++++------
+ 1 file changed, 29 insertions(+), 8 deletions(-)
+
+diff --git a/docs/design/reaper-budget-starvation.md b/docs/design/reaper-budget-starvation.md
+index ab06b64..82e892b 100644
+--- a/docs/design/reaper-budget-starvation.md
++++ b/docs/design/reaper-budget-starvation.md
+@@ -329,20 +329,41 @@ transports agree on it. The check that could not be run, ran.
+ 
+ ### Effect, measured on gascity-packs (12 candidates, dry-run, scratch log)
+ 
++**At the SHIPPED 8s budget**, twelve samples of each script interleaved so both
++saw the same contention (host load ~30-36, 16 cores). The outcome is the last
++terminal event of the cycle:
++
++    complete scans    pre-change  6 of 12       post-change  11 of 12
++
++That ratio is the bead, live. §1's tally from the reap log — 88
++`budget_exhausted` against 51 `scan_complete`, 63% of cycles not finishing — is
++the same number seen from the other end, and the pre-change 6/12 reproduces it
++on demand.
++
++A single interleaved pair, showing where the pre-change cycle dies:
++
++| | pre-change | post-change |
++|---|---|---|
++| candidates examined | 7 of 12 | **12 of 12** |
++| terminal event | `worktree_budget_truncated`, reason `budget_spent_before_git_status`, then `budget_exhausted` | `scan_complete` |
++
++That reason code is one of §4's 17 `budget_spent_before_git_status` lines: the
++budget was gone before a millisecond-scale local `git status` could run on
++candidate 8. Decisions agree wherever both scripts reach the same candidate.
++
++Forced-budget controls, same rig:
++
+ | budget | pre-change | post-change |
+ |---|---|---|
+-| 8s | `scan_complete` 12/12, 4s remaining | `scan_complete` 12/12, **5s** remaining |
+ | 3s | `budget_exhausted` — **1 of 12**, deferred 11 | **`scan_complete` 12/12** |
+ | 2s | `budget_exhausted` — 1 of 12 | `budget_exhausted` — 1 of 12 |
+ 
+-The 3s row is this bead's symptom and its fix in one line: the same rig, the same
+-candidates, the same gates, starving before and complete after. Decisions are
+-byte-identical at every budget where both finish (reaped=9 skipped=3 of 12).
+-
+-The 2s row is the honest bound and matches §9: this buys back roughly two
+-fixed-overhead units, not the whole budget. The roster read at `:945` is still
++The 2s row is the honest bound, and the 1-of-12 post-change failure in the 8s
++sample above is the same bound showing up in the wild. This buys back roughly two
++fixed-overhead units, not the whole budget: the roster read at `:945` is still
+ `gc session list`, still gc-class, still in the budget. **Nobody should read this
+-as "the reaper now always completes."**
++as "the reaper now always completes."** It converts a coin flip into a strong
++favourite, on one rig, at one load.
+ 
+ ### One thing this change had to fix on the way past
+ 
+-- 
+2.50.1 (Apple Git-155)
+

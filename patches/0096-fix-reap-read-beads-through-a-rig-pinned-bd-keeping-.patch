@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 13 Sep 2026 18:06:10 -0400
-Subject: [PATCH 96/96] fix(reap): read beads through a rig-pinned bd, keeping
+Subject: [PATCH 96/97] fix(reap): read beads through a rig-pinned bd, keeping
  gc bd as the fallback
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
