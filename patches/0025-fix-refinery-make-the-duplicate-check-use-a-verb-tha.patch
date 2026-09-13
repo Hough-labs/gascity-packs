@@ -60,7 +60,7 @@ gastown shell tests 9/9, go vet/build/test -race green, registry.toml ok.
  2 files changed, 145 insertions(+), 5 deletions(-)
 
 diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
-index 6dee9b0..0056d20 100644
+index 6dee9b01..0056d203 100644
 --- a/gastown/formulas/mol-refinery-patrol.toml
 +++ b/gastown/formulas/mol-refinery-patrol.toml
 @@ -421,14 +421,48 @@ TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_bran
@@ -118,7 +118,7 @@ index 6dee9b0..0056d20 100644
     - Proceed with merge (failure not caused by this branch)
  
 diff --git a/tests/test_prompt_formula_command_drift.py b/tests/test_prompt_formula_command_drift.py
-index 133fbb3..573d341 100644
+index 133fbb34..573d3413 100644
 --- a/tests/test_prompt_formula_command_drift.py
 +++ b/tests/test_prompt_formula_command_drift.py
 @@ -26,6 +26,7 @@ import subprocess

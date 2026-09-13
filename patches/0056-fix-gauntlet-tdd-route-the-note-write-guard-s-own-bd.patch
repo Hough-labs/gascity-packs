@@ -25,7 +25,7 @@ NoteWritesAppendTests guards; restoring the fix passes both.
  1 file changed, 1 insertion(+), 1 deletion(-)
 
 diff --git a/gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py b/gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py
-index 886b5a1..41b7002 100644
+index 886b5a19..41b70023 100644
 --- a/gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py
 +++ b/gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py
 @@ -368,7 +368,7 @@ class NoteWritesAppendTests(unittest.TestCase):

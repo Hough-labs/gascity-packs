@@ -79,7 +79,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
  6 files changed, 387 insertions(+), 44 deletions(-)
 
 diff --git a/gastown/assets/scripts/polecat-home-audit.sh b/gastown/assets/scripts/polecat-home-audit.sh
-index 20baa44..d574b5f 100755
+index 20baa44a..d574b5fa 100755
 --- a/gastown/assets/scripts/polecat-home-audit.sh
 +++ b/gastown/assets/scripts/polecat-home-audit.sh
 @@ -50,11 +50,14 @@
@@ -226,7 +226,7 @@ index 20baa44..d574b5f 100755
      RIG_SEGMENT=$(basename "$(dirname "$(dirname "$WT")")")
      ROSTER_NAME="$RIG_SEGMENT/$AGENT"
 diff --git a/gastown/assets/scripts/polecat-worktree-reap.sh b/gastown/assets/scripts/polecat-worktree-reap.sh
-index cae127c..6df7e09 100755
+index cae127c9..6df7e09e 100755
 --- a/gastown/assets/scripts/polecat-worktree-reap.sh
 +++ b/gastown/assets/scripts/polecat-worktree-reap.sh
 @@ -18,9 +18,11 @@
@@ -329,7 +329,7 @@ index cae127c..6df7e09 100755
          #
          # The dot is IN the class because a sub-bead id carries one
 diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
-index ff9f1a0..6738dc9 100644
+index ff9f1a04..6738dc97 100644
 --- a/gastown/formulas/mol-witness-patrol.toml
 +++ b/gastown/formulas/mol-witness-patrol.toml
 @@ -567,10 +567,18 @@ in it. Treat the log as a report, not as a completed cleanup.
@@ -377,7 +377,7 @@ index ff9f1a0..6738dc9 100644
  **Why it needs a step of its own.** A per-bead worktree is found through
  its bead. A home has NO bead, so every guard the rig owns is structurally
 diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
-index 248d078..430db6f 100755
+index 248d0783..430db6f9 100755
 --- a/gastown/tests/test_gastown_pack_assets.sh
 +++ b/gastown/tests/test_gastown_pack_assets.sh
 @@ -328,8 +328,22 @@ PY
@@ -426,7 +426,7 @@ index 248d078..430db6f 100755
          fail "home audit must defer a home that still hosts per-bead worktrees; a LIVE polecat from another slot can be working inside a dead home's subtree (gcp-actg)"
      grep -F 'git -C "$WT" status --porcelain' "$audit" >/dev/null ||
 diff --git a/gastown/tests/test_polecat_home_audit.sh b/gastown/tests/test_polecat_home_audit.sh
-index f22fede..159d019 100755
+index f22fedeb..159d019d 100755
 --- a/gastown/tests/test_polecat_home_audit.sh
 +++ b/gastown/tests/test_polecat_home_audit.sh
 @@ -712,6 +712,74 @@ test_every_line_is_stamped_at_the_event_not_at_the_run() {
@@ -512,7 +512,7 @@ index f22fede..159d019 100755
  
  echo "polecat home audit tests passed"
 diff --git a/gastown/tests/test_polecat_worktree_reap.sh b/gastown/tests/test_polecat_worktree_reap.sh
-index efd5215..44c84f0 100644
+index efd52159..44c84f0b 100644
 --- a/gastown/tests/test_polecat_worktree_reap.sh
 +++ b/gastown/tests/test_polecat_worktree_reap.sh
 @@ -979,6 +979,136 @@ test_an_all_missing_batch_is_not_a_store_failure() {

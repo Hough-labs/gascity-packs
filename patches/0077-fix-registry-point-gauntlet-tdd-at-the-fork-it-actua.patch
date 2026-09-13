@@ -43,7 +43,7 @@ against the pre-change validator and green after.
  3 files changed, 62 insertions(+), 6 deletions(-)
 
 diff --git a/registry.toml b/registry.toml
-index 1f815e8..cbe5cb7 100644
+index 1f815e8c..cbe5cb77 100644
 --- a/registry.toml
 +++ b/registry.toml
 @@ -317,12 +317,12 @@ schema = 1
@@ -62,7 +62,7 @@ index 1f815e8..cbe5cb7 100644
      hash = "sha256:851ea09226728eb4e34ddbbf98186495516059af96ac8787c9921db070630f86"
      description = "Initial gauntlet-tdd release: the RED-to-GREEN contract loop as one formula (mol-tdd-red-green) plus a wrapper command, pinned to the bats lane with gauntlet lint as the red gate."
 diff --git a/tests/test_validate_registry.py b/tests/test_validate_registry.py
-index a03473f..198f8f0 100644
+index a03473f4..198f8f03 100644
 --- a/tests/test_validate_registry.py
 +++ b/tests/test_validate_registry.py
 @@ -45,6 +45,37 @@ def test_parse_source_accepts_bare_repo_url_as_root_pack() -> None:
@@ -104,7 +104,7 @@ index a03473f..198f8f0 100644
      spec = validate_registry.parse_source(
          "https://GITHUB.COM/gastownhall/gascity-packs/tree/main/cass/"
 diff --git a/validate_registry.py b/validate_registry.py
-index e07c545..b972c18 100755
+index e07c545e..b972c183 100755
 --- a/validate_registry.py
 +++ b/validate_registry.py
 @@ -19,10 +19,29 @@ from urllib.parse import urlparse

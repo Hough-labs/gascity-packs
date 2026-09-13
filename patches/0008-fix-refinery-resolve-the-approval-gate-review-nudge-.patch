@@ -54,7 +54,7 @@ or witness check that surfaces `failed:` markers would close the loop from
  3 files changed, 205 insertions(+), 4 deletions(-)
 
 diff --git a/gastown/README.md b/gastown/README.md
-index 5a98bc3..9b7ca8b 100644
+index 5a98bc35..9b7ca8b0 100644
 --- a/gastown/README.md
 +++ b/gastown/README.md
 @@ -44,6 +44,18 @@ require_merge_approval = "true"
@@ -87,7 +87,7 @@ index 5a98bc3..9b7ca8b 100644
  A reviewer agent produces the signal:
  
 diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
-index a475414..0bfaec1 100644
+index a4754142..0bfaec12 100644
 --- a/gastown/formulas/mol-refinery-patrol.toml
 +++ b/gastown/formulas/mol-refinery-patrol.toml
 @@ -90,8 +90,12 @@ default = "false"
@@ -177,7 +177,7 @@ index a475414..0bfaec1 100644
    echo "APPROVAL GATE REFUSED: $WORK — $1"
    echo "Bead left open and assigned to the refinery; skip the merge and run patrol-summary + next-iteration."
 diff --git a/gastown/tests/test_merge_approval_gate.sh b/gastown/tests/test_merge_approval_gate.sh
-index cf3003a..1cec0c9 100755
+index cf3003aa..1cec0c90 100755
 --- a/gastown/tests/test_merge_approval_gate.sh
 +++ b/gastown/tests/test_merge_approval_gate.sh
 @@ -829,6 +829,11 @@ PY

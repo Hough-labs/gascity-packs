@@ -35,7 +35,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
  2 files changed, 21 insertions(+), 4 deletions(-)
 
 diff --git a/gastown/tests/test_polecat_work_bead_claim_guard.sh b/gastown/tests/test_polecat_work_bead_claim_guard.sh
-index 00b168d..ff2fd8f 100755
+index 00b168dc..ff2fd8f4 100755
 --- a/gastown/tests/test_polecat_work_bead_claim_guard.sh
 +++ b/gastown/tests/test_polecat_work_bead_claim_guard.sh
 @@ -30,6 +30,13 @@ REFINERY="$RIG/gastown.refinery"
@@ -78,7 +78,7 @@ index 00b168d..ff2fd8f 100755
  }
  
 diff --git a/tests/test_no_bare_bd_commands.py b/tests/test_no_bare_bd_commands.py
-index 5d39cee..4e60fce 100644
+index 5d39ceef..4e60fce2 100644
 --- a/tests/test_no_bare_bd_commands.py
 +++ b/tests/test_no_bare_bd_commands.py
 @@ -176,6 +176,17 @@ GC_BD_ARGV_TAIL_ALLOWLIST: dict[Path, set[str]] = {

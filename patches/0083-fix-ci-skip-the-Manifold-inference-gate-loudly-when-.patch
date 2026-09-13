@@ -73,7 +73,7 @@ go vet clean, golangci-lint 0 issues, go test ok, shellcheck clean.
 
 diff --git a/.github/scripts/manifold-config-status.sh b/.github/scripts/manifold-config-status.sh
 new file mode 100755
-index 0000000..02a9a9b
+index 00000000..02a9a9b6
 --- /dev/null
 +++ b/.github/scripts/manifold-config-status.sh
 @@ -0,0 +1,107 @@
@@ -185,7 +185,7 @@ index 0000000..02a9a9b
 +
 +exit 0
 diff --git a/.github/workflows/gascity-pack-inference.yml b/.github/workflows/gascity-pack-inference.yml
-index 3ceb012..7661744 100644
+index 3ceb012f..7661744f 100644
 --- a/.github/workflows/gascity-pack-inference.yml
 +++ b/.github/workflows/gascity-pack-inference.yml
 @@ -123,7 +123,20 @@ jobs:
@@ -218,7 +218,7 @@ index 3ceb012..7661744 100644
            GATE_TIMEOUT: ${{ github.event.client_payload.timeout || github.event.inputs.timeout || '75m' }}
            GATE: ${{ github.event.client_payload.gate || github.event.inputs.gate || 'all' }}
 diff --git a/.github/workflows/supported-pack-nightly.yml b/.github/workflows/supported-pack-nightly.yml
-index 9035bc2..ba858f1 100644
+index 9035bc2f..ba858f15 100644
 --- a/.github/workflows/supported-pack-nightly.yml
 +++ b/.github/workflows/supported-pack-nightly.yml
 @@ -193,6 +193,22 @@ jobs:
@@ -261,7 +261,7 @@ index 9035bc2..ba858f1 100644
            GATE_TIMEOUT: ${{ github.event.inputs.timeout || matrix.gate_timeout }}
          run: |
 diff --git a/tests/test_gascity_pack_inference_gate.py b/tests/test_gascity_pack_inference_gate.py
-index 604a455..ca97403 100644
+index 604a4551..ca97403b 100644
 --- a/tests/test_gascity_pack_inference_gate.py
 +++ b/tests/test_gascity_pack_inference_gate.py
 @@ -605,6 +605,204 @@ def test_gas_city_installer_covers_the_refs_the_workflows_pass() -> None:

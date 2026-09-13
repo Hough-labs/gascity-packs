@@ -51,7 +51,7 @@ origin/integration worktree and are filed as gcp-ks5.
  5 files changed, 44 insertions(+), 6 deletions(-)
 
 diff --git a/gastown/assets/scripts/polecat-worktree-reap.sh b/gastown/assets/scripts/polecat-worktree-reap.sh
-index 5900cbf..340fd5d 100755
+index 5900cbf1..340fd5d8 100755
 --- a/gastown/assets/scripts/polecat-worktree-reap.sh
 +++ b/gastown/assets/scripts/polecat-worktree-reap.sh
 @@ -213,9 +213,15 @@ while IFS= read -r WT; do
@@ -83,7 +83,7 @@ index 5900cbf..340fd5d 100755
 +    echo "polecat-worktree-reap: reaped=$REAPED skipped=$SKIPPED (log: $LOG_FILE)"
 +fi
 diff --git a/gastown/formulas/mol-polecat-work.toml b/gastown/formulas/mol-polecat-work.toml
-index 189a1ab..52b4d0d 100644
+index 189a1ab6..52b4d0db 100644
 --- a/gastown/formulas/mol-polecat-work.toml
 +++ b/gastown/formulas/mol-polecat-work.toml
 @@ -107,9 +107,19 @@ cd "$WORKTREE_PATH"
@@ -108,7 +108,7 @@ index 189a1ab..52b4d0d 100644
  - An agent can pick up new work even if an old worktree is being recovered
  - Multiple orphaned worktrees can coexist without collision
 diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
-index d3af93a..4098612 100644
+index d3af93a3..4098612d 100644
 --- a/gastown/formulas/mol-witness-patrol.toml
 +++ b/gastown/formulas/mol-witness-patrol.toml
 @@ -530,6 +530,7 @@ tail -n 50 "${LOG_DIR:-$GC_CITY/.gc/runtime/logs}/polecat-worktree-reap.log"
@@ -120,7 +120,7 @@ index d3af93a..4098612 100644
  
  A `worktree_dirty_kept` that repeats across cycles means real work is
 diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
-index 58089e8..973236e 100755
+index 58089e86..973236ea 100755
 --- a/gastown/tests/test_gastown_pack_assets.sh
 +++ b/gastown/tests/test_gastown_pack_assets.sh
 @@ -248,6 +248,22 @@ test_post_merge_worktree_teardown_has_an_owner() {
@@ -147,7 +147,7 @@ index 58089e8..973236e 100755
      # housekeeping into data loss.
      grep -F '*/polecats/*/worktrees/*' "$reaper" >/dev/null ||
 diff --git a/gastown/tests/test_polecat_worktree_reap.sh b/gastown/tests/test_polecat_worktree_reap.sh
-index 86b871c..7b72c70 100644
+index 86b871c9..7b72c702 100644
 --- a/gastown/tests/test_polecat_worktree_reap.sh
 +++ b/gastown/tests/test_polecat_worktree_reap.sh
 @@ -14,8 +14,9 @@ write_gc_stub() {

@@ -67,7 +67,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
  2 files changed, 424 insertions(+), 5 deletions(-)
 
 diff --git a/gastown/assets/scripts/polecat-worktree-reap.sh b/gastown/assets/scripts/polecat-worktree-reap.sh
-index 3f1ff95..18febd5 100755
+index 3f1ff953..18febd5a 100755
 --- a/gastown/assets/scripts/polecat-worktree-reap.sh
 +++ b/gastown/assets/scripts/polecat-worktree-reap.sh
 @@ -169,6 +169,33 @@
@@ -334,7 +334,7 @@ index 3f1ff95..18febd5 100755
      # worktree's `.git` file and git's admin entry BEFORE unlinking the tree, and
      # this script cannot survive the SIGKILL its caller delivers at [session]
 diff --git a/gastown/tests/test_polecat_worktree_reap.sh b/gastown/tests/test_polecat_worktree_reap.sh
-index f0818b5..d2e18e8 100644
+index f0818b56..d2e18e83 100644
 --- a/gastown/tests/test_polecat_worktree_reap.sh
 +++ b/gastown/tests/test_polecat_worktree_reap.sh
 @@ -37,6 +37,14 @@ write_gc_stub() {

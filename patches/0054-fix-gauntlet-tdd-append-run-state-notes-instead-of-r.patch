@@ -39,7 +39,7 @@ Reintroducing the bug fails both; the fix passes both.
  2 files changed, 77 insertions(+), 10 deletions(-)
 
 diff --git a/gauntlet-tdd/formulas/mol-tdd-red-green.formula.toml b/gauntlet-tdd/formulas/mol-tdd-red-green.formula.toml
-index 3e6c189..2310883 100644
+index 3e6c1893..23108831 100644
 --- a/gauntlet-tdd/formulas/mol-tdd-red-green.formula.toml
 +++ b/gauntlet-tdd/formulas/mol-tdd-red-green.formula.toml
 @@ -8,7 +8,16 @@ contract; the loop refuses to advance on an assertion it cannot see fail.
@@ -136,7 +136,7 @@ index 3e6c189..2310883 100644
  status: complete"
  echo "[tdd-red-green] GREEN for {{contract_bead}}"
 diff --git a/gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py b/gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py
-index b5e2634..886b5a1 100644
+index b5e26342..886b5a19 100644
 --- a/gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py
 +++ b/gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py
 @@ -347,6 +347,64 @@ class NoCrossStepShellStateTests(unittest.TestCase):

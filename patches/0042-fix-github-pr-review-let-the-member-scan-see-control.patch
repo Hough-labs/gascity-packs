@@ -37,7 +37,7 @@ of this branch:
  2 files changed, 11 insertions(+)
 
 diff --git a/gascity/assets/scripts/workflow_outcome.py b/gascity/assets/scripts/workflow_outcome.py
-index a51002f..bdaf78d 100755
+index a51002f0..bdaf78d8 100755
 --- a/gascity/assets/scripts/workflow_outcome.py
 +++ b/gascity/assets/scripts/workflow_outcome.py
 @@ -137,6 +137,10 @@ def load_root(runner: Runner, root_bead_id: str) -> dict[str, Any]:
@@ -62,7 +62,7 @@ index a51002f..bdaf78d 100755
                  f"{ROOT_BEAD_ID_KEY}={root_bead_id}",
              ]
 diff --git a/gascity/tests/test_workflow_outcome.py b/gascity/tests/test_workflow_outcome.py
-index 65ee8cf..fbb65c7 100644
+index 65ee8cf8..fbb65c7d 100644
 --- a/gascity/tests/test_workflow_outcome.py
 +++ b/gascity/tests/test_workflow_outcome.py
 @@ -170,6 +170,10 @@ class ResolveWorkflowOutcomeTest(unittest.TestCase):

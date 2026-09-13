@@ -36,7 +36,7 @@ suite passes; shellcheck clean.
  2 files changed, 68 insertions(+), 6 deletions(-)
 
 diff --git a/gastown/assets/scripts/polecat-worktree-reap.sh b/gastown/assets/scripts/polecat-worktree-reap.sh
-index 1170e9f..59755a3 100755
+index 1170e9f0..59755a35 100755
 --- a/gastown/assets/scripts/polecat-worktree-reap.sh
 +++ b/gastown/assets/scripts/polecat-worktree-reap.sh
 @@ -287,9 +287,19 @@ $(printf '%s\n' "$CANDIDATES" | while IFS= read -r wt; do
@@ -82,7 +82,7 @@ index 1170e9f..59755a3 100755
  ROSTER_FETCHED=0
  
 diff --git a/gastown/tests/test_polecat_worktree_reap.sh b/gastown/tests/test_polecat_worktree_reap.sh
-index 569b5a4..bcd3911 100644
+index 569b5a40..bcd3911e 100644
 --- a/gastown/tests/test_polecat_worktree_reap.sh
 +++ b/gastown/tests/test_polecat_worktree_reap.sh
 @@ -360,6 +360,59 @@ JSON

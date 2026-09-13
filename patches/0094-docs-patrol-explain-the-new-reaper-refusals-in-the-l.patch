@@ -36,7 +36,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
  1 file changed, 4 insertions(+), 3 deletions(-)
 
 diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
-index 4536b2b..d1bdc3f 100644
+index 4536b2b8..d1bdc3fd 100644
 --- a/gastown/formulas/mol-witness-patrol.toml
 +++ b/gastown/formulas/mol-witness-patrol.toml
 @@ -716,11 +716,12 @@ jq -r 'select(.reason != "") | [.ts, .event, .reason, .budget_remaining, .bead]

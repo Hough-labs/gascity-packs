@@ -26,7 +26,7 @@ through to skip-this-bead with no route to `absent`.
  1 file changed, 8 insertions(+), 5 deletions(-)
 
 diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
-index 81fada9..ba999c9 100644
+index 81fada94..ba999c9e 100644
 --- a/gastown/formulas/mol-witness-patrol.toml
 +++ b/gastown/formulas/mol-witness-patrol.toml
 @@ -262,9 +262,14 @@ a NEW session with a different ID — the old one never comes back.

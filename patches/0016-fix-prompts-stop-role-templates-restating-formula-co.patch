@@ -94,7 +94,7 @@ live agent picks up the fix until the pack is redeployed.
  create mode 100644 tests/test_prompt_formula_command_drift.py
 
 diff --git a/gastown/README.md b/gastown/README.md
-index 9b7ca8b..ab1a59a 100644
+index 9b7ca8b0..ab1a59ac 100644
 --- a/gastown/README.md
 +++ b/gastown/README.md
 @@ -103,6 +103,36 @@ becomes the start of review instead of the terminal handoff, and a refused
@@ -135,7 +135,7 @@ index 9b7ca8b..ab1a59a 100644
  
  Gastown owns `mol-shutdown-dance` and the dog agent that runs stuck-agent
 diff --git a/gastown/agents/boot/prompt.template.md b/gastown/agents/boot/prompt.template.md
-index eb1ddc7..e10f95c 100644
+index eb1ddc7c..e10f95c2 100644
 --- a/gastown/agents/boot/prompt.template.md
 +++ b/gastown/agents/boot/prompt.template.md
 @@ -77,11 +77,25 @@ Drain-ack and exit. Next Boot wake will re-evaluate.
@@ -178,7 +178,7 @@ index eb1ddc7..e10f95c 100644
  
  Working directory: {{ .WorkDir }}
 diff --git a/gastown/agents/deacon/prompt.template.md b/gastown/agents/deacon/prompt.template.md
-index 83617f9..d2622cc 100644
+index 83617f93..d2622cc4 100644
 --- a/gastown/agents/deacon/prompt.template.md
 +++ b/gastown/agents/deacon/prompt.template.md
 @@ -60,7 +60,10 @@ Your formula: `mol-deacon-patrol`
@@ -296,7 +296,7 @@ index 83617f9..d2622cc 100644
  | Compact wisps (dry run) | `gc bd mol wisp gc --age 24h --dry-run` |
  | Compact wisps | `gc bd mol wisp gc --age 24h` |
 diff --git a/gastown/agents/polecat/prompt.template.md b/gastown/agents/polecat/prompt.template.md
-index 3661c0e..5bf6c00 100644
+index 3661c0ee..5bf6c001 100644
 --- a/gastown/agents/polecat/prompt.template.md
 +++ b/gastown/agents/polecat/prompt.template.md
 @@ -225,9 +225,15 @@ while [ "$SHOW_TRY" -lt 3 ]; do
@@ -318,7 +318,7 @@ index 3661c0e..5bf6c00 100644
    exit 0
  fi
 diff --git a/gastown/agents/refinery/prompt.template.md b/gastown/agents/refinery/prompt.template.md
-index bb048a4..2a3534f 100644
+index bb048a4d..2a3534f2 100644
 --- a/gastown/agents/refinery/prompt.template.md
 +++ b/gastown/agents/refinery/prompt.template.md
 @@ -66,30 +66,15 @@ external observers (witness, mayor) only catch on a slow patrol cycle.
@@ -465,7 +465,7 @@ index bb048a4..2a3534f 100644
  | Snapshot event position | `gc events --seq` |
  | Wait for assignment | `gc events --watch --type=bead.updated --after=$SEQ` |
 diff --git a/gastown/agents/witness/prompt.template.md b/gastown/agents/witness/prompt.template.md
-index 641135e..3a61292 100644
+index 641135e8..3a612924 100644
 --- a/gastown/agents/witness/prompt.template.md
 +++ b/gastown/agents/witness/prompt.template.md
 @@ -157,14 +157,15 @@ polecat in your rig. Use judgment — there are no hardcoded thresholds.
@@ -580,7 +580,7 @@ index 641135e..3a61292 100644
  Rig: {{ .RigName }}
  Working directory: {{ .WorkDir }}
 diff --git a/gastown/formulas/mol-deacon-patrol.toml b/gastown/formulas/mol-deacon-patrol.toml
-index d158805..cae6ef2 100644
+index d1588058..cae6ef2e 100644
 --- a/gastown/formulas/mol-deacon-patrol.toml
 +++ b/gastown/formulas/mol-deacon-patrol.toml
 @@ -456,23 +456,44 @@ gc mail inbox
@@ -640,7 +640,7 @@ index d158805..cae6ef2 100644
  
 diff --git a/tests/test_prompt_formula_command_drift.py b/tests/test_prompt_formula_command_drift.py
 new file mode 100644
-index 0000000..f798183
+index 00000000..f7981834
 --- /dev/null
 +++ b/tests/test_prompt_formula_command_drift.py
 @@ -0,0 +1,246 @@

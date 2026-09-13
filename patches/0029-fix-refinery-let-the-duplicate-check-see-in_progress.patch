@@ -57,7 +57,7 @@ thirteenth bead was filed.
  2 files changed, 163 insertions(+), 1 deletion(-)
 
 diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
-index 0056d20..62cb241 100644
+index 0056d203..62cb241d 100644
 --- a/gastown/formulas/mol-refinery-patrol.toml
 +++ b/gastown/formulas/mol-refinery-patrol.toml
 @@ -432,9 +432,18 @@ TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_bran
@@ -81,7 +81,7 @@ index 0056d20..62cb241 100644
       DUP_MSG=$(cat "$DUP_ERR"); rm -f "$DUP_ERR"
       DUP_COUNT=$(printf '%s' "$DUP_JSON" | jq 'length' 2>/dev/null)
 diff --git a/tests/test_prompt_formula_command_drift.py b/tests/test_prompt_formula_command_drift.py
-index f0ec319..8864836 100644
+index f0ec3197..88648364 100644
 --- a/tests/test_prompt_formula_command_drift.py
 +++ b/tests/test_prompt_formula_command_drift.py
 @@ -41,6 +41,16 @@ POOL_RETURN_ASSIGNEE = re.compile(r"""--assignee=(?:""|'')""")

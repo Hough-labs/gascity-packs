@@ -62,7 +62,7 @@ gcp-gfjg (discovered-from gcp-wzhy).
  2 files changed, 62 insertions(+), 7 deletions(-)
 
 diff --git a/gastown/formulas/mol-deacon-patrol.toml b/gastown/formulas/mol-deacon-patrol.toml
-index cae6ef2..033cfb6 100644
+index cae6ef2e..033cfb61 100644
 --- a/gastown/formulas/mol-deacon-patrol.toml
 +++ b/gastown/formulas/mol-deacon-patrol.toml
 @@ -205,15 +205,58 @@ closes that gap.
@@ -131,7 +131,7 @@ index cae6ef2..033cfb6 100644
  move work recently?" — every claim, status transition, metadata update,
  or note bumps it.
 diff --git a/scripts/gascity_pack_inference_gate.py b/scripts/gascity_pack_inference_gate.py
-index c072189..de23a53 100644
+index c0721894..de23a53f 100644
 --- a/scripts/gascity_pack_inference_gate.py
 +++ b/scripts/gascity_pack_inference_gate.py
 @@ -151,7 +151,19 @@ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {

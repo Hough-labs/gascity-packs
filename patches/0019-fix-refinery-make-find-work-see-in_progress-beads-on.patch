@@ -62,7 +62,7 @@ stub) — filed as gcp-nduz.
  create mode 100755 gastown/tests/test_refinery_find_work.sh
 
 diff --git a/gastown/agents/refinery/prompt.template.md b/gastown/agents/refinery/prompt.template.md
-index 2a3534f..c98e639 100644
+index 2a3534f2..c98e639f 100644
 --- a/gastown/agents/refinery/prompt.template.md
 +++ b/gastown/agents/refinery/prompt.template.md
 @@ -138,7 +138,10 @@ without catching the mismatch (upstream #1833).
@@ -87,7 +87,7 @@ index 2a3534f..c98e639 100644
  | Wait for assignment | `gc events --watch --type=bead.updated --after=$SEQ` |
  | Read work metadata | `gc bd show $WORK --json \| jq '.[0].metadata'` |
 diff --git a/gastown/formulas/mol-polecat-work.toml b/gastown/formulas/mol-polecat-work.toml
-index 52b4d0d..bcd709a 100644
+index 52b4d0db..bcd709a2 100644
 --- a/gastown/formulas/mol-polecat-work.toml
 +++ b/gastown/formulas/mol-polecat-work.toml
 @@ -444,6 +444,19 @@ the PR is open and matches the branch, base, and origin repository.
@@ -111,7 +111,7 @@ index 52b4d0d..bcd709a 100644
  
  `${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery` resolves to
 diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
-index 58e5901..6dee9b0 100644
+index 58e59019..6dee9b01 100644
 --- a/gastown/formulas/mol-refinery-patrol.toml
 +++ b/gastown/formulas/mol-refinery-patrol.toml
 @@ -200,8 +200,10 @@ description = """
@@ -158,7 +158,7 @@ index 58e5901..6dee9b0 100644
  gc bd show $WORK --json | jq '.[0].metadata'
 diff --git a/gastown/tests/test_refinery_find_work.sh b/gastown/tests/test_refinery_find_work.sh
 new file mode 100755
-index 0000000..880dbac
+index 00000000..880dbace
 --- /dev/null
 +++ b/gastown/tests/test_refinery_find_work.sh
 @@ -0,0 +1,307 @@

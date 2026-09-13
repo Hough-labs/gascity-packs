@@ -27,7 +27,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
  1 file changed, 3 insertions(+), 1 deletion(-)
 
 diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
-index 53a0cbc..46066ff 100644
+index 53a0cbcb..46066ffc 100644
 --- a/gastown/formulas/mol-witness-patrol.toml
 +++ b/gastown/formulas/mol-witness-patrol.toml
 @@ -351,7 +351,9 @@ if [ -z "$DEFAULT_BRANCH" ]; then

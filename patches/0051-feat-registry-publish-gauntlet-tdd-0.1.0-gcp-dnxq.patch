@@ -34,7 +34,7 @@ Validation:
  1 file changed, 13 insertions(+)
 
 diff --git a/registry.toml b/registry.toml
-index 4f57c0a..255dfc7 100644
+index 4f57c0ac..255dfc7b 100644
 --- a/registry.toml
 +++ b/registry.toml
 @@ -313,3 +313,16 @@ schema = 1

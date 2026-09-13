@@ -22,7 +22,7 @@ patches/ re-exported for the amended 0083.
  1 file changed, 4 insertions(+), 2 deletions(-)
 
 diff --git a/.github/workflows/supported-pack-nightly.yml b/.github/workflows/supported-pack-nightly.yml
-index ba858f1..62d52fd 100644
+index ba858f15..62d52fd4 100644
 --- a/.github/workflows/supported-pack-nightly.yml
 +++ b/.github/workflows/supported-pack-nightly.yml
 @@ -255,7 +255,8 @@ jobs:

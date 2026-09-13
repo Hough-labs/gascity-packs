@@ -28,7 +28,7 @@ this the bare-bd guard fails against our own new test file. Rebuilt with
  1 file changed, 20 insertions(+), 8 deletions(-)
 
 diff --git a/tests/test_prompt_formula_command_drift.py b/tests/test_prompt_formula_command_drift.py
-index f798183..133fbb3 100644
+index f7981834..133fbb34 100644
 --- a/tests/test_prompt_formula_command_drift.py
 +++ b/tests/test_prompt_formula_command_drift.py
 @@ -222,16 +222,28 @@ def test_detectors_catch_the_drift_they_are_named_for() -> None:

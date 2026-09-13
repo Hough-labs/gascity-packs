@@ -54,7 +54,7 @@ Formula wiring lands in the next commit.
 
 diff --git a/gastown/assets/scripts/checks/merge-approval-gate.sh b/gastown/assets/scripts/checks/merge-approval-gate.sh
 new file mode 100755
-index 0000000..bc36721
+index 00000000..bc36721d
 --- /dev/null
 +++ b/gastown/assets/scripts/checks/merge-approval-gate.sh
 @@ -0,0 +1,257 @@
@@ -317,7 +317,7 @@ index 0000000..bc36721
 +exit 0
 diff --git a/gastown/assets/scripts/record-merge-approval.sh b/gastown/assets/scripts/record-merge-approval.sh
 new file mode 100755
-index 0000000..5d9d1ac
+index 00000000..5d9d1acf
 --- /dev/null
 +++ b/gastown/assets/scripts/record-merge-approval.sh
 @@ -0,0 +1,123 @@
@@ -446,7 +446,7 @@ index 0000000..5d9d1ac
 +echo "merge approval recorded: bead=$BEAD verdict=$VERDICT pr=$PR_NUMBER sha=$HEAD_SHA reviewer=$REVIEWER at=$RECORDED_AT"
 diff --git a/gastown/tests/test_merge_approval_gate.sh b/gastown/tests/test_merge_approval_gate.sh
 new file mode 100755
-index 0000000..78993a0
+index 00000000..78993a0e
 --- /dev/null
 +++ b/gastown/tests/test_merge_approval_gate.sh
 @@ -0,0 +1,616 @@

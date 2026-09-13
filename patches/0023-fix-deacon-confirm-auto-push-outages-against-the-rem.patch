@@ -70,7 +70,7 @@ Filed as gcp-mvsm, discovered-from this bead, rather than fixed inline.
  3 files changed, 463 insertions(+), 34 deletions(-)
 
 diff --git a/gastown/assets/scripts/dolt-push-state-check.sh b/gastown/assets/scripts/dolt-push-state-check.sh
-index e418f58..c2f69b1 100755
+index e418f581..c2f69b17 100755
 --- a/gastown/assets/scripts/dolt-push-state-check.sh
 +++ b/gastown/assets/scripts/dolt-push-state-check.sh
 @@ -39,15 +39,63 @@
@@ -286,7 +286,7 @@ index e418f58..c2f69b1 100755
    done < <(printf '%s' "$RIGS_JSON" | jq -r '.rigs[] | select(.suspended != true) | [.name, .path] | @tsv')
  }
 diff --git a/gastown/formulas/mol-deacon-patrol.toml b/gastown/formulas/mol-deacon-patrol.toml
-index 9658c31..297e9b2 100644
+index 9658c31c..297e9b21 100644
 --- a/gastown/formulas/mol-deacon-patrol.toml
 +++ b/gastown/formulas/mol-deacon-patrol.toml
 @@ -502,8 +502,9 @@ printf '%s\\n' "$RESULT"
@@ -391,7 +391,7 @@ index 9658c31..297e9b2 100644
  [[steps]]
  id = "system-health"
 diff --git a/gastown/tests/test_dolt_push_state_check.sh b/gastown/tests/test_dolt_push_state_check.sh
-index 1bbe59d..510264e 100755
+index 1bbe59d0..510264ee 100755
 --- a/gastown/tests/test_dolt_push_state_check.sh
 +++ b/gastown/tests/test_dolt_push_state_check.sh
 @@ -2,13 +2,26 @@

@@ -68,7 +68,7 @@ still scanned directly.
  create mode 100644 tests/test_wisp_molecule_queries.py
 
 diff --git a/gastown/agents/deacon/prompt.template.md b/gastown/agents/deacon/prompt.template.md
-index 23323a1..83617f9 100644
+index 23323a13..83617f93 100644
 --- a/gastown/agents/deacon/prompt.template.md
 +++ b/gastown/agents/deacon/prompt.template.md
 @@ -89,9 +89,20 @@ If `next-iteration` already ran, do not pour again; run `gc hook`.
@@ -95,7 +95,7 @@ index 23323a1..83617f9 100644
    NEXT=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id // empty')
    if [ -z "$NEXT" ]; then
 diff --git a/gastown/agents/refinery/prompt.template.md b/gastown/agents/refinery/prompt.template.md
-index b2cd38b..bb048a4 100644
+index b2cd38b0..bb048a4d 100644
 --- a/gastown/agents/refinery/prompt.template.md
 +++ b/gastown/agents/refinery/prompt.template.md
 @@ -69,7 +69,10 @@ external observers (witness, mayor) only catch on a slow patrol cycle.
@@ -120,7 +120,7 @@ index b2cd38b..bb048a4 100644
  NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id // empty')
  if [ -z "$NEXT" ]; then
 diff --git a/gastown/agents/witness/prompt.template.md b/gastown/agents/witness/prompt.template.md
-index 3b96830..5a085e7 100644
+index 3b968308..5a085e70 100644
 --- a/gastown/agents/witness/prompt.template.md
 +++ b/gastown/agents/witness/prompt.template.md
 @@ -164,10 +164,12 @@ nothing).
@@ -169,7 +169,7 @@ index 3b96830..5a085e7 100644
  done
  if [ -n "$CURRENT_WISP" ] && [ -z "$ASSIGNED_WISP" ]; then
 diff --git a/gastown/formulas/mol-deacon-patrol.toml b/gastown/formulas/mol-deacon-patrol.toml
-index 9568e6d..d158805 100644
+index 9568e6db..d1588058 100644
 --- a/gastown/formulas/mol-deacon-patrol.toml
 +++ b/gastown/formulas/mol-deacon-patrol.toml
 @@ -460,7 +460,7 @@ Handle any urgent messages that arrived during patrol. Archive the rest.
@@ -182,7 +182,7 @@ index 9568e6d..d158805 100644
  
  NEXT=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix='{{binding_prefix}}' --json | jq -r '.new_epic_id // empty')
 diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
-index 0bfaec1..fb310b8 100644
+index 0bfaec12..fb310b89 100644
 --- a/gastown/formulas/mol-refinery-patrol.toml
 +++ b/gastown/formulas/mol-refinery-patrol.toml
 @@ -148,7 +148,7 @@ wisp, burn the current wisp, then request a restart:
@@ -246,7 +246,7 @@ index 0bfaec1..fb310b8 100644
  NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
  if [ -z "$NEXT" ]; then
 diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
-index 4703946..449fc94 100644
+index 4703946f..449fc94d 100644
 --- a/gastown/formulas/mol-witness-patrol.toml
 +++ b/gastown/formulas/mol-witness-patrol.toml
 @@ -527,13 +527,23 @@ is already assigned — the new session resumes from context.
@@ -292,7 +292,7 @@ index 4703946..449fc94 100644
  
  **4. Exit this turn:**
 diff --git a/tests/test_no_bare_bd_commands.py b/tests/test_no_bare_bd_commands.py
-index 4d35385..d6d4783 100644
+index 4d353855..d6d4783d 100644
 --- a/tests/test_no_bare_bd_commands.py
 +++ b/tests/test_no_bare_bd_commands.py
 @@ -142,6 +142,12 @@ BARE_BD_PATH_CHECK = re.compile(r"\bcommand[ \t]+-v[ \t]+bd\b")
@@ -323,7 +323,7 @@ index 4d35385..d6d4783 100644
  def python_argv_violations(path: Path, text: str) -> list[str]:
 diff --git a/tests/test_wisp_molecule_queries.py b/tests/test_wisp_molecule_queries.py
 new file mode 100644
-index 0000000..23ee7f9
+index 00000000..23ee7f9d
 --- /dev/null
 +++ b/tests/test_wisp_molecule_queries.py
 @@ -0,0 +1,98 @@

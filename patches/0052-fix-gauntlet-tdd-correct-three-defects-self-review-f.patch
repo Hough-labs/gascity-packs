@@ -58,7 +58,7 @@ with `total=3 pass=3 fail=0`. Suite: 19 passed, 41 subtests.
  3 files changed, 168 insertions(+), 14 deletions(-)
 
 diff --git a/gauntlet-tdd/README.md b/gauntlet-tdd/README.md
-index 32e0c69..515bdbc 100644
+index 32e0c694..515bdbc4 100644
 --- a/gauntlet-tdd/README.md
 +++ b/gauntlet-tdd/README.md
 @@ -64,6 +64,15 @@ The formula assumes these verbs, all of which are dispatched in
@@ -78,7 +78,7 @@ index 32e0c69..515bdbc 100644
  **`v0.1.0-454-g201c94f`**. The CLI has no `--version` flag and no `version`
  subcommand, so `git describe` in the gauntlet checkout is the version marker
 diff --git a/gauntlet-tdd/formulas/mol-tdd-red-green.formula.toml b/gauntlet-tdd/formulas/mol-tdd-red-green.formula.toml
-index 99922a2..3e6c189 100644
+index 99922a2d..3e6c1893 100644
 --- a/gauntlet-tdd/formulas/mol-tdd-red-green.formula.toml
 +++ b/gauntlet-tdd/formulas/mol-tdd-red-green.formula.toml
 @@ -105,22 +105,37 @@ ACCEPTANCE=$(gc bd show "{{contract_bead}}" --json | jq -r '.[0].acceptance_crit
@@ -235,7 +235,7 @@ index 99922a2..3e6c189 100644
  set -e
  
 diff --git a/gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py b/gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py
-index 429e70a..b5e2634 100644
+index 429e70a7..b5e26342 100644
 --- a/gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py
 +++ b/gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py
 @@ -70,10 +70,27 @@ def shell_lines(body: str) -> list[str]:

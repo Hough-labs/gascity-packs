@@ -64,7 +64,7 @@ the bead asks for. The residual failures in both runs are test_no_bare_bd_comman
  create mode 100644 tests/test_env_hermeticity.py
 
 diff --git a/discord/tests/test_discord_intake_service.py b/discord/tests/test_discord_intake_service.py
-index 5fdd196..849c111 100755
+index 5fdd1961..849c111d 100755
 --- a/discord/tests/test_discord_intake_service.py
 +++ b/discord/tests/test_discord_intake_service.py
 @@ -19,6 +19,30 @@ import discord_intake_common as common
@@ -116,7 +116,7 @@ index 5fdd196..849c111 100755
          beads_dir = pathlib.Path(self.tempdir.name, ".beads")
          beads_dir.mkdir(parents=True, exist_ok=True)
 diff --git a/gascity/tests/test_formula_assets.py b/gascity/tests/test_formula_assets.py
-index b966d43..362e00d 100755
+index b966d438..362e00da 100755
 --- a/gascity/tests/test_formula_assets.py
 +++ b/gascity/tests/test_formula_assets.py
 @@ -10,6 +10,22 @@ import tomllib
@@ -451,7 +451,7 @@ index b966d43..362e00d 100755
                  [str(script)],
                  env=env,
 diff --git a/github/tests/test_github_intake_service.py b/github/tests/test_github_intake_service.py
-index 4066dbb..6343228 100755
+index 4066dbbf..6343228b 100755
 --- a/github/tests/test_github_intake_service.py
 +++ b/github/tests/test_github_intake_service.py
 @@ -17,6 +17,30 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "scripts"))
@@ -531,7 +531,7 @@ index 4066dbb..6343228 100755
          snapshot = {
 diff --git a/tests/test_env_hermeticity.py b/tests/test_env_hermeticity.py
 new file mode 100644
-index 0000000..e584681
+index 00000000..e5846817
 --- /dev/null
 +++ b/tests/test_env_hermeticity.py
 @@ -0,0 +1,210 @@

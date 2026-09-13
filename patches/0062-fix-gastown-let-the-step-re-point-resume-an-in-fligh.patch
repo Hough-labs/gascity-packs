@@ -46,7 +46,7 @@ it pins is reverted, and passes green when restored.
  2 files changed, 58 insertions(+), 10 deletions(-)
 
 diff --git a/gastown/agents/polecat/prompt.template.md b/gastown/agents/polecat/prompt.template.md
-index ee46623..e08ad0d 100644
+index ee466238..e08ad0d3 100644
 --- a/gastown/agents/polecat/prompt.template.md
 +++ b/gastown/agents/polecat/prompt.template.md
 @@ -257,10 +257,23 @@ fi
@@ -90,7 +90,7 @@ index ee46623..e08ad0d 100644
  
  # Stamp a stable session identity so the churn-watcher and the resume re-verify
 diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
-index 959ef32..8637e05 100755
+index 959ef322..8637e055 100755
 --- a/gastown/tests/test_gastown_pack_assets.sh
 +++ b/gastown/tests/test_gastown_pack_assets.sh
 @@ -663,10 +663,23 @@ PY

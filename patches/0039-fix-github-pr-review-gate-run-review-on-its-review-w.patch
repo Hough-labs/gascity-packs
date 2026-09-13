@@ -75,7 +75,7 @@ test_city_claim_command_* subtests fail identically on a clean checkout.
 
 diff --git a/gascity/assets/scripts/workflow_outcome.py b/gascity/assets/scripts/workflow_outcome.py
 new file mode 100755
-index 0000000..a51002f
+index 00000000..a51002f0
 --- /dev/null
 +++ b/gascity/assets/scripts/workflow_outcome.py
 @@ -0,0 +1,293 @@
@@ -373,7 +373,7 @@ index 0000000..a51002f
 +if __name__ == "__main__":
 +    raise SystemExit(main())
 diff --git a/gascity/assets/workflows/github-pr-review/run-review.md b/gascity/assets/workflows/github-pr-review/run-review.md
-index 4dbe6b7..65f65d3 100644
+index 4dbe6b73..65f65d3a 100644
 --- a/gascity/assets/workflows/github-pr-review/run-review.md
 +++ b/gascity/assets/workflows/github-pr-review/run-review.md
 @@ -33,22 +33,80 @@ gate. Pass review_mode {{review_mode}} and interaction_mode
@@ -465,7 +465,7 @@ index 4dbe6b7..65f65d3 100644
  The adapter does not check out a mutation worktree, push commits, amend
  contributor branches, submit formal GitHub review events, or create follow-up
 diff --git a/gascity/tests/test_formula_assets.py b/gascity/tests/test_formula_assets.py
-index 98252ae..aca4fd4 100755
+index 98252aef..aca4fd45 100755
 --- a/gascity/tests/test_formula_assets.py
 +++ b/gascity/tests/test_formula_assets.py
 @@ -3580,7 +3580,7 @@ class FormulaAssetTests(unittest.TestCase):
@@ -525,7 +525,7 @@ index 98252ae..aca4fd4 100755
          text = effective_formula_text(root, "github-issue-fix")
 diff --git a/gascity/tests/test_workflow_outcome.py b/gascity/tests/test_workflow_outcome.py
 new file mode 100644
-index 0000000..65ee8cf
+index 00000000..65ee8cf8
 --- /dev/null
 +++ b/gascity/tests/test_workflow_outcome.py
 @@ -0,0 +1,248 @@

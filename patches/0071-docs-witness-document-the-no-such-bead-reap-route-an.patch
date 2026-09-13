@@ -48,7 +48,7 @@ prose-and-formula edit. Documentation only — no behavior change.
  3 files changed, 30 insertions(+), 8 deletions(-)
 
 diff --git a/gastown/agents/witness/prompt.template.md b/gastown/agents/witness/prompt.template.md
-index e4bca78..67d80d9 100644
+index e4bca787..67d80d9c 100644
 --- a/gastown/agents/witness/prompt.template.md
 +++ b/gastown/agents/witness/prompt.template.md
 @@ -132,8 +132,9 @@ polecat is still available for FIX_NEEDED rework.
@@ -76,7 +76,7 @@ index e4bca78..67d80d9 100644
  ---
  
 diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
-index 46066ff..ff9f1a0 100644
+index 46066ffc..ff9f1a04 100644
 --- a/gastown/formulas/mol-witness-patrol.toml
 +++ b/gastown/formulas/mol-witness-patrol.toml
 @@ -563,7 +563,9 @@ patrol; the flip is an operator decision — append `--no-dry-run` to the
@@ -131,7 +131,7 @@ index 46066ff..ff9f1a0 100644
  | `worktree_reap_failed` | Directory survived removal | Investigate permissions/mounts, mail mayor |
  | `worktree_list_failed` | `git worktree list` ran and did not answer, so no candidate was enumerated. `reason`: `worktree_list_timed_out` or `worktree_list_failed` | Timed out → budget first. Failed → the rig checkout itself is unhealthy; inspect `$RIG_ROOT` by hand |
 diff --git a/gastown/tests/test_polecat_worktree_reap.sh b/gastown/tests/test_polecat_worktree_reap.sh
-index 2910ac3..efd5215 100644
+index 2910ac35..efd52159 100644
 --- a/gastown/tests/test_polecat_worktree_reap.sh
 +++ b/gastown/tests/test_polecat_worktree_reap.sh
 @@ -19,7 +19,7 @@ write_gc_stub() {

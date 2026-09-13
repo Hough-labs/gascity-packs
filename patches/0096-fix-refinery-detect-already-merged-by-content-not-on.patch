@@ -58,7 +58,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
  create mode 100755 gastown/tests/test_refinery_already_merged.sh
 
 diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
-index 93c7136..0f4b094 100644
+index 93c71367..0f4b0947 100644
 --- a/gastown/formulas/mol-refinery-patrol.toml
 +++ b/gastown/formulas/mol-refinery-patrol.toml
 @@ -252,10 +252,10 @@ branch and no close is unfinished work, not someone else's in-flight work.
@@ -321,7 +321,7 @@ index 93c7136..0f4b094 100644
  SKIP the merge script (step 1 below) and go straight to **2. Cleanup**, then
 diff --git a/gastown/tests/test_refinery_already_merged.sh b/gastown/tests/test_refinery_already_merged.sh
 new file mode 100755
-index 0000000..7ea0a91
+index 00000000..7ea0a91e
 --- /dev/null
 +++ b/gastown/tests/test_refinery_already_merged.sh
 @@ -0,0 +1,377 @@
@@ -703,7 +703,7 @@ index 0000000..7ea0a91
 +fi
 +echo "refinery already-merged gate tests passed"
 diff --git a/scripts/gascity_pack_inference_gate.py b/scripts/gascity_pack_inference_gate.py
-index de23a53..ec448e6 100644
+index de23a53f..ec448e62 100644
 --- a/scripts/gascity_pack_inference_gate.py
 +++ b/scripts/gascity_pack_inference_gate.py
 @@ -124,6 +124,13 @@ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {

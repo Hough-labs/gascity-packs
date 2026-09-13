@@ -32,7 +32,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
  1 file changed, 77 insertions(+), 14 deletions(-)
 
 diff --git a/docs/design/reaper-budget-starvation.md b/docs/design/reaper-budget-starvation.md
-index 3d0722c..581c592 100644
+index 3d0722c8..581c592b 100644
 --- a/docs/design/reaper-budget-starvation.md
 +++ b/docs/design/reaper-budget-starvation.md
 @@ -1,9 +1,14 @@

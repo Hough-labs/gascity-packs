@@ -17,7 +17,7 @@ not.
  1 file changed, 5 insertions(+), 1 deletion(-)
 
 diff --git a/gastown/tests/test_polecat_home_audit.sh b/gastown/tests/test_polecat_home_audit.sh
-index 91789b4..dc6ff41 100755
+index 91789b4e..dc6ff41a 100755
 --- a/gastown/tests/test_polecat_home_audit.sh
 +++ b/gastown/tests/test_polecat_home_audit.sh
 @@ -453,7 +453,11 @@ test_the_sweep_reads_no_beads() {

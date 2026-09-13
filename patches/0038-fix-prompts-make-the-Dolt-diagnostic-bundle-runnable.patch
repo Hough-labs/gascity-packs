@@ -71,7 +71,7 @@ mattering, but this change makes the runbook honest today regardless.
  1 file changed, 92 insertions(+), 36 deletions(-)
 
 diff --git a/gastown/template-fragments/operational-awareness.template.md b/gastown/template-fragments/operational-awareness.template.md
-index 6b045f0..fd4ab43 100644
+index 6b045f0b..fd4ab43e 100644
 --- a/gastown/template-fragments/operational-awareness.template.md
 +++ b/gastown/template-fragments/operational-awareness.template.md
 @@ -98,70 +98,126 @@ Two distinct servers, one of them holding exactly one rig's beads, is a normal

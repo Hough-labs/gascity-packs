@@ -52,7 +52,7 @@ origin/integration worktree and are filed as gcp-cvb, not touched here.
  3 files changed, 209 insertions(+), 11 deletions(-)
 
 diff --git a/embed_test.go b/embed_test.go
-index 4a048b0..bafd6ce 100644
+index 4a048b0c..bafd6ce8 100644
 --- a/embed_test.go
 +++ b/embed_test.go
 @@ -12,6 +12,8 @@ func TestGastownEmbedsPackContent(t *testing.T) {
@@ -65,7 +65,7 @@ index 4a048b0..bafd6ce 100644
  		"overlay/per-provider/codex/.codex/hooks.json",
  	} {
 diff --git a/gastown/README.md b/gastown/README.md
-index 3b9435b..c32517a 100644
+index 3b9435bb..c32517aa 100644
 --- a/gastown/README.md
 +++ b/gastown/README.md
 @@ -33,6 +33,50 @@ gc formula show mol-shutdown-dance
@@ -120,7 +120,7 @@ index 3b9435b..c32517a 100644
  
  Gastown owns `mol-shutdown-dance` and the dog agent that runs stuck-agent
 diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
-index 63a46fb..82f784c 100644
+index 63a46fb1..82f784c4 100644
 --- a/gastown/formulas/mol-refinery-patrol.toml
 +++ b/gastown/formulas/mol-refinery-patrol.toml
 @@ -27,6 +27,13 @@ In `mr` mode, refinery treats PR publication as the terminal handoff for

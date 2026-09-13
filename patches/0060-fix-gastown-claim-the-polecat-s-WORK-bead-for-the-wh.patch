@@ -66,7 +66,7 @@ gascity claim-command subprocess timeouts are pre-existing on origin/integration
  4 files changed, 258 insertions(+), 15 deletions(-)
 
 diff --git a/gastown/agents/polecat/prompt.template.md b/gastown/agents/polecat/prompt.template.md
-index 8874904..4640481 100644
+index 88749047..46404819 100644
 --- a/gastown/agents/polecat/prompt.template.md
 +++ b/gastown/agents/polecat/prompt.template.md
 @@ -243,8 +243,37 @@ if [ "$ASSIGNEE" != "$EXPECTED_ASSIGNEE" ] || [ "$STATUS" != "in_progress" ]; th
@@ -163,7 +163,7 @@ index 8874904..4640481 100644
    gc runtime drain-ack
    exit
 diff --git a/gastown/formulas/mol-polecat-work.toml b/gastown/formulas/mol-polecat-work.toml
-index 121f199..2bcd68e 100644
+index 121f199a..2bcd68e7 100644
 --- a/gastown/formulas/mol-polecat-work.toml
 +++ b/gastown/formulas/mol-polecat-work.toml
 @@ -76,7 +76,7 @@ Every check is idempotent — safe to re-run after crash/restart.
@@ -271,7 +271,7 @@ index 121f199..2bcd68e 100644
  merge, and close the bead. If there's a conflict, the refinery puts the
  bead back in the pool with `rejection_reason` metadata — a new polecat
 diff --git a/gastown/template-fragments/approval-fallacy.template.md b/gastown/template-fragments/approval-fallacy.template.md
-index a12b458..55bb49b 100644
+index a12b4582..55bb49b9 100644
 --- a/gastown/template-fragments/approval-fallacy.template.md
 +++ b/gastown/template-fragments/approval-fallacy.template.md
 @@ -57,6 +57,7 @@ fi
@@ -315,7 +315,7 @@ index a12b458..55bb49b 100644
    gc runtime drain-ack
    exit
 diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
-index a5ef5b0..959ef32 100755
+index a5ef5b0a..959ef322 100755
 --- a/gastown/tests/test_gastown_pack_assets.sh
 +++ b/gastown/tests/test_gastown_pack_assets.sh
 @@ -674,8 +674,123 @@ PY

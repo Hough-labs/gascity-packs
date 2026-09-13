@@ -55,7 +55,7 @@ about (set-metadata/unset-metadata).
  create mode 100755 gastown/tests/test_polecat_work_bead_claim_guard.sh
 
 diff --git a/gastown/formulas/mol-polecat-work.toml b/gastown/formulas/mol-polecat-work.toml
-index e9b1664..3933e66 100644
+index e9b1664c..3933e66a 100644
 --- a/gastown/formulas/mol-polecat-work.toml
 +++ b/gastown/formulas/mol-polecat-work.toml
 @@ -99,13 +99,32 @@ discarded. Observed live on winnow-x32.4, winnow-x32.5 and winnow-48fm, and
@@ -129,7 +129,7 @@ index e9b1664..3933e66 100644
  Downstream readers — the witness's worktree reaper and the resume re-verify —
  use `assignee == polecat_session` to tell "a polecat still holds this" from
 diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
-index a0ed4d6..c43beb5 100755
+index a0ed4d68..c43beb56 100755
 --- a/gastown/tests/test_gastown_pack_assets.sh
 +++ b/gastown/tests/test_gastown_pack_assets.sh
 @@ -903,15 +903,28 @@ PY
@@ -168,7 +168,7 @@ index a0ed4d6..c43beb5 100755
      # passed through unassigned would re-open the very window this closes.
 diff --git a/gastown/tests/test_polecat_work_bead_claim_guard.sh b/gastown/tests/test_polecat_work_bead_claim_guard.sh
 new file mode 100755
-index 0000000..00b168d
+index 00000000..00b168dc
 --- /dev/null
 +++ b/gastown/tests/test_polecat_work_bead_claim_guard.sh
 @@ -0,0 +1,258 @@

@@ -63,7 +63,7 @@ earlier. Worth revisiting if the fork ever gains its own workflow file.
  create mode 100755 tests/test_fork_patch_guard.sh
 
 diff --git a/.githooks/pre-push b/.githooks/pre-push
-index 5ec2ee3..6ce8b28 100755
+index 5ec2ee31..6ce8b28f 100755
 --- a/.githooks/pre-push
 +++ b/.githooks/pre-push
 @@ -1,12 +1,29 @@
@@ -119,7 +119,7 @@ index 5ec2ee3..6ce8b28 100755
 +  make -s check-patches REV="$local_sha"
  done
 diff --git a/Makefile b/Makefile
-index 8d1c9a2..9e50ca6 100644
+index 8d1c9a25..9e50ca6b 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -7,6 +7,11 @@
@@ -189,7 +189,7 @@ index 8d1c9a2..9e50ca6 100644
 +test-patch-guard:
 +	@bash tests/test_fork_patch_guard.sh
 diff --git a/docs/fork-patches.md b/docs/fork-patches.md
-index fcf4745..66c3e5e 100644
+index fcf4745c..66c3e5ec 100644
 --- a/docs/fork-patches.md
 +++ b/docs/fork-patches.md
 @@ -52,6 +52,28 @@ The guard is advisory either way — `git push --no-verify` bypasses it, and a c
@@ -250,7 +250,7 @@ index fcf4745..66c3e5e 100644
  1. Pick the new upstream commit (`git fetch upstream`, then resolve it with
 diff --git a/scripts/check-patches.sh b/scripts/check-patches.sh
 new file mode 100755
-index 0000000..febdb35
+index 00000000..febdb35a
 --- /dev/null
 +++ b/scripts/check-patches.sh
 @@ -0,0 +1,72 @@
@@ -328,7 +328,7 @@ index 0000000..febdb35
 +echo "patches/ up to date ($actual patches)"
 diff --git a/tests/test_fork_patch_guard.sh b/tests/test_fork_patch_guard.sh
 new file mode 100755
-index 0000000..d30208f
+index 00000000..d30208fd
 --- /dev/null
 +++ b/tests/test_fork_patch_guard.sh
 @@ -0,0 +1,198 @@

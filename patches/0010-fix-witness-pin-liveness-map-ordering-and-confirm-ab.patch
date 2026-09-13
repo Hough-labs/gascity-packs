@@ -54,7 +54,7 @@ they are out of scope for this bead.
  1 file changed, 61 insertions(+), 8 deletions(-)
 
 diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
-index 449fc94..81fada9 100644
+index 449fc94d..81fada94 100644
 --- a/gastown/formulas/mol-witness-patrol.toml
 +++ b/gastown/formulas/mol-witness-patrol.toml
 @@ -144,7 +144,17 @@ This happens when:

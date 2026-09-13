@@ -46,7 +46,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
  create mode 100755 gastown/tests/test_refinery_reject_branch_survival.sh
 
 diff --git a/gastown/formulas/mol-polecat-work.toml b/gastown/formulas/mol-polecat-work.toml
-index bd16412..e9b1664 100644
+index bd164129..e9b1664c 100644
 --- a/gastown/formulas/mol-polecat-work.toml
 +++ b/gastown/formulas/mol-polecat-work.toml
 @@ -224,6 +224,7 @@ work applied to an existing branch. Fetch the named remote branch first.
@@ -66,7 +66,7 @@ index bd16412..e9b1664 100644
  If resuming a rejected branch, rebase onto latest base:
  ```bash
 diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
-index 55325ed..93c7136 100644
+index 55325edf..93c71367 100644
 --- a/gastown/formulas/mol-refinery-patrol.toml
 +++ b/gastown/formulas/mol-refinery-patrol.toml
 @@ -452,8 +452,24 @@ TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_bran
@@ -98,7 +98,7 @@ index 55325ed..93c7136 100644
       CURRENT_WISP=${GC_BEAD_ID:-}
 diff --git a/gastown/tests/test_refinery_reject_branch_survival.sh b/gastown/tests/test_refinery_reject_branch_survival.sh
 new file mode 100755
-index 0000000..eec51e6
+index 00000000..eec51e60
 --- /dev/null
 +++ b/gastown/tests/test_refinery_reject_branch_survival.sh
 @@ -0,0 +1,315 @@

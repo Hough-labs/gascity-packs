@@ -15,7 +15,7 @@ git_pack_content_hash over the gauntlet-tdd subtree at that commit.
  1 file changed, 2 insertions(+), 2 deletions(-)
 
 diff --git a/registry.toml b/registry.toml
-index 161c636..74d56e5 100644
+index 161c6366..74d56e59 100644
 --- a/registry.toml
 +++ b/registry.toml
 @@ -323,6 +323,6 @@ schema = 1

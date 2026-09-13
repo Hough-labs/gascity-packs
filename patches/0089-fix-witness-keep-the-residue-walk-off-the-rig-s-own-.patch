@@ -58,7 +58,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
  2 files changed, 45 insertions(+), 6 deletions(-)
 
 diff --git a/gastown/assets/scripts/polecat-worktree-reap.sh b/gastown/assets/scripts/polecat-worktree-reap.sh
-index f09b5ec..3f1ff95 100755
+index f09b5ecd..3f1ff953 100755
 --- a/gastown/assets/scripts/polecat-worktree-reap.sh
 +++ b/gastown/assets/scripts/polecat-worktree-reap.sh
 @@ -631,6 +631,14 @@ if [ -s "$SCAN_ROOTS_FILE" ]; then
@@ -77,7 +77,7 @@ index f09b5ec..3f1ff95 100755
              leaf=${entry##*/}
              bead_leaf_ok "${leaf%.reaping}" || continue
 diff --git a/gastown/tests/test_polecat_worktree_reap.sh b/gastown/tests/test_polecat_worktree_reap.sh
-index e4b2698..f0818b5 100644
+index e4b2698d..f0818b56 100644
 --- a/gastown/tests/test_polecat_worktree_reap.sh
 +++ b/gastown/tests/test_polecat_worktree_reap.sh
 @@ -722,9 +722,16 @@ JSON

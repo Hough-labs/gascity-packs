@@ -60,7 +60,7 @@ adds no new violations to it.
  3 files changed, 341 insertions(+), 8 deletions(-)
 
 diff --git a/gastown/README.md b/gastown/README.md
-index c32517a..5a98bc3 100644
+index c32517aa..5a98bc35 100644
 --- a/gastown/README.md
 +++ b/gastown/README.md
 @@ -71,6 +71,17 @@ invalidates it. Every other outcome refuses, including the ones the gate cannot
@@ -82,7 +82,7 @@ index c32517a..5a98bc3 100644
  promoted to `mr`, because a reviewed merge needs a PR to review; PR publication
  becomes the start of review instead of the terminal handoff, and a refused
 diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
-index 18a0b17..46941d7 100644
+index 18a0b17b..46941d7e 100644
 --- a/gastown/formulas/mol-refinery-patrol.toml
 +++ b/gastown/formulas/mol-refinery-patrol.toml
 @@ -461,19 +461,66 @@ if [ "$APPROVAL_REQUIRED" -eq 1 ] && [ "$MERGE_STRATEGY" = "direct" ]; then
@@ -178,7 +178,7 @@ index 18a0b17..46941d7 100644
  The head SHA is the whole point. An approval authorizes one commit, not a
  branch: the gate re-reads the live PR head and refuses anything else, so
 diff --git a/gastown/tests/test_merge_approval_gate.sh b/gastown/tests/test_merge_approval_gate.sh
-index 78993a0..5a3a5ee 100755
+index 78993a0e..5a3a5eeb 100755
 --- a/gastown/tests/test_merge_approval_gate.sh
 +++ b/gastown/tests/test_merge_approval_gate.sh
 @@ -595,6 +595,274 @@ PY

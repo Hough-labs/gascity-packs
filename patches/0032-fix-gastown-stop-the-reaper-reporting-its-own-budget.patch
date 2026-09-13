@@ -80,7 +80,7 @@ integration, in two gastown test stubs this change does not touch).
  4 files changed, 503 insertions(+), 31 deletions(-)
 
 diff --git a/gastown/assets/scripts/polecat-worktree-reap.sh b/gastown/assets/scripts/polecat-worktree-reap.sh
-index 59755a3..4ab6ef8 100755
+index 59755a35..4ab6ef81 100755
 --- a/gastown/assets/scripts/polecat-worktree-reap.sh
 +++ b/gastown/assets/scripts/polecat-worktree-reap.sh
 @@ -68,6 +68,23 @@
@@ -430,7 +430,7 @@ index 59755a3..4ab6ef8 100755
  
  if [ "$DRY_RUN" -eq 1 ]; then
 diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
-index c33e05e..e72ea94 100644
+index c33e05e0..e72ea944 100644
 --- a/gastown/formulas/mol-witness-patrol.toml
 +++ b/gastown/formulas/mol-witness-patrol.toml
 @@ -540,18 +540,41 @@ repo). Read this cycle's lines:
@@ -481,7 +481,7 @@ index c33e05e..e72ea94 100644
  A `worktree_dirty_kept` that repeats across cycles means real work is
  stranded on disk under a bead that is already closed. Mail the mayor —
 diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
-index 794a414..97201db 100755
+index 794a4140..97201dbe 100755
 --- a/gastown/tests/test_gastown_pack_assets.sh
 +++ b/gastown/tests/test_gastown_pack_assets.sh
 @@ -341,6 +341,29 @@ PY
@@ -515,7 +515,7 @@ index 794a414..97201db 100755
  
  test_dolt_push_outage_detection_is_wired() {
 diff --git a/gastown/tests/test_polecat_worktree_reap.sh b/gastown/tests/test_polecat_worktree_reap.sh
-index bcd3911..bec111f 100644
+index bcd3911e..bec111ff 100644
 --- a/gastown/tests/test_polecat_worktree_reap.sh
 +++ b/gastown/tests/test_polecat_worktree_reap.sh
 @@ -60,6 +60,48 @@ SH

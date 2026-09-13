@@ -58,7 +58,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
  4 files changed, 192 insertions(+), 16 deletions(-)
 
 diff --git a/gastown/formulas/mol-deacon-patrol.toml b/gastown/formulas/mol-deacon-patrol.toml
-index 3b19fc6..b89cb3e 100644
+index 3b19fc62..b89cb3eb 100644
 --- a/gastown/formulas/mol-deacon-patrol.toml
 +++ b/gastown/formulas/mol-deacon-patrol.toml
 @@ -707,10 +707,27 @@ session already claimed is still yours to resume, and an open-only query leaves
@@ -100,7 +100,7 @@ index 3b19fc6..b89cb3e 100644
    exit 1
  fi
 diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
-index 62cb241..b197556 100644
+index 62cb241d..b1975562 100644
 --- a/gastown/formulas/mol-refinery-patrol.toml
 +++ b/gastown/formulas/mol-refinery-patrol.toml
 @@ -148,7 +148,13 @@ wisp, burn the current wisp, then request a restart:
@@ -222,7 +222,7 @@ index 62cb241..b197556 100644
    exit 1
  fi
 diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
-index e72ea94..728752f 100644
+index e72ea944..728752fc 100644
 --- a/gastown/formulas/mol-witness-patrol.toml
 +++ b/gastown/formulas/mol-witness-patrol.toml
 @@ -738,10 +738,27 @@ pour a duplicate every cycle, and the prior wisp leaks. Query
@@ -266,7 +266,7 @@ index e72ea94..728752f 100644
  ```
  
 diff --git a/tests/test_wisp_molecule_queries.py b/tests/test_wisp_molecule_queries.py
-index 23ee7f9..d317d44 100644
+index 23ee7f9d..d317d44f 100644
 --- a/tests/test_wisp_molecule_queries.py
 +++ b/tests/test_wisp_molecule_queries.py
 @@ -1,4 +1,4 @@

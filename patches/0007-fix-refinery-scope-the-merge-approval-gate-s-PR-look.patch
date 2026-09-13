@@ -55,7 +55,7 @@ gate left on; do not disable the gate or edit the pack cache to unblock it.
  2 files changed, 233 insertions(+), 14 deletions(-)
 
 diff --git a/gastown/assets/scripts/checks/merge-approval-gate.sh b/gastown/assets/scripts/checks/merge-approval-gate.sh
-index bc36721..19c6d68 100755
+index bc36721d..19c6d685 100755
 --- a/gastown/assets/scripts/checks/merge-approval-gate.sh
 +++ b/gastown/assets/scripts/checks/merge-approval-gate.sh
 @@ -28,7 +28,8 @@
@@ -159,7 +159,7 @@ index bc36721..19c6d68 100755
      undecidable "pr_lookup_failed pr=$SIG_PR"
  fi
 diff --git a/gastown/tests/test_merge_approval_gate.sh b/gastown/tests/test_merge_approval_gate.sh
-index 5a3a5ee..cf3003a 100755
+index 5a3a5eeb..cf3003aa 100755
 --- a/gastown/tests/test_merge_approval_gate.sh
 +++ b/gastown/tests/test_merge_approval_gate.sh
 @@ -63,6 +63,24 @@ SH

@@ -65,7 +65,7 @@ already shipped; it is not reopened here.
  3 files changed, 441 insertions(+), 61 deletions(-)
 
 diff --git a/gastown/agents/refinery/prompt.template.md b/gastown/agents/refinery/prompt.template.md
-index 08131e9..c1fa7ed 100644
+index 08131e99..c1fa7ed6 100644
 --- a/gastown/agents/refinery/prompt.template.md
 +++ b/gastown/agents/refinery/prompt.template.md
 @@ -141,6 +141,10 @@ without catching the mismatch (upstream #1833).
@@ -89,7 +89,7 @@ index 08131e9..c1fa7ed 100644
  | Wait for assignment | `gc events --watch --type=bead.updated --after=$SEQ` |
  | Read work metadata | `gc bd show $WORK --json \| jq '.[0].metadata'` |
 diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
-index 85e21cf..55325ed 100644
+index 85e21cf1..55325edf 100644
 --- a/gastown/formulas/mol-refinery-patrol.toml
 +++ b/gastown/formulas/mol-refinery-patrol.toml
 @@ -204,11 +204,27 @@ needs = ["check-inbox"]
@@ -162,7 +162,7 @@ index 85e21cf..55325ed 100644
  ```bash
  gc bd show $WORK --json | jq '.[0].metadata'
 diff --git a/gastown/tests/test_refinery_find_work.sh b/gastown/tests/test_refinery_find_work.sh
-index 81684e1..4b036b7 100755
+index 81684e13..4b036b79 100755
 --- a/gastown/tests/test_refinery_find_work.sh
 +++ b/gastown/tests/test_refinery_find_work.sh
 @@ -16,9 +16,18 @@

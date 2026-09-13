@@ -76,7 +76,7 @@ Does not address gcp-actg (polecat HOME worktrees, excluded by the
  2 files changed, 457 insertions(+), 58 deletions(-)
 
 diff --git a/gastown/assets/scripts/polecat-worktree-reap.sh b/gastown/assets/scripts/polecat-worktree-reap.sh
-index 4ab6ef8..cae127c 100755
+index 4ab6ef81..cae127c9 100755
 --- a/gastown/assets/scripts/polecat-worktree-reap.sh
 +++ b/gastown/assets/scripts/polecat-worktree-reap.sh
 @@ -30,6 +30,24 @@
@@ -398,7 +398,7 @@ index 4ab6ef8..cae127c 100755
  done <<EOF
  $DECISIONS
 diff --git a/gastown/tests/test_polecat_worktree_reap.sh b/gastown/tests/test_polecat_worktree_reap.sh
-index bec111f..2910ac3 100644
+index bec111ff..2910ac35 100644
 --- a/gastown/tests/test_polecat_worktree_reap.sh
 +++ b/gastown/tests/test_polecat_worktree_reap.sh
 @@ -19,10 +19,24 @@ write_gc_stub() {

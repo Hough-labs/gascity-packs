@@ -66,7 +66,7 @@ narrow it to the confirmed case and to say plainly that
  4 files changed, 274 insertions(+), 16 deletions(-)
 
 diff --git a/gastown/agents/witness/prompt.template.md b/gastown/agents/witness/prompt.template.md
-index 99f2095..929bb47 100644
+index 99f20954..929bb474 100644
 --- a/gastown/agents/witness/prompt.template.md
 +++ b/gastown/agents/witness/prompt.template.md
 @@ -154,8 +154,14 @@ Your patrol job is to read
@@ -87,7 +87,7 @@ index 99f2095..929bb47 100644
  ---
  
 diff --git a/gastown/assets/scripts/polecat-worktree-reap.sh b/gastown/assets/scripts/polecat-worktree-reap.sh
-index 1bbac86..5abcade 100755
+index 1bbac86a..5abcade9 100755
 --- a/gastown/assets/scripts/polecat-worktree-reap.sh
 +++ b/gastown/assets/scripts/polecat-worktree-reap.sh
 @@ -47,8 +47,13 @@
@@ -219,7 +219,7 @@ index 1bbac86..5abcade 100755
                  "no bead authorises this reap and HEAD is on no remote-tracking branch, so the commits here exist nowhere else; kept for the witness to salvage" \
                  no_such_bead_content_unpublished
 diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
-index 4222354..5ff942c 100644
+index 42223546..5ff942cd 100644
 --- a/gastown/formulas/mol-witness-patrol.toml
 +++ b/gastown/formulas/mol-witness-patrol.toml
 @@ -647,9 +647,19 @@ own evidence: gate 3 above, plus
@@ -261,7 +261,7 @@ index 4222354..5ff942c 100644
  | `worktree_reap_failed` | Directory survived removal | Investigate permissions/mounts, mail mayor |
  | `worktree_list_failed` | `git worktree list` ran and did not answer, so no candidate was enumerated. `reason`: `worktree_list_timed_out` or `worktree_list_failed` | Timed out → budget first. Failed → the rig checkout itself is unhealthy; inspect `$RIG_ROOT` by hand |
 diff --git a/gastown/tests/test_polecat_worktree_reap.sh b/gastown/tests/test_polecat_worktree_reap.sh
-index 114be5e..c0d01d8 100644
+index 114be5e7..c0d01d87 100644
 --- a/gastown/tests/test_polecat_worktree_reap.sh
 +++ b/gastown/tests/test_polecat_worktree_reap.sh
 @@ -105,6 +105,15 @@ write_git_stub() {

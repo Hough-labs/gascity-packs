@@ -37,7 +37,7 @@ the confirming signal.
  3 files changed, 4 insertions(+), 4 deletions(-)
 
 diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
-index f15613f..db5a0ad 100644
+index f15613f7..db5a0ada 100644
 --- a/.github/workflows/ci.yml
 +++ b/.github/workflows/ci.yml
 @@ -27,7 +27,7 @@ jobs:
@@ -50,7 +50,7 @@ index f15613f..db5a0ad 100644
        - name: Validate registry
          # --require-git: without git, no commit or content-hash verification runs at
 diff --git a/.github/workflows/gascity-pack-inference.yml b/.github/workflows/gascity-pack-inference.yml
-index d1e6c2f..c95bfb3 100644
+index d1e6c2f5..c95bfb3f 100644
 --- a/.github/workflows/gascity-pack-inference.yml
 +++ b/.github/workflows/gascity-pack-inference.yml
 @@ -110,7 +110,7 @@ jobs:
@@ -63,7 +63,7 @@ index d1e6c2f..c95bfb3 100644
        - name: Install Gas City
          env:
 diff --git a/.github/workflows/supported-pack-nightly.yml b/.github/workflows/supported-pack-nightly.yml
-index a38034c..bca7320 100644
+index a38034c7..bca73203 100644
 --- a/.github/workflows/supported-pack-nightly.yml
 +++ b/.github/workflows/supported-pack-nightly.yml
 @@ -67,7 +67,7 @@ jobs:

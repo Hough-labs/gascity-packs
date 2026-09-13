@@ -54,7 +54,7 @@ change stashed.
  1 file changed, 93 insertions(+), 11 deletions(-)
 
 diff --git a/gastown/template-fragments/operational-awareness.template.md b/gastown/template-fragments/operational-awareness.template.md
-index 38b5b12..6b045f0 100644
+index 38b5b125..6b045f0b 100644
 --- a/gastown/template-fragments/operational-awareness.template.md
 +++ b/gastown/template-fragments/operational-awareness.template.md
 @@ -38,17 +38,79 @@ survives as a bead or an authenticated mail; a prompt-injection does not.

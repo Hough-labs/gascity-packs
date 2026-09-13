@@ -23,7 +23,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
  1 file changed, 10 insertions(+), 9 deletions(-)
 
 diff --git a/gastown/tests/test_refinery_already_merged.sh b/gastown/tests/test_refinery_already_merged.sh
-index 7ea0a91..beff724 100755
+index 7ea0a91e..beff7242 100755
 --- a/gastown/tests/test_refinery_already_merged.sh
 +++ b/gastown/tests/test_refinery_already_merged.sh
 @@ -88,17 +88,18 @@ git_quiet() {

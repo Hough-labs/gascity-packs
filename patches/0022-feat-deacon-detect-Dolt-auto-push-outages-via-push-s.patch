@@ -73,7 +73,7 @@ failure set is a strict subset of the fork point's.
  create mode 100755 gastown/tests/test_dolt_push_state_check.sh
 
 diff --git a/gastown/agents/deacon/agent.toml b/gastown/agents/deacon/agent.toml
-index 29b7595..80e9765 100644
+index 29b7595a..80e97654 100644
 --- a/gastown/agents/deacon/agent.toml
 +++ b/gastown/agents/deacon/agent.toml
 @@ -1,6 +1,18 @@
@@ -97,7 +97,7 @@ index 29b7595..80e9765 100644
  max_active_sessions = 1
 diff --git a/gastown/assets/scripts/dolt-push-state-check.sh b/gastown/assets/scripts/dolt-push-state-check.sh
 new file mode 100755
-index 0000000..e418f58
+index 00000000..e418f581
 --- /dev/null
 +++ b/gastown/assets/scripts/dolt-push-state-check.sh
 @@ -0,0 +1,302 @@
@@ -404,7 +404,7 @@ index 0000000..e418f58
 +fi
 +printf '%s\n' "$SNAPSHOT_FILE"
 diff --git a/gastown/formulas/mol-deacon-patrol.toml b/gastown/formulas/mol-deacon-patrol.toml
-index 033cfb6..9658c31 100644
+index 033cfb61..9658c31c 100644
 --- a/gastown/formulas/mol-deacon-patrol.toml
 +++ b/gastown/formulas/mol-deacon-patrol.toml
 @@ -454,10 +454,120 @@ Log `Dolt health: OK` and move on.
@@ -531,7 +531,7 @@ index 033cfb6..9658c31 100644
  
 diff --git a/gastown/tests/test_dolt_push_state_check.sh b/gastown/tests/test_dolt_push_state_check.sh
 new file mode 100755
-index 0000000..1bbe59d
+index 00000000..1bbe59d0
 --- /dev/null
 +++ b/gastown/tests/test_dolt_push_state_check.sh
 @@ -0,0 +1,353 @@
@@ -889,7 +889,7 @@ index 0000000..1bbe59d
 +fi
 +echo "dolt push-state check tests passed ($PASS assertions)"
 diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
-index d90eea1..c9e63b7 100755
+index d90eea19..c9e63b76 100755
 --- a/gastown/tests/test_gastown_pack_assets.sh
 +++ b/gastown/tests/test_gastown_pack_assets.sh
 @@ -325,9 +325,47 @@ PY

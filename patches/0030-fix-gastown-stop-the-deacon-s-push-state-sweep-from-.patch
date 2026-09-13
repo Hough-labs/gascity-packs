@@ -90,7 +90,7 @@ filed there and touch none of the files this commit changes.
  create mode 100755 gastown/tests/test_agent_pre_start_budget.sh
 
 diff --git a/gastown/agents/deacon/agent.toml b/gastown/agents/deacon/agent.toml
-index 80e9765..1e973fb 100644
+index 80e97654..1e973fbd 100644
 --- a/gastown/agents/deacon/agent.toml
 +++ b/gastown/agents/deacon/agent.toml
 @@ -1,18 +1,28 @@
@@ -135,7 +135,7 @@ index 80e9765..1e973fb 100644
  idle_timeout = "1h"
  max_active_sessions = 1
 diff --git a/gastown/assets/scripts/dolt-push-state-check.sh b/gastown/assets/scripts/dolt-push-state-check.sh
-index c2f69b1..bec6ef8 100755
+index c2f69b17..bec6ef8a 100755
 --- a/gastown/assets/scripts/dolt-push-state-check.sh
 +++ b/gastown/assets/scripts/dolt-push-state-check.sh
 @@ -102,13 +102,23 @@
@@ -185,7 +185,7 @@ index c2f69b1..bec6ef8 100755
  if [ -n "$OUTPUT" ]; then
    printf '%s\n' "$OUTPUT" | jq -s \
 diff --git a/gastown/assets/scripts/worktree-setup.sh b/gastown/assets/scripts/worktree-setup.sh
-index 0dfe4ef..1dc431c 100755
+index 0dfe4efd..1dc431c6 100755
 --- a/gastown/assets/scripts/worktree-setup.sh
 +++ b/gastown/assets/scripts/worktree-setup.sh
 @@ -10,9 +10,92 @@
@@ -305,7 +305,7 @@ index 0dfe4ef..1dc431c 100755
  
  if git -C "$RIG_ROOT" show-ref --verify --quiet "refs/heads/$BRANCH"; then
 diff --git a/gastown/formulas/mol-deacon-patrol.toml b/gastown/formulas/mol-deacon-patrol.toml
-index baaed4b..3b19fc6 100644
+index baaed4b5..3b19fc62 100644
 --- a/gastown/formulas/mol-deacon-patrol.toml
 +++ b/gastown/formulas/mol-deacon-patrol.toml
 @@ -477,21 +477,53 @@ case this step exists to catch. The detector reaches every scope through
@@ -384,7 +384,7 @@ index baaed4b..3b19fc6 100644
  id = "system-health"
 diff --git a/gastown/tests/test_agent_pre_start_budget.sh b/gastown/tests/test_agent_pre_start_budget.sh
 new file mode 100755
-index 0000000..770f070
+index 00000000..770f070f
 --- /dev/null
 +++ b/gastown/tests/test_agent_pre_start_budget.sh
 @@ -0,0 +1,175 @@
@@ -564,7 +564,7 @@ index 0000000..770f070
 +
 +echo "agent pre_start budget guard passed"
 diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
-index 2d656b8..794a414 100755
+index 2d656b87..794a4140 100755
 --- a/gastown/tests/test_gastown_pack_assets.sh
 +++ b/gastown/tests/test_gastown_pack_assets.sh
 @@ -352,17 +352,39 @@ test_dolt_push_outage_detection_is_wired() {

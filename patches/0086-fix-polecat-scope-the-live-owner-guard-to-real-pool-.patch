@@ -47,7 +47,7 @@ subtests).
  4 files changed, 68 insertions(+), 8 deletions(-)
 
 diff --git a/gastown/agents/polecat/prompt.template.md b/gastown/agents/polecat/prompt.template.md
-index 5686adf..30c147c 100644
+index 5686adfa..30c147ce 100644
 --- a/gastown/agents/polecat/prompt.template.md
 +++ b/gastown/agents/polecat/prompt.template.md
 @@ -177,6 +177,10 @@ while [ "$CLAIM_TRY" -lt 3 ]; do
@@ -105,7 +105,7 @@ index 5686adf..30c147c 100644
  runtime session name, then alias) and only falls through to unassigned pool work
  routed to `${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat`.
 diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
-index e588d4b..a0ed4d6 100755
+index e588d4b2..a0ed4d68 100755
 --- a/gastown/tests/test_gastown_pack_assets.sh
 +++ b/gastown/tests/test_gastown_pack_assets.sh
 @@ -237,7 +237,7 @@ test_claim_refuses_a_pour_onto_a_live_owner() {
@@ -118,7 +118,7 @@ index e588d4b..a0ed4d6 100755
  }
  
 diff --git a/gastown/tests/test_polecat_live_owner_guard.sh b/gastown/tests/test_polecat_live_owner_guard.sh
-index 0270565..9ffdf7a 100755
+index 0270565f..9ffdf7af 100755
 --- a/gastown/tests/test_polecat_live_owner_guard.sh
 +++ b/gastown/tests/test_polecat_live_owner_guard.sh
 @@ -45,7 +45,7 @@ write_gc_stub() {
@@ -214,7 +214,7 @@ index 0270565..9ffdf7a 100755
  
  echo "polecat live-owner guard tests passed"
 diff --git a/tests/test_no_bare_bd_commands.py b/tests/test_no_bare_bd_commands.py
-index 28b2dff..5d39cee 100644
+index 28b2dffb..5d39ceef 100644
 --- a/tests/test_no_bare_bd_commands.py
 +++ b/tests/test_no_bare_bd_commands.py
 @@ -169,6 +169,13 @@ GC_BD_ARGV_TAIL_ALLOWLIST: dict[Path, set[str]] = {

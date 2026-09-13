@@ -98,7 +98,7 @@ full-suite load and passes in isolation, unrelated to this diff.
 
 diff --git a/.github/scripts/install-gascity-archive.sh b/.github/scripts/install-gascity-archive.sh
 new file mode 100755
-index 0000000..f839906
+index 00000000..f8399065
 --- /dev/null
 +++ b/.github/scripts/install-gascity-archive.sh
 @@ -0,0 +1,286 @@
@@ -389,7 +389,7 @@ index 0000000..f839906
 +
 +"$target" version
 diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
-index db5a0ad..5863af1 100644
+index db5a0ada..5863af1a 100644
 --- a/.github/workflows/ci.yml
 +++ b/.github/workflows/ci.yml
 @@ -38,10 +38,16 @@ jobs:
@@ -430,7 +430,7 @@ index db5a0ad..5863af1 100644
 -          GC_BIN="$(go env GOPATH)/bin/gc" ./conformance.sh
 +        run: ./conformance.sh
 diff --git a/.github/workflows/gascity-pack-inference.yml b/.github/workflows/gascity-pack-inference.yml
-index c95bfb3..3ceb012 100644
+index c95bfb3f..3ceb012f 100644
 --- a/.github/workflows/gascity-pack-inference.yml
 +++ b/.github/workflows/gascity-pack-inference.yml
 @@ -112,13 +112,13 @@ jobs:
@@ -461,7 +461,7 @@ index c95bfb3..3ceb012 100644
              --pack "${PACK:-all-supported}" \
              --gate "${GATE:-all}" \
 diff --git a/.github/workflows/pack-release-compatibility.yml b/.github/workflows/pack-release-compatibility.yml
-index 059fc72..b3e3dcd 100644
+index 059fc720..b3e3dcd7 100644
 --- a/.github/workflows/pack-release-compatibility.yml
 +++ b/.github/workflows/pack-release-compatibility.yml
 @@ -68,19 +68,20 @@ jobs:
@@ -490,7 +490,7 @@ index 059fc72..b3e3dcd 100644
              args+=(--pack "$PACK")
            fi
 diff --git a/.github/workflows/supported-pack-nightly.yml b/.github/workflows/supported-pack-nightly.yml
-index bca7320..9035bc2 100644
+index bca73203..9035bc2f 100644
 --- a/.github/workflows/supported-pack-nightly.yml
 +++ b/.github/workflows/supported-pack-nightly.yml
 @@ -228,14 +228,15 @@ jobs:
@@ -523,7 +523,7 @@ index bca7320..9035bc2 100644
              --pack "${{ matrix.pack }}" \
              --gate "${{ matrix.gate }}" \
 diff --git a/tests/test_gascity_pack_inference_gate.py b/tests/test_gascity_pack_inference_gate.py
-index 3448ddc..604a455 100644
+index 3448ddcf..604a4551 100644
 --- a/tests/test_gascity_pack_inference_gate.py
 +++ b/tests/test_gascity_pack_inference_gate.py
 @@ -523,6 +523,88 @@ def test_ci_workflows_use_self_hosted_runner_labels() -> None:

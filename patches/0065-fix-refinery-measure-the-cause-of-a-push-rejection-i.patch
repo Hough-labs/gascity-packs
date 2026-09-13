@@ -61,7 +61,7 @@ so it is replaced by the two shapes above rather than kept.
  2 files changed, 181 insertions(+), 10 deletions(-)
 
 diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
-index b197556..d419d60 100644
+index b1975562..d419d606 100644
 --- a/gastown/formulas/mol-refinery-patrol.toml
 +++ b/gastown/formulas/mol-refinery-patrol.toml
 @@ -1159,6 +1159,22 @@ gate: an approval authorizes one commit, so when `APPROVAL_REQUIRED` is 1 the
@@ -177,7 +177,7 @@ index b197556..d419d60 100644
  `merged_sha` and `merged_target` are the only forensic breadcrumbs tying a
  closed bead to its merge commit on `$TARGET`. `--unset-metadata
 diff --git a/gastown/tests/test_refinery_merge_push.sh b/gastown/tests/test_refinery_merge_push.sh
-index 074a58e..8edadd5 100755
+index 074a58eb..8edadd59 100755
 --- a/gastown/tests/test_refinery_merge_push.sh
 +++ b/gastown/tests/test_refinery_merge_push.sh
 @@ -27,6 +27,17 @@

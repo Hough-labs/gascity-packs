@@ -68,7 +68,7 @@ which share the shape but have distinct triggers.
  create mode 100755 gastown/tests/test_polecat_live_owner_guard.sh
 
 diff --git a/gastown/agents/polecat/prompt.template.md b/gastown/agents/polecat/prompt.template.md
-index b4f2679..5686adf 100644
+index b4f26791..5686adfa 100644
 --- a/gastown/agents/polecat/prompt.template.md
 +++ b/gastown/agents/polecat/prompt.template.md
 @@ -206,22 +206,37 @@ fi
@@ -248,7 +248,7 @@ index b4f2679..5686adf 100644
  tier handed back this session's own in-flight WORK bead — which
  `mol-polecat-work` holds `in_progress` for the whole run, so a second sling
 diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
-index 430db6f..e588d4b 100755
+index 430db6f9..e588d4b2 100755
 --- a/gastown/tests/test_gastown_pack_assets.sh
 +++ b/gastown/tests/test_gastown_pack_assets.sh
 @@ -193,6 +193,54 @@ test_polecat_startup_uses_standard_hook_claim() {
@@ -330,7 +330,7 @@ index 430db6f..e588d4b 100755
  
 diff --git a/gastown/tests/test_polecat_live_owner_guard.sh b/gastown/tests/test_polecat_live_owner_guard.sh
 new file mode 100755
-index 0000000..0270565
+index 00000000..0270565f
 --- /dev/null
 +++ b/gastown/tests/test_polecat_live_owner_guard.sh
 @@ -0,0 +1,252 @@

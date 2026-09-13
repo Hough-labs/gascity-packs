@@ -73,7 +73,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
  4 files changed, 279 insertions(+), 9 deletions(-)
 
 diff --git a/gastown/agents/witness/prompt.template.md b/gastown/agents/witness/prompt.template.md
-index 67d80d9..99f2095 100644
+index 67d80d9c..99f20954 100644
 --- a/gastown/agents/witness/prompt.template.md
 +++ b/gastown/agents/witness/prompt.template.md
 @@ -141,6 +141,14 @@ published `HEAD` instead. Everything else it leaves alone and logs.
@@ -92,7 +92,7 @@ index 67d80d9..99f2095 100644
  `$GC_CITY/.gc/runtime/logs/polecat-worktree-reap.log` and act on what is
  not routine — a `worktree_dirty_kept` that repeats across cycles means real
 diff --git a/gastown/assets/scripts/polecat-worktree-reap.sh b/gastown/assets/scripts/polecat-worktree-reap.sh
-index 6df7e09..1bbac86 100755
+index 6df7e09e..1bbac86a 100755
 --- a/gastown/assets/scripts/polecat-worktree-reap.sh
 +++ b/gastown/assets/scripts/polecat-worktree-reap.sh
 @@ -71,6 +71,35 @@
@@ -293,7 +293,7 @@ index 6df7e09..1bbac86 100755
  # cycle when the clock cut one short — including when the truncation landed on
  # the LAST candidate and the loop head therefore never fired.
 diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
-index 6738dc9..4222354 100644
+index 6738dc97..42223546 100644
 --- a/gastown/formulas/mol-witness-patrol.toml
 +++ b/gastown/formulas/mol-witness-patrol.toml
 @@ -558,10 +558,49 @@ is deliberate: `city.toml` holds the *native* gascity reaper
@@ -368,7 +368,7 @@ index 6738dc9..4222354 100644
  A `worktree_dirty_kept` that repeats across cycles means real work is
  stranded on disk under a bead that is already closed. Mail the mayor —
 diff --git a/gastown/tests/test_polecat_worktree_reap.sh b/gastown/tests/test_polecat_worktree_reap.sh
-index 44c84f0..114be5e 100644
+index 44c84f0b..114be5e7 100644
 --- a/gastown/tests/test_polecat_worktree_reap.sh
 +++ b/gastown/tests/test_polecat_worktree_reap.sh
 @@ -1058,6 +1058,113 @@ JSON

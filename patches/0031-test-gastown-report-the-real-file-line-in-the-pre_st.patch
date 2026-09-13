@@ -32,7 +32,7 @@ will do is open the file at the line it names.
  1 file changed, 6 insertions(+), 5 deletions(-)
 
 diff --git a/gastown/tests/test_agent_pre_start_budget.sh b/gastown/tests/test_agent_pre_start_budget.sh
-index 770f070..b39ccb1 100755
+index 770f070f..b39ccb1b 100755
 --- a/gastown/tests/test_agent_pre_start_budget.sh
 +++ b/gastown/tests/test_agent_pre_start_budget.sh
 @@ -134,12 +134,13 @@ assert_bounded() {

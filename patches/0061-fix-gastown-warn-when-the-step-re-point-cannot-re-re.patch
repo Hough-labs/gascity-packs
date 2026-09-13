@@ -21,7 +21,7 @@ so this is a reporting gap, not a control-flow one.
  1 file changed, 2 insertions(+)
 
 diff --git a/gastown/agents/polecat/prompt.template.md b/gastown/agents/polecat/prompt.template.md
-index 4640481..ee46623 100644
+index 46404819..ee466238 100644
 --- a/gastown/agents/polecat/prompt.template.md
 +++ b/gastown/agents/polecat/prompt.template.md
 @@ -267,6 +267,8 @@ if [ -z "$STEP_REF" ]; then

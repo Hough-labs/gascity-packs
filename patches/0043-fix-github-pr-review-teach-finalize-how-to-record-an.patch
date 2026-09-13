@@ -36,7 +36,7 @@ Extends the scope-wiring test with the finalize abort-path assertions.
  2 files changed, 22 insertions(+)
 
 diff --git a/gascity/assets/workflows/github-pr-review/finalize.md b/gascity/assets/workflows/github-pr-review/finalize.md
-index 4a202c5..5624e61 100644
+index 4a202c54..5624e617 100644
 --- a/gascity/assets/workflows/github-pr-review/finalize.md
 +++ b/gascity/assets/workflows/github-pr-review/finalize.md
 @@ -4,3 +4,18 @@ id, head SHA, review subject path, review report path, rendered comment path,
@@ -59,7 +59,7 @@ index 4a202c5..5624e61 100644
 +the failed scope member is what makes the workflow root resolve to fail. Close
 +`gc.outcome=fail` only when the record itself could not be written.
 diff --git a/gascity/tests/test_formula_assets.py b/gascity/tests/test_formula_assets.py
-index 6b813e9..b966d43 100755
+index 6b813e9d..b966d438 100755
 --- a/gascity/tests/test_formula_assets.py
 +++ b/gascity/tests/test_formula_assets.py
 @@ -3680,6 +3680,13 @@ class FormulaAssetTests(unittest.TestCase):

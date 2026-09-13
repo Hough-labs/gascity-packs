@@ -52,7 +52,7 @@ home_children_kept no longer reads as a statement about the home's contents.
  3 files changed, 128 insertions(+), 28 deletions(-)
 
 diff --git a/gastown/assets/scripts/polecat-home-audit.sh b/gastown/assets/scripts/polecat-home-audit.sh
-index 3af363d..20baa44 100755
+index 3af363de..20baa44a 100755
 --- a/gastown/assets/scripts/polecat-home-audit.sh
 +++ b/gastown/assets/scripts/polecat-home-audit.sh
 @@ -42,6 +42,13 @@
@@ -187,7 +187,7 @@ index 3af363d..20baa44 100755
          continue
      fi
 diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
-index 3909595..31522e3 100644
+index 39095953..31522e38 100644
 --- a/gastown/formulas/mol-witness-patrol.toml
 +++ b/gastown/formulas/mol-witness-patrol.toml
 @@ -692,7 +692,7 @@ tail -n 50 "${LOG_DIR:-$GC_CITY/.gc/runtime/logs}/polecat-home-audit.log" | jq -
@@ -200,7 +200,7 @@ index 3909595..31522e3 100644
  | `home_unpublished_commits_kept` | Commits reaching no remote, often on a detached HEAD | Investigate by hand. Whether they are superseded takes a CONTENT check at origin — a rebase/squash-merging refinery rewrites hashes, so `git merge-base --is-ancestor` lies here. The sweep deliberately does not guess |
  | `home_owner_unconfirmed` | The roster parsed but this home's liveness query did not answer | Nothing was removed. If it repeats, the roster shape has drifted |
 diff --git a/gastown/tests/test_polecat_home_audit.sh b/gastown/tests/test_polecat_home_audit.sh
-index dc6ff41..f22fede 100755
+index dc6ff41a..f22fedeb 100755
 --- a/gastown/tests/test_polecat_home_audit.sh
 +++ b/gastown/tests/test_polecat_home_audit.sh
 @@ -262,6 +262,73 @@ JSON

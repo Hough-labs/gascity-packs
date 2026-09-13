@@ -46,7 +46,7 @@ already forbids in mol-shutdown-dance.
  2 files changed, 57 insertions(+), 2 deletions(-)
 
 diff --git a/gastown/formulas/mol-digest-generate.toml b/gastown/formulas/mol-digest-generate.toml
-index 638981d..b31082c 100644
+index 638981dd..b31082c4 100644
 --- a/gastown/formulas/mol-digest-generate.toml
 +++ b/gastown/formulas/mol-digest-generate.toml
 @@ -171,12 +171,28 @@ gc mail send mayor/ -s "Gas Town Digest: $DATE" -m "$DIGEST"
@@ -81,7 +81,7 @@ index 638981d..b31082c 100644
  ```bash
  gc bd close <work-bead> --reason "Digest generated and sent"
 diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
-index 79c7f1e..248d078 100755
+index 79c7f1e0..248d0783 100755
 --- a/gastown/tests/test_gastown_pack_assets.sh
 +++ b/gastown/tests/test_gastown_pack_assets.sh
 @@ -47,6 +47,44 @@ test_retired_dog_formulas_are_not_reintroduced() {

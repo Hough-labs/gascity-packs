@@ -117,7 +117,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
  4 files changed, 682 insertions(+), 145 deletions(-)
 
 diff --git a/gastown/agents/witness/agent.toml b/gastown/agents/witness/agent.toml
-index bb35180..c89da3b 100644
+index bb351809..c89da3b6 100644
 --- a/gastown/agents/witness/agent.toml
 +++ b/gastown/agents/witness/agent.toml
 @@ -18,11 +18,30 @@ work_dir = ".gc/agents/{{.Rig}}/witness"
@@ -157,7 +157,7 @@ index bb35180..c89da3b 100644
  nudge = "Run 'gc prime' to check worker status and begin patrol cycle."
  idle_timeout = "1h"
 diff --git a/gastown/assets/scripts/polecat-worktree-reap.sh b/gastown/assets/scripts/polecat-worktree-reap.sh
-index 5abcade..f09b5ec 100755
+index 5abcade9..f09b5ecd 100755
 --- a/gastown/assets/scripts/polecat-worktree-reap.sh
 +++ b/gastown/assets/scripts/polecat-worktree-reap.sh
 @@ -105,6 +105,70 @@
@@ -943,7 +943,7 @@ index 5abcade..f09b5ec 100755
          continue
      fi
 diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
-index 5ff942c..4536b2b 100644
+index 5ff942cd..4536b2b8 100644
 --- a/gastown/formulas/mol-witness-patrol.toml
 +++ b/gastown/formulas/mol-witness-patrol.toml
 @@ -553,13 +553,9 @@ an incident.
@@ -1014,7 +1014,7 @@ index 5ff942c..4536b2b 100644
  | `worktree_bead_query_failed` | The one bulk bead read ran and did not answer. `reason`: `bead_query_timed_out` (slower than the seconds the run had left — the detail names them) or `bead_query_failed` (non-zero exit) | Nothing was examined this cycle. **`bead_query_timed_out` on a small remaining budget is the reaper's clock, not the store** — compare the detail's "Ns left of the Ms budget" before suspecting the endpoint. A `bead_query_failed`, or a timeout with most of the budget still unspent, is the rig's Dolt endpoint |
  | `worktree_budget_exhausted` | The run hit its own wall-clock budget and stopped at the top of the loop. The detail carries examined/skipped/deferred counts, the window this cycle covered, and where the next resumes | Routine on a rig with many candidates; the rest are deferred to the next cycle. **Not evidence for the `--no-dry-run` flip** — this cycle reviewed a window, not the set. Persistent + a growing candidate count means the store is too slow for the budget — raise `[session] setup_timeout` AND `GC_REAP_BUDGET_SECONDS` together, or investigate the endpoint |
 diff --git a/gastown/tests/test_polecat_worktree_reap.sh b/gastown/tests/test_polecat_worktree_reap.sh
-index 6df954c..e4b2698 100644
+index 6df954c9..e4b2698d 100644
 --- a/gastown/tests/test_polecat_worktree_reap.sh
 +++ b/gastown/tests/test_polecat_worktree_reap.sh
 @@ -570,7 +570,29 @@ test_bead_status_is_read_in_one_bulk_query() {

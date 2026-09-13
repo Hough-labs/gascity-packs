@@ -54,7 +54,7 @@ test_city_claim_command_* subtests, all untouched by this branch).
 
 diff --git a/gascity/assets/workflows/github-pr-review/review-scope.md b/gascity/assets/workflows/github-pr-review/review-scope.md
 new file mode 100644
-index 0000000..4cdbe87
+index 00000000..4cdbe87e
 --- /dev/null
 +++ b/gascity/assets/workflows/github-pr-review/review-scope.md
 @@ -0,0 +1,8 @@
@@ -67,7 +67,7 @@ index 0000000..4cdbe87
 +this body failed, instead of letting readiness alone carry the run on to
 +posting a verdict.
 diff --git a/gascity/formulas/github-pr-review.formula.toml b/gascity/formulas/github-pr-review.formula.toml
-index f29c521..912e2c0 100644
+index f29c521b..912e2c0f 100644
 --- a/gascity/formulas/github-pr-review.formula.toml
 +++ b/gascity/formulas/github-pr-review.formula.toml
 @@ -68,37 +68,59 @@ needs = ["snapshot"]
@@ -136,7 +136,7 @@ index f29c521..912e2c0 100644
  metadata = { "gc.run_target" = "gc.run-operator" }
  description_file = "../assets/workflows/github-pr-review/finalize.md"
 diff --git a/gascity/tests/test_formula_assets.py b/gascity/tests/test_formula_assets.py
-index aca4fd4..6b813e9 100755
+index aca4fd45..6b813e9d 100755
 --- a/gascity/tests/test_formula_assets.py
 +++ b/gascity/tests/test_formula_assets.py
 @@ -617,6 +617,20 @@ def formula_nodes(data: dict) -> list[dict]:

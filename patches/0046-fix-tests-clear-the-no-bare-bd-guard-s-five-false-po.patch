@@ -52,7 +52,7 @@ is blanket-exempt. Both `bash gastown/tests/test_merge_approval_gate.sh` and
  3 files changed, 40 insertions(+), 16 deletions(-)
 
 diff --git a/gastown/tests/test_merge_approval_gate.sh b/gastown/tests/test_merge_approval_gate.sh
-index 1cec0c9..99734bb 100755
+index 1cec0c90..99734bb6 100755
 --- a/gastown/tests/test_merge_approval_gate.sh
 +++ b/gastown/tests/test_merge_approval_gate.sh
 @@ -27,14 +27,14 @@ write_gc_stub() {
@@ -82,7 +82,7 @@ index 1cec0c9..99734bb 100755
      line=$(cat "$log")
      grep -F 'merge_approval.verdict=approved' <<<"$line" >/dev/null ||
 diff --git a/gastown/tests/test_refinery_find_work.sh b/gastown/tests/test_refinery_find_work.sh
-index 880dbac..81684e1 100755
+index 880dbace..81684e13 100755
 --- a/gastown/tests/test_refinery_find_work.sh
 +++ b/gastown/tests/test_refinery_find_work.sh
 @@ -60,10 +60,11 @@ with open(out, "w") as handle:
@@ -114,7 +114,7 @@ index 880dbac..81684e1 100755
      bead
      for bead in beads
 diff --git a/tests/test_no_bare_bd_commands.py b/tests/test_no_bare_bd_commands.py
-index d6d4783..28b2dff 100644
+index d6d4783d..28b2dffb 100644
 --- a/tests/test_no_bare_bd_commands.py
 +++ b/tests/test_no_bare_bd_commands.py
 @@ -149,11 +149,32 @@ BARE_BD_SERIALIZED_ARGV = re.compile(

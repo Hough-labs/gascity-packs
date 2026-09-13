@@ -58,7 +58,7 @@ reproduce identically on the parent commit and are unrelated to this change.
  create mode 100755 gastown/tests/test_refinery_origin_repo.sh
 
 diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
-index 46941d7..a475414 100644
+index 46941d7e..a4754142 100644
 --- a/gastown/formulas/mol-refinery-patrol.toml
 +++ b/gastown/formulas/mol-refinery-patrol.toml
 @@ -420,24 +420,36 @@ BRANCH=$(gc bd show $WORK --json | jq -r '.[0].metadata.branch')
@@ -151,7 +151,7 @@ index 46941d7..a475414 100644
      PR_ERR=$(mktemp)
 diff --git a/gastown/tests/test_refinery_origin_repo.sh b/gastown/tests/test_refinery_origin_repo.sh
 new file mode 100755
-index 0000000..e639073
+index 00000000..e639073a
 --- /dev/null
 +++ b/gastown/tests/test_refinery_origin_repo.sh
 @@ -0,0 +1,255 @@

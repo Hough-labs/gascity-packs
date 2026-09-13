@@ -18,7 +18,7 @@ It is not; match the neighbour.
  1 file changed, 1 insertion(+), 1 deletion(-)
 
 diff --git a/gastown/formulas/mol-deacon-patrol.toml b/gastown/formulas/mol-deacon-patrol.toml
-index 297e9b2..baaed4b 100644
+index 297e9b21..baaed4b5 100644
 --- a/gastown/formulas/mol-deacon-patrol.toml
 +++ b/gastown/formulas/mol-deacon-patrol.toml
 @@ -576,7 +576,7 @@ cycle commits a bead per cycle), and dedupe so it is said once per condition:

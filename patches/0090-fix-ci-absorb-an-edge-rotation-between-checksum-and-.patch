@@ -55,7 +55,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
  create mode 100644 tests/test_install_gascity_archive.py
 
 diff --git a/.github/scripts/install-gascity-archive.sh b/.github/scripts/install-gascity-archive.sh
-index f839906..42413ab 100755
+index f8399065..42413ab5 100755
 --- a/.github/scripts/install-gascity-archive.sh
 +++ b/.github/scripts/install-gascity-archive.sh
 @@ -242,30 +242,96 @@ install_binary_with_sudo_fallback() {
@@ -184,7 +184,7 @@ index f839906..42413ab 100755
    echo "$bin_dir" >> "$GITHUB_PATH"
 diff --git a/tests/test_install_gascity_archive.py b/tests/test_install_gascity_archive.py
 new file mode 100644
-index 0000000..706f5e9
+index 00000000..706f5e99
 --- /dev/null
 +++ b/tests/test_install_gascity_archive.py
 @@ -0,0 +1,298 @@

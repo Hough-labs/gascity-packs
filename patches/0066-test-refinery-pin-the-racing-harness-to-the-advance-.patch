@@ -31,7 +31,7 @@ status.
  2 files changed, 11 insertions(+), 9 deletions(-)
 
 diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
-index d419d60..85e21cf 100644
+index d419d606..85e21cf1 100644
 --- a/gastown/formulas/mol-refinery-patrol.toml
 +++ b/gastown/formulas/mol-refinery-patrol.toml
 @@ -1212,6 +1212,10 @@ merge_ff_push() {
@@ -46,7 +46,7 @@ index d419d60..85e21cf 100644
  
    while [ "$mfp_attempt" -lt "$mfp_max" ]; do
 diff --git a/gastown/tests/test_refinery_merge_push.sh b/gastown/tests/test_refinery_merge_push.sh
-index 8edadd5..aef9d69 100755
+index 8edadd59..aef9d698 100755
 --- a/gastown/tests/test_refinery_merge_push.sh
 +++ b/gastown/tests/test_refinery_merge_push.sh
 @@ -369,13 +369,13 @@ test_rejected_push_with_a_moving_target_still_retries() {

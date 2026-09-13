@@ -54,7 +54,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
  6 files changed, 237 insertions(+), 32 deletions(-)
 
 diff --git a/gastown/agents/witness/agent.toml b/gastown/agents/witness/agent.toml
-index ca75206..938dc73 100644
+index ca752065..938dc730 100644
 --- a/gastown/agents/witness/agent.toml
 +++ b/gastown/agents/witness/agent.toml
 @@ -7,8 +7,15 @@ work_dir = ".gc/agents/{{.Rig}}/witness"
@@ -76,7 +76,7 @@ index ca75206..938dc73 100644
  nudge = "Run 'gc prime' to check worker status and begin patrol cycle."
  idle_timeout = "1h"
 diff --git a/gastown/agents/witness/prompt.template.md b/gastown/agents/witness/prompt.template.md
-index a80d86e..641135e 100644
+index a80d86e7..641135e8 100644
 --- a/gastown/agents/witness/prompt.template.md
 +++ b/gastown/agents/witness/prompt.template.md
 @@ -128,9 +128,15 @@ polecat is still available for FIX_NEEDED rework.
@@ -99,7 +99,7 @@ index a80d86e..641135e 100644
  Your patrol job is to read
  `$GC_CITY/.gc/runtime/logs/polecat-worktree-reap.log` and act on what is
 diff --git a/gastown/assets/scripts/polecat-worktree-reap.sh b/gastown/assets/scripts/polecat-worktree-reap.sh
-index 340fd5d..b45b00c 100755
+index 340fd5d8..b45b00cb 100755
 --- a/gastown/assets/scripts/polecat-worktree-reap.sh
 +++ b/gastown/assets/scripts/polecat-worktree-reap.sh
 @@ -26,7 +26,17 @@
@@ -251,7 +251,7 @@ index 340fd5d..b45b00c 100755
      echo "polecat-worktree-reap: reaped=$REAPED skipped=$SKIPPED (log: $LOG_FILE)"
  fi
 diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
-index 4098612..50552ed 100644
+index 4098612d..50552edd 100644
 --- a/gastown/formulas/mol-witness-patrol.toml
 +++ b/gastown/formulas/mol-witness-patrol.toml
 @@ -493,8 +493,20 @@ It lives in `pre_start` rather than in a command here because pack assets
@@ -306,7 +306,7 @@ index 4098612..50552ed 100644
  | `worktree_status_unreadable` | `git status` failed inside the worktree | Inspect by hand; likely a broken or moved checkout |
  | `worktree_reap_failed` | Directory survived removal | Investigate permissions/mounts, mail mayor |
 diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
-index 973236e..32d4809 100755
+index 973236ea..32d48095 100755
 --- a/gastown/tests/test_gastown_pack_assets.sh
 +++ b/gastown/tests/test_gastown_pack_assets.sh
 @@ -272,9 +272,29 @@ PY
@@ -341,7 +341,7 @@ index 973236e..32d4809 100755
      # into it.
      ! grep -F 'LOG_DIR="$RIG_ROOT' "$reaper" >/dev/null ||
 diff --git a/gastown/tests/test_polecat_worktree_reap.sh b/gastown/tests/test_polecat_worktree_reap.sh
-index 7b72c70..91abb5f 100644
+index 7b72c702..91abb5f9 100644
 --- a/gastown/tests/test_polecat_worktree_reap.sh
 +++ b/gastown/tests/test_polecat_worktree_reap.sh
 @@ -104,7 +104,7 @@ JSON

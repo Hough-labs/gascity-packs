@@ -15,7 +15,7 @@ meaning is unchanged and the fallback query itself was already `gc bd ready`.
  2 files changed, 2 insertions(+), 2 deletions(-)
 
 diff --git a/gastown/agents/polecat/prompt.template.md b/gastown/agents/polecat/prompt.template.md
-index e08ad0d..81cb02a 100644
+index e08ad0d3..81cb02ae 100644
 --- a/gastown/agents/polecat/prompt.template.md
 +++ b/gastown/agents/polecat/prompt.template.md
 @@ -261,7 +261,7 @@ if [ -z "$STEP_REF" ]; then
@@ -28,7 +28,7 @@ index e08ad0d..81cb02a 100644
    NEXT_STEP_ID="$(gc bd list --assignee="$EXPECTED_ASSIGNEE" --status=in_progress \
      --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null |
 diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
-index 8637e05..d8e87f4 100755
+index 8637e055..d8e87f43 100755
 --- a/gastown/tests/test_gastown_pack_assets.sh
 +++ b/gastown/tests/test_gastown_pack_assets.sh
 @@ -784,7 +784,7 @@ PY

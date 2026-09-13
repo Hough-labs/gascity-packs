@@ -18,7 +18,7 @@ stays complete.
  1 file changed, 19 insertions(+), 2 deletions(-)
 
 diff --git a/gauntlet-tdd/README.md b/gauntlet-tdd/README.md
-index 515bdbc..ae254e6 100644
+index 515bdbc4..ae254e69 100644
 --- a/gauntlet-tdd/README.md
 +++ b/gauntlet-tdd/README.md
 @@ -156,6 +156,23 @@ cannot drift onto the hurl lane, and the two open hurl-corpus defects in the

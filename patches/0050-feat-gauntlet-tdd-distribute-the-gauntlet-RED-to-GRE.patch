@@ -88,7 +88,7 @@ pack subtree has to exist in history before it can be pinned.
  create mode 100644 gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py
 
 diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
-index ebc8ff8..bc19095 100644
+index ebc8ff83..bc190951 100644
 --- a/.github/workflows/ci.yml
 +++ b/.github/workflows/ci.yml
 @@ -41,7 +41,7 @@ jobs:
@@ -102,7 +102,7 @@ index ebc8ff8..bc19095 100644
          run: |
 diff --git a/gauntlet-tdd/README.md b/gauntlet-tdd/README.md
 new file mode 100644
-index 0000000..32e0c69
+index 00000000..32e0c694
 --- /dev/null
 +++ b/gauntlet-tdd/README.md
 @@ -0,0 +1,195 @@
@@ -303,7 +303,7 @@ index 0000000..32e0c69
 +to CI until it is added there.
 diff --git a/gauntlet-tdd/commands/tdd/red-green/help.md b/gauntlet-tdd/commands/tdd/red-green/help.md
 new file mode 100644
-index 0000000..b5309d5
+index 00000000..b5309d5b
 --- /dev/null
 +++ b/gauntlet-tdd/commands/tdd/red-green/help.md
 @@ -0,0 +1,60 @@
@@ -369,7 +369,7 @@ index 0000000..b5309d5
 +  GC_RIG            current rig name (when running inside a rig session)
 diff --git a/gauntlet-tdd/commands/tdd/red-green/run.sh b/gauntlet-tdd/commands/tdd/red-green/run.sh
 new file mode 100755
-index 0000000..196c403
+index 00000000..196c403f
 --- /dev/null
 +++ b/gauntlet-tdd/commands/tdd/red-green/run.sh
 @@ -0,0 +1,94 @@
@@ -469,7 +469,7 @@ index 0000000..196c403
 +exec "$@"
 diff --git a/gauntlet-tdd/formulas/mol-tdd-red-green.formula.toml b/gauntlet-tdd/formulas/mol-tdd-red-green.formula.toml
 new file mode 100644
-index 0000000..99922a2
+index 00000000..99922a2d
 --- /dev/null
 +++ b/gauntlet-tdd/formulas/mol-tdd-red-green.formula.toml
 @@ -0,0 +1,361 @@
@@ -836,7 +836,7 @@ index 0000000..99922a2
 +"""
 diff --git a/gauntlet-tdd/pack.toml b/gauntlet-tdd/pack.toml
 new file mode 100644
-index 0000000..d5b5a75
+index 00000000..d5b5a75e
 --- /dev/null
 +++ b/gauntlet-tdd/pack.toml
 @@ -0,0 +1,32 @@
@@ -874,7 +874,7 @@ index 0000000..d5b5a75
 +schema = 2
 diff --git a/gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py b/gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py
 new file mode 100644
-index 0000000..429e70a
+index 00000000..429e70a7
 --- /dev/null
 +++ b/gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py
 @@ -0,0 +1,277 @@

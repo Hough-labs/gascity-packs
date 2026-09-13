@@ -23,7 +23,7 @@ the bare-bd regex does not match).
  1 file changed, 3 insertions(+), 3 deletions(-)
 
 diff --git a/tests/test_prompt_formula_command_drift.py b/tests/test_prompt_formula_command_drift.py
-index 573d341..f0ec319 100644
+index 573d3413..f0ec3197 100644
 --- a/tests/test_prompt_formula_command_drift.py
 +++ b/tests/test_prompt_formula_command_drift.py
 @@ -34,7 +34,7 @@ FENCE_CLOSE = re.compile(r"^\s*```\s*$")

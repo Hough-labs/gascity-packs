@@ -71,7 +71,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
  2 files changed, 184 insertions(+), 10 deletions(-)
 
 diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
-index 31522e3..53a0cbc 100644
+index 31522e38..53a0cbcb 100644
 --- a/gastown/formulas/mol-witness-patrol.toml
 +++ b/gastown/formulas/mol-witness-patrol.toml
 @@ -334,6 +334,37 @@ WORKTREE=$(echo "$META" | jq -r '.worktree // empty')
@@ -179,7 +179,7 @@ index 31522e3..53a0cbc 100644
  **Step 3b: Clean up worktree and return bead to pool.**
  
 diff --git a/tests/test_prompt_formula_command_drift.py b/tests/test_prompt_formula_command_drift.py
-index 8864836..fa61f55 100644
+index 88648364..fa61f557 100644
 --- a/tests/test_prompt_formula_command_drift.py
 +++ b/tests/test_prompt_formula_command_drift.py
 @@ -23,6 +23,7 @@ from __future__ import annotations

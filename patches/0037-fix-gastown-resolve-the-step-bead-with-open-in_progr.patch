@@ -28,7 +28,7 @@ and add contract assertions that fail on the `in_progress`-only form.
  4 files changed, 33 insertions(+), 7 deletions(-)
 
 diff --git a/gastown/agents/polecat/prompt.template.md b/gastown/agents/polecat/prompt.template.md
-index a7a3bb6..8874904 100644
+index a7a3bb62..88749047 100644
 --- a/gastown/agents/polecat/prompt.template.md
 +++ b/gastown/agents/polecat/prompt.template.md
 @@ -398,10 +398,13 @@ handed to somebody else — means submit-and-exit already ran. Otherwise run it:
@@ -48,7 +48,7 @@ index a7a3bb6..8874904 100644
      jq -r '[.[] | .metadata."gc.root_bead_id" // empty] | .[0] // empty' 2>/dev/null)
    if [ -n "$ROOT_BEAD_ID" ]; then
 diff --git a/gastown/formulas/mol-polecat-work.toml b/gastown/formulas/mol-polecat-work.toml
-index 93b26d8..121f199 100644
+index 93b26d81..121f199a 100644
 --- a/gastown/formulas/mol-polecat-work.toml
 +++ b/gastown/formulas/mol-polecat-work.toml
 @@ -322,7 +322,7 @@ Hand off your work and self-clean. You cease to exist after this step.
@@ -93,7 +93,7 @@ index 93b26d8..121f199 100644
        --include-infra --limit=0 --json 2>/dev/null | jq -r '.[0].id // empty')
  fi
 diff --git a/gastown/template-fragments/approval-fallacy.template.md b/gastown/template-fragments/approval-fallacy.template.md
-index ec850bc..a12b458 100644
+index ec850bcf..a12b4582 100644
 --- a/gastown/template-fragments/approval-fallacy.template.md
 +++ b/gastown/template-fragments/approval-fallacy.template.md
 @@ -36,10 +36,13 @@ means submit-and-exit already reassigned it. Otherwise run it:
@@ -113,7 +113,7 @@ index ec850bc..a12b458 100644
      jq -r '[.[] | .metadata."gc.root_bead_id" // empty] | .[0] // empty' 2>/dev/null)
    if [ -n "$ROOT_BEAD_ID" ]; then
 diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
-index 04f4732..c6fe61a 100755
+index 04f47326..c6fe61a8 100755
 --- a/gastown/tests/test_gastown_pack_assets.sh
 +++ b/gastown/tests/test_gastown_pack_assets.sh
 @@ -456,6 +456,15 @@ PY

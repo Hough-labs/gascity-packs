@@ -70,7 +70,7 @@ the two do not overlap textually.
  create mode 100755 gastown/tests/test_refinery_merge_push.sh
 
 diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
-index fb310b8..58e5901 100644
+index fb310b89..58e59019 100644
 --- a/gastown/formulas/mol-refinery-patrol.toml
 +++ b/gastown/formulas/mol-refinery-patrol.toml
 @@ -919,7 +919,8 @@ the live head -> land it with the same ff-only merge script the direct path
@@ -392,7 +392,7 @@ index fb310b8..58e5901 100644
  **5. Cleanup:**
  ```bash
 diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
-index 32d4809..d90eea1 100755
+index 32d48095..d90eea19 100755
 --- a/gastown/tests/test_gastown_pack_assets.sh
 +++ b/gastown/tests/test_gastown_pack_assets.sh
 @@ -193,14 +193,38 @@ print(text[start:end])
@@ -450,7 +450,7 @@ index 32d4809..d90eea1 100755
      raise SystemExit(1)
 diff --git a/gastown/tests/test_refinery_merge_push.sh b/gastown/tests/test_refinery_merge_push.sh
 new file mode 100755
-index 0000000..074a58e
+index 00000000..074a58eb
 --- /dev/null
 +++ b/gastown/tests/test_refinery_merge_push.sh
 @@ -0,0 +1,376 @@
@@ -831,7 +831,7 @@ index 0000000..074a58e
 +fi
 +echo "refinery merge-push tests passed"
 diff --git a/scripts/gascity_pack_inference_gate.py b/scripts/gascity_pack_inference_gate.py
-index 1cf3e2a..c072189 100644
+index 1cf3e2aa..c0721894 100644
 --- a/scripts/gascity_pack_inference_gate.py
 +++ b/scripts/gascity_pack_inference_gate.py
 @@ -124,8 +124,13 @@ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
@@ -851,7 +851,7 @@ index 1cf3e2a..c072189 100644
          '--set-metadata merged_sha="$MERGED_SHA"',
          'gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT"',
 diff --git a/tests/test_gascity_pack_inference_gate.py b/tests/test_gascity_pack_inference_gate.py
-index 48f7ec2..6ed5cc6 100644
+index 48f7ec2c..6ed5cc67 100644
 --- a/tests/test_gascity_pack_inference_gate.py
 +++ b/tests/test_gascity_pack_inference_gate.py
 @@ -1137,7 +1137,8 @@ def test_gastown_build_workflow_contract_covers_orchestration_roles() -> None:

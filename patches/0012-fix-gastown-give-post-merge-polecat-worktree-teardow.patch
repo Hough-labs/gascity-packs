@@ -69,7 +69,7 @@ to the happy path.
  create mode 100644 gastown/tests/test_polecat_worktree_reap.sh
 
 diff --git a/gastown/agents/witness/agent.toml b/gastown/agents/witness/agent.toml
-index 424fbae..ca75206 100644
+index 424fbae2..ca752065 100644
 --- a/gastown/agents/witness/agent.toml
 +++ b/gastown/agents/witness/agent.toml
 @@ -1,6 +1,15 @@
@@ -89,7 +89,7 @@ index 424fbae..ca75206 100644
  idle_timeout = "1h"
  # Preemptively cycle the witness before the typical provider cred-cache
 diff --git a/gastown/agents/witness/prompt.template.md b/gastown/agents/witness/prompt.template.md
-index 5a085e7..a80d86e 100644
+index 5a085e70..a80d86e7 100644
 --- a/gastown/agents/witness/prompt.template.md
 +++ b/gastown/agents/witness/prompt.template.md
 @@ -16,6 +16,7 @@
@@ -140,7 +140,7 @@ index 5a085e7..a80d86e 100644
  
 diff --git a/gastown/assets/scripts/polecat-worktree-reap.sh b/gastown/assets/scripts/polecat-worktree-reap.sh
 new file mode 100755
-index 0000000..5900cbf
+index 00000000..5900cbf1
 --- /dev/null
 +++ b/gastown/assets/scripts/polecat-worktree-reap.sh
 @@ -0,0 +1,248 @@
@@ -393,7 +393,7 @@ index 0000000..5900cbf
 +
 +echo "polecat-worktree-reap: reaped=$REAPED skipped=$SKIPPED (log: $LOG_FILE)"
 diff --git a/gastown/formulas/mol-polecat-work.toml b/gastown/formulas/mol-polecat-work.toml
-index 411b476..189a1ab 100644
+index 411b476a..189a1ab6 100644
 --- a/gastown/formulas/mol-polecat-work.toml
 +++ b/gastown/formulas/mol-polecat-work.toml
 @@ -115,6 +115,12 @@ Worktrees are scoped to the work bead (not the agent name) so that:
@@ -410,7 +410,7 @@ index 411b476..189a1ab 100644
  
  Check if `metadata.branch` already records a branch:
 diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
-index ba999c9..d3af93a 100644
+index ba999c9e..d3af93a3 100644
 --- a/gastown/formulas/mol-witness-patrol.toml
 +++ b/gastown/formulas/mol-witness-patrol.toml
 @@ -25,9 +25,12 @@ monitors the WORK layer:
@@ -547,7 +547,7 @@ index ba999c9..d3af93a 100644
  Ensure the refinery is processing work and the queue is healthy.
  
 diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
-index 56e1205..58089e8 100755
+index 56e1205d..58089e86 100755
 --- a/gastown/tests/test_gastown_pack_assets.sh
 +++ b/gastown/tests/test_gastown_pack_assets.sh
 @@ -1,4 +1,7 @@
@@ -616,7 +616,7 @@ index 56e1205..58089e8 100755
  test_composition_is_documented
 diff --git a/gastown/tests/test_polecat_worktree_reap.sh b/gastown/tests/test_polecat_worktree_reap.sh
 new file mode 100644
-index 0000000..86b871c
+index 00000000..86b871c9
 --- /dev/null
 +++ b/gastown/tests/test_polecat_worktree_reap.sh
 @@ -0,0 +1,197 @@

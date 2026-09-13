@@ -66,7 +66,7 @@ test scripts, and timeouts in the gascity claim tests) and are filed separately.
  4 files changed, 286 insertions(+), 35 deletions(-)
 
 diff --git a/gastown/agents/polecat/prompt.template.md b/gastown/agents/polecat/prompt.template.md
-index 5bf6c00..a7a3bb6 100644
+index 5bf6c001..a7a3bb62 100644
 --- a/gastown/agents/polecat/prompt.template.md
 +++ b/gastown/agents/polecat/prompt.template.md
 @@ -390,16 +390,29 @@ refinery wake is a bug). Do not trust memory for this — check mechanically.
@@ -134,7 +134,7 @@ index 5bf6c00..a7a3bb6 100644
  # in_progress bead with an unpushed branch is the worse outcome.
  ```
 diff --git a/gastown/formulas/mol-polecat-work.toml b/gastown/formulas/mol-polecat-work.toml
-index bcd709a..38f23b2 100644
+index bcd709a2..38f23b2a 100644
 --- a/gastown/formulas/mol-polecat-work.toml
 +++ b/gastown/formulas/mol-polecat-work.toml
 @@ -17,9 +17,12 @@ merge review.
@@ -360,7 +360,7 @@ index bcd709a..38f23b2 100644
 -**Exit criteria:** Branch pushed, metadata set, bead reassigned, refinery signaled, drain acknowledged, session exited."""
 +**Exit criteria:** Branch pushed, metadata set, bead reassigned, refinery signaled, this step's bead closed, drain acknowledged, session exited."""
 diff --git a/gastown/template-fragments/approval-fallacy.template.md b/gastown/template-fragments/approval-fallacy.template.md
-index 1832190..ec850bc 100644
+index 1832190e..ec850bcf 100644
 --- a/gastown/template-fragments/approval-fallacy.template.md
 +++ b/gastown/template-fragments/approval-fallacy.template.md
 @@ -27,17 +27,30 @@ reassignment, wake/nudge, and drain. **Run that step.**
@@ -430,7 +430,7 @@ index 1832190..ec850bc 100644
  # in_progress bead with an unpushed branch is the worse outcome.
  ```
 diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
-index 97201db..24d1426 100755
+index 97201dbe..24d14261 100755
 --- a/gastown/tests/test_gastown_pack_assets.sh
 +++ b/gastown/tests/test_gastown_pack_assets.sh
 @@ -425,8 +425,124 @@ test_dolt_push_outage_detection_is_wired() {

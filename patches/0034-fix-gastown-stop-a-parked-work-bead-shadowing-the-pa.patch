@@ -67,7 +67,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
  4 files changed, 197 insertions(+), 19 deletions(-)
 
 diff --git a/gastown/agents/deacon/prompt.template.md b/gastown/agents/deacon/prompt.template.md
-index d2622cc..41f24d7 100644
+index d2622cc4..41f24d76 100644
 --- a/gastown/agents/deacon/prompt.template.md
 +++ b/gastown/agents/deacon/prompt.template.md
 @@ -54,18 +54,27 @@ Your formula: `mol-deacon-patrol`
@@ -111,7 +111,7 @@ index d2622cc..41f24d7 100644
  # Step 4: Read the formula recipe — these are the steps to execute
  # (Use 'gc bd formula show' for the recipe on disk; 'gc bd mol show' is
 diff --git a/gastown/agents/refinery/prompt.template.md b/gastown/agents/refinery/prompt.template.md
-index c98e639..08131e9 100644
+index c98e639f..08131e99 100644
 --- a/gastown/agents/refinery/prompt.template.md
 +++ b/gastown/agents/refinery/prompt.template.md
 @@ -150,15 +150,25 @@ for ORPHAN in $ORPHANS; do
@@ -145,7 +145,7 @@ index c98e639..08131e9 100644
  
  Then follow the formula. The step descriptions below are your instructions —
 diff --git a/gastown/template-fragments/propulsion.template.md b/gastown/template-fragments/propulsion.template.md
-index 439a356..a60c8aa 100644
+index 439a3563..a60c8aab 100644
 --- a/gastown/template-fragments/propulsion.template.md
 +++ b/gastown/template-fragments/propulsion.template.md
 @@ -94,7 +94,7 @@ filed. The refinery can't merge branches you haven't pushed.
@@ -176,7 +176,7 @@ index 439a356..a60c8aa 100644
  3. If none → Pour a new wisp and assign it to yourself
  
 diff --git a/tests/test_wisp_molecule_queries.py b/tests/test_wisp_molecule_queries.py
-index d317d44..77d3ad9 100644
+index d317d44f..77d3ad9c 100644
 --- a/tests/test_wisp_molecule_queries.py
 +++ b/tests/test_wisp_molecule_queries.py
 @@ -21,6 +21,18 @@ executed lands in its own surplus set, and the loop stops advancing — again wi

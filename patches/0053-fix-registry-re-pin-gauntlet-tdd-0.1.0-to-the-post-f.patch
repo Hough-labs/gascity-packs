@@ -24,7 +24,7 @@ Re-pinned to 420f8da with the hash recomputed by validate_registry.py's own
  1 file changed, 2 insertions(+), 2 deletions(-)
 
 diff --git a/registry.toml b/registry.toml
-index 255dfc7..e715e73 100644
+index 255dfc7b..e715e735 100644
 --- a/registry.toml
 +++ b/registry.toml
 @@ -323,6 +323,6 @@ schema = 1

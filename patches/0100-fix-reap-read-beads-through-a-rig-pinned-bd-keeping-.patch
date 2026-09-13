@@ -73,7 +73,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
  5 files changed, 592 insertions(+), 13 deletions(-)
 
 diff --git a/docs/design/reaper-budget-starvation.md b/docs/design/reaper-budget-starvation.md
-index 581c592..ab06b64 100644
+index 581c592b..ab06b64e 100644
 --- a/docs/design/reaper-budget-starvation.md
 +++ b/docs/design/reaper-budget-starvation.md
 @@ -278,3 +278,87 @@ remaining budget, and assert the cursor still advances.
@@ -165,7 +165,7 @@ index 581c592..ab06b64 100644
 +advance least exactly when the budget is tightest. Bead C (`gcp-7fgg`) is
 +untouched — still zero occurrences of `cursor` in `mol-witness-patrol.toml`.
 diff --git a/gastown/assets/scripts/polecat-worktree-reap.sh b/gastown/assets/scripts/polecat-worktree-reap.sh
-index 18febd5..490cb0c 100755
+index 18febd5a..490cb0c2 100755
 --- a/gastown/assets/scripts/polecat-worktree-reap.sh
 +++ b/gastown/assets/scripts/polecat-worktree-reap.sh
 @@ -210,6 +210,13 @@
@@ -358,7 +358,7 @@ index 18febd5..490cb0c 100755
              RECHECK_REASON="budget_spent_before_recheck_bead_read"
              return
 diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
-index d1bdc3f..140c81a 100644
+index d1bdc3fd..140c81ae 100644
 --- a/gastown/formulas/mol-witness-patrol.toml
 +++ b/gastown/formulas/mol-witness-patrol.toml
 @@ -726,7 +726,7 @@ jq -r 'select(.reason != "") | [.ts, .event, .reason, .budget_remaining, .bead]
@@ -371,7 +371,7 @@ index d1bdc3f..140c81a 100644
  
  A `worktree_dirty_kept` that repeats across cycles means real work is
 diff --git a/gastown/tests/test_polecat_worktree_reap.sh b/gastown/tests/test_polecat_worktree_reap.sh
-index d2e18e8..cf3ada9 100644
+index d2e18e83..cf3ada9c 100644
 --- a/gastown/tests/test_polecat_worktree_reap.sh
 +++ b/gastown/tests/test_polecat_worktree_reap.sh
 @@ -269,6 +269,71 @@ add_bead_worktree() {
@@ -681,7 +681,7 @@ index d2e18e8..cf3ada9 100644
  test_dry_run_removes_nothing_and_rerun_is_idempotent
  test_bead_status_is_read_in_one_bulk_query
 diff --git a/tests/test_no_bare_bd_commands.py b/tests/test_no_bare_bd_commands.py
-index 4e60fce..c3dece9 100644
+index 4e60fce2..c3dece96 100644
 --- a/tests/test_no_bare_bd_commands.py
 +++ b/tests/test_no_bare_bd_commands.py
 @@ -196,6 +196,40 @@ GC_BD_ARGV_TAIL_ALLOWLIST: dict[Path, set[str]] = {

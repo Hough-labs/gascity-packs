@@ -82,7 +82,7 @@ reproduce unchanged at the fork point ef98960 and are untouched here.
  create mode 100755 gastown/tests/test_polecat_home_audit.sh
 
 diff --git a/gastown/agents/witness/prompt.template.md b/gastown/agents/witness/prompt.template.md
-index 3a61292..e4bca78 100644
+index 3a612924..e4bca787 100644
 --- a/gastown/agents/witness/prompt.template.md
 +++ b/gastown/agents/witness/prompt.template.md
 @@ -17,6 +17,8 @@
@@ -96,7 +96,7 @@ index 3a61292..e4bca78 100644
  - Triage help requests from polecats
 diff --git a/gastown/assets/scripts/polecat-home-audit.sh b/gastown/assets/scripts/polecat-home-audit.sh
 new file mode 100755
-index 0000000..3af363d
+index 00000000..3af363de
 --- /dev/null
 +++ b/gastown/assets/scripts/polecat-home-audit.sh
 @@ -0,0 +1,639 @@
@@ -740,7 +740,7 @@ index 0000000..3af363d
 +    echo "polecat-home-audit: removed=$REMOVED skipped=$SKIPPED of $TOTAL (log: $LOG_FILE)$BUDGET_NOTE"
 +fi
 diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
-index 728752f..3909595 100644
+index 728752fc..39095953 100644
 --- a/gastown/formulas/mol-witness-patrol.toml
 +++ b/gastown/formulas/mol-witness-patrol.toml
 @@ -28,9 +28,12 @@ monitors the WORK layer:
@@ -894,7 +894,7 @@ index 728752f..3909595 100644
  Ensure the refinery is processing work and the queue is healthy.
  
 diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
-index c6fe61a..a5ef5b0 100755
+index c6fe61a8..a5ef5b0a 100755
 --- a/gastown/tests/test_gastown_pack_assets.sh
 +++ b/gastown/tests/test_gastown_pack_assets.sh
 @@ -366,6 +366,108 @@ PY
@@ -1016,7 +1016,7 @@ index c6fe61a..a5ef5b0 100755
  test_shutdown_dance_lifecycle_and_audit_contracts
 diff --git a/gastown/tests/test_polecat_home_audit.sh b/gastown/tests/test_polecat_home_audit.sh
 new file mode 100755
-index 0000000..91789b4
+index 00000000..91789b4e
 --- /dev/null
 +++ b/gastown/tests/test_polecat_home_audit.sh
 @@ -0,0 +1,656 @@

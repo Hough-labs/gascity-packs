@@ -18,7 +18,7 @@ where the value comes from. No behavior change; the block now runs as written.
  1 file changed, 2 insertions(+), 1 deletion(-)
 
 diff --git a/gascity/assets/workflows/github-pr-review/run-review.md b/gascity/assets/workflows/github-pr-review/run-review.md
-index 65f65d3..85fa26b 100644
+index 65f65d3a..85fa26be 100644
 --- a/gascity/assets/workflows/github-pr-review/run-review.md
 +++ b/gascity/assets/workflows/github-pr-review/run-review.md
 @@ -40,6 +40,7 @@ without it. If workflow root metadata already carries

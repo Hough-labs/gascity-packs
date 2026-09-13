@@ -25,7 +25,7 @@ Two residual defects in the parked-bead path:
  1 file changed, 7 insertions(+), 2 deletions(-)
 
 diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
-index 82f784c..18a0b17 100644
+index 82f784c4..18a0b17b 100644
 --- a/gastown/formulas/mol-refinery-patrol.toml
 +++ b/gastown/formulas/mol-refinery-patrol.toml
 @@ -499,9 +499,14 @@ park_awaiting_review() {

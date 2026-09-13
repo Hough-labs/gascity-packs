@@ -27,7 +27,7 @@ previous commit's formula and green after.
  2 files changed, 41 insertions(+)
 
 diff --git a/gastown/formulas/mol-polecat-work.toml b/gastown/formulas/mol-polecat-work.toml
-index 38f23b2..93b26d8 100644
+index 38f23b2a..93b26d81 100644
 --- a/gastown/formulas/mol-polecat-work.toml
 +++ b/gastown/formulas/mol-polecat-work.toml
 @@ -340,6 +340,10 @@ substitute `$GC_BEAD_ID` here — for a polecat that is the convoy the molecule
@@ -74,7 +74,7 @@ index 38f23b2..93b26d8 100644
      gc bd close "$STEP_BEAD_ID" --reason "submit-and-exit: branch pushed, work bead handed to the refinery"
  else
 diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
-index 24d1426..04f4732 100755
+index 24d14261..04f47326 100755
 --- a/gastown/tests/test_gastown_pack_assets.sh
 +++ b/gastown/tests/test_gastown_pack_assets.sh
 @@ -456,6 +456,25 @@ PY
