@@ -169,6 +169,33 @@
 #   re-reads are ONE bulk pair for the whole cycle, taken lazily at the first
 #   removal and reused by the rest.
 #
+#   EVERY gate is renewed, including the two that used to be carried over on the
+#   grounds that they could not have moved (gcp-jxtc):
+#     - GATE 1, the path. The removal is ADDRESSED by that path, so it is the
+#       gate the others are all about — a `git status` verdict is about whatever
+#       is at the path now, not about what was enumerated. A witness salvage, an
+#       operator, or another housekeeping pass can move or replace a directory
+#       mid-cycle, and a symlink left in its place would have the delete follow
+#       itself straight out of the tree every gate was evaluated against. It is
+#       also the cheapest check in the script, so nothing was bought by trusting
+#       it.
+#     - GATE 5, publication, on the no-such-bead route. That route has no bead
+#       closure to authorise the reap and no owner to confirm absent: "the
+#       commits exist somewhere other than this directory" is the whole of its
+#       safety case, which makes it the last evidence that should be allowed to
+#       age. A branch can be deleted from the remote inside a cycle.
+#
+# THE RESERVE — a destructive step does not start on a spent clock (gcp-jxtc):
+#   The removal below is kill-safe, not kill-free: an interruption leaves a
+#   `.reaping` directory for the next cycle to finish and a line for the witness
+#   to read. Starting one with no budget left is choosing that outcome for
+#   nothing, since the reap is idempotent and the worktree is still a candidate
+#   next cycle with a fresh budget. So `--removal-reserve` seconds (default 2)
+#   must REMAIN before the rename is entered; short of that the candidate is
+#   recorded `worktree_reap_failed` / `reap_budget_insufficient` — authorised,
+#   not performed, nothing renamed and nothing removed — and held inside the
+#   next cycle's window rather than rotated past.
+#
 # COST MODEL — why this script is shaped the way it is (gcp-ntbf):
 #   It runs as the witness pre_start, which gascity bounds by [session]
 #   setup_timeout (10s by default) and SIGKILLs on overrun. A killed pre_start
@@ -244,6 +271,12 @@
 #                      wall-clock budget for the whole run (default 8s). Must
 #                      stay well inside the caller's [session] setup_timeout;
 #                      raise it only alongside a matching setup_timeout bump.
+#   --removal-reserve <secs> | GC_REAP_REMOVAL_RESERVE_SECONDS
+#                      seconds of budget that must REMAIN before a destructive
+#                      step is allowed to start (default 2s). A removal that
+#                      begins on a spent clock is the one the caller's SIGKILL
+#                      lands inside; refusing to start is free, because the
+#                      worktree stays a candidate for the next cycle.
 #
 # Usage:
 #   GC_RIG=helm polecat-worktree-reap.sh                    # dry run
@@ -258,6 +291,13 @@ RIG_ROOT=""
 RIG_NAME="${GC_RIG:-}"
 # Well inside gascity's 10s default [session] setup_timeout — see COST MODEL.
 BUDGET_SECONDS="${GC_REAP_BUDGET_SECONDS:-8}"
+# Budget that must still be UNSPENT for a destructive step to be entered at all.
+# The removal itself is rename-first and therefore kill-safe (see THE
+# INTERRUPTED REMOVAL), but kill-safe is not the same as free: an interrupted
+# removal still costs the next cycle a `.reaping` directory to finish and the
+# witness a line to read. Starting one with no clock left buys nothing, so the
+# reserve turns "we ran out of time mid-removal" into "we never started".
+REMOVAL_RESERVE_SECONDS="${GC_REAP_REMOVAL_RESERVE_SECONDS:-2}"
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -273,6 +313,11 @@ while [ "$#" -gt 0 ]; do
             [ "$#" -gt 0 ] || { echo "polecat-worktree-reap: --budget needs a value" >&2; exit 2; }
             BUDGET_SECONDS="$1"
             ;;
+        --removal-reserve)
+            shift
+            [ "$#" -gt 0 ] || { echo "polecat-worktree-reap: --removal-reserve needs a value" >&2; exit 2; }
+            REMOVAL_RESERVE_SECONDS="$1"
+            ;;
         -*) echo "polecat-worktree-reap: unknown flag $1" >&2; exit 2 ;;
         *) RIG_ROOT="$1" ;;
     esac
@@ -282,6 +327,15 @@ done
 case "$BUDGET_SECONDS" in
     '' | *[!0-9]* | 0)
         echo "polecat-worktree-reap: budget must be a positive whole number of seconds" >&2
+        exit 2
+        ;;
+esac
+
+# Zero is allowed here and means "no reserve" — an operator who wants the old
+# behaviour back should be able to say so without editing the script.
+case "$REMOVAL_RESERVE_SECONDS" in
+    '' | *[!0-9]*)
+        echo "polecat-worktree-reap: --removal-reserve must be a whole number of seconds" >&2
         exit 2
         ;;
 esac
@@ -1027,6 +1081,69 @@ ensure_rig_git_dir() {
     fi
 }
 
+# recheck_publication <worktree> — re-run gate 5's content test at the POINT OF
+# USE. Prints `yes`, `no`, or `unconfirmed:<reason>`.
+#
+# Gate 5 is the ENTIRE safety burden on the no-such-bead route: there is no bead
+# closure to authorise that removal and no owner to confirm absent, so "the
+# commits exist somewhere other than this directory" is the only thing standing
+# between the reap and lost work. It was established by the probe above and then
+# never renewed — the route returned 0 out of the re-validation on evidence
+# taken moments earlier, which is exactly the stale authorisation the rest of
+# this function exists to refuse. A branch can be deleted from the remote, and a
+# fetch can move the remote-tracking refs, inside the seconds a cycle lasts.
+#
+# Deliberately narrower than the gate-5 block it mirrors: that one has to tell
+# `worktree_unpublished_kept` from `worktree_publication_unconfirmed` from a
+# budget truncation, because it is DECIDING. This one is only re-confirming, and
+# anything short of a renewed `yes` is a refusal, so the three unknowns collapse
+# into one token the caller records verbatim.
+recheck_publication() {
+    local wt=$1 limit rc head contains
+    limit=$(budget_left)
+    rc=0
+    head=$(run_bounded "$limit" git -C "$wt" rev-parse HEAD 2>/dev/null) || rc=$?
+    case "$(classify_outcome "$limit" "$rc")" in
+        ok)
+            if [ -z "$head" ]; then
+                printf 'unconfirmed:recheck_publication_probe_failed\n'
+                return
+            fi
+            ;;
+        skipped)
+            printf 'unconfirmed:budget_spent_before_recheck_publication_probe\n'
+            return
+            ;;
+        timeout)
+            printf 'unconfirmed:recheck_publication_probe_timed_out\n'
+            return
+            ;;
+        *)
+            printf 'unconfirmed:recheck_publication_probe_failed\n'
+            return
+            ;;
+    esac
+    limit=$(budget_left)
+    rc=0
+    contains=$(run_bounded "$limit" \
+        git -C "$RIG_ROOT" branch --remotes --contains "$head" 2>/dev/null) || rc=$?
+    case "$(classify_outcome "$limit" "$rc")" in
+        ok)
+            # A killed command can still have written a partial list, so only an
+            # `ok` capture is read as an answer at all — same discipline as the
+            # deciding probe.
+            if [ -n "$contains" ]; then
+                printf 'yes\n'
+            else
+                printf 'no\n'
+            fi
+            ;;
+        skipped) printf 'unconfirmed:budget_spent_before_recheck_publication_check\n' ;;
+        timeout) printf 'unconfirmed:recheck_publication_probe_timed_out\n' ;;
+        *) printf 'unconfirmed:recheck_publication_probe_failed\n' ;;
+    esac
+}
+
 # revalidate_gates <bead> <worktree> <administrable> <no-such-bead>
 #
 # Re-check, immediately before the destructive call, the gates that can have
@@ -1042,7 +1159,36 @@ ensure_rig_git_dir() {
 # for the caller to skip on.
 revalidate_gates() {
     local bead=$1 wt=$2 administrable=$3 no_bead=$4
-    local limit rc dirty status owner
+    local limit rc dirty status owner leaf published
+
+    # Gate 1, AT THE POINT OF USE. It is checked first because it is the gate
+    # every other one is about: the later checks all ask questions about "this
+    # worktree", and none of them is meaningful if the path is no longer the
+    # thing gate 1 admitted. It is also the only gate that costs nothing —
+    # parameter expansion and two stat(2)s, no fork, no store, no clock worth
+    # measuring — so there is no budget argument for taking it on trust.
+    #
+    # Stale authorisation is not authorisation, and a path is authorisation
+    # here: the whole removal is addressed by it. What can change underneath a
+    # run: the directory can be moved or removed by a witness salvage, an
+    # operator, or another housekeeping pass, and what is left at the path can
+    # be a symlink rather than the worktree that was enumerated. `mv` would then
+    # rename a link and the delete would follow it out of the tree the gates
+    # were evaluated against. Refuse instead — the candidate costs nothing to
+    # re-examine next cycle.
+    leaf=${wt##*/}
+    if ! per_bead_shape "$wt" ||
+        ! bead_leaf_ok "${leaf%.reaping}" ||
+        [ "${leaf%.reaping}" != "$bead" ] ||
+        [ "$wt" = "$MAIN_WT" ] ||
+        [ "$wt" = "$RIG_ROOT" ] ||
+        [ -L "$wt" ] ||
+        [ ! -d "$wt" ]; then
+        record worktree_shape_unconfirmed "$bead" "$wt" \
+            "the path no longer re-confirms as bead $bead's own per-bead worktree directory under this rig's worktree root immediately before the removal; the removal is addressed by that path, so it is not entered" \
+            shape_changed_at_point_of_use
+        return 1
+    fi
 
     if [ "$administrable" -eq 1 ]; then
         limit=$(budget_left)
@@ -1062,11 +1208,28 @@ revalidate_gates() {
         fi
     fi
 
-    # The no-such-bead path has no bead to re-read and no owner to confirm — its
-    # gates are 3 above and 5, and gate 5's evidence was taken from this same
-    # worktree moments ago.
+    # The no-such-bead path has no bead to re-read and no owner to confirm: its
+    # gates are 1 and 3 above, and 5. So gate 5 is renewed here rather than
+    # carried over from the probe that decided it — on this route it is the only
+    # thing standing between the reap and unrecoverable work, which makes it the
+    # LAST gate that should be allowed to run on aged evidence.
     if [ "$no_bead" -eq 1 ]; then
-        return 0
+        published=$(recheck_publication "$wt")
+        case "$published" in
+            yes) return 0 ;;
+            no)
+                record worktree_unpublished_kept "$bead" "$wt" \
+                    "HEAD was published when this cycle checked gate 5 and is on no remote-tracking branch when re-checked immediately before the removal; no bead authorises this reap, so the commits here may exist nowhere else and it is kept for the witness to salvage" \
+                    unpublished_at_point_of_use
+                return 1
+                ;;
+            *)
+                record worktree_publication_unconfirmed "$bead" "$wt" \
+                    "the publication probe could not be renewed immediately before the removal (${published#unconfirmed:}); no bead authorises this reap and a probe that did not answer is not proof the commits exist elsewhere, so the worktree is kept and re-checked next cycle" \
+                    "${published#unconfirmed:}"
+                return 1
+                ;;
+        esac
     fi
 
     refresh_removal_snapshot
@@ -1465,6 +1628,32 @@ while IFS=$'\037' read -r STATUS OWNER KIND WT; do
 
     # ── Re-validate at the POINT OF USE, then remove (gcp-mves) ──────────────
     if ! revalidate_gates "$BEAD" "$WT" "$ADMINISTRABLE" "$NO_SUCH_BEAD"; then
+        SKIPPED=$((SKIPPED + 1))
+        continue
+    fi
+
+    # ── A destructive step does not START on a spent clock (gcp-jxtc) ────────
+    # The sequence below is kill-safe, not kill-free: an interruption leaves a
+    # `.reaping` directory that the next cycle has to finish and the witness has
+    # to read. Entering one with no budget left is choosing that outcome, and it
+    # buys nothing — the removal is idempotent and the worktree is still a
+    # candidate next cycle, with a fresh budget, from the top.
+    #
+    # Checked HERE rather than folded into revalidate_gates because it is not a
+    # question about the worktree at all: every gate above can be re-confirmed
+    # and this can still refuse. The refusal is a `worktree_reap_failed` — a
+    # reap that was authorised and did not happen is exactly what that event
+    # reports, and reporting it as a gate failure would point the witness at a
+    # worktree that has nothing wrong with it.
+    if [ "$(budget_left)" -lt "$REMOVAL_RESERVE_SECONDS" ]; then
+        # The clock cut this decision short, so it must stay inside the next
+        # cycle's window rather than be rotated past — same as every other
+        # truncation. The candidate was never actually disposed of.
+        TRUNCATED=1
+        DECIDED_LAST="$DECIDED_PREV"
+        record worktree_reap_failed "$BEAD" "$WT" \
+            "$(budget_left)s of the ${BUDGET_SECONDS}s budget remained and a removal needs ${REMOVAL_RESERVE_SECONDS}s in reserve to start; nothing was renamed and nothing was removed, at candidate $EXAMINED of $TOTAL" \
+            reap_budget_insufficient
         SKIPPED=$((SKIPPED + 1))
         continue
     fi

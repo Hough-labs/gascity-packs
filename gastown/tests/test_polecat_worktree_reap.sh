@@ -37,6 +37,14 @@ write_gc_stub() {
 #   GC_BD_FUZZY      an id bd answers with a DIFFERENT row for (a fuzzy hit):
 #                    no exact echo AND no not-found line, so the reaper can see
 #                    neither a bead nor a verdict. Transient.
+#   GC_BD_REOPEN_AFTER an id that reads `closed` on the FIRST `gc bd show` and
+#                    `open` on every one after it. The reaper reads bead status
+#                    twice — once in the bulk read at the top of the cycle and
+#                    once in the re-check immediately before a removal — so this
+#                    is a bead reopening inside the seconds a cycle lasts, which
+#                    is the window the point-of-use re-validation exists for.
+#                    Needs GC_BD_CALLS set: the call count is what tells the two
+#                    reads apart.
 #   GC_SESSION_DELAY seconds to stall a roster read (budget tests)
 case "$1" in
     session)
@@ -78,6 +86,14 @@ case "$1" in
                     echo "Error fetching $a: no issue found matching \"$a\"" >&2
                 fi
             done
+            if [ -n "${GC_BD_REOPEN_AFTER:-}" ] && [ -n "${GC_BD_CALLS:-}" ] &&
+                [ "$(wc -c <"$GC_BD_CALLS" | tr -d ' ')" -gt 1 ]; then
+                # Second read onward: the bead is open again. The status the
+                # reaper acted on is now stale, and nothing but a re-read can
+                # tell it so.
+                rows=$(printf '%s' "$rows" |
+                    jq -c --arg id "$GC_BD_REOPEN_AFTER" 'map(if .id == $id then .status = "open" else . end)')
+            fi
             if [ "$(printf '%s' "$rows" | jq -r 'length')" = "0" ]; then
                 printf '{"error":"no issues found matching the provided IDs","schema_version":1}'
                 exit 1
@@ -124,6 +140,20 @@ write_git_stub() {
     #                    tree and the next sees a dirty one, which is the only
     #                    way to drive a gate going stale between its check and
     #                    the removal it authorised.
+    #   GIT_RELOCATE_AFTER_STATUS a worktree path to rename aside immediately
+    #                    AFTER a `git ... status` answers. Gate 1 admitted a
+    #                    path and every later gate is a question about whatever
+    #                    is at it; this makes the directory stop being that
+    #                    thing between the two, which is the only way to drive
+    #                    the path gate going stale from outside the script.
+    #   GIT_CONTAINS_COUNT_FILE one byte appended per `git ... branch --remotes
+    #                    --contains`.
+    #   GIT_LATER_CONTAINS_FAIL non-empty: that branch read exits 129 on every
+    #                    call AFTER the first. Gate 5 is probed once when the
+    #                    no-such-bead route decides and again when the removal
+    #                    re-validates, so this is the publication evidence
+    #                    failing to renew at the point of use. Needs
+    #                    GIT_CONTAINS_COUNT_FILE.
     #
     # The gate-5 hooks exist for the same reason the gate-3 ones do: the
     # difference between "the probe ran and found nothing" and "the probe never
@@ -180,6 +210,12 @@ case " \$* " in
             echo scratch >"\$GIT_DIRTY_AFTER_STATUS/went-dirty.txt"
             exit "\$rc"
         fi
+        if [ -n "\${GIT_RELOCATE_AFTER_STATUS:-}" ]; then
+            out=\$("$real" "\$@"); rc=\$?
+            printf '%s' "\$out"
+            mv "\$GIT_RELOCATE_AFTER_STATUS" "\$GIT_RELOCATE_AFTER_STATUS.moved-aside" 2>/dev/null || true
+            exit "\$rc"
+        fi
         ;;
     *" rev-parse HEAD "*)
         if [ -n "\${GIT_REVPARSE_DELAY:-}" ]; then sleep "\$GIT_REVPARSE_DELAY"; fi
@@ -189,8 +225,14 @@ case " \$* " in
         fi
         ;;
     *" --remotes --contains "*)
+        if [ -n "\${GIT_CONTAINS_COUNT_FILE:-}" ]; then printf 'x' >>"\$GIT_CONTAINS_COUNT_FILE"; fi
         if [ -n "\${GIT_CONTAINS_DELAY:-}" ]; then sleep "\$GIT_CONTAINS_DELAY"; fi
         if [ -n "\${GIT_CONTAINS_FAIL:-}" ]; then
+            echo "fatal: simulated remote-contains failure" >&2
+            exit 129
+        fi
+        if [ -n "\${GIT_LATER_CONTAINS_FAIL:-}" ] && [ -n "\${GIT_CONTAINS_COUNT_FILE:-}" ] &&
+            [ "\$(wc -c <"\$GIT_CONTAINS_COUNT_FILE" | tr -d ' ')" -gt 1 ]; then
             echo "fatal: simulated remote-contains failure" >&2
             exit 129
         fi
@@ -1839,6 +1881,190 @@ test_gates_are_rechecked_at_the_point_of_use() {
     rm -rf "$tmp"
 }
 
+test_a_bead_reopened_between_classification_and_removal_is_refused() {
+    # The bead's named acceptance case. Gate 2 is the closure that AUTHORISES a
+    # reap, and it is read once, in the bulk query at the top of the cycle. A
+    # rig is live while that ages: the refinery can reject a merge and a mayor
+    # can re-sling the bead inside the seconds a cycle lasts, at which point a
+    # polecat is building in the very directory this run is about to delete.
+    #
+    # GC_BD_REOPEN_AFTER serves `closed` to the classification read and `open`
+    # to the re-check read, which is exactly that window and nothing else.
+    local tmp rig bin home log wt
+    tmp=$(mktemp -d)
+    rig="$tmp/rig"
+    bin="$tmp/bin"
+    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
+    log="$tmp/logs/polecat-worktree-reap.log"
+    wt="$home/worktrees/wt-closed"
+
+    reapable_one_worktree_fixture "$tmp"
+
+    GC_RIG=rig LOG_DIR="$tmp/logs" GC_BEADS_JSON="$tmp/beads.json" \
+        GC_SESSIONS_JSON="$tmp/sessions.json" GC_BD_CALLS="$tmp/bdcalls" \
+        GC_BD_REOPEN_AFTER=wt-closed PATH="$bin:$PATH" \
+        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out.txt" 2>&1 ||
+        fail "reaper exited non-zero: $(cat "$tmp/out.txt")"
+
+    [[ "$(wc -c <"$tmp/bdcalls" | tr -d ' ')" -ge 2 ]] ||
+        fail "the bead status was read only once, so the reopen never reached a re-check and nothing was under test"
+    [[ -d "$wt" ]] ||
+        fail "a worktree whose bead reopened between classification and removal was deleted"
+    [[ "$(jq -r 'select(.bead == "wt-closed") | .event' "$log" | tail -n 1)" == "worktree_bead_reopened" ]] ||
+        fail "the reopened bead was not recorded as the reason the removal was refused"
+    [[ "$(reason_for "$log" worktree_bead_reopened)" == "bead_changed_at_point_of_use" ]] ||
+        fail "the refusal does not name the point of use"
+    ! grep -F '"event":"worktree_reaped"' "$log" >/dev/null ||
+        fail "the run reported a reap it must have refused"
+
+    rm -rf "$tmp"
+}
+
+test_the_path_gate_is_rechecked_at_the_point_of_use() {
+    # Gate 1 is what ADDRESSES the removal: every later gate answers a question
+    # about "whatever is at this path", so a clean-tree verdict says nothing
+    # once the path stops being the directory that was enumerated. A witness
+    # salvage, an operator, or another housekeeping pass can move one mid-cycle.
+    #
+    # GIT_RELOCATE_AFTER_STATUS renames the worktree aside the instant gate 3
+    # answers, so the re-validation opens on a path that is no longer there.
+    local tmp rig bin home log wt
+    tmp=$(mktemp -d)
+    rig="$tmp/rig"
+    bin="$tmp/bin"
+    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
+    log="$tmp/logs/polecat-worktree-reap.log"
+    wt="$home/worktrees/wt-closed"
+
+    reapable_one_worktree_fixture "$tmp"
+
+    GC_RIG=rig LOG_DIR="$tmp/logs" GC_BEADS_JSON="$tmp/beads.json" \
+        GC_SESSIONS_JSON="$tmp/sessions.json" GIT_RELOCATE_AFTER_STATUS="$wt" \
+        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out.txt" 2>&1 ||
+        fail "reaper exited non-zero: $(cat "$tmp/out.txt")"
+
+    [[ -d "$wt.moved-aside" ]] ||
+        fail "the fixture never relocated the worktree, so nothing was under test"
+    [[ "$(jq -r 'select(.bead == "wt-closed") | .event' "$log" | tail -n 1)" == "worktree_shape_unconfirmed" ]] ||
+        fail "a candidate whose path stopped re-confirming was not refused on the path gate"
+    [[ "$(reason_for "$log" worktree_shape_unconfirmed)" == "shape_changed_at_point_of_use" ]] ||
+        fail "the path refusal does not name the point of use"
+    ! grep -F '"event":"worktree_reaped"' "$log" >/dev/null ||
+        fail "the run reported a reap of a path it could not re-confirm"
+
+    rm -rf "$tmp"
+}
+
+test_the_no_such_bead_route_renews_its_publication_evidence() {
+    # The no-such-bead route has no bead closure to authorise the reap and no
+    # owner to confirm absent: "these commits exist somewhere other than this
+    # directory" is the WHOLE of its safety case. It used to return out of the
+    # re-validation immediately, standing on a probe taken moments earlier —
+    # which is the same stale authorisation the rest of that function refuses.
+    #
+    # GIT_LATER_CONTAINS_FAIL lets the deciding probe answer and breaks the
+    # renewing one, so the run reaches the removal with evidence it cannot
+    # re-confirm. A probe that did not answer is not proof of publication.
+    local tmp rig bin home log wt
+    tmp=$(mktemp -d)
+    rig="$tmp/rig"
+    bin="$tmp/bin"
+    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
+    log="$tmp/logs/polecat-worktree-reap.log"
+    wt="$home/worktrees/wt-gone-published"
+    mkdir -p "$tmp/logs"
+
+    setup_rig "$rig"
+    publish_rig "$rig" "$tmp/remote.git"
+    write_gc_stub "$bin"
+    write_git_stub "$bin"
+    add_bead_worktree "$rig" "$home" wt-gone-published
+
+    # bd answers "no issue found matching" for this id and always will, so the
+    # route under test is the one gate 5 carries alone.
+    printf '[{"id":"unrelated","status":"closed","metadata":{}}]' >"$tmp/beads.json"
+    printf '{"sessions":[]}' >"$tmp/sessions.json"
+
+    GC_RIG=rig LOG_DIR="$tmp/logs" GC_BEADS_JSON="$tmp/beads.json" \
+        GC_SESSIONS_JSON="$tmp/sessions.json" \
+        GIT_CONTAINS_COUNT_FILE="$tmp/contains" GIT_LATER_CONTAINS_FAIL=1 \
+        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out.txt" 2>&1 ||
+        fail "reaper exited non-zero: $(cat "$tmp/out.txt")"
+
+    [[ "$(wc -c <"$tmp/contains" | tr -d ' ')" -ge 2 ]] ||
+        fail "the publication probe ran only once, so it was never renewed at the point of use"
+    [[ -d "$wt" ]] ||
+        fail "a no-such-bead worktree was reaped on publication evidence that could not be renewed"
+    [[ "$(jq -r 'select(.bead == "wt-gone-published") | .event' "$log" | tail -n 1)" == "worktree_publication_unconfirmed" ]] ||
+        fail "the unrenewable publication evidence was not reported as unconfirmed"
+    [[ "$(reason_for "$log" worktree_publication_unconfirmed)" == "recheck_publication_probe_failed" ]] ||
+        fail "the refusal does not name the renewing probe as what failed"
+    ! grep -F '"event":"worktree_reaped"' "$log" >/dev/null ||
+        fail "the run reported a reap it must have refused"
+
+    rm -rf "$tmp"
+}
+
+test_a_removal_does_not_start_without_budget_to_finish_it() {
+    # The bead's other acceptance case, in the vocabulary the script actually
+    # has: `git worktree remove` is gone (gcp-mves replaced it with
+    # rename-prune-delete), so the timeout that used to fire an unbounded,
+    # ungated delete has no call site. What remains true is that a destructive
+    # step must not START on a clock that cannot finish it — an interrupted
+    # removal is survivable but not free, and entering one with no budget left
+    # buys nothing when the reap is idempotent and the candidate comes back next
+    # cycle with a fresh budget.
+    #
+    # Driven by the reserve rather than by a sleep: the invariant is "less
+    # budget remains than a removal needs", and asking for more reserve than the
+    # whole budget states that with no timing at all.
+    local tmp rig bin home log wt
+    tmp=$(mktemp -d)
+    rig="$tmp/rig"
+    bin="$tmp/bin"
+    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
+    log="$tmp/logs/polecat-worktree-reap.log"
+    wt="$home/worktrees/wt-closed"
+
+    reapable_one_worktree_fixture "$tmp"
+
+    GC_RIG=rig LOG_DIR="$tmp/logs" GC_BEADS_JSON="$tmp/beads.json" \
+        GC_SESSIONS_JSON="$tmp/sessions.json" PATH="$bin:$PATH" \
+        bash "$SCRIPT" "$rig" --no-dry-run --budget 30 --removal-reserve 600 \
+        >"$tmp/out.txt" 2>&1 ||
+        fail "reaper exited non-zero: $(cat "$tmp/out.txt")"
+
+    # NOTHING was touched: not renamed, not marked, not deleted. A refusal that
+    # left a `.reaping` behind would be the very cost the reserve exists to
+    # avoid paying.
+    [[ -d "$wt" ]] ||
+        fail "a removal started without the budget to finish it and deleted the worktree"
+    [[ ! -e "$wt.reaping" ]] ||
+        fail "the removal was entered and interrupted; the reserve must refuse BEFORE the rename"
+    [[ "$(jq -r 'select(.bead == "wt-closed") | .event' "$log" | tail -n 1)" == "worktree_reap_failed" ]] ||
+        fail "a reap that was authorised and did not happen was not recorded as worktree_reap_failed"
+    [[ "$(reason_for "$log" worktree_reap_failed)" == "reap_budget_insufficient" ]] ||
+        fail "the refusal does not name the spent budget as the cause"
+    grep -F '"event":"worktree_reaped"' "$log" >/dev/null &&
+        fail "the run reported a reap it must have refused"
+
+    # A truncated decision must stay inside the next cycle's window rather than
+    # be rotated past: the candidate was never disposed of.
+    ! grep -F '"event":"worktree_scan_complete"' "$log" >/dev/null ||
+        fail "a cycle that refused a removal for lack of budget reported itself as a complete scan"
+
+    # And the default reserve does not stand in the way of an ordinary reap.
+    rm -f "$log"
+    GC_RIG=rig LOG_DIR="$tmp/logs" GC_BEADS_JSON="$tmp/beads.json" \
+        GC_SESSIONS_JSON="$tmp/sessions.json" PATH="$bin:$PATH" \
+        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out2.txt" 2>&1 ||
+        fail "reaper exited non-zero: $(cat "$tmp/out2.txt")"
+    [[ ! -e "$wt" ]] ||
+        fail "the default reserve blocks an ordinary reap"
+
+    rm -rf "$tmp"
+}
+
 test_the_promotion_criterion_says_what_a_dry_run_cannot_show() {
     # Ask 4. The staged-rollout criterion at agents/witness/agent.toml:20-25 was
     # written as sufficient: "review the logged would-reap set across several
@@ -1887,6 +2113,10 @@ test_legacy_residue_is_enumerated_from_disk
 test_residue_still_honours_the_gates
 test_residue_with_no_bead_is_kept
 test_gates_are_rechecked_at_the_point_of_use
+test_a_bead_reopened_between_classification_and_removal_is_refused
+test_the_path_gate_is_rechecked_at_the_point_of_use
+test_the_no_such_bead_route_renews_its_publication_evidence
+test_a_removal_does_not_start_without_budget_to_finish_it
 test_the_promotion_criterion_says_what_a_dry_run_cannot_show
 
 echo "polecat worktree reap tests passed"
