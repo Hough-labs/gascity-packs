@@ -269,6 +269,71 @@ add_bead_worktree() {
     git -C "$1" worktree add -q "$2/worktrees/$3" --detach HEAD
 }
 
+arm_pinned_store() {
+    # arm_pinned_store <rig> — give the rig a `.beads/config.yaml`, which is the
+    # only thing that arms the reaper's pinned read (gcp-uzq0). Every test that
+    # does NOT call this keeps exercising the `gc bd` transport, which is why
+    # the suite's existing expectations are untouched by that change.
+    mkdir -p "$1/.beads"
+    printf 'issue_prefix: wt\n' >"$1/.beads/config.yaml"
+}
+
+write_bd_stub() {
+    # The pinned transport, modelled on the ONE call the reaper makes through
+    # it: `bd`, given `-C <rig root> --readonly show <ids> --json`.
+    #
+    # Deliberately NOT a copy of the gc stub's bead logic. This stub asserts the
+    # shape of the invocation — that `-C` names the rig root the reaper was
+    # handed, so a regression to a CWD-resolved read fails here rather than in
+    # production — and then answers from the same fixture the gc stub reads. A
+    # stub that accepted any argv would pass for a call that read the wrong
+    # store, which is the entire risk this transport carries.
+    #
+    # Test hooks:
+    #   BD_CALLS        append one byte per `show`, to tell the two transports
+    #                   apart and to count the gate read vs the re-check
+    #   BD_DELAY        seconds to stall, for budget tests
+    #   BD_KNOWS_NOTHING non-empty: answer a well-formed but EMPTY array, the
+    #                   "this store knows none of these ids" case the reaper
+    #                   must refuse to act on
+    #   BD_ABSENT       non-empty: exit non-zero without answering
+    local bin="$1"
+    mkdir -p "$bin"
+    cat >"$bin/bd" <<'SH'
+#!/usr/bin/env sh
+if [ -n "${BD_ABSENT:-}" ]; then
+    echo "bd: simulated missing transport" >&2
+    exit 127
+fi
+[ "$1" = "-C" ] || { echo "bd stub: expected -C, got $1" >&2; exit 64; }
+shift
+dir="$1"
+shift
+[ "$dir" = "$BD_EXPECT_RIG_ROOT" ] ||
+    { echo "bd stub: -C $dir is not the rig root $BD_EXPECT_RIG_ROOT" >&2; exit 64; }
+[ "$1" = "--readonly" ] || { echo "bd stub: expected --readonly, got $1" >&2; exit 64; }
+shift
+[ "$1" = "show" ] || { echo "bd stub: expected show, got $1" >&2; exit 64; }
+shift
+if [ -n "${BD_CALLS:-}" ]; then printf 'x' >>"$BD_CALLS"; fi
+if [ -n "${BD_DELAY:-}" ]; then sleep "$BD_DELAY"; fi
+if [ -n "${BD_KNOWS_NOTHING:-}" ]; then printf '[]'; exit 0; fi
+ids=""
+for a in "$@"; do
+    case "$a" in
+        -*) continue ;;
+    esac
+    ids="$ids$a
+"
+done
+jq -c --arg ids "$ids" '
+    ($ids | split("\n") | map(select(length > 0))) as $want
+    | [ .[] | select(.id as $i | $want | index($i)) ]
+' "$GC_BEADS_JSON"
+SH
+    chmod +x "$bin/bd"
+}
+
 
 publish_rig() {
     # publish_rig <rig> <bare-remote> — give the rig a remote-tracking ref, so
@@ -2090,8 +2155,233 @@ test_the_promotion_criterion_says_what_a_dry_run_cannot_show() {
         fail "--no-dry-run appears outside the prose: ${wired//$'\n'/ | }"
 }
 
+test_the_pinned_read_serves_both_bead_reads_and_gc_bd_is_not_called() {
+    # gcp-uzq0. The wrapper costs ~2.4x the pinned call for the same answer, and
+    # this cycle makes two bead reads — enough, on a slow endpoint, to spend the
+    # whole 8s budget before the first `git status`. So when the rig root holds a
+    # beads project, BOTH reads must go through the pinned transport and the
+    # wrapper must not be paid at all.
+    local tmp rig bin home beads sessions logdir bdcalls gccalls
+    tmp=$(mktemp -d)
+    rig="$tmp/rig"
+    bin="$tmp/bin"
+    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
+    beads="$tmp/beads.json"
+    sessions="$tmp/sessions.json"
+    logdir="$tmp/logs"
+    bdcalls="$tmp/bd-calls"
+    gccalls="$tmp/gc-calls"
+    mkdir -p "$logdir"
+
+    setup_rig "$rig"
+    arm_pinned_store "$rig"
+    write_gc_stub "$bin"
+    write_bd_stub "$bin"
+    add_bead_worktree "$rig" "$home" "wt-closed"
+    add_bead_worktree "$rig" "$home" "wt-open"
+
+    jq -n '[
+        {id:"wt-closed", status:"closed", metadata:{polecat_session:"deadsess"}},
+        {id:"wt-open",   status:"open",   metadata:{polecat_session:"deadsess"}}
+    ]' >"$beads"
+    printf '{"sessions":[]}' >"$sessions"
+
+    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+        BD_EXPECT_RIG_ROOT="$rig" BD_CALLS="$bdcalls" GC_BD_CALLS="$gccalls" \
+        GC_REAP_BUDGET_SECONDS=120 PATH="$bin:$PATH" \
+        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out.txt" 2>&1 ||
+        fail "reaper exited non-zero: $(cat "$tmp/out.txt")"
+
+    # The decisions must be exactly what the wrapper would have produced. A fast
+    # read that reaps differently is not a transport change, it is a bug.
+    [[ ! -e "$home/worktrees/wt-closed" ]] ||
+        fail "the pinned read did not reap a closed, clean, unowned worktree"
+    [[ -e "$home/worktrees/wt-open" ]] ||
+        fail "the pinned read reaped an OPEN bead's worktree"
+
+    [[ -s "$bdcalls" ]] || fail "the pinned transport was never used"
+    [[ ! -s "$gccalls" ]] ||
+        fail "gc bd was still paid $(wc -c <"$gccalls" | tr -d ' ') time(s) despite the pinned read answering"
+    # Gate read plus the point-of-use re-check, both on the pinned store: the two
+    # reads must never end up on different ledgers.
+    [[ "$(wc -c <"$bdcalls" | tr -d ' ')" == "2" ]] ||
+        fail "expected 2 pinned reads (gate + re-check), got $(wc -c <"$bdcalls" | tr -d ' ')"
+
+    rm -rf "$tmp"
+}
+
+test_a_rig_with_no_beads_project_still_reads_through_gc() {
+    # `-C` fails closed on a directory with no beads project rather than walking
+    # up to $PWD, so the reaper only arms the pinned read when the rig root
+    # actually holds one. Without that config the wrapper stays the transport —
+    # which is what keeps every other test in this file honest.
+    local tmp rig bin home beads sessions logdir bdcalls gccalls
+    tmp=$(mktemp -d)
+    rig="$tmp/rig"
+    bin="$tmp/bin"
+    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
+    beads="$tmp/beads.json"
+    sessions="$tmp/sessions.json"
+    logdir="$tmp/logs"
+    bdcalls="$tmp/bd-calls"
+    gccalls="$tmp/gc-calls"
+    mkdir -p "$logdir"
+
+    setup_rig "$rig"
+    write_gc_stub "$bin"
+    write_bd_stub "$bin"
+    add_bead_worktree "$rig" "$home" "wt-closed"
+
+    jq -n '[{id:"wt-closed", status:"closed", metadata:{polecat_session:"deadsess"}}]' >"$beads"
+    printf '{"sessions":[]}' >"$sessions"
+
+    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+        BD_EXPECT_RIG_ROOT="$rig" BD_CALLS="$bdcalls" GC_BD_CALLS="$gccalls" \
+        GC_REAP_BUDGET_SECONDS=120 PATH="$bin:$PATH" \
+        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out.txt" 2>&1 ||
+        fail "reaper exited non-zero: $(cat "$tmp/out.txt")"
+
+    [[ ! -s "$bdcalls" ]] ||
+        fail "the pinned read was armed on a rig root with no .beads/config.yaml"
+    [[ -s "$gccalls" ]] || fail "no bead read happened at all"
+    [[ ! -e "$home/worktrees/wt-closed" ]] ||
+        fail "the gc transport stopped reaping when the pinned path was added"
+
+    rm -rf "$tmp"
+}
+
+test_a_pinned_store_that_knows_no_asked_id_is_not_acted_on() {
+    # The dangerous failure is not a slow pinned read, it is a WRONG one. A store
+    # that resolves none of the ids would push every candidate onto the
+    # no-such-bead route, which decides on the worktree's own evidence — so an
+    # answer with no asked-for id in it is discarded and the wrapper re-asked,
+    # paying back the call this was trying to save.
+    local tmp rig bin home beads sessions logdir bdcalls gccalls
+    tmp=$(mktemp -d)
+    rig="$tmp/rig"
+    bin="$tmp/bin"
+    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
+    beads="$tmp/beads.json"
+    sessions="$tmp/sessions.json"
+    logdir="$tmp/logs"
+    bdcalls="$tmp/bd-calls"
+    gccalls="$tmp/gc-calls"
+    mkdir -p "$logdir"
+
+    setup_rig "$rig"
+    arm_pinned_store "$rig"
+    write_gc_stub "$bin"
+    write_bd_stub "$bin"
+    add_bead_worktree "$rig" "$home" "wt-open"
+
+    # The bead is OPEN. If the empty pinned answer were trusted, the id would
+    # look absent, the no-such-bead route would take over, and gate 2's
+    # protection for in-flight work would never run.
+    jq -n '[{id:"wt-open", status:"open", metadata:{polecat_session:"deadsess"}}]' >"$beads"
+    printf '{"sessions":[]}' >"$sessions"
+
+    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+        BD_EXPECT_RIG_ROOT="$rig" BD_CALLS="$bdcalls" GC_BD_CALLS="$gccalls" \
+        BD_KNOWS_NOTHING=1 GC_REAP_BUDGET_SECONDS=120 PATH="$bin:$PATH" \
+        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out.txt" 2>&1 ||
+        fail "reaper exited non-zero: $(cat "$tmp/out.txt")"
+
+    [[ -s "$bdcalls" ]] || fail "the pinned transport was never tried"
+    [[ -s "$gccalls" ]] ||
+        fail "an all-absent pinned answer was acted on instead of falling back to gc bd"
+    [[ -e "$home/worktrees/wt-open" ]] ||
+        fail "an open bead's worktree was reaped after a pinned store answered about nothing"
+
+    rm -rf "$tmp"
+}
+
+test_a_missing_pinned_transport_falls_back_instead_of_failing_the_cycle() {
+    # `bd` not being on PATH is a deployment fact, not a reason to lose the
+    # cycle. The wrapper is still there; use it.
+    local tmp rig bin home beads sessions logdir gccalls
+    tmp=$(mktemp -d)
+    rig="$tmp/rig"
+    bin="$tmp/bin"
+    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
+    beads="$tmp/beads.json"
+    sessions="$tmp/sessions.json"
+    logdir="$tmp/logs"
+    gccalls="$tmp/gc-calls"
+    mkdir -p "$logdir"
+
+    setup_rig "$rig"
+    arm_pinned_store "$rig"
+    write_gc_stub "$bin"
+    write_bd_stub "$bin"
+    add_bead_worktree "$rig" "$home" "wt-closed"
+
+    jq -n '[{id:"wt-closed", status:"closed", metadata:{polecat_session:"deadsess"}}]' >"$beads"
+    printf '{"sessions":[]}' >"$sessions"
+
+    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+        BD_EXPECT_RIG_ROOT="$rig" BD_ABSENT=1 GC_BD_CALLS="$gccalls" \
+        GC_REAP_BUDGET_SECONDS=120 PATH="$bin:$PATH" \
+        bash "$SCRIPT" "$rig" --no-dry-run >"$tmp/out.txt" 2>&1 ||
+        fail "reaper exited non-zero: $(cat "$tmp/out.txt")"
+
+    [[ -s "$gccalls" ]] || fail "a failed pinned read did not fall back to gc bd"
+    [[ ! -e "$home/worktrees/wt-closed" ]] ||
+        fail "the cycle was lost when the pinned transport was unavailable"
+
+    rm -rf "$tmp"
+}
+
+test_a_pinned_read_that_times_out_names_its_own_transport() {
+    # gcp-mqu9's lesson, applied to the new fork in the road: a log line that
+    # says "the bead read timed out" without saying WHICH read sends the next
+    # reader at the wrong thing. It also must NOT be retried through the slower
+    # wrapper — re-asking cannot fit where the faster call did not, and burning
+    # the remainder of the budget on it is how a yield becomes a SIGKILL.
+    local tmp rig bin home beads sessions logdir gccalls
+    tmp=$(mktemp -d)
+    rig="$tmp/rig"
+    bin="$tmp/bin"
+    home="$tmp/city/.gc/worktrees/rig/polecats/nux"
+    beads="$tmp/beads.json"
+    sessions="$tmp/sessions.json"
+    logdir="$tmp/logs"
+    gccalls="$tmp/gc-calls"
+    mkdir -p "$logdir"
+
+    setup_rig "$rig"
+    arm_pinned_store "$rig"
+    write_gc_stub "$bin"
+    write_bd_stub "$bin"
+    add_bead_worktree "$rig" "$home" "wt-closed"
+
+    jq -n '[{id:"wt-closed", status:"closed", metadata:{polecat_session:"deadsess"}}]' >"$beads"
+    printf '{"sessions":[]}' >"$sessions"
+
+    GC_RIG=rig LOG_DIR="$logdir" GC_BEADS_JSON="$beads" GC_SESSIONS_JSON="$sessions" \
+        BD_EXPECT_RIG_ROOT="$rig" BD_DELAY=20 GC_BD_CALLS="$gccalls" \
+        PATH="$bin:$PATH" bash "$SCRIPT" "$rig" --no-dry-run --budget 4 \
+        >"$tmp/out.txt" 2>&1 ||
+        fail "a pinned read that outlives the budget must still yield cleanly: $(cat "$tmp/out.txt")"
+
+    local log
+    log=$(cat "$logdir"/polecat-worktree-reap.log)
+    grep -q 'bead_query_timed_out' <<<"$log" ||
+        fail "a pinned read that outran the budget was not recorded as a timeout: $log"
+    grep -q "bd pinned to $rig" <<<"$log" ||
+        fail "the timeout line does not name the transport that actually timed out: $log"
+    [[ ! -s "$gccalls" ]] ||
+        fail "a pinned timeout was retried through gc bd, spending budget the cycle did not have"
+
+    rm -rf "$tmp"
+}
+
 test_reaps_only_closed_clean_unowned_bead_worktrees
 test_real_removal_is_opt_in
+test_the_pinned_read_serves_both_bead_reads_and_gc_bd_is_not_called
+test_a_rig_with_no_beads_project_still_reads_through_gc
+test_a_pinned_store_that_knows_no_asked_id_is_not_acted_on
+test_a_missing_pinned_transport_falls_back_instead_of_failing_the_cycle
+test_a_pinned_read_that_times_out_names_its_own_transport
 test_unreadable_session_roster_skips_the_reap
 test_dry_run_removes_nothing_and_rerun_is_idempotent
 test_bead_status_is_read_in_one_bulk_query
