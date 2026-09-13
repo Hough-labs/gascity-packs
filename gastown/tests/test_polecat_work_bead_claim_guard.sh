@@ -30,6 +30,13 @@ REFINERY="$RIG/gastown.refinery"
 CREW="$RIG/crew.valkyrie"
 BEAD="gcp-cvbs"
 
+# The exact argv tails the claim hands to `gc`. They are grepped out of the fake
+# gc's call log — data the stub recorded, never an invocation — so they are
+# hoisted here where the drift guard's allowlist can pin them line by line.
+CLAIM_CALL="bd update $BEAD --status=in_progress --assignee=$ME --set-metadata polecat_session=$ME" # gc-bd-argv-tail: expected argv tail, not an invocation
+CLAIM_CALL_PREFIX="bd update $BEAD" # gc-bd-argv-tail: expected argv tail, not an invocation
+CLAIM_STATUS_PREFIX="bd update $BEAD --status=in_progress" # gc-bd-argv-tail: expected argv tail, not an invocation
+
 fail() {
     echo "FAIL: $*" >&2
     exit 1
@@ -121,13 +128,12 @@ HARNESS
 
 assert_claimed() {
     local dir="$1" why="$2"
-    grep -F "bd update $BEAD --status=in_progress --assignee=$ME --set-metadata polecat_session=$ME" \
-        "$dir/calls.log" >/dev/null || fail "$why"
+    grep -F "$CLAIM_CALL" "$dir/calls.log" >/dev/null || fail "$why"
 }
 
 assert_not_claimed() {
     local dir="$1" why="$2"
-    ! grep -F "bd update $BEAD" "$dir/calls.log" >/dev/null || fail "$why"
+    ! grep -F "$CLAIM_CALL_PREFIX" "$dir/calls.log" >/dev/null || fail "$why"
 }
 
 # The defect itself. gaunt-m58w was assigned to gauntlet/crew.valkyrie — the
@@ -221,7 +227,7 @@ test_claim_is_read_back_and_settles() {
 
     ! grep -F 'after the claim; it may still be re-slung' <<<"$out" >/dev/null ||
         fail "a claim the stub accepted still reported an unsettled readback: $out"
-    [[ "$(grep -c -F "bd update $BEAD --status=in_progress" "$dir/calls.log")" == "1" ]] ||
+    [[ "$(grep -c -F "$CLAIM_STATUS_PREFIX" "$dir/calls.log")" == "1" ]] ||
         fail "the readback loop retried a claim that had already landed"
 }
 

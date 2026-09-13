@@ -176,6 +176,17 @@ GC_BD_ARGV_TAIL_ALLOWLIST: dict[Path, set[str]] = {
         "restore_call='bd update winnow-iaroy --assignee=gastown__polecat-gc-8a4d'"
         " # gc-bd-argv-tail: expected argv tail, not an invocation",
     },
+    Path("gastown/tests/test_polecat_work_bead_claim_guard.sh"): {
+        '"bd show") # gc-bd-argv-tail: case label matching the fake gc\'s argv tail',
+        '"bd update") # gc-bd-argv-tail: case label matching the fake gc\'s argv tail',
+        'CLAIM_CALL="bd update $BEAD --status=in_progress --assignee=$ME'
+        ' --set-metadata polecat_session=$ME"'
+        " # gc-bd-argv-tail: expected argv tail, not an invocation",
+        'CLAIM_CALL_PREFIX="bd update $BEAD"'
+        " # gc-bd-argv-tail: expected argv tail, not an invocation",
+        'CLAIM_STATUS_PREFIX="bd update $BEAD --status=in_progress"'
+        " # gc-bd-argv-tail: expected argv tail, not an invocation",
+    },
     Path("gastown/tests/test_refinery_find_work.sh"): {
         "# Stub `gc` implementing just enough of `bd list` to answer the shipped"
         " query. # gc-bd-argv-tail: prose, not an invocation",
