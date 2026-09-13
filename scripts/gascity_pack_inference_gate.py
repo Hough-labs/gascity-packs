@@ -124,6 +124,13 @@ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
         "{{build_command}}",
         "{{test_command}}",
         "branch_has_real_change",
+        # The rebase-aware arm of the already-merged gate. Without it the
+        # ancestor check is the only arm, and on a lane that lands work by
+        # rebasing that check can essentially never fire — so a crash between
+        # push and close halts a genuinely merged bead as a false completion
+        # (gcp-a4e7, live case winnow-zgr2y.6).
+        "branch_already_landed",
+        "--set-metadata already_merged_via=",
         'git worktree add --detach "$mfp_wt" "$BEFORE_SHA"',
         'git -C "$mfp_wt" merge --ff-only "$TEMP_SHA"',
         # The merge must be proven, not asserted: the target has to have
