@@ -210,6 +210,13 @@
 #       not slow, impossible. Candidate sets only grow (the reaper is staged at
 #       dry-run and the native gascity reaper is a documented macOS no-op,
 #       gc-zxxy), so a per-item round trip is a cliff every rig walks toward.
+#     - Both bead reads go through a `-C`-pinned `bd` rooted at `$RIG_ROOT` when
+#       that root holds a beads project, falling back to `gc bd` otherwise and
+#       whenever the pinned answer cannot be trusted. Same store, same rows,
+#       ~2.4x less wall clock here and ~5x on a rig with an external Dolt — see
+#       THE PINNED READ below for the measurements, and for why this is not the
+#       bare call the repo's guard forbids. One wrapped call has been measured
+#       at 5.4s — most of an 8s budget, spent before the first `git status`.
 #     - The script enforces its OWN wall-clock budget, well inside the caller's,
 #       and every external command is bounded by the time remaining in it. When
 #       the budget expires the script reports what it examined and exits 0. A
@@ -448,6 +455,51 @@ else
     GC_BD=(gc bd)
 fi
 
+# ── THE PINNED READ — the same store, without the wrapper (gcp-uzq0) ─────────
+# `gc bd --rig <name>` is, in gc's own words, "run bd in the correct rig
+# directory". The routing is the whole value; the seconds are pure tax, and the
+# tax is what this script cannot afford. Measured back to back on gascity-packs,
+# same ledger, same server, 8 ids:
+#
+#     bd, pinned with -C <rig root>          0.65 / 0.70 / 1.04 s
+#     gc bd --rig <rig> show <ids> --json   1.53 / 1.78 / 1.99 s
+#
+# and the gap is wider the slower the endpoint — the bead records ~5.4s for a
+# single wrapped call on winnow against an external Dolt. Two of this cycle's
+# reads are bead reads, so the wrapper alone can spend the entire 8s budget
+# before the first `git status` runs. That is the 17 `budget_spent_before_git_status`
+# lines in the log, and it is why a rig with more candidates than seconds
+# examines NOTHING rather than examining fewer.
+#
+# THE POLICY THIS IS THREADING. `bd` invoked bare resolves its ledger from the
+# CURRENT DIRECTORY, which is exactly what the repo's bare-bd guard
+# (tests/test_no_bare_bd_commands.py, gcp-mvsm) exists to stop: a pack asset
+# that reads whichever store it happens to be standing in is a correctness bug
+# wearing a speed costume. `-C "$RIG_ROOT"` is not that call. It PINS the
+# project to the same rig checkout this whole script is already reasoning about
+# — the directory it enumerates worktrees under, reads git status in, and asks
+# `gc bd --rig` about — and it FAILS CLOSED when that directory holds no beads
+# project ("cannot use -C directory ...: no beads project found", exit 1)
+# rather than walking up to $PWD. Verified equal to the wrapped read on every
+# endpoint origin reachable from this city: `inherited_city` (gascity-packs),
+# `managed_city` (the town ledger) and `explicit` (winnow, external Dolt on
+# 127.0.0.1:3307) all returned byte-identical {id,status,assignee} sets.
+# `--readonly` is belt and braces: this script has no business writing a bead,
+# and the flag makes that structural rather than a promise.
+#
+# TRUST, NOT HOPE. The pinned answer is used only when it resolves at least one
+# of the exact ids asked for (see `bead_read`). A store that knows none of them
+# is likelier the wrong store than a rig where every worktree is a non-bead, and
+# guessing wrong there is not a slow cycle — an all-absent batch pushes every
+# candidate onto the no-such-bead route, which decides on the worktree's own
+# evidence. So that answer is discarded and `gc bd` re-asked, at the cost of the
+# call this was trying to save. The budget model, the bounded calls and every
+# reason code below are untouched: this substitutes the transport, nothing else.
+PINNED_BD=()
+if [ -f "$RIG_ROOT/.beads/config.yaml" ]; then
+    PINNED_BD=(bd -C "$RIG_ROOT" --readonly) # bd-pinned-store: -C pins the rig checkout, never $PWD
+fi
+
 # classify_outcome <limit-given> <exit-code> — name what actually happened to a
 # bounded call: `skipped` (the budget was already spent, so the command never
 # ran), `timeout` (it ran and was killed at the limit), `failed` (it ran and
@@ -467,6 +519,73 @@ classify_outcome() {
     else
         printf 'ok\n'
     fi
+}
+
+# read_resolved_an_asked_id <json-file> <id>... — did the store echo at least
+# one of the EXACT ids handed to it? The lookup fuzzy-matches, so "answered
+# with rows" is not the same question; this asks whether any row's id is one we
+# named. Used to decide whether a pinned answer is the rig's own store talking.
+read_resolved_an_asked_id() {
+    local file="$1"
+    shift
+    jq -e --args '
+        type == "array"
+        and ([.[] | .id // empty] as $echoed
+            | ($echoed | length) > (($echoed - $ARGS.positional) | length))
+    ' "$@" <"$file" >/dev/null 2>&1
+}
+
+# bead_read <out-file> <err-file> — the cycle's bulk bead read, cheapest correct
+# transport first. Sets BEAD_READ_LIMIT / BEAD_READ_RC / BEAD_READ_OUTCOME (the
+# verdict the caller's own case statements already speak) and BEAD_READ_VIA, the
+# human name of the transport that produced the answer.
+#
+# BEAD_READ_VIA exists because of gcp-mqu9: this log's failure lines used to
+# assert a cause they had not observed, and two separate investigations went at
+# a healthy Dolt server on the strength of them. Now that the read has two
+# possible transports, a line saying "the bead read failed" without saying WHICH
+# read would repeat that mistake at one remove.
+#
+# Both call sites go through here so the two reads cannot drift into using
+# different stores — a gate read and a point-of-use re-check that disagreed
+# about which ledger they were reading would be worse than either being slow.
+bead_read() {
+    local out_file="$1" err_file="$2"
+    local limit rc=0
+
+    if [ "${#PINNED_BD[@]}" -gt 0 ]; then
+        limit=$(budget_left)
+        run_bounded "$limit" "${PINNED_BD[@]}" show "${BEAD_IDS_ARGV[@]}" --json \
+            >"$out_file" 2>"$err_file" || rc=$?
+        BEAD_READ_LIMIT="$limit"
+        BEAD_READ_RC="$rc"
+        BEAD_READ_OUTCOME=$(classify_outcome "$limit" "$rc")
+        BEAD_READ_VIA="bd pinned to $RIG_ROOT"
+        case "$BEAD_READ_OUTCOME" in
+            skipped | timeout)
+                # Out of clock, not out of transport. Re-asking through the
+                # slower wrapper cannot fit where the faster one did not, and
+                # the reason codes the caller emits for these two are about the
+                # budget — which is exactly what happened.
+                return
+                ;;
+        esac
+        if read_resolved_an_asked_id "$out_file" "${BEAD_IDS_ARGV[@]}"; then
+            return
+        fi
+        # The pinned store answered and knew none of these ids. Could be a rig
+        # whose candidates are genuinely all non-beads; could be the wrong
+        # store. Only one of those is safe to act on, so pay for the wrapper.
+        rc=0
+    fi
+
+    limit=$(budget_left)
+    run_bounded "$limit" "${GC_BD[@]}" show "${BEAD_IDS_ARGV[@]}" --json \
+        >"$out_file" 2>"$err_file" || rc=$?
+    BEAD_READ_LIMIT="$limit"
+    BEAD_READ_RC="$rc"
+    BEAD_READ_OUTCOME=$(classify_outcome "$limit" "$rc")
+    BEAD_READ_VIA="${GC_BD[*]}"
 }
 
 # per_bead_shape <path> — true when <path> has the per-bead worktree shape
@@ -808,11 +927,11 @@ trap 'rm -f "$BEADS_FILE" "$SESSIONS_FILE" "$BEAD_ERR_FILE" "$NOT_FOUND_FILE" \
     "$RECHECK_BEADS_FILE" "$REGISTERED_FILE" "$RESIDUE_FILE" "$SCAN_ROOTS_FILE" \
     "$DISK_ENTRIES_FILE"' EXIT
 
-BEAD_QUERY_LIMIT=$(budget_left)
-BEAD_QUERY_RC=0
-run_bounded "$BEAD_QUERY_LIMIT" "${GC_BD[@]}" show "${BEAD_IDS_ARGV[@]}" --json \
-    >"$BEADS_FILE" 2>"$BEAD_ERR_FILE" || BEAD_QUERY_RC=$?
-BEAD_QUERY_OUTCOME=$(classify_outcome "$BEAD_QUERY_LIMIT" "$BEAD_QUERY_RC")
+bead_read "$BEADS_FILE" "$BEAD_ERR_FILE"
+BEAD_QUERY_LIMIT="$BEAD_READ_LIMIT"
+BEAD_QUERY_RC="$BEAD_READ_RC"
+BEAD_QUERY_OUTCOME="$BEAD_READ_OUTCOME"
+BEAD_QUERY_VIA="$BEAD_READ_VIA"
 
 # The ids bd itself declared absent, keyed on bd's OWN error class rather than
 # on a regex guess at what a bead id looks like. bd writes one line per missing
@@ -871,13 +990,13 @@ if ! jq -e 'type == "array"' "$BEADS_FILE" >/dev/null 2>&1; then
             ;;
         timeout)
             record worktree_bead_query_failed "" "" \
-                "bulk gc bd show for ${#BEAD_IDS_ARGV[@]} bead(s) did not answer within the ${BEAD_QUERY_LIMIT}s left of the ${BUDGET_SECONDS}s budget" \
+                "bulk bead read via '$BEAD_QUERY_VIA' for ${#BEAD_IDS_ARGV[@]} bead(s) did not answer within the ${BEAD_QUERY_LIMIT}s left of the ${BUDGET_SECONDS}s budget" \
                 bead_query_timed_out
             echo "polecat-worktree-reap: bead read timed out after ${BEAD_QUERY_LIMIT}s of the ${BUDGET_SECONDS}s budget; reaped=0 skipped=$TOTAL (log: $LOG_FILE)"
             ;;
         *)
             record worktree_bead_query_failed "" "" \
-                "bulk gc bd show for ${#BEAD_IDS_ARGV[@]} bead(s) exited $BEAD_QUERY_RC and returned no usable JSON" \
+                "bulk bead read via '$BEAD_QUERY_VIA' for ${#BEAD_IDS_ARGV[@]} bead(s) exited $BEAD_QUERY_RC and returned no usable JSON" \
                 bead_query_failed
             echo "polecat-worktree-reap: bead read failed (exit $BEAD_QUERY_RC); reaped=0 skipped=$TOTAL (log: $LOG_FILE)"
             ;;
@@ -1018,11 +1137,10 @@ refresh_removal_snapshot() {
         return
     fi
     RECHECK_TAKEN=1
-    local limit rc=0
-    limit=$(budget_left)
-    run_bounded "$limit" "${GC_BD[@]}" show "${BEAD_IDS_ARGV[@]}" --json \
-        >"$RECHECK_BEADS_FILE" 2>/dev/null || rc=$?
-    case "$(classify_outcome "$limit" "$rc")" in
+    local rc=0
+    bead_read "$RECHECK_BEADS_FILE" /dev/null
+    rc="$BEAD_READ_RC"
+    case "$BEAD_READ_OUTCOME" in
         skipped)
             RECHECK_REASON="budget_spent_before_recheck_bead_read"
             return

@@ -278,3 +278,87 @@ remaining budget, and assert the cursor still advances.
 **Bead C re-confirmed.** `gastown/formulas/mol-witness-patrol.toml` still
 contains zero occurrences of `cursor`. The home audit has no rotation to this
 day, so Bead C stands exactly as written.
+
+---
+
+## 10. Bead A — delivered (2026-09-13, `gastown.furiosa`)
+
+Both bead reads (`:813` gate read, `:1023` point-of-use re-check) now go through
+one helper, `bead_read`, which prefers a `-C`-pinned read-only `bd` rooted at
+`$RIG_ROOT` and keeps
+`gc bd` as the fallback. The budget model, `run_bounded`, `classify_outcome` and
+every reason code are untouched — this is a transport substitution, as §5 asked.
+
+### The policy question §5 flagged, resolved rather than sidestepped
+
+§5 says "a bare `bd` invocation rooted at `$RIG_ROOT`", and the bead's own notes
+say bare `bd` is what `tests/test_no_bare_bd_commands.py` (gcp-mvsm) exists to
+forbid. Both are right, and they are not in conflict once the guard's actual
+subject is named: the guard is about **routing**, not about the binary. What it
+forbids is a pack asset reading whichever store it is standing in.
+
+A `-C`-pinned `bd` is not that call. It pins the project to a named directory and
+**fails closed** on a directory with no beads project rather than walking up to
+`$PWD`:
+
+    bd, given -C /tmp/empty (a directory holding no beads project):
+    Error: cannot use -C directory "/tmp/empty": no beads project found   (exit 1)
+
+So the guard was amended, narrowly and visibly, rather than worked around. The
+new `PINNED_STORE_BD_ALLOWLIST` is triple-locked exactly like the allowlist
+already in that file — exact tracked path, literal marker, byte-exact line — so
+a copy of the line elsewhere, an edit in place, or the marker attached to any
+other `bd` call all still fail. Two new tests assert each of those, and one
+asserts `gc bd` is still built and still reachable as the fallback. Nothing was
+suppressed and no `--no-verify` was used.
+
+### Equivalence: the contract, per §6.3, on all three endpoint origins
+
+Same id list, back to back, `{id,status,assignee}` compared:
+
+| `gc.endpoint_origin` | rig | result |
+|---|---|---|
+| `inherited_city` | gascity-packs | identical, 8 ids |
+| `managed_city` | the town ledger | identical, 3 ids |
+| `explicit` (external Dolt :3307) | winnow | identical, 3 ids |
+
+**This closes A4b, which the dispatch note recorded as unsatisfiable today.**
+That note reasoned from every explicit rig being SUSPENDED. A suspended rig is
+not an unreachable endpoint: winnow's `127.0.0.1:3307` answers, and both
+transports agree on it. The check that could not be run, ran.
+
+### Effect, measured on gascity-packs (12 candidates, dry-run, scratch log)
+
+| budget | pre-change | post-change |
+|---|---|---|
+| 8s | `scan_complete` 12/12, 4s remaining | `scan_complete` 12/12, **5s** remaining |
+| 3s | `budget_exhausted` — **1 of 12**, deferred 11 | **`scan_complete` 12/12** |
+| 2s | `budget_exhausted` — 1 of 12 | `budget_exhausted` — 1 of 12 |
+
+The 3s row is this bead's symptom and its fix in one line: the same rig, the same
+candidates, the same gates, starving before and complete after. Decisions are
+byte-identical at every budget where both finish (reaped=9 skipped=3 of 12).
+
+The 2s row is the honest bound and matches §9: this buys back roughly two
+fixed-overhead units, not the whole budget. The roster read at `:945` is still
+`gc session list`, still gc-class, still in the budget. **Nobody should read this
+as "the reaper now always completes."**
+
+### One thing this change had to fix on the way past
+
+The log lines for a failed bead read said "bulk gc bd show ..." unconditionally.
+With two possible transports that sentence becomes a gcp-mqu9 repeat — a
+diagnostic asserting a cause it did not observe. The detail now names the
+transport that actually failed, and the `reap-merged-worktrees` table in
+`mol-witness-patrol.toml` was corrected with it: its "a timeout with most of the
+budget still unspent is the rig's Dolt endpoint" branch is the misdirection two
+witnesses already flagged in the bead, and a 5.4s wrapped call is most of an 8s
+budget on its own. It now tells the reader to time the named transport against
+the rig's own endpoint first.
+
+### Still open, unchanged by this
+
+Bead B (cursor advance under starvation) still wants the §8 nod, and §9's
+observation stands: `gcp-jxtc`'s fourth rollback site makes `DECIDED_LAST`
+advance least exactly when the budget is tightest. Bead C (`gcp-7fgg`) is
+untouched — still zero occurrences of `cursor` in `mol-witness-patrol.toml`.
