@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sun, 13 Sep 2026 17:18:14 -0400
+Subject: [PATCH 97/97] test(refinery): route the already-merged stub's log
+ through gc bd (gcp-a4e7)
+
+The contract test's fake `gc` logged only `"$*"` -- the argv tail -- so its
+case label and its assertions named `bd show` / `bd close` with no `gc` in
+front. tests/test_no_bare_bd_commands.py reads those as bare bd invocations
+and fails the shipped-pack-assets guard, which is what the refinery rejected
+this branch for.
+
+The stub IS `gc`, so record and match the whole command: log `gc $*` and
+switch on `"gc $*"`. The log now reads as the command the shipped block
+actually ran, the case label and assertions name `gc bd ...`, and the guard
+passes with no allowlist exemption.
+
+Still RED against the pre-fix gate (11 failures) and GREEN against the fix.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ gastown/tests/test_refinery_already_merged.sh | 19 ++++++++++---------
+ 1 file changed, 10 insertions(+), 9 deletions(-)
+
+diff --git a/gastown/tests/test_refinery_already_merged.sh b/gastown/tests/test_refinery_already_merged.sh
+index 7ea0a91..beff724 100755
+--- a/gastown/tests/test_refinery_already_merged.sh
++++ b/gastown/tests/test_refinery_already_merged.sh
+@@ -88,17 +88,18 @@ git_quiet() {
+         "$@"
+ }
+ 
+-# A `gc` that answers exactly what the shipped blocks call. `bd show --json`
+-# serves the work bead's metadata (the gate reads `fork_sha` from it); every
+-# other call is recorded so a test can read back what the gate decided.
++# A `gc` that answers exactly what the shipped blocks call. The `gc bd show
++# --json` call serves the work bead's metadata (the gate reads `fork_sha` from
++# it); every other call is recorded so a test can read back what the gate
++# decided.
+ make_gc_stub() {
+     local dir="$1"
+     mkdir -p "$dir"
+     cat > "$dir/gc" <<'STUB'
+ #!/usr/bin/env bash
+-printf '%s\n' "$*" >> "${GC_STUB_LOG:?GC_STUB_LOG unset}"
+-case "$*" in
+-    *"bd show"*--json*) printf '[{"metadata":{"fork_sha":"%s"}}]\n' "${GC_STUB_FORK_SHA:-}" ;;
++printf 'gc %s\n' "$*" >> "${GC_STUB_LOG:?GC_STUB_LOG unset}"
++case "gc $*" in
++    *"gc bd show"*--json*) printf '[{"metadata":{"fork_sha":"%s"}}]\n' "${GC_STUB_FORK_SHA:-}" ;;
+ esac
+ exit 0
+ STUB
+@@ -241,7 +242,7 @@ test_crash_after_a_rebasing_merge_closes_as_already_merged() {
+ 
+     [ "$status" -eq 0 ] ||
+         fail "rebased already-merged branch exited $status, want 0 (close as merged, do not halt)"
+-    logged "bd close test-bead" ||
++    logged "gc bd close test-bead" ||
+         fail "rebased already-merged branch never closed the bead — the merged work is stranded"
+     logged "--set-metadata merge_result=already_merged" ||
+         fail "rebased already-merged branch did not record merge_result=already_merged"
+@@ -288,7 +289,7 @@ test_starved_zero_commit_branch_still_halts() {
+         fail "empty branch exited 0 — a branch with no commits must halt, never close"
+     logged "--set-metadata merge_result=refused_false_completion" ||
+         fail "empty branch did not halt as a false completion"
+-    ! logged "bd close test-bead" ||
++    ! logged "gc bd close test-bead" ||
+         fail "empty branch was closed as merged — the content arm swallowed a false completion"
+     rm -rf "$TMP"
+ }
+@@ -347,7 +348,7 @@ test_unmerged_branch_falls_through_to_the_merge() {
+ 
+     [ "$status" -eq 0 ] ||
+         fail "ordinary merge candidate exited $status, want 0 (fall through to the merge script)"
+-    ! logged "bd close test-bead" ||
++    ! logged "gc bd close test-bead" ||
+         fail "ordinary merge candidate was closed by the gate instead of being merged"
+     ! logged "merge_result=refused_false_completion" ||
+         fail "ordinary merge candidate was halted as a false completion"
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,725 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <hunter.hough@gmail.com>
+Date: Sun, 13 Sep 2026 16:48:01 -0400
+Subject: [PATCH 96/97] fix(refinery): detect already-merged by content, not
+ only ancestry (gcp-a4e7)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+mol-refinery-patrol's merge-state gate had a single already-merged arm,
+`git merge-base --is-ancestor origin/$BRANCH origin/$TARGET`. That arm is
+essentially unreachable on this lane: the merge script rebases `temp` onto
+the target and ff-merges, which rewrites every commit, so after a successful
+merge the pre-rebase branch sha is nowhere on the target.
+
+The consequence was the exact outcome the arm exists to prevent. A crash
+between `git push` and `gc bd close` fell through to the false-completion
+guard, which correctly reported 0 commits / 0 diff (the rebase drops the
+already-applied commit) and halted a genuinely merged bead: status blocked,
+merge_result=refused_false_completion, gc.routed_to=human, mayor and witness
+paged. Live case winnow-zgr2y.6.
+
+Ancestry is a sufficient condition for already-merged, never a necessary one,
+so add a second arm on the axis that survives a rewrite:
+
+- `branch_already_landed` asks `git cherry` whether every commit the branch
+  introduced since its recorded `fork_sha` is already upstream by patch-id.
+  It fires only when the branch also has a non-empty diff against its own
+  fork point and carries a commit the target lacks, which is what keeps it
+  from swallowing the two halts it sits next to: the starved 0-commit polecat,
+  and the branch merely rebased onto newer target whose counted commits belong
+  to other beads (gcp-duy's false positive, on the reachability axis).
+- `upstream_equivalent_sha` names the commit ON the target that carries the
+  work, so the rebase-aware close records a `merged_sha` that is actually
+  reachable from `merged_target` — the pre-rebase branch tip is not.
+- `close_already_merged` is now shared by both arms, so they cannot drift on
+  what a merged close records, and stamps `already_merged_via` (ancestor |
+  rebase_patch_id) plus `merged_source_sha`.
+
+Without `fork_sha` recorded neither arm can fire; the gate stays conservative
+and falls through to the halt, exactly as before.
+
+The helper group and the gate are now sentinel-delimited so the shipped text
+is executable by tests rather than transcribed. gastown/tests/test_refinery_
+already_merged.sh extracts both and runs them against real repositories with a
+`gc` stub: a crash after a REBASING merge (the shape that reproduces the
+defect — an ff-merge fixture goes green against the unfixed gate), the ancestor
+arm a fast-forward rig still needs, both halts, a missing fork_sha, and an
+ordinary merge candidate falling through. Verified red on the pre-fix gate
+(6 failures, including "was halted as a false completion") and green after.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ gastown/formulas/mol-refinery-patrol.toml     | 198 +++++++--
+ gastown/tests/test_refinery_already_merged.sh | 377 ++++++++++++++++++
+ scripts/gascity_pack_inference_gate.py        |   7 +
+ 3 files changed, 555 insertions(+), 27 deletions(-)
+ create mode 100755 gastown/tests/test_refinery_already_merged.sh
+
+diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
+index 93c7136..0f4b094 100644
+--- a/gastown/formulas/mol-refinery-patrol.toml
++++ b/gastown/formulas/mol-refinery-patrol.toml
+@@ -252,10 +252,10 @@ branch and no close is unfinished work, not someone else's in-flight work.
+ 
+ Re-entering a bead the refinery already claimed is safe because the
+ merge-push step discriminates before it acts — the already-merged
+-short-circuit (ancestor + `fork_sha` commit count) closes a branch that
+-previously landed, and the false-completion guard refuses a branch that
+-introduces no change. Status was never the thing protecting that; it was only
+-hiding the work.
++short-circuit (ancestor, or patch-id equality after a rebase that collapsed to
++nothing, both gated on `fork_sha`) closes a branch that previously landed, and
++the false-completion guard refuses a branch that introduces no change. Status
++was never the thing protecting that; it was only hiding the work.
+ 
+ **The second query — `gc.routed_to=<self>` with no assignee (gcp-mi9t).** A
+ bead carrying `gc.routed_to=<rig>/{{binding_prefix}}refinery` and no assignee
+@@ -833,6 +833,7 @@ Target: $TARGET"
+   exit 1
+ }
+ 
++# --- merge-state-helpers:begin ---
+ branch_has_real_change() {
+   # Shared false-completion predicate (0-diff/0-commit guard). Does
+   # <branch-ref> introduce a real change vs its merge-base with
+@@ -857,6 +858,84 @@ branch_has_real_change() {
+   return 0
+ }
+ 
++branch_already_landed() {
++  # Rebase-aware already-merged predicate: has <branch-ref> already landed on
++  # <target-ref>, judged by CONTENT rather than by reachability?
++  #
++  # Ancestor-ness is a SUFFICIENT condition for already-merged, never a
++  # necessary one. This lane lands work by rebasing `temp` onto the target and
++  # ff-merging, which REWRITES every commit — so after a successful merge
++  # `origin/$BRANCH` is not an ancestor of `origin/$TARGET`; its pre-rebase sha
++  # is nowhere on the target. The ancestor arm can therefore essentially never
++  # fire here, which made a crash between `git push` and `gc bd close` fall
++  # through to the 0-diff guard: the rebase correctly drops the already-applied
++  # commit, the guard correctly sees 0 commits / 0 diff, and a genuinely merged
++  # bead got halted to a human as a false completion (winnow-zgr2y.6, refiled
++  # gcp-a4e7). Patch-id equality is the axis that survives the rewrite.
++  #   exit 0 = every commit introduced since <fork-sha> is already upstream by
++  #            patch-id -> already merged, safe to close
++  #   exit 1 = NOT already merged. Either the branch still carries a commit the
++  #            target does not have, or it introduced nothing of its own — the
++  #            starved 0-commit polecat, and gcp-duy's branch that was merely
++  #            rebased/reset onto newer target so its "commits since fork" are
++  #            other beads'. Both belong to the false-completion guard.
++  #   exit 2 = cannot evaluate: no fork_sha recorded, the fork commit is not in
++  #            this repo, or a git invocation errored. Fail closed and let the
++  #            false-completion guard decide, exactly as a missing fork_sha
++  #            already does on the ancestor arm.
++  bal_target="$1"
++  bal_branch="$2"
++  bal_fork="$3"
++  [ -n "$bal_fork" ] || return 2
++  git rev-parse --verify --quiet "$bal_fork^{commit}" >/dev/null 2>&1 || return 2
++  # The branch must have introduced something OF ITS OWN since the fork point.
++  # Both halves are load-bearing: a non-empty diff against the fork rules out
++  # the starved 0-commit polecat, and requiring commits the target does not
++  # already contain rules out the rebased zero-change branch whose counted
++  # commits arrived via the rebase (gcp-duy's false positive — do not let this
++  # arm reintroduce it on the content axis).
++  git diff --quiet "$bal_fork" "$bal_branch" 2>/dev/null
++  case "$?" in
++    0) return 1 ;;  # nothing since the fork -> nothing of its own was merged
++    1) : ;;         # real change since the fork -> keep checking
++    *) return 2 ;;  # git diff errored -> suspect -> fail closed
++  esac
++  [ "$(git rev-list --count "$bal_branch" --not "$bal_target" 2>/dev/null || echo 0)" -ge 1 ] || return 1
++  # `git cherry <target> <branch> <fork>` marks each commit since the fork '-'
++  # when an equivalent patch is already upstream and '+' when it is not. All
++  # '-' with no '+' is the rebasing rig's already-merged fingerprint.
++  bal_cherry=$(git cherry "$bal_target" "$bal_branch" "$bal_fork" 2>/dev/null) || return 2
++  [ -n "$bal_cherry" ] || return 1
++  printf '%s\n' "$bal_cherry" | grep -q '^+' && return 1
++  return 0
++}
++
++upstream_equivalent_sha() {
++  # Name the commit ON <target-ref> that carries <branch-ref>'s work, so a
++  # rebase-aware close writes a `merged_sha` that is actually reachable from
++  # the target — the field's whole purpose as the breadcrumb tying a closed
++  # bead to its merge commit. The pre-rebase branch tip is NOT on the target
++  # after a rewrite, so it cannot serve here.
++  #
++  # Scans the bounded range merge-base(target, branch)..target, which on a
++  # crash-after-push is the merge that just landed plus whatever raced it.
++  #   stdout = the matching target commit; exit 0
++  #   exit 1 = no match in the scanned range; the caller falls back rather than
++  #            inventing a sha.
++  ues_target="$1"
++  ues_branch="$2"
++  ues_id=$(git show "$ues_branch" 2>/dev/null | git patch-id --stable 2>/dev/null | cut -d' ' -f1)
++  [ -n "$ues_id" ] || return 1
++  ues_base=$(git merge-base "$ues_target" "$ues_branch" 2>/dev/null) || return 1
++  for ues_commit in $(git rev-list --max-count=500 "$ues_base..$ues_target" 2>/dev/null); do
++    if [ "$(git show "$ues_commit" 2>/dev/null | git patch-id --stable 2>/dev/null | cut -d' ' -f1)" = "$ues_id" ]; then
++      printf '%s\n' "$ues_commit"
++      return 0
++    fi
++  done
++  return 1
++}
++
+ halt_false_completion() {
+   # branch_has_real_change tripped: a close-as-merged would assert "work was
+   # merged" for a branch that merges to a no-op, which is definitionally
+@@ -880,6 +959,39 @@ halt_false_completion() {
+   exit 1
+ }
+ 
++close_already_merged() {
++  # Shared already-merged close, used by BOTH arms of the merge-state gate (the
++  # ancestor short-circuit and the rebase-aware content check) so the two can
++  # never drift on what a merged close records.
++  #   $1 = merged_sha — a commit on $TARGET that carries this bead's work
++  #   $2 = already_merged_via — how it was established: ancestor | rebase_patch_id
++  #   $3 = human-readable evidence for the close reason and the log line
++  # Both the metadata write and the close must land. A partial write would
++  # report merged with the bead still open, so on failure this STOPS and a
++  # later patrol retries instead.
++  cam_sha="$1"
++  cam_via="$2"
++  cam_evidence="$3"
++  cam_short=$(git rev-parse --short "$cam_sha" 2>/dev/null || printf '%s' "$cam_sha")
++  if gc bd update "$WORK" \
++       --set-metadata merge_result=already_merged \
++       --set-metadata merged_sha="$cam_sha" \
++       --set-metadata merged_target="$TARGET" \
++       --set-metadata already_merged_via="$cam_via" \
++       --set-metadata merged_source_sha="$(git rev-parse "origin/$BRANCH" 2>/dev/null || printf '%s' unknown)" \
++       --unset-metadata rejection_reason && \
++     gc bd close "$WORK" --reason "Already merged to $TARGET at $cam_short ($cam_evidence; closed instead of halting)"; then
++    echo "ALREADY_MERGED: $cam_evidence — closed $WORK as merged at $cam_short. Skip the merge script; run Cleanup, then patrol-summary + next-iteration."
++    exit 0
++  fi
++  # The update/close did not land (transient API failure). Do NOT report
++  # merged with the bead still open; STOP so a later patrol retries.
++  echo "ALREADY_MERGED close failed for $WORK; bead still open. STOP; a later patrol will retry."
++  gc runtime drain-ack
++  exit 1
++}
++# --- merge-state-helpers:end ---
++
+ pr_lookup_missing() {
+   case "$1" in
+     *"Could not resolve to a PullRequest"*|*"could not resolve to a PullRequest"*|*"no pull requests found"*|*"Not Found"*|*"not found"*|*"404"*) return 0 ;;
+@@ -1088,17 +1200,39 @@ one), exactly like a normal merge. Only genuine errors drain-ack.
+ - **Already merged (close, do NOT halt):** a previous refinery pass merged this
+   branch and the polecat crashed before the bead closed. That is a real
+   completion, so close it as merged with `merged_sha` forensics rather than let
+-  the 0-diff guard escalate a done bead to a human. An ancestor check alone is
+-  not enough: a 0-commit branch is trivially an ancestor of the target (its tip
+-  is still the fork point), so gate the close on the branch also carrying >=1
+-  commit since its recorded `metadata.fork_sha`. Without `fork_sha` recorded,
+-  stay conservative and fall through to the false-completion guard.
++  the 0-diff guard escalate a done bead to a human. Two arms detect it, because
++  one predicate cannot cover both merge shapes:
++  - **Reachability (`already_merged_via=ancestor`).** `origin/$BRANCH` is an
++    ancestor of `origin/$TARGET`. Ancestry alone is not enough — a 0-commit
++    branch is trivially an ancestor (its tip is still the fork point) — so
++    gate the close on the branch also carrying >=1 commit since its recorded
++    `metadata.fork_sha`.
++  - **Content (`already_merged_via=rebase_patch_id`).** Ancestry is a
++    *sufficient* condition for already-merged, never a necessary one, and on
++    this lane it is essentially unreachable: the merge script rebases `temp`
++    onto the target and ff-merges, which REWRITES the commits, so after a
++    successful merge the pre-rebase `origin/$BRANCH` sha is nowhere on
++    `$TARGET`. A crash between `git push` and `gc bd close` therefore used to
++    fall straight through to the 0-diff guard — the rebase correctly drops the
++    already-applied commit, the guard correctly sees 0 commits / 0 diff, and a
++    genuinely merged bead got halted to a human (winnow-zgr2y.6, refiled
++    gcp-a4e7). So when the rebase collapses to nothing, ask `git cherry`
++    whether every commit since `fork_sha` is already upstream by patch-id
++    before halting.
++
++  Without `fork_sha` recorded, neither arm can fire: stay conservative and fall
++  through to the false-completion guard.
+ - **False completion (halt):** a branch that introduces no change vs its
+   merge-base is definitionally not a merge. Refuse it before touching `$TARGET`.
+   Legit no-op resolutions use wontfix/duplicate/not-planned, never merged — so
+-  this never blocks a real merge.
++  this never blocks a real merge. The fork point is what keeps the content arm
++  above from swallowing this case: a genuinely empty branch has no diff against
++  its own `fork_sha`, and a branch merely rebased onto newer target carries no
++  commit the target lacks (gcp-duy), so neither reaches the already-merged
++  close.
+ 
+ ```bash
++# --- merge-state-gate:begin ---
+ FORK_SHA=$(gc bd show "$WORK" --json | jq -r '.[0].metadata.fork_sha // empty')
+ if ! git fetch origin "+refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}" "+refs/heads/${TARGET}:refs/remotes/origin/${TARGET}"; then
+   echo "git fetch failed; cannot evaluate merge state. STOP. Do not mutate bead state."
+@@ -1114,22 +1248,8 @@ case "$ANCESTOR_STATUS" in
+       REAL_COMMITS=$(git rev-list --count "$FORK_SHA..origin/$BRANCH" 2>/dev/null || echo 0)
+     fi
+     if [ -n "$FORK_SHA" ] && [ "$REAL_COMMITS" -ge 1 ]; then
+-      ALREADY_SHA=$(git rev-parse "origin/$BRANCH")
+-      ALREADY_SHORT=$(git rev-parse --short "origin/$BRANCH")
+-      if gc bd update "$WORK" \
+-           --set-metadata merge_result=already_merged \
+-           --set-metadata merged_sha="$ALREADY_SHA" \
+-           --set-metadata merged_target="$TARGET" \
+-           --unset-metadata rejection_reason && \
+-         gc bd close "$WORK" --reason "Already merged to $TARGET at $ALREADY_SHORT (branch is an ancestor of target; closed instead of halting)"; then
+-        echo "ALREADY_MERGED: origin/$BRANCH is an ancestor of origin/$TARGET with $REAL_COMMITS commit(s) since fork — closed $WORK as merged. Skip the merge script; run Cleanup, then patrol-summary + next-iteration."
+-        exit 0
+-      fi
+-      # The update/close did not land (transient API failure). Do NOT report
+-      # merged with the bead still open; STOP so a later patrol retries.
+-      echo "ALREADY_MERGED close failed for $WORK; bead still open. STOP; a later patrol will retry."
+-      gc runtime drain-ack
+-      exit 1
++      close_already_merged "$(git rev-parse "origin/$BRANCH")" ancestor \
++        "origin/$BRANCH is an ancestor of origin/$TARGET with $REAL_COMMITS commit(s) since fork"
+     fi
+     # Ancestor but no recorded real commits: a 0-commit branch. Fall through to
+     # the false-completion guard, which refuses to close it as merged.
+@@ -1146,13 +1266,37 @@ branch_has_real_change "origin/$TARGET" temp
+ BHRC_STATUS=$?
+ case "$BHRC_STATUS" in
+   0) : ;;  # verified real change -> continue to the merge script below
+-  1) halt_false_completion "$BRANCH" "$(git merge-base "origin/$TARGET" temp 2>/dev/null || printf '%s' "origin/$TARGET")" ;;
++  1)
++    # The rebase collapsed `temp` to nothing. Two opposite states look
++    # identical from here, and the branch's own fork point is what separates
++    # them: work that already landed (the rebase reports its commits as
++    # previously applied) versus a polecat that produced nothing. Ask the
++    # content-based predicate before halting — on this rebasing lane the
++    # ancestor arm above cannot fire, so this is the ONLY arm that can catch a
++    # crash between `git push` and `gc bd close`.
++    branch_already_landed "origin/$TARGET" "origin/$BRANCH" "$FORK_SHA"
++    BAL_STATUS=$?
++    if [ "$BAL_STATUS" -eq 0 ]; then
++      # merged_sha must name a commit ON the target; the pre-rebase branch tip
++      # is not one after the rewrite. Fall back to the verified target tip only
++      # if the carrying commit cannot be localized — never to the branch tip.
++      ALREADY_SHA=$(upstream_equivalent_sha "origin/$TARGET" "origin/$BRANCH") ||
++        ALREADY_SHA=$(git rev-parse "origin/$TARGET")
++      close_already_merged "$ALREADY_SHA" rebase_patch_id \
++        "every commit on origin/$BRANCH since $FORK_SHA is already upstream in origin/$TARGET by patch-id, and its rebase is empty"
++    fi
++    # Not already landed (status 1), or not evaluable (status 2): a branch that
++    # merges to a no-op and has no evidence of having landed is a false
++    # completion. Halt.
++    halt_false_completion "$BRANCH" "$(git merge-base "origin/$TARGET" temp 2>/dev/null || printf '%s' "origin/$TARGET")"
++    ;;
+   *)
+     echo "branch_has_real_change could not evaluate temp vs origin/$TARGET (tool error, status $BHRC_STATUS). STOP. Do not mutate bead state."
+     gc runtime drain-ack
+     exit 1
+     ;;
+ esac
++# --- merge-state-gate:end ---
+ ```
+ If this block closed the bead as already-merged, the merge is already done:
+ SKIP the merge script (step 1 below) and go straight to **2. Cleanup**, then
+diff --git a/gastown/tests/test_refinery_already_merged.sh b/gastown/tests/test_refinery_already_merged.sh
+new file mode 100755
+index 0000000..7ea0a91
+--- /dev/null
++++ b/gastown/tests/test_refinery_already_merged.sh
+@@ -0,0 +1,377 @@
++#!/usr/bin/env bash
++# Contract tests for mol-refinery-patrol's merge-state gate (gcp-a4e7).
++#
++# The gate has to separate three states that all present as "the rebase of this
++# branch onto the target is empty":
++#
++#   1. the work ALREADY LANDED and the polecat crashed between `git push` and
++#      `gc bd close` -> close the bead as merged;
++#   2. the polecat produced nothing at all -> halt as a false completion;
++#   3. the branch was merely rebased/reset onto newer target and never
++#      introduced anything of its own (gcp-duy) -> also halt.
++#
++# Before the fix the gate had a single already-merged arm, `git merge-base
++# --is-ancestor origin/$BRANCH origin/$TARGET`. That arm is unreachable on this
++# lane: the merge script rebases `temp` onto the target and ff-merges, which
++# rewrites the commit, so the pre-rebase branch sha is nowhere on the target
++# afterwards. State 1 therefore fell through to the 0-diff guard and halted a
++# genuinely merged bead to a human (live case winnow-zgr2y.6) -- exactly the
++# outcome the already-merged arm exists to prevent.
++#
++# So state 1 is exercised here against a REBASING origin, which is the shape
++# that reproduces the defect: a test that lands the branch by fast-forward goes
++# green against the unfixed gate, because ancestry still holds there. The
++# ancestor arm is kept under test too (a rig that ff-merges must still
++# short-circuit), and states 2 and 3 pin the halts the content arm must not
++# swallow.
++#
++# Nothing here asserts the fix by grepping. Both shipped blocks -- the helper
++# group and the gate that calls it -- are extracted from the formula between
++# their sentinels and EXECUTED against real git repositories, with a `gc` stub
++# recording what the gate did to the bead. A regression shows up as "a merged
++# bead was marked refused_false_completion" or "an empty branch was closed as
++# merged", not as an absent string.
++set -uo pipefail
++
++ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
++FORMULA="$ROOT/gastown/formulas/mol-refinery-patrol.toml"
++
++FAILURES=0
++
++fail() {
++    echo "FAIL: $*" >&2
++    FAILURES=$((FAILURES + 1))
++}
++
++# Extract one sentinel-delimited block of shipped formula text, substituting the
++# formula's own [vars] defaults. Any `{{...}}` left over is a hard error rather
++# than a block that executes a literal placeholder and passes vacuously.
++extract_block() {
++    python3 - "$FORMULA" "$1" "$2" <<'PY'
++import re
++import sys
++import tomllib
++
++formula, name, out = sys.argv[1:4]
++begin = f"# --- {name}:begin ---"
++end = f"# --- {name}:end ---"
++
++with open(formula, "rb") as handle:
++    doc = tomllib.load(handle)
++
++blocks = [
++    text.split(begin, 1)[1].split(end, 1)[0]
++    for text in (step.get("description", "") for step in doc["steps"])
++    if begin in text and end in text
++]
++if len(blocks) != 1:
++    sys.exit(f"expected exactly one {name} block in {formula}, found {len(blocks)}")
++
++block = blocks[0]
++values = {n: spec.get("default", "") for n, spec in (doc.get("vars") or {}).items()}
++block = re.sub(r"\{\{\s*(\w+)\s*\}\}", lambda m: values.get(m.group(1), m.group(0)), block)
++leftover = re.findall(r"\{\{[^}]*\}\}", block)
++if leftover:
++    sys.exit(f"unsubstituted placeholders in {name}: {sorted(set(leftover))}")
++
++with open(out, "w") as handle:
++    handle.write(block)
++PY
++}
++
++git_quiet() {
++    git -c init.defaultBranch=integration \
++        -c user.email=test@example.com \
++        -c user.name="Contract Test" \
++        -c advice.detachedHead=false \
++        -c protocol.file.allow=always \
++        "$@"
++}
++
++# A `gc` that answers exactly what the shipped blocks call. `bd show --json`
++# serves the work bead's metadata (the gate reads `fork_sha` from it); every
++# other call is recorded so a test can read back what the gate decided.
++make_gc_stub() {
++    local dir="$1"
++    mkdir -p "$dir"
++    cat > "$dir/gc" <<'STUB'
++#!/usr/bin/env bash
++printf '%s\n' "$*" >> "${GC_STUB_LOG:?GC_STUB_LOG unset}"
++case "$*" in
++    *"bd show"*--json*) printf '[{"metadata":{"fork_sha":"%s"}}]\n' "${GC_STUB_FORK_SHA:-}" ;;
++esac
++exit 0
++STUB
++    chmod +x "$dir/gc"
++}
++
++# Build a rig at the moment merge-push runs: a bare origin holding the target
++# and the polecat branch, and the refinery's clone with `temp` already rebased
++# onto the target, which is what the `rebase` step leaves behind.
++#
++# $3 selects how the branch relates to the target:
++#   landed_by_rebase  the work is on the target under a REWRITTEN sha (the
++#                     crash-after-push case this bead is about)
++#   landed_by_ff      the work is on the target under its own sha (ancestor arm)
++#   unmerged          ordinary merge candidate, nothing on the target yet
++#   empty_branch      the polecat committed nothing; tip is still the fork
++#   rebased_no_change branch reset onto a commit that is another bead's work
++build_rig() {
++    local root="$1" branch="$2" shape="$3"
++    ORIGIN="$root/origin.git"
++    REFINERY="$root/refinery"
++    mkdir -p "$root"
++    git_quiet init --bare -q "$ORIGIN"
++
++    git_quiet init -q "$root/seed"
++    echo baseline > "$root/seed/README.md"
++    git_quiet -C "$root/seed" add README.md
++    git_quiet -C "$root/seed" commit -qm "chore: baseline"
++    git_quiet -C "$root/seed" push -q "$ORIGIN" HEAD:integration
++    FORK_SHA=$(git_quiet -C "$root/seed" rev-parse HEAD)
++
++    # The polecat's branch.
++    git_quiet clone -q --branch integration "$ORIGIN" "$root/polecat"
++    git_quiet -C "$root/polecat" checkout -q -b "$branch"
++    if [ "$shape" != "empty_branch" ]; then
++        echo "the work this bead carried" > "$root/polecat/feature.txt"
++        git_quiet -C "$root/polecat" add feature.txt
++        git_quiet -C "$root/polecat" commit -qm "feat: the work this bead carried"
++    fi
++
++    case "$shape" in
++        landed_by_rebase)
++            # The refinery's own merge: rebase the branch onto the target and
++            # ff-merge it. The commit that lands is a REWRITE -- same patch, new
++            # sha -- so the branch is no longer an ancestor of the target.
++            local lander="$root/lander"
++            git_quiet clone -q --branch integration "$ORIGIN" "$lander"
++            git_quiet -C "$lander" fetch -q "$root/polecat" "$branch:temp"
++            git_quiet -C "$lander" checkout -q temp
++            # A commit of its own first, so the rebase must rewrite rather than
++            # fast-forward -- otherwise the landed sha equals the branch sha and
++            # the ancestor arm would still fire.
++            git_quiet -C "$lander" checkout -q integration
++            echo "someone else" > "$lander/other.txt"
++            git_quiet -C "$lander" add other.txt
++            git_quiet -C "$lander" commit -qm "feat: a concurrent bead"
++            git_quiet -C "$lander" checkout -q temp
++            git_quiet -C "$lander" rebase -q integration
++            git_quiet -C "$lander" checkout -q integration
++            git_quiet -C "$lander" merge -q --ff-only temp
++            LANDED_SHA=$(git_quiet -C "$lander" rev-parse HEAD)
++            git_quiet -C "$lander" push -q origin integration
++            ;;
++        landed_by_ff)
++            local lander="$root/lander"
++            git_quiet clone -q --branch integration "$ORIGIN" "$lander"
++            git_quiet -C "$lander" fetch -q "$root/polecat" "$branch:temp"
++            git_quiet -C "$lander" merge -q --ff-only temp
++            LANDED_SHA=$(git_quiet -C "$lander" rev-parse HEAD)
++            git_quiet -C "$lander" push -q origin integration
++            ;;
++        rebased_no_change)
++            # gcp-duy: another bead lands, and this branch is reset onto it. It
++            # now has a non-empty diff against its own fork point, but every
++            # commit it carries is already on the target and belongs elsewhere.
++            local lander="$root/lander"
++            git_quiet clone -q --branch integration "$ORIGIN" "$lander"
++            echo "another bead's work" > "$lander/elsewhere.txt"
++            git_quiet -C "$lander" add elsewhere.txt
++            git_quiet -C "$lander" commit -qm "feat: a different bead entirely"
++            git_quiet -C "$lander" push -q origin integration
++            git_quiet -C "$root/polecat" fetch -q origin integration
++            git_quiet -C "$root/polecat" reset -q --hard origin/integration
++            ;;
++    esac
++
++    git_quiet -C "$root/polecat" push -q origin "$branch"
++
++    git_quiet clone -q --branch integration "$ORIGIN" "$REFINERY"
++    git_quiet -C "$REFINERY" fetch -q origin "$branch"
++    git_quiet -C "$REFINERY" checkout -q -b temp "origin/$branch"
++    # The `rebase` step ran before merge-push; reproduce its result, including
++    # the "skipped previously applied commit" collapse to zero.
++    git_quiet -C "$REFINERY" rebase -q origin/integration >/dev/null 2>&1 ||
++        git_quiet -C "$REFINERY" rebase --abort >/dev/null 2>&1
++}
++
++# Execute the shipped helper group + gate against the refinery clone. Echoes the
++# gate's exit status; the gc stub log holds what it did to the bead.
++run_gate() {
++    local branch="$1" fork="$2"
++    (
++        cd "$REFINERY" || exit 90
++        export PATH="$STUBDIR:$PATH"
++        export GC_STUB_LOG GC_STUB_FORK_SHA="$fork"
++        # No `set -e`: the blocks must abort on their own explicit checks.
++        # shellcheck disable=SC2034
++        WORK=test-bead
++        # shellcheck disable=SC2034
++        BRANCH="$branch"
++        # shellcheck disable=SC2034
++        TARGET=integration
++        # shellcheck disable=SC1090
++        . "$HELPERS"
++        # shellcheck disable=SC1090
++        . "$GATE"
++    ) >/dev/null 2>&1
++}
++
++logged() { grep -qF -- "$1" "$GC_STUB_LOG"; }
++
++new_case() {
++    TMP=$(mktemp -d)
++    GC_STUB_LOG="$TMP/gc.log"
++    : > "$GC_STUB_LOG"
++    export GC_STUB_LOG
++}
++
++# --- tests ------------------------------------------------------------------
++
++test_crash_after_a_rebasing_merge_closes_as_already_merged() {
++    # The defect: the work IS on the target, under a rewritten sha, and the
++    # rebase of the branch collapses to nothing. The old gate halted here.
++    local status
++    new_case
++    build_rig "$TMP" polecat/test landed_by_rebase
++
++    run_gate polecat/test "$FORK_SHA"
++    status=$?
++
++    [ "$status" -eq 0 ] ||
++        fail "rebased already-merged branch exited $status, want 0 (close as merged, do not halt)"
++    logged "bd close test-bead" ||
++        fail "rebased already-merged branch never closed the bead — the merged work is stranded"
++    logged "--set-metadata merge_result=already_merged" ||
++        fail "rebased already-merged branch did not record merge_result=already_merged"
++    logged "--set-metadata already_merged_via=rebase_patch_id" ||
++        fail "rebased already-merged branch did not record how it was established"
++    ! logged "merge_result=refused_false_completion" ||
++        fail "rebased already-merged branch was halted as a false completion — the gcp-a4e7 defect"
++    # merged_sha must name a commit that is actually ON the target. The
++    # pre-rebase branch tip is not one, which is the whole reason this arm
++    # cannot reuse the ancestor arm's sha.
++    logged "--set-metadata merged_sha=$LANDED_SHA" ||
++        fail "merged_sha does not name the commit on integration that carried the work ($LANDED_SHA)"
++    rm -rf "$TMP"
++}
++
++test_fast_forward_merge_still_short_circuits_on_ancestry() {
++    # A rig that lands by fast-forward keeps the cheaper arm; the content arm
++    # must not have displaced it.
++    local status
++    new_case
++    build_rig "$TMP" polecat/test landed_by_ff
++
++    run_gate polecat/test "$FORK_SHA"
++    status=$?
++
++    [ "$status" -eq 0 ] ||
++        fail "ff-merged branch exited $status, want 0"
++    logged "--set-metadata already_merged_via=ancestor" ||
++        fail "ff-merged branch did not take the ancestor arm"
++    logged "--set-metadata merged_sha=$LANDED_SHA" ||
++        fail "ff-merged branch recorded the wrong merged_sha"
++    rm -rf "$TMP"
++}
++
++test_starved_zero_commit_branch_still_halts() {
++    local status
++    new_case
++    build_rig "$TMP" polecat/test empty_branch
++
++    run_gate polecat/test "$FORK_SHA"
++    status=$?
++
++    [ "$status" -ne 0 ] ||
++        fail "empty branch exited 0 — a branch with no commits must halt, never close"
++    logged "--set-metadata merge_result=refused_false_completion" ||
++        fail "empty branch did not halt as a false completion"
++    ! logged "bd close test-bead" ||
++        fail "empty branch was closed as merged — the content arm swallowed a false completion"
++    rm -rf "$TMP"
++}
++
++test_rebased_zero_change_branch_is_not_already_landed() {
++    # gcp-duy's shape: the branch was reset onto newer target, so its "commits
++    # since fork_sha" arrived via the rebase and belong to other beads.
++    #
++    # This is asserted against the predicate rather than the whole gate on
++    # purpose. Such a branch tip IS on the target, so the ancestor arm reaches
++    # it first and closes it — that false positive is gcp-duy's open defect on
++    # the reachability axis, not this one's. What belongs here is the narrower
++    # obligation this bead creates: the new content arm must not become a
++    # SECOND way to reach the same wrong answer.
++    local status
++    new_case
++    build_rig "$TMP" polecat/test rebased_no_change
++
++    status=$(
++        cd "$REFINERY" || exit 90
++        # shellcheck disable=SC1090
++        . "$HELPERS"
++        branch_already_landed origin/integration origin/polecat/test "$FORK_SHA"
++        printf '%s' "$?"
++    )
++
++    [ "$status" = "1" ] ||
++        fail "branch_already_landed returned $status for a branch that introduced nothing of its own, want 1 (not already merged)"
++    rm -rf "$TMP"
++}
++
++test_missing_fork_sha_stays_conservative() {
++    # Without fork_sha neither arm can separate landed work from a starved
++    # polecat, so the gate must fall through to the halt rather than guess.
++    local status
++    new_case
++    build_rig "$TMP" polecat/test landed_by_rebase
++
++    run_gate polecat/test ""
++    status=$?
++
++    [ "$status" -ne 0 ] ||
++        fail "missing fork_sha exited 0 — the gate guessed instead of staying conservative"
++    ! logged "merge_result=already_merged" ||
++        fail "missing fork_sha closed the bead as merged with no fork point to judge against"
++    rm -rf "$TMP"
++}
++
++test_unmerged_branch_falls_through_to_the_merge() {
++    local status
++    new_case
++    build_rig "$TMP" polecat/test unmerged
++
++    run_gate polecat/test "$FORK_SHA"
++    status=$?
++
++    [ "$status" -eq 0 ] ||
++        fail "ordinary merge candidate exited $status, want 0 (fall through to the merge script)"
++    ! logged "bd close test-bead" ||
++        fail "ordinary merge candidate was closed by the gate instead of being merged"
++    ! logged "merge_result=refused_false_completion" ||
++        fail "ordinary merge candidate was halted as a false completion"
++    rm -rf "$TMP"
++}
++
++HARNESS=$(mktemp -d)
++trap 'rm -rf "$HARNESS"' EXIT
++HELPERS="$HARNESS/helpers.sh"
++GATE="$HARNESS/gate.sh"
++STUBDIR="$HARNESS/bin"
++extract_block merge-state-helpers "$HELPERS"
++extract_block merge-state-gate "$GATE"
++make_gc_stub "$STUBDIR"
++
++test_crash_after_a_rebasing_merge_closes_as_already_merged
++test_fast_forward_merge_still_short_circuits_on_ancestry
++test_starved_zero_commit_branch_still_halts
++test_rebased_zero_change_branch_is_not_already_landed
++test_missing_fork_sha_stays_conservative
++test_unmerged_branch_falls_through_to_the_merge
++
++if [ "$FAILURES" -ne 0 ]; then
++    echo "refinery already-merged gate tests: $FAILURES failure(s)" >&2
++    exit 1
++fi
++echo "refinery already-merged gate tests passed"
+diff --git a/scripts/gascity_pack_inference_gate.py b/scripts/gascity_pack_inference_gate.py
+index de23a53..ec448e6 100644
+--- a/scripts/gascity_pack_inference_gate.py
++++ b/scripts/gascity_pack_inference_gate.py
+@@ -124,6 +124,13 @@ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
+         "{{build_command}}",
+         "{{test_command}}",
+         "branch_has_real_change",
++        # The rebase-aware arm of the already-merged gate. Without it the
++        # ancestor check is the only arm, and on a lane that lands work by
++        # rebasing that check can essentially never fire — so a crash between
++        # push and close halts a genuinely merged bead as a false completion
++        # (gcp-a4e7, live case winnow-zgr2y.6).
++        "branch_already_landed",
++        "--set-metadata already_merged_via=",
+         'git worktree add --detach "$mfp_wt" "$BEFORE_SHA"',
+         'git -C "$mfp_wt" merge --ff-only "$TEMP_SHA"',
+         # The merge must be proven, not asserted: the target has to have
+-- 
+2.50.1 (Apple Git-155)
+
