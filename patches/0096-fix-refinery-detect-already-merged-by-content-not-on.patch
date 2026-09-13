@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <hunter.hough@gmail.com>
 Date: Sun, 13 Sep 2026 16:48:01 -0400
-Subject: [PATCH 96/97] fix(refinery): detect already-merged by content, not
+Subject: [PATCH 96/99] fix(refinery): detect already-merged by content, not
  only ancestry (gcp-a4e7)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

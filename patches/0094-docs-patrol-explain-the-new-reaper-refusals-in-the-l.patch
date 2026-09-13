@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 13 Sep 2026 16:31:01 -0400
-Subject: [PATCH 94/97] docs(patrol): explain the new reaper refusals in the
+Subject: [PATCH 94/99] docs(patrol): explain the new reaper refusals in the
  log-review table (gcp-jxtc)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sun, 13 Sep 2026 17:38:30 -0400
+Subject: [PATCH 99/99] test(polecat): register the claim-guard test with the
+ bare-bd drift guard (gcp-cvbs)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`tests/test_no_bare_bd_commands.py` scans every tracked asset for `bd`
+invocations that bypass `gc bd` routing. The new claim-guard test names
+`bd` as DATA in five places — two case labels in its fake `gc`, and three
+expected argv tails it greps out of that stub's call log — so the guard
+fired on all five and the branch was rejected.
+
+Exempt them the way the guard requires, rather than loosening the guard:
+the exemption is triple-locked (exact tracked path + the `gc-bd-argv-tail`
+marker on the line + a verbatim line match), which is deliberate so that
+editing an exempted line re-fires the guard and the line is re-confirmed
+as data.
+
+Two of the three argv tails could not carry the marker where they stood —
+one was a backslash continuation, and the marker would have broken it.
+Hoist all three into named constants beside the other fixtures, each on
+its own marked line, and grep the constants. That also removes the
+duplicated literal between `assert_claimed` and the readback assertion.
+
+Verified every allowlisted entry still matches a live line in the file, so
+none of the five is a dead exemption.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../tests/test_polecat_work_bead_claim_guard.sh    | 14 ++++++++++----
+ tests/test_no_bare_bd_commands.py                  | 11 +++++++++++
+ 2 files changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/gastown/tests/test_polecat_work_bead_claim_guard.sh b/gastown/tests/test_polecat_work_bead_claim_guard.sh
+index 00b168d..ff2fd8f 100755
+--- a/gastown/tests/test_polecat_work_bead_claim_guard.sh
++++ b/gastown/tests/test_polecat_work_bead_claim_guard.sh
+@@ -30,6 +30,13 @@ REFINERY="$RIG/gastown.refinery"
+ CREW="$RIG/crew.valkyrie"
+ BEAD="gcp-cvbs"
+ 
++# The exact argv tails the claim hands to `gc`. They are grepped out of the fake
++# gc's call log — data the stub recorded, never an invocation — so they are
++# hoisted here where the drift guard's allowlist can pin them line by line.
++CLAIM_CALL="bd update $BEAD --status=in_progress --assignee=$ME --set-metadata polecat_session=$ME" # gc-bd-argv-tail: expected argv tail, not an invocation
++CLAIM_CALL_PREFIX="bd update $BEAD" # gc-bd-argv-tail: expected argv tail, not an invocation
++CLAIM_STATUS_PREFIX="bd update $BEAD --status=in_progress" # gc-bd-argv-tail: expected argv tail, not an invocation
++
+ fail() {
+     echo "FAIL: $*" >&2
+     exit 1
+@@ -121,13 +128,12 @@ HARNESS
+ 
+ assert_claimed() {
+     local dir="$1" why="$2"
+-    grep -F "bd update $BEAD --status=in_progress --assignee=$ME --set-metadata polecat_session=$ME" \
+-        "$dir/calls.log" >/dev/null || fail "$why"
++    grep -F "$CLAIM_CALL" "$dir/calls.log" >/dev/null || fail "$why"
+ }
+ 
+ assert_not_claimed() {
+     local dir="$1" why="$2"
+-    ! grep -F "bd update $BEAD" "$dir/calls.log" >/dev/null || fail "$why"
++    ! grep -F "$CLAIM_CALL_PREFIX" "$dir/calls.log" >/dev/null || fail "$why"
+ }
+ 
+ # The defect itself. gaunt-m58w was assigned to gauntlet/crew.valkyrie — the
+@@ -221,7 +227,7 @@ test_claim_is_read_back_and_settles() {
+ 
+     ! grep -F 'after the claim; it may still be re-slung' <<<"$out" >/dev/null ||
+         fail "a claim the stub accepted still reported an unsettled readback: $out"
+-    [[ "$(grep -c -F "bd update $BEAD --status=in_progress" "$dir/calls.log")" == "1" ]] ||
++    [[ "$(grep -c -F "$CLAIM_STATUS_PREFIX" "$dir/calls.log")" == "1" ]] ||
+         fail "the readback loop retried a claim that had already landed"
+ }
+ 
+diff --git a/tests/test_no_bare_bd_commands.py b/tests/test_no_bare_bd_commands.py
+index 5d39cee..4e60fce 100644
+--- a/tests/test_no_bare_bd_commands.py
++++ b/tests/test_no_bare_bd_commands.py
+@@ -176,6 +176,17 @@ GC_BD_ARGV_TAIL_ALLOWLIST: dict[Path, set[str]] = {
+         "restore_call='bd update winnow-iaroy --assignee=gastown__polecat-gc-8a4d'"
+         " # gc-bd-argv-tail: expected argv tail, not an invocation",
+     },
++    Path("gastown/tests/test_polecat_work_bead_claim_guard.sh"): {
++        '"bd show") # gc-bd-argv-tail: case label matching the fake gc\'s argv tail',
++        '"bd update") # gc-bd-argv-tail: case label matching the fake gc\'s argv tail',
++        'CLAIM_CALL="bd update $BEAD --status=in_progress --assignee=$ME'
++        ' --set-metadata polecat_session=$ME"'
++        " # gc-bd-argv-tail: expected argv tail, not an invocation",
++        'CLAIM_CALL_PREFIX="bd update $BEAD"'
++        " # gc-bd-argv-tail: expected argv tail, not an invocation",
++        'CLAIM_STATUS_PREFIX="bd update $BEAD --status=in_progress"'
++        " # gc-bd-argv-tail: expected argv tail, not an invocation",
++    },
+     Path("gastown/tests/test_refinery_find_work.sh"): {
+         "# Stub `gc` implementing just enough of `bd list` to answer the shipped"
+         " query. # gc-bd-argv-tail: prose, not an invocation",
+-- 
+2.50.1 (Apple Git-155)
+
