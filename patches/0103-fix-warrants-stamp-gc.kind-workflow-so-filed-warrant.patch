@@ -1,0 +1,260 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Mon, 14 Sep 2026 13:53:24 -0400
+Subject: [PATCH 103/103] fix(warrants): stamp gc.kind=workflow so filed
+ warrants actually pour (gcp-w310)
+
+Pool demand detection polls for a ready, unassigned bead carrying BOTH
+gc.kind=workflow and gc.routed_to -- that pair is what makes a bead a
+pollable workflow root. Every warrant-filing template in the pack stamped
+only gc.routed_to, so a filed warrant was a plain bead wearing a routing
+label: no demand was ever signalled, no dog was ever spawned, and the
+warrant sat open and unassigned forever while every status surface stayed
+green. gascity-9qfg sat routed to the dog pool with zero dog sessions ever
+appearing in `gc session list`; per the mayor's note two earlier batches
+went unclaimed for two days the same way.
+
+The bead named four sites (three in mol-deacon-patrol, one in
+mol-witness-patrol). Two more carry the identical defect and are fixed
+here too, because leaving them would have left the bug live:
+
+- gastown/agents/boot/prompt.template.md -- boot has no formula, so its
+  warrant command is authoritative rather than a copy (gastown/README.md
+  documents this as one of the three restatement exceptions). Every
+  warrant boot files for a stuck deacon would still have been inert.
+- gastown/formulas/mol-shutdown-dance.toml -- the preamble is the canonical
+  recipe every warrant producer is written from, so leaving it would have
+  taught the broken shape to the next one.
+
+The fix is the metadata key alone. It is deliberately NOT the "pour via
+sling/mol" alternative the bead offers as a second option: mol-shutdown-
+dance states its own dispatch contract as "this formula is not poured with
+template vars -- dispatch is a claimed task bead", and the dog prompt reads
+target/reason/requester off $GC_BEAD_ID with no separate warrant_id. Slinging
+would have required redesigning that whole path; marking the warrant as its
+own workflow root leaves the dog's claim contract untouched.
+
+Guarded by a new detector in the drift test, alongside the pool-return and
+warrant-dedup invariants it already enforces -- same silent-orphan class,
+where the bead looks healthy by inspection and nothing errors. The detector
+is scoped to warrant creation rather than every routed create: the routing
+key alone is correct on a bead a claimed session picks up by assignment,
+and only a pool-dispatched create needs the root marker.
+
+Validation: the new detector was run against the pre-fix text of all four
+patched files via `git show HEAD:<path>` and flagged exactly the six sites
+above (red), then `pytest tests/test_prompt_formula_command_drift.py` at
+9 passed (green). Full sweep: go vet clean, golangci-lint 0 issues,
+validate_registry.py ok, go test ./... ok.
+
+Pre-existing and NOT from this branch: tests/test_no_bare_bd_commands.py
+fails on base 8daf4447 over prose in docs/design/reaper-budget-starvation.md,
+reproduced from a pristine detached worktree. Filed as gcp-98gh (P1,
+discovered-from gcp-w310) and notified to the witness. It reddens GitHub CI
+on integration and therefore on this PR, while all four configured rig gates
+stay green -- that gate gap is the more consequential half of gcp-98gh.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ gastown/README.md                          |  4 +-
+ gastown/agents/boot/prompt.template.md     |  2 +-
+ gastown/formulas/mol-deacon-patrol.toml    |  6 +-
+ gastown/formulas/mol-shutdown-dance.toml   | 11 +++-
+ gastown/formulas/mol-witness-patrol.toml   |  2 +-
+ tests/test_prompt_formula_command_drift.py | 69 ++++++++++++++++++++++
+ 6 files changed, 87 insertions(+), 7 deletions(-)
+
+diff --git a/gastown/README.md b/gastown/README.md
+index ab1a59ac..77b4d21f 100644
+--- a/gastown/README.md
++++ b/gastown/README.md
+@@ -131,7 +131,9 @@ Three narrow exceptions, each of which must be *complete*, not condensed:
+ 
+ `tests/test_prompt_formula_command_drift.py` enforces the invariants whose loss
+ was observed in practice: pool-returning updates declare their routing, warrant
+-creation in injected context is deduped, and a prompt bail-out path drain-acks.
++creation in injected context is deduped, a pool-routed warrant also declares
++`gc.kind=workflow` so it is a pollable workflow root, and a prompt bail-out path
++drain-acks.
+ 
+ ## Dog Pool
+ 
+diff --git a/gastown/agents/boot/prompt.template.md b/gastown/agents/boot/prompt.template.md
+index e10f95c2..fe37a56a 100644
+--- a/gastown/agents/boot/prompt.template.md
++++ b/gastown/agents/boot/prompt.template.md
+@@ -93,7 +93,7 @@ if [ "${EXISTING_WARRANT:-0}" -gt 0 ]; then
+ else
+   gc bd create --type=task \
+     --title="Stuck: $TARGET_SESSION" \
+-    --metadata '{"target":"{{ .BindingPrefix }}deacon","reason":"Stale patrol wisp, no activity","requester":"boot","gc.routed_to":"{{ .BindingPrefix }}dog"}' \
++    --metadata '{"target":"{{ .BindingPrefix }}deacon","reason":"Stale patrol wisp, no activity","requester":"boot","gc.kind":"workflow","gc.routed_to":"{{ .BindingPrefix }}dog"}' \
+     --label=warrant
+ fi
+ ```
+diff --git a/gastown/formulas/mol-deacon-patrol.toml b/gastown/formulas/mol-deacon-patrol.toml
+index b89cb3eb..1d03c147 100644
+--- a/gastown/formulas/mol-deacon-patrol.toml
++++ b/gastown/formulas/mol-deacon-patrol.toml
+@@ -175,7 +175,7 @@ if [ "${EXISTING_WARRANT:-0}" -gt 0 ]; then
+ else
+   gc bd create --type=task --label=warrant \
+     --title="Stuck: <session>" \
+-    --metadata '{"target":"<session>","reason":"<reason>","requester":"deacon","gc.routed_to":"{{binding_prefix}}dog"}'
++    --metadata '{"target":"<session>","reason":"<reason>","requester":"deacon","gc.kind":"workflow","gc.routed_to":"{{binding_prefix}}dog"}'
+ fi
+ ```
+ 
+@@ -296,7 +296,7 @@ if [ "${EXISTING_WARRANT:-0}" -gt 0 ]; then
+ else
+     gc bd create --type=task --label=warrant \
+         --title="Stuck queue: <session> — $ASSIGNED beads, no activity $duration" \
+-        --metadata '{"target":"<session>","reason":"queue starvation: N beads, no bead.updated_at progress","requester":"deacon","gc.routed_to":"{{binding_prefix}}dog"}'
++        --metadata '{"target":"<session>","reason":"queue starvation: N beads, no bead.updated_at progress","requester":"deacon","gc.kind":"workflow","gc.routed_to":"{{binding_prefix}}dog"}'
+ fi
+ ```
+ 
+@@ -348,7 +348,7 @@ if [ "${EXISTING_WARRANT:-0}" -gt 0 ]; then
+ else
+   gc bd create --type=task --label=warrant \
+     --title="Stuck dog: <agent>" \
+-    --metadata '{"target":"<session>","reason":"<reason>","requester":"deacon","gc.routed_to":"{{binding_prefix}}dog"}'
++    --metadata '{"target":"<session>","reason":"<reason>","requester":"deacon","gc.kind":"workflow","gc.routed_to":"{{binding_prefix}}dog"}'
+ fi
+ ```
+ 
+diff --git a/gastown/formulas/mol-shutdown-dance.toml b/gastown/formulas/mol-shutdown-dance.toml
+index 03dadf9c..6896de24 100644
+--- a/gastown/formulas/mol-shutdown-dance.toml
++++ b/gastown/formulas/mol-shutdown-dance.toml
+@@ -6,10 +6,19 @@ Dispatched by filing a warrant bead routed to the dog pool:
+ ```bash
+ gc bd create --type=task \
+   --title="Stuck: <agent>" \
+-  --metadata '{"target":"<session>","reason":"<reason>","requester":"<who>","gc.routed_to":"<binding-prefix>dog"}' \
++  --metadata '{"target":"<session>","reason":"<reason>","requester":"<who>","gc.kind":"workflow","gc.routed_to":"<binding-prefix>dog"}' \
+   --label=warrant
+ ```
+ 
++`gc.kind=workflow` is not decoration. Pool demand detection polls for a
++ready, unassigned bead carrying **both** `gc.kind=workflow` and
++`gc.routed_to` — that pair is what makes a bead a pollable workflow root.
++A warrant that stamps only `gc.routed_to` is a plain bead wearing a routing
++label: no demand is ever signalled, no dog is ever spawned, and the bead
++sits open and unassigned forever while every status surface stays green.
++That is exactly what happened to gascity-9qfg, which sat routed to the dog
++pool with zero dog sessions ever appearing in `gc session list` (gcp-w310).
++
+ The dog pool picks up the warrant and runs this formula against the
+ claimed warrant bead. The claimed bead is the warrant id; use
+ `$GC_BEAD_ID` for warrant verification, closure, and audit output.
+diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
+index 140c81ae..7361e4ec 100644
+--- a/gastown/formulas/mol-witness-patrol.toml
++++ b/gastown/formulas/mol-witness-patrol.toml
+@@ -969,7 +969,7 @@ if [ "${EXISTING_WARRANT:-0}" -gt 0 ]; then
+ else
+   gc bd create --type=task \
+     --title="Stuck: <session-name>" \
+-    --metadata '{"target":"<session-name>","reason":"No progress on <bead> for <duration>","requester":"witness","gc.routed_to":"{{binding_prefix}}dog"}' \
++    --metadata '{"target":"<session-name>","reason":"No progress on <bead> for <duration>","requester":"witness","gc.kind":"workflow","gc.routed_to":"{{binding_prefix}}dog"}' \
+     --label=warrant
+ fi
+ ```
+diff --git a/tests/test_prompt_formula_command_drift.py b/tests/test_prompt_formula_command_drift.py
+index fa61f557..03d02f48 100644
+--- a/tests/test_prompt_formula_command_drift.py
++++ b/tests/test_prompt_formula_command_drift.py
+@@ -182,6 +182,36 @@ def warrant_dedup_violations(path: Path, text: str) -> list[str]:
+     return violations
+ 
+ 
++def warrant_workflow_kind_violations(path: Path, text: str) -> list[str]:
++    """A warrant routed to the dog pool must also declare `gc.kind=workflow`.
++
++    Pool demand detection polls for a ready, unassigned bead carrying BOTH
++    `gc.kind=workflow` and `gc.routed_to`; that pair is what makes a bead a
++    pollable workflow root. A warrant that stamps only the routing is a plain
++    bead wearing a routing label — no demand is signalled, no dog spawns, and
++    the bead sits open and unassigned forever while every status surface stays
++    green. Same silent-orphan class as a pool return with no routing at all,
++    and it cost gascity-9qfg a shutdown dance that never ran (gcp-w310).
++
++    Scoped to warrant creation rather than every routed create: the routing
++    key alone is correct on a bead a claimed session will pick up by
++    assignment, and only a pool-dispatched create needs the root marker.
++    """
++    violations = []
++    for number, command in logical_commands(text):
++        if "gc bd create" not in command or "--label=warrant" not in command:
++            continue
++        if "gc.routed_to" not in command:
++            continue
++        if "gc.kind" in command:
++            continue
++        violations.append(
++            f"{path.relative_to(REPO_ROOT)}:{number}: warrant routed to the "
++            "pool without gc.kind=workflow"
++        )
++    return violations
++
++
+ def bail_without_drain_violations(path: Path, text: str) -> list[str]:
+     """A prompt block that gives up must drain-ack, as the formula does.
+ 
+@@ -360,6 +390,20 @@ def test_prompt_templates_do_not_restate_warrant_creation_unguarded() -> None:
+     )
+ 
+ 
++def test_warrant_creation_declares_the_workflow_root_marker() -> None:
++    violations = []
++    for path in gastown_assets():
++        violations.extend(
++            warrant_workflow_kind_violations(path, path.read_text(encoding="utf-8"))
++        )
++
++    assert not violations, (
++        "a warrant with gc.routed_to but no gc.kind=workflow is not a pollable "
++        "workflow root: no dog pool demand is signalled, no dog spawns, and the "
++        "warrant sits open and unassigned forever:\n" + "\n".join(violations)
++    )
++
++
+ def test_prompt_template_bail_paths_drain_ack() -> None:
+     violations = []
+     for path in agent_prompts():
+@@ -553,6 +597,31 @@ def test_detectors_catch_the_drift_they_are_named_for() -> None:
+         fixture, "| File warrant | `gc bd create --type=task --label=warrant ...` |"
+     )
+ 
++    # Built line-by-line for the same reason as the warrant fixtures above.
++    routed_warrant = "\n".join(
++        [
++            "gc bd create --type=task --label=warrant \\",
++            "  --title=\"Stuck: $TARGET_SESSION\" \\",
++            "  --metadata '{\"target\":\"x\",\"gc.routed_to\":\"gastown.dog\"}'",
++        ]
++    )
++    assert warrant_workflow_kind_violations(fixture, routed_warrant)
++    rooted_warrant = "\n".join(
++        [
++            "gc bd create --type=task --label=warrant \\",
++            "  --title=\"Stuck: $TARGET_SESSION\" \\",
++            "  --metadata '{\"target\":\"x\",\"gc.kind\":\"workflow\","
++            "\"gc.routed_to\":\"gastown.dog\"}'",
++        ]
++    )
++    assert not warrant_workflow_kind_violations(fixture, rooted_warrant)
++    # A create that is not pool-routed needs no root marker: an assigned bead
++    # is picked up by assignment, not by demand detection.
++    assert not warrant_workflow_kind_violations(
++        fixture,
++        "gc bd create --type=task --label=warrant --metadata '{\"target\":\"x\"}'",
++    )
++
+     assert bail_without_drain_violations(fixture, "```bash\necho no\nexit 1\n```")
+     assert not bail_without_drain_violations(
+         fixture, "```bash\necho no\ngc runtime drain-ack\nexit 1\n```"
+-- 
+2.50.1 (Apple Git-155)
+

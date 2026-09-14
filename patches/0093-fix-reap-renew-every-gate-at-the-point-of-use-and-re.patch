@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 13 Sep 2026 16:25:41 -0400
-Subject: [PATCH 093/102] fix(reap): renew every gate at the point of use and
+Subject: [PATCH 093/103] fix(reap): renew every gate at the point of use and
  refuse a removal on a spent clock (gcp-jxtc)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

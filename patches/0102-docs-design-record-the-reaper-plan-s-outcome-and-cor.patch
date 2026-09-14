@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Mon, 14 Sep 2026 09:18:30 -0400
-Subject: [PATCH 102/102] docs(design): record the reaper plan's outcome and
+Subject: [PATCH 102/103] docs(design): record the reaper plan's outcome and
  correct my own call (gcp-uzq0)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
