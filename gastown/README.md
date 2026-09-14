@@ -131,7 +131,9 @@ Three narrow exceptions, each of which must be *complete*, not condensed:
 
 `tests/test_prompt_formula_command_drift.py` enforces the invariants whose loss
 was observed in practice: pool-returning updates declare their routing, warrant
-creation in injected context is deduped, and a prompt bail-out path drain-acks.
+creation in injected context is deduped, a pool-routed warrant also declares
+`gc.kind=workflow` so it is a pollable workflow root, and a prompt bail-out path
+drain-acks.
 
 ## Dog Pool
 

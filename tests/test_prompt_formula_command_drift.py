@@ -182,6 +182,36 @@ def warrant_dedup_violations(path: Path, text: str) -> list[str]:
     return violations
 
 
+def warrant_workflow_kind_violations(path: Path, text: str) -> list[str]:
+    """A warrant routed to the dog pool must also declare `gc.kind=workflow`.
+
+    Pool demand detection polls for a ready, unassigned bead carrying BOTH
+    `gc.kind=workflow` and `gc.routed_to`; that pair is what makes a bead a
+    pollable workflow root. A warrant that stamps only the routing is a plain
+    bead wearing a routing label — no demand is signalled, no dog spawns, and
+    the bead sits open and unassigned forever while every status surface stays
+    green. Same silent-orphan class as a pool return with no routing at all,
+    and it cost gascity-9qfg a shutdown dance that never ran (gcp-w310).
+
+    Scoped to warrant creation rather than every routed create: the routing
+    key alone is correct on a bead a claimed session will pick up by
+    assignment, and only a pool-dispatched create needs the root marker.
+    """
+    violations = []
+    for number, command in logical_commands(text):
+        if "gc bd create" not in command or "--label=warrant" not in command:
+            continue
+        if "gc.routed_to" not in command:
+            continue
+        if "gc.kind" in command:
+            continue
+        violations.append(
+            f"{path.relative_to(REPO_ROOT)}:{number}: warrant routed to the "
+            "pool without gc.kind=workflow"
+        )
+    return violations
+
+
 def bail_without_drain_violations(path: Path, text: str) -> list[str]:
     """A prompt block that gives up must drain-ack, as the formula does.
 
@@ -357,6 +387,20 @@ def test_prompt_templates_do_not_restate_warrant_creation_unguarded() -> None:
     assert not violations, (
         "point at the owning formula step instead of restating the warrant "
         "command, or carry the dedup guard inline:\n" + "\n".join(violations)
+    )
+
+
+def test_warrant_creation_declares_the_workflow_root_marker() -> None:
+    violations = []
+    for path in gastown_assets():
+        violations.extend(
+            warrant_workflow_kind_violations(path, path.read_text(encoding="utf-8"))
+        )
+
+    assert not violations, (
+        "a warrant with gc.routed_to but no gc.kind=workflow is not a pollable "
+        "workflow root: no dog pool demand is signalled, no dog spawns, and the "
+        "warrant sits open and unassigned forever:\n" + "\n".join(violations)
     )
 
 
@@ -551,6 +595,31 @@ def test_detectors_catch_the_drift_they_are_named_for() -> None:
     # carry the guard — it has to point at the formula instead.
     assert warrant_dedup_violations(
         fixture, "| File warrant | `gc bd create --type=task --label=warrant ...` |"
+    )
+
+    # Built line-by-line for the same reason as the warrant fixtures above.
+    routed_warrant = "\n".join(
+        [
+            "gc bd create --type=task --label=warrant \\",
+            "  --title=\"Stuck: $TARGET_SESSION\" \\",
+            "  --metadata '{\"target\":\"x\",\"gc.routed_to\":\"gastown.dog\"}'",
+        ]
+    )
+    assert warrant_workflow_kind_violations(fixture, routed_warrant)
+    rooted_warrant = "\n".join(
+        [
+            "gc bd create --type=task --label=warrant \\",
+            "  --title=\"Stuck: $TARGET_SESSION\" \\",
+            "  --metadata '{\"target\":\"x\",\"gc.kind\":\"workflow\","
+            "\"gc.routed_to\":\"gastown.dog\"}'",
+        ]
+    )
+    assert not warrant_workflow_kind_violations(fixture, rooted_warrant)
+    # A create that is not pool-routed needs no root marker: an assigned bead
+    # is picked up by assignment, not by demand detection.
+    assert not warrant_workflow_kind_violations(
+        fixture,
+        "gc bd create --type=task --label=warrant --metadata '{\"target\":\"x\"}'",
     )
 
     assert bail_without_drain_violations(fixture, "```bash\necho no\nexit 1\n```")

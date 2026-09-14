@@ -175,7 +175,7 @@ if [ "${EXISTING_WARRANT:-0}" -gt 0 ]; then
 else
   gc bd create --type=task --label=warrant \
     --title="Stuck: <session>" \
-    --metadata '{"target":"<session>","reason":"<reason>","requester":"deacon","gc.routed_to":"{{binding_prefix}}dog"}'
+    --metadata '{"target":"<session>","reason":"<reason>","requester":"deacon","gc.kind":"workflow","gc.routed_to":"{{binding_prefix}}dog"}'
 fi
 ```
 
@@ -296,7 +296,7 @@ if [ "${EXISTING_WARRANT:-0}" -gt 0 ]; then
 else
     gc bd create --type=task --label=warrant \
         --title="Stuck queue: <session> — $ASSIGNED beads, no activity $duration" \
-        --metadata '{"target":"<session>","reason":"queue starvation: N beads, no bead.updated_at progress","requester":"deacon","gc.routed_to":"{{binding_prefix}}dog"}'
+        --metadata '{"target":"<session>","reason":"queue starvation: N beads, no bead.updated_at progress","requester":"deacon","gc.kind":"workflow","gc.routed_to":"{{binding_prefix}}dog"}'
 fi
 ```
 
@@ -348,7 +348,7 @@ if [ "${EXISTING_WARRANT:-0}" -gt 0 ]; then
 else
   gc bd create --type=task --label=warrant \
     --title="Stuck dog: <agent>" \
-    --metadata '{"target":"<session>","reason":"<reason>","requester":"deacon","gc.routed_to":"{{binding_prefix}}dog"}'
+    --metadata '{"target":"<session>","reason":"<reason>","requester":"deacon","gc.kind":"workflow","gc.routed_to":"{{binding_prefix}}dog"}'
 fi
 ```
 

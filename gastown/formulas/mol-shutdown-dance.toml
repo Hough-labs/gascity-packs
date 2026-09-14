@@ -6,9 +6,18 @@ Dispatched by filing a warrant bead routed to the dog pool:
 ```bash
 gc bd create --type=task \
   --title="Stuck: <agent>" \
-  --metadata '{"target":"<session>","reason":"<reason>","requester":"<who>","gc.routed_to":"<binding-prefix>dog"}' \
+  --metadata '{"target":"<session>","reason":"<reason>","requester":"<who>","gc.kind":"workflow","gc.routed_to":"<binding-prefix>dog"}' \
   --label=warrant
 ```
+
+`gc.kind=workflow` is not decoration. Pool demand detection polls for a
+ready, unassigned bead carrying **both** `gc.kind=workflow` and
+`gc.routed_to` — that pair is what makes a bead a pollable workflow root.
+A warrant that stamps only `gc.routed_to` is a plain bead wearing a routing
+label: no demand is ever signalled, no dog is ever spawned, and the bead
+sits open and unassigned forever while every status surface stays green.
+That is exactly what happened to gascity-9qfg, which sat routed to the dog
+pool with zero dog sessions ever appearing in `gc session list` (gcp-w310).
 
 The dog pool picks up the warrant and runs this formula against the
 claimed warrant bead. The claimed bead is the warrant id; use
