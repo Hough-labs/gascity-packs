@@ -1,0 +1,138 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Mon, 14 Sep 2026 09:18:30 -0400
+Subject: [PATCH 102/102] docs(design): record the reaper plan's outcome and
+ correct my own call (gcp-uzq0)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Bead A SHIPPED in b743d7f0. My escalation that the approach was repo-forbidden
+was too strong and was acted on. The guard forbids bare bd because it resolves
+from $PWD; `bd -C "$RIG_ROOT" --readonly` pins the rig checkout and fails closed,
+and the implementation extended the policy with its own triple-locked exemption
+plus a regression test proving the exemption is narrow (4 passed at HEAD).
+
+Also records: Bead B -> gcp-jkd3 (parked, rig drained, before/after measurement
+confounded), Bead C -> gcp-7fgg, direction 2 -> gcp-d9uj; and that §9's pin
+caveat expired (pin moved to fdfbedd7, reaper 1866 lines).
+
+Direction 2's blocking constraint was overstated: a formula step CAN name a
+content-hashed pack asset, and this repo already does it three times including
+270 lines below the comment saying it cannot. gcp-d9uj reuses that pattern.
+
+Third instance in this bead family of a stated blocker already solved elsewhere
+in the tree. Check for shipped machinery before specifying new machinery.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ docs/design/reaper-budget-starvation.md | 90 +++++++++++++++++++++----
+ 1 file changed, 77 insertions(+), 13 deletions(-)
+
+diff --git a/docs/design/reaper-budget-starvation.md b/docs/design/reaper-budget-starvation.md
+index 82e892b2..a85c570d 100644
+--- a/docs/design/reaper-budget-starvation.md
++++ b/docs/design/reaper-budget-starvation.md
+@@ -1,18 +1,10 @@
+ # Reaper budget starvation — analysis and plan (gcp-uzq0)
+ 
+-Status: **unblocked, dispatchable after the Bead B question in §8.**
+-`gcp-jxtc` LANDED 2026-09-13T20:59Z — `16f92c8` verified on `origin/integration`.
+-Every line reference below was re-verified against that result (1748 lines); see
+-§9 for what changed and the one finding it strengthens.
+-
+-**Do not validate against live reaper logs.** The city's import pin is still
+-`2583963` (2026-09-06), where the reaper is **1079 lines** — 23 commits behind
+-`integration`. Every operational number in §1 was produced by that pinned script,
+-not by the one this plan patches.
+-
+-Author: `gascity-packs/crew.pacman`, 2026-09-13. Written at the mayor's request
+-(analysis + plan + test approach) after they assigned `gcp-uzq0` with measured
+-evidence.
++Status: **SUPERSEDED IN PART — read §10 before acting on anything below.**
++Bead A SHIPPED (b743d7f0). Bead B is now gcp-jkd3 (parked). Direction 2 is now
++gcp-d9uj. §§1-4 (symptom, cost accounting, the cursor analysis) still stand and
++are what the successor beads are built on; §5's Bead A and §9's pin caveat do
++not.
+ 
+ ---
+ 
+@@ -383,3 +375,75 @@ Bead B (cursor advance under starvation) still wants the §8 nod, and §9's
+ observation stands: `gcp-jxtc`'s fourth rollback site makes `DECIDED_LAST`
+ advance least exactly when the budget is tightest. Bead C (`gcp-7fgg`) is
+ untouched — still zero occurrences of `cursor` in `mol-witness-patrol.toml`.
++
++---
++
++## 10. Outcome (2026-09-14) — what shipped, what moved, what I got wrong
++
++### Bead A shipped, and my "repo-forbidden" call was wrong
++
++§5 planned cheap reads; I then escalated that the approach was dead because
++`tests/test_no_bare_bd_commands.py` forbids bare `bd` in every tracked file. That
++was too strong, and it was acted on — the mayor dropped Bead A on my say-so.
++
++It then landed correctly in **b743d7f0**, merged 22:40Z. The distinction I
++missed: the guard forbids bare `bd` because bare `bd` resolves its ledger from
++the **current directory** — a pack asset reading whichever store it stands in.
++`bd -C "$RIG_ROOT" --readonly` is not that call. It pins the project to the rig
++checkout the script already reasons about and **fails closed** ("no beads project
++found", exit 1) rather than walking up to `$PWD`.
++
++The implementation extended the policy rather than evading it: a separate
++triple-locked `PINNED_STORE_BD_ALLOWLIST` (marker `bd-pinned-store`) plus a
++regression test proving the exemption is narrow — the same line without the
++marker, the same line pointed at a different directory, and a bare `bd show`
++carrying the marker are all still flagged. Verified at HEAD: 4 passed. It also
++carries a trust check (a pinned answer is used only if it resolves at least one
++of the exact ids asked for, else discard and re-ask through `gc bd`) and reported
++byte-identical results across all three endpoint origins including `explicit`.
++
++The lesson for §5's A4: I framed "does bare `bd` resolve the same store?" as an
++open question for the bead when the repo already had a standing decision. The
++error was not checking for one. But a standing decision is a decision about a
++*mechanism*, and the fix here was a different mechanism — so the correction runs
++both ways, and "there is a guard" was not sufficient grounds to declare the
++direction dead.
++
++### The successor beads
++
++| Was | Now | State |
++|---|---|---|
++| Bead A — cheap reads | **shipped**, b743d7f0 | done |
++| Bead B — cursor advance | **gcp-jkd3** | P1, open, DELIBERATELY PARKED — do not sling |
++| Bead C — home-audit rotation | **gcp-7fgg** | open, unchanged |
++| Direction 2 — move off pre_start | **gcp-d9uj** | P2, open, design pass done |
++
++`gcp-jkd3` is parked pending a comparable candidate set: this rig is fully
++drained (every polecat stopped) with 12 candidate worktrees, and jkd3's own
++description warns the 34% → 81% `scan_complete` jump is confounded by the
++candidate set falling 44 → ~10. Judging a coverage fix there measures the drain.
++
++### §9's pin caveat has expired
++
++§9 said the pin had not moved and to avoid validating against running-agent
++behaviour. The pin **has** moved — `fdfbedd7`, reaper now 1866 lines — and
++gcp-jkd3 reproduced the cursor defect against the new pin at 02:20Z on 09-14.
++
++### The direction-2 constraint was overstated
++
++`mol-witness-patrol.toml:545-551` says the reaper lives in `pre_start` because
++pack assets sit in a content-hashed cache directory "that a formula step cannot
++name." A formula step can, and this repo already does it three times — including
++in that same file at `:808-833` (resolving `polecat-home-audit.sh`), plus
++`mol-deacon-patrol.toml:513-517` and `mol-refinery-patrol.toml:651,676`.
++
++The pattern resolves the pack root from `gc formula list --json` → this formula's
++`.source` → `dirname` twice, with `GC_PACK_DIR` as a fallback that is explicitly
++never the primary (relying on it alone is what made the refinery's approval gate
++permanently unresolvable, gcp-amo). `gcp-d9uj` reuses it verbatim and fixes the
++stale comment in the same pass.
++
++That is the third time in this bead family that a stated blocker turned out to be
++already solved elsewhere in the tree — after `gcp-5u8u` (worktree-keyed scan) and
++§2 here (cursor rotation). Check for shipped machinery before specifying new
++machinery is the standing lesson.
+-- 
+2.50.1 (Apple Git-155)
+

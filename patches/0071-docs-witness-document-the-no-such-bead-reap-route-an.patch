@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Wed, 2 Sep 2026 15:16:40 -0400
-Subject: [PATCH 071/101] docs(witness): document the no-such-bead reap route
+Subject: [PATCH 071/102] docs(witness): document the no-such-bead reap route
  and its two new events (gcp-ac59)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
