@@ -128,7 +128,7 @@ if [ "${EXISTING_WARRANT:-0}" -gt 0 ]; then
 else
   gc bd create --type=task --labels=warrant \\
     --title="Stuck: $TARGET_SESSION" \\
-    --metadata '{"target":"{{binding_prefix}}deacon","reason":"Stale patrol wisp, no activity","requester":"boot","gc.routed_to":"{{binding_prefix}}dog"}'
+    --metadata '{"target":"{{binding_prefix}}deacon","reason":"Stale patrol wisp, no activity","requester":"boot","gc.kind":"workflow","gc.routed_to":"{{binding_prefix}}dog"}'
 fi
 ```
 
