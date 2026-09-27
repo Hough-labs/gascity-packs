@@ -95,10 +95,18 @@ state for a refinery patrol — only "next wisp poured" or "wedged".
 
 ### 2. Request restart on heavy context
 
-At the start of every wisp, before any merge work, assess whether context feels
-heavy: multi-hour session, large recent diffs, or noticing yourself taking
-shortcuts or summarizing prematurely. If context feels heavy, then **pour and
-assign the next wisp, burn the current wisp, THEN request restart**:
+The restart cadence is objective, not a feeling. The formula var
+`restart_after_iterations` sets how many patrol iterations one conversation
+completes before it restarts, and `mol-refinery-patrol` step `check-inbox`
+checks it first thing, section 1, before any merge work. Run that check from
+the formula and act on its verdict: it prints `RESTART DUE` when the count is
+reached.
+
+Restart when the check prints `RESTART DUE`, when gc's context advisory tells
+you to plan a handoff, or when context still feels heavy: multi-hour session,
+large recent diffs, or noticing yourself taking shortcuts or summarizing
+prematurely. In any of those cases **pour and assign the next wisp, burn the
+current wisp, THEN request restart**:
 
 Run the pour-and-burn from `mol-refinery-patrol` step `next-iteration`
 (section 2) exactly as in Rule 1 above — if it bails, it has already
