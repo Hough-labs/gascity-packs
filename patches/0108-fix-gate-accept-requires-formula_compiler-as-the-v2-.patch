@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sun, 27 Sep 2026 18:09:29 -0400
+Subject: [PATCH 108/109] fix(gate): accept [requires] formula_compiler as the
+ v2 declaration (gcp-hc5z.1)
+
+load_methodology_formula rejected any methodology formula whose top-level
+contract was not "graph.v2". The gascity pack is moving to the current
+syntax, [requires] formula_compiler = ">=2.0.0", which gc compiles
+identically (internal/formula/requirements.go turns both forms into the
+same >=2.0.0 constraint). The gate also reads the third-party methodology
+packs, which stay on the deprecated alias until upstream migrates, so it
+now accepts either form. The error message names both.
+
+Three new cases cover it: a [requires]-only formula is accepted, a
+contract-only formula is accepted, and a formula with neither is rejected.
+Red-checked: the [requires]-only case fails against the gate at
+origin/integration. test_validate_methodology_flow_contracts_accept_current_packs
+stays green.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ scripts/gascity_pack_inference_gate.py    | 12 +++++--
+ tests/test_gascity_pack_inference_gate.py | 40 +++++++++++++++++++++++
+ 2 files changed, 50 insertions(+), 2 deletions(-)
+
+diff --git a/scripts/gascity_pack_inference_gate.py b/scripts/gascity_pack_inference_gate.py
+index ec448e62..8b1da76c 100644
+--- a/scripts/gascity_pack_inference_gate.py
++++ b/scripts/gascity_pack_inference_gate.py
+@@ -2616,8 +2616,16 @@ def load_methodology_formula(pack_source: Path, formula_name: str | None, missin
+         return None
+     if payload.get("formula") != formula_name:
+         missing.append(f"{formula_name}: formula field is {payload.get('formula')!r}, want {formula_name!r}")
+-    if payload.get("contract") != "graph.v2":
+-        missing.append(f"{formula_name}: contract is {payload.get('contract')!r}, want 'graph.v2'")
++    requires = payload.get("requires")
++    compiler = requires.get("formula_compiler") if isinstance(requires, dict) else None
++    # The gascity pack declares [requires] formula_compiler; third-party packs
++    # still use the deprecated contract alias. gc compiles both as v2.
++    if payload.get("contract") != "graph.v2" and compiler != ">=2.0.0":
++        missing.append(
++            f"{formula_name}: formula_compiler requirement is {compiler!r} and contract is "
++            f"{payload.get('contract')!r}, want [requires] formula_compiler = '>=2.0.0' "
++            "or contract = 'graph.v2'"
++        )
+     return payload
+ 
+ 
+diff --git a/tests/test_gascity_pack_inference_gate.py b/tests/test_gascity_pack_inference_gate.py
+index ca97403b..518d521e 100644
+--- a/tests/test_gascity_pack_inference_gate.py
++++ b/tests/test_gascity_pack_inference_gate.py
+@@ -1409,6 +1409,46 @@ def test_validate_methodology_flow_contracts_accept_current_packs() -> None:
+         )
+ 
+ 
++def write_methodology_formula(pack_source: Path, header: str) -> None:
++    formulas = pack_source / "formulas"
++    formulas.mkdir(parents=True)
++    (formulas / "demo-build.formula.toml").write_text(
++        f'formula = "demo-build"\nversion = 1\n{header}\n[[steps]]\nid = "run"\ntitle = "Run"\n',
++        encoding="utf-8",
++    )
++
++
++def test_load_methodology_formula_accepts_requires_table(tmp_path) -> None:
++    write_methodology_formula(tmp_path, '[requires]\nformula_compiler = ">=2.0.0"\n')
++    missing: list[str] = []
++
++    payload = gascity_pack_inference_gate.load_methodology_formula(tmp_path, "demo-build", missing)
++
++    assert payload is not None
++    assert missing == []
++
++
++def test_load_methodology_formula_accepts_deprecated_contract_alias(tmp_path) -> None:
++    write_methodology_formula(tmp_path, 'contract = "graph.v2"\n')
++    missing: list[str] = []
++
++    payload = gascity_pack_inference_gate.load_methodology_formula(tmp_path, "demo-build", missing)
++
++    assert payload is not None
++    assert missing == []
++
++
++def test_load_methodology_formula_rejects_formula_without_compiler_requirement(tmp_path) -> None:
++    write_methodology_formula(tmp_path, "")
++    missing: list[str] = []
++
++    gascity_pack_inference_gate.load_methodology_formula(tmp_path, "demo-build", missing)
++
++    assert len(missing) == 1
++    assert "formula_compiler = '>=2.0.0'" in missing[0]
++    assert "contract = 'graph.v2'" in missing[0]
++
++
+ def test_validate_methodology_flow_contract_rejects_missing_specialist_review_lane(tmp_path) -> None:
+     spec = gascity_pack_inference_gate.PACK_SPECS["superpowers"]
+     pack_source = tmp_path / "superpowers"
+-- 
+2.54.0 (Apple Git-157)
+
