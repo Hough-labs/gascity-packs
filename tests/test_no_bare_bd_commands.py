@@ -169,6 +169,12 @@ GC_BD_ARGV_TAIL_ALLOWLIST: dict[Path, set[str]] = {
         'fail "producer must write the whole signal in a single bd update"'
         " # gc-bd-argv-tail: failure message, not an invocation",
     },
+    Path("gastown/tests/test_polecat_handoff_stamp.sh"): {
+        (
+            "grep -E '^bd update ' \"$TMP/calls.log\" || true"
+            " # gc-bd-argv-tail: stub call log, not an invocation"
+        ),
+    },
     Path("gastown/tests/test_polecat_live_owner_guard.sh"): {
         '"bd show") # gc-bd-argv-tail: case label matching the fake gc\'s argv tail',
         '"bd update") exit "${GC_UPDATE_EXIT:-0}" ;;'
