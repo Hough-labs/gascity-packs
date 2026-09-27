@@ -1,0 +1,41 @@
+gate(test): GATE_ALL — verify-everything mode. Every lane runs;
+gate(test): RUN  make test
+ok  	github.com/ferth-ai/winnow/api	212.410s
+ok  	github.com/ferth-ai/winnow/internal/ingest/geography	402.118s
+panic: test timed out after 30m0s
+	running tests:
+		TestResolutionKeepsTheEntityLayerLoadable (10m57s)
+
+goroutine 17 [running]:
+testing.(*M).startAlarm.func1()
+	/opt/homebrew/Cellar/go/1.27.1/libexec/src/testing/testing.go:2959 +0x2c4
+created by time.goFunc
+	/opt/homebrew/Cellar/go/1.27.1/libexec/src/time/sleep.go:182 +0x38
+
+goroutine 1 [chan receive]:
+testing.(*T).Run(0x788242336008, {0x10077ecda?, 0x78824227ca88?}, 0x1008df3e8)
+	/opt/homebrew/Cellar/go/1.27.1/libexec/src/testing/testing.go:2266 +0x3cc
+testing.runTests.func1(0x788242336008)
+	/opt/homebrew/Cellar/go/1.27.1/libexec/src/testing/testing.go:2742 +0x38
+testing.tRunner(0x788242336008, 0x78824227cbb8)
+	/opt/homebrew/Cellar/go/1.27.1/libexec/src/testing/testing.go:2193 +0xc4
+testing.runTests({0x10077a7e8, 0x1a}, {0x100780b41, 0x34}, 0x7882421ec180, {0x1008f9608, 0x1, 0x1}, {0x78824227cc58?, 0x78824226e1e0?, ...})
+	/opt/homebrew/Cellar/go/1.27.1/libexec/src/testing/testing.go:2740 +0x400
+testing.(*M).Run(0x788242304320)
+	/opt/homebrew/Cellar/go/1.27.1/libexec/src/testing/testing.go:2600 +0x578
+main.main()
+	_testmain.go:46 +0x80
+
+goroutine 6 [sleep]:
+time.Sleep(0x2540be400)
+	/opt/homebrew/Cellar/go/1.27.1/libexec/src/runtime/time.go:368 +0x150
+github.com/ferth-ai/winnow/internal/ingest/entityres.TestResolutionKeepsTheEntityLayerLoadable(0x788242336248?)
+	/Users/hunter/gc/.gc/worktrees/winnow/polecats/gastown.slit/worktrees/winnow-vn65m/internal/ingest/entityres/res_test.go:5 +0x28
+testing.tRunner(0x788242336248, 0x1008df3e8)
+	/opt/homebrew/Cellar/go/1.27.1/libexec/src/testing/testing.go:2193 +0xc4
+created by testing.(*T).Run in goroutine 1
+	/opt/homebrew/Cellar/go/1.27.1/libexec/src/testing/testing.go:2258 +0x3b8
+FAIL	github.com/ferth-ai/winnow/internal/ingest/entityres	1803.007s
+ok  	github.com/ferth-ai/winnow/internal/okpkg	0.340s
+FAIL
+make: *** [test] Error 1

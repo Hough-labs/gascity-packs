@@ -1,0 +1,9 @@
+gate(test): RUN  bats --formatter tap .gauntlet/winnow-13dg-gate-matches.bats
+1..2
+ok 1 lane-arms-small-list: the same patterns still match a short list
+not ok 2 lane-prereq: a selected lane whose tool is missing FAILS, it does not skip
+# (in test file .gauntlet/winnow-13dg-gate-matches.bats, line 686)
+#   `[ "$status" -eq 2 ]' failed
+gate(test): FAIL — the .gauntlet lane executed 2 assertions and exited 1.
+gate(test): RUN  bash -c 'cd client/apps/mobile && CONTRAST_PORT=5179 bun run contrast'
+gate(test): FATAL — the contrast lane could not bind port 5179; another worktree holds it.

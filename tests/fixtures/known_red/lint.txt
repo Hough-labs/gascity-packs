@@ -1,0 +1,47 @@
+gate(lint): GATE_ALL — verify-everything mode. Every lane runs;
+gate(lint): RUN  make lint
+internal/store/store.go:7:9: Error return value of `f.Close` is not checked (errcheck)
+	f.Close()
+	       ^
+1 issues:
+* errcheck: 1
+make: *** [lint] Error 1
+gate(lint): RUN  make agent-lint
+level=error msg="Timeout exceeded: try increasing it by passing --timeout option"
+make: *** [agent-lint] Error 4
+gate(lint): RUN  bash -c cd client && bun run lint
+$ bun run --filter '*' lint
+@winnow/web lint: 
+@winnow/web lint: /Users/hunter/gc/.gc/worktrees/winnow/polecats/gastown.slit/worktrees/winnow-vn65m/client/apps/web/features/account/avatar.tsx
+@winnow/web lint:   52:7  warning  Using `<img>` could result in slower LCP and higher bandwidth.  @next/next/no-img-element
+@winnow/web lint: /Users/hunter/gc/.gc/worktrees/winnow/polecats/gastown.slit/worktrees/winnow-vn65m/client/apps/web/features/auth/use-sign-out.ts
+@winnow/web lint:   47:7  error  'router' is assigned a value but never used  @typescript-eslint/no-unused-vars
+@winnow/web lint: 
+@winnow/web lint: ✖ 2 problems (1 error, 1 warning)
+@winnow/web lint: 
+@winnow/web lint: Exited with code 1
+gate(lint): RUN  make shellcheck
+shell-lint: shellcheck 0.11.0 over 24 script(s) under scripts/
+
+In scripts/prune.sh line 2:
+rm -rf $1/tmp
+       ^-- SC2086 (info): Double quote to prevent globbing and word splitting.
+
+Did you mean:
+rm -rf "$1"/tmp
+
+
+In scripts/prune.sh line 3:
+echo `date`
+     ^----^ SC2046 (warning): Quote this to prevent word splitting.
+     ^----^ SC2005 (style): Useless echo? Instead of 'echo $(cmd)', just use 'cmd'.
+     ^----^ SC2006 (style): Use $(...) notation instead of legacy backticks `...`.
+
+Did you mean:
+echo $(date)
+
+For more information:
+  https://www.shellcheck.net/wiki/SC2046 -- Quote this to prevent word splitt...
+  https://www.shellcheck.net/wiki/SC2086 -- Double quote to prevent globbing ...
+  https://www.shellcheck.net/wiki/SC2005 -- Useless echo? Instead of 'echo $(...
+SHELL LINT FAILED: shellcheck reported findings in scripts/.
