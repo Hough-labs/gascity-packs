@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sun, 27 Sep 2026 17:07:28 -0400
+Subject: [PATCH 106/106] docs(formulas): say what self-review actually runs
+ (gcp-et7g.1, gcp-eief part 1)
+
+The self-review step claimed more than it does. Its title said
+"(affected-aware)", its heading and else-branch said the fallback runs "the
+full suite", and its closing paragraph said "the rig's CI will run the same
+affected subset". None of that holds everywhere: on winnow test_command is
+`gate.sh test`, which already selects by diff, and winnow CI has no
+pull_request trigger at all.
+
+The title is now "Self-review and run tests". The heading names
+affected_tests_command when the rig sets one, else test_command as the rig
+configured it (which may itself select by diff), and the else-branch comment
+says the same. The closing paragraph now makes the claim that is true on
+every rig: a change that fails locally fails again downstream, at the
+refinery gate or in CI.
+
+Wording only; the commands the step runs are unchanged. Rides this bead per
+Hunter (2026-09-27): same file, same pin move.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ gastown/formulas/mol-polecat-work.toml | 16 +++++++++-------
+ 1 file changed, 9 insertions(+), 7 deletions(-)
+
+diff --git a/gastown/formulas/mol-polecat-work.toml b/gastown/formulas/mol-polecat-work.toml
+index 9cac73dc..03f28e26 100644
+--- a/gastown/formulas/mol-polecat-work.toml
++++ b/gastown/formulas/mol-polecat-work.toml
+@@ -352,7 +352,7 @@ on the bead."""
+ 
+ [[steps]]
+ id = "self-review"
+-title = "Self-review and run tests (affected-aware)"
++title = "Self-review and run tests"
+ needs = ["implement"]
+ description = """
+ Review your changes and verify they work. Override of mol-polecat-base
+@@ -386,7 +386,8 @@ debug cruft, unintended file changes. Fix anything you find.
+ {{build_command}}
+ ```
+ 
+-**3. Run tests — affected subset if rig provides one, full suite otherwise:**
++**3. Run tests — the rig's `affected_tests_command` when it sets one, else its
++`test_command` as configured (which may itself select by diff):**
+ ```bash
+ if [ -n "{{affected_tests_command}}" ]; then
+     # Rig has an affected-tests detector. Run only the tests our diff
+@@ -395,7 +396,9 @@ if [ -n "{{affected_tests_command}}" ]; then
+     # internally and execute the relevant test subset.
+     {{affected_tests_command}}
+ else
+-    # No affected detector — run the full suite (legacy behavior).
++    # No affected detector — run test_command as the rig configured it.
++    # That is not necessarily the full suite: a rig's test_command may
++    # itself select by diff.
+     {{test_command}}
+ fi
+ ```
+@@ -403,10 +406,9 @@ fi
+ **ALL CHECKS MUST PASS.** If your change caused the failure, fix it.
+ If pre-existing, file a bead.
+ 
+-Refusing to push on local failure is a feature: the rig's CI will run the
+-same affected subset (and more), and a PR that already fails locally will
+-fail in CI too — wasting reviewer attention and CI minutes. Fix before
+-submitting.
++Refusing to push on local failure is a feature: a change that fails locally
++fails again downstream, at the refinery gate or in CI — wasting reviewer
++attention and gate time. Fix before submitting.
+ 
+ **4. Ensure everything is committed:**
+ ```bash
+-- 
+2.54.0 (Apple Git-157)
+
