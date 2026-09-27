@@ -472,7 +472,7 @@ Once the branch is canonical (on origin), the worktree is disposable:
 # Delete worktree if it exists
 cd <rig-root>
 git worktree remove <worktree-path> --force 2>/dev/null
-rm -rf <worktree-path> 2>/dev/null  # Fallback
+if [ -e <worktree-path> ]; then echo "WARN <worktree-path> survived git worktree remove; left for inspection"; fi
 git worktree prune
 ```
 

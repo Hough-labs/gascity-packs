@@ -450,6 +450,67 @@ HOOK
     rm -rf "$tmp"
 }
 
+# Run the block's own cleanup against a given parent and worktree path. Echoes
+# the function's status; its stdout goes to "$3" so a test can read the WARN.
+run_cleanup() {
+    local parent="$1" wt="$2" out="$3"
+    (
+        cd "$WORK" || exit 90
+        # shellcheck disable=SC1090
+        . "$BLOCK"
+        # Consumed by merge_ff_push_cleanup_wt, not by this shell.
+        # shellcheck disable=SC2034
+        mfp_parent="$parent"
+        # shellcheck disable=SC2034
+        mfp_wt="$wt"
+        merge_ff_push_cleanup_wt >"$out" 2>&1
+        echo "$?"
+    )
+}
+
+test_cleanup_removes_emptied_parent() {
+    # The success path: `git worktree remove` empties the scratch parent, and the
+    # cleanup must then remove it without a recursive force-delete (gcp-l8td.1).
+    local tmp parent status
+    tmp=$(mktemp -d)
+    make_rig "$tmp"
+    parent=$(mktemp -d "$tmp/gascity-refinery-merge.XXXXXX")
+    git_q -C "$WORK" worktree add --detach "$parent/target" dev ||
+        fail "harness bug: could not create the merge worktree at $parent/target"
+
+    status=$(run_cleanup "$parent" "$parent/target" "$tmp/cleanup.out")
+
+    [ "$status" = "0" ] ||
+        fail "cleanup of an emptied parent returned $status, want 0"
+    [ ! -e "$parent" ] ||
+        fail "cleanup left the emptied parent $parent behind"
+    rm -rf "$tmp"
+}
+
+test_cleanup_leaks_parent_loudly_when_worktree_remove_fails() {
+    # `git worktree remove` is allowed to fail, and then the parent is not empty.
+    # Leaking a temp dir loudly is recoverable; force-deleting whatever is left in
+    # it is not. The parent and its contents must survive, with a WARN on stdout,
+    # and the cleanup must still return 0 (gcp-l8td.1).
+    local tmp parent status
+    tmp=$(mktemp -d)
+    make_rig "$tmp"
+    parent=$(mktemp -d "$tmp/gascity-refinery-merge.XXXXXX")
+    echo left >"$parent/leftover.txt"
+
+    status=$(run_cleanup "$parent" "$parent/not-a-worktree" "$tmp/cleanup.out")
+
+    [ "$status" = "0" ] ||
+        fail "cleanup after a failed worktree remove returned $status, want 0"
+    [ -d "$parent" ] ||
+        fail "cleanup deleted the non-empty parent $parent — it must be left for inspection"
+    [ -f "$parent/leftover.txt" ] ||
+        fail "cleanup deleted $parent/leftover.txt out of the non-empty parent"
+    grep -q 'WARN left temp dir' "$tmp/cleanup.out" ||
+        fail "cleanup leaked $parent silently; want 'WARN left temp dir' on stdout, got: $(cat "$tmp/cleanup.out")"
+    rm -rf "$tmp"
+}
+
 test_block_does_not_rely_on_set_e() {
     # The abort path must be explicit. `set -e` inside the block would re-create
     # the dependency on shell-option inheritance that produced the false merge.
@@ -478,6 +539,8 @@ test_noop_ff_does_not_report_a_merge
 test_vetoed_push_stops_without_retrying
 test_rejected_push_with_a_moving_target_still_retries
 test_push_carries_an_explicit_gate_wait_budget
+test_cleanup_removes_emptied_parent
+test_cleanup_leaks_parent_loudly_when_worktree_remove_fails
 
 if [ "$FAILURES" -ne 0 ]; then
     echo "refinery merge-push tests: $FAILURES failure(s)" >&2
