@@ -520,6 +520,12 @@ def merged_steps(parent_steps: list[dict], child_steps: list[dict]) -> list[dict
     return result
 
 
+# Compiler-requirement declarations a child inherits from its extends parents
+# when it does not declare its own: the [requires] table, and the deprecated
+# top-level contract = "graph.v2" alias that third-party packs still use.
+INHERITED_REQUIREMENT_KEYS = ("contract", "requires")
+
+
 def resolve_formula(root: pathlib.Path, name: str, seen: tuple[str, ...] = ()) -> dict:
     if name in seen:
         raise AssertionError(f"circular formula extends: {' -> '.join((*seen, name))}")
@@ -532,15 +538,18 @@ def resolve_formula(root: pathlib.Path, name: str, seen: tuple[str, ...] = ()) -
         "formula": data["formula"],
         "description": data.get("description", ""),
         "version": data.get("version", 1),
-        "contract": data.get("contract", ""),
         "target_required": data.get("target_required"),
         "vars": {},
         "steps": [],
     }
+    for key in INHERITED_REQUIREMENT_KEYS:
+        if key in data:
+            merged[key] = data[key]
     for parent in parents:
         parent_data = resolve_formula(root, parent, (*seen, name))
-        if not merged["contract"]:
-            merged["contract"] = parent_data.get("contract", "")
+        for key in INHERITED_REQUIREMENT_KEYS:
+            if key not in merged and key in parent_data:
+                merged[key] = parent_data[key]
         if merged["target_required"] is None:
             merged["target_required"] = parent_data.get("target_required")
         merged["vars"].update(parent_data.get("vars", {}))
@@ -565,15 +574,18 @@ def resolve_formula_from_dirs(formula_dirs: list[pathlib.Path], name: str, seen:
         "formula": data["formula"],
         "description": data.get("description", ""),
         "version": data.get("version", 1),
-        "contract": data.get("contract", ""),
         "target_required": data.get("target_required"),
         "vars": {},
         "steps": [],
     }
+    for key in INHERITED_REQUIREMENT_KEYS:
+        if key in data:
+            merged[key] = data[key]
     for parent in parents:
         parent_data = resolve_formula_from_dirs(formula_dirs, parent, (*seen, name))
-        if not merged["contract"]:
-            merged["contract"] = parent_data.get("contract", "")
+        for key in INHERITED_REQUIREMENT_KEYS:
+            if key not in merged and key in parent_data:
+                merged[key] = parent_data[key]
         if merged["target_required"] is None:
             merged["target_required"] = parent_data.get("target_required")
         merged["vars"].update(parent_data.get("vars", {}))
@@ -709,11 +721,27 @@ class FormulaAssetTests(unittest.TestCase):
             data = tomllib.loads(path.read_text(encoding="utf-8"))
             name = path.name.removesuffix(".formula.toml")
             self.assertEqual(data["formula"], name)
-            self.assertEqual(data["contract"], "graph.v2")
+            self.assertNotIn("contract", data)
+            self.assertEqual(data["requires"], {"formula_compiler": ">=2.0.0"})
             var_names = set(data.get("vars", {}))
             self.assertNotIn("issue", var_names)
             self.assertNotIn("bead_id", var_names)
             self.assertNotIn("convoy_id", var_names, f"{path.name} must not redeclare reserved convoy_id")
+
+    def test_every_formula_declares_compiler_requirement_table(self) -> None:
+        # gc doctor warns on the deprecated contract = "graph.v2" alias, so every
+        # formula declares the [requires] table instead, without leaning on
+        # extends. The exact comparison also catches a [requires] header placed
+        # above top-level keys, which would pull them into the table.
+        root = pathlib.Path(__file__).resolve().parents[1]
+        paths = sorted((root / "formulas").glob("*.formula.toml"))
+
+        self.assertTrue(paths)
+        for path in paths:
+            with self.subTest(formula=path.name):
+                data = tomllib.loads(path.read_text(encoding="utf-8"))
+                self.assertNotIn("contract", data)
+                self.assertEqual(data.get("requires"), {"formula_compiler": ">=2.0.0"})
 
     def test_expected_role_agents_are_providerless(self) -> None:
         root = pathlib.Path(__file__).resolve().parents[1]
@@ -1203,7 +1231,8 @@ class FormulaAssetTests(unittest.TestCase):
             with self.subTest(formula=name):
                 data = load_formula(root, name)
                 self.assertEqual(data["formula"], name)
-                self.assertEqual(data["contract"], "graph.v2")
+                self.assertNotIn("contract", data)
+                self.assertEqual(data["requires"], {"formula_compiler": ">=2.0.0"})
                 self.assertTrue(data["internal"])
                 self.assertNotIn("catalog", data)
                 self.assertNotIn("extends", data)
@@ -1785,7 +1814,8 @@ class FormulaAssetTests(unittest.TestCase):
         root = pathlib.Path(__file__).resolve().parents[1]
         review = load_formula(root, "build-basic-review")
         self.assertEqual(review["type"], "expansion")
-        self.assertEqual(review["contract"], "graph.v2")
+        self.assertNotIn("contract", review)
+        self.assertEqual(review["requires"], {"formula_compiler": ">=2.0.0"})
         self.assertEqual(
             review["vars"]["implementation_target"]["default"],
             "gc.implementation-worker",
@@ -3522,7 +3552,8 @@ class FormulaAssetTests(unittest.TestCase):
         for name, (url_var, optional_vars) in expected.items():
             with self.subTest(name=name):
                 data = resolve_formula(root, name)
-                self.assertEqual(data["contract"], "graph.v2")
+                self.assertNotIn("contract", data)
+                self.assertEqual(data["requires"], {"formula_compiler": ">=2.0.0"})
                 self.assertFalse(data["target_required"])
                 self.assertTrue(data["vars"][url_var]["required"])
                 self.assertEqual(set(data["vars"]) - {url_var}, optional_vars)
