@@ -671,7 +671,7 @@ on the bead."""
 
 [[steps]]
 id = "self-review"
-title = "Self-review and run tests (affected-aware)"
+title = "Self-review and run tests"
 needs = ["implement"]
 description = """
 Review your changes and verify they work. Override of mol-polecat-base
@@ -723,7 +723,8 @@ debug cruft, unintended file changes. Fix anything you find.
 {{build_command}}
 ```
 
-**3. Run tests — affected subset if rig provides one, full suite otherwise:**
+**3. Run tests — the rig's `affected_tests_command` when it sets one, else its
+`test_command` as configured (which may itself select by diff):**
 ```bash
 : "${BASE_REF:?base ref not resolved — run step 1 of this step first}"
 if [ -n "{{affected_tests_command}}" ]; then
@@ -739,7 +740,9 @@ if [ -n "{{affected_tests_command}}" ]; then
     # exits 0, and pushes untested work.
     {{affected_tests_command}}
 else
-    # No affected detector — run the full suite (legacy behavior).
+    # No affected detector — run test_command as the rig configured it.
+    # That is not necessarily the full suite: a rig's test_command may
+    # itself select by diff.
     {{test_command}}
 fi
 ```
@@ -747,10 +750,9 @@ fi
 **ALL CHECKS MUST PASS.** If your change caused the failure, fix it.
 If pre-existing, file a bead.
 
-Refusing to push on local failure is a feature: the rig's CI will run the
-same affected subset (and more), and a PR that already fails locally will
-fail in CI too — wasting reviewer attention and CI minutes. Fix before
-submitting.
+Refusing to push on local failure is a feature: a change that fails locally
+fails again downstream, at the refinery gate or in CI — wasting reviewer
+attention and gate time. Fix before submitting.
 
 **4. Ensure everything is committed:**
 ```bash
