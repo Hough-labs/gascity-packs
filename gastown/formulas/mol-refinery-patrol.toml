@@ -209,11 +209,13 @@ Search for work beads assigned to you, then for work merely routed to you:
 # --- find-work-query:begin ---
 REFINERY_SELF="${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery"
 WORK=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee=$GC_AGENT --status=open,in_progress \
-  --exclude-type=epic --has-metadata-key=branch --limit=1 --json | jq -r '.[0].id // empty')
+  --exclude-type=epic --has-metadata-key=branch --limit=0 --json |
+  jq -r 'sort_by(.priority, (.metadata.first_submitted_at // .created_at)) | .[0].id // empty')
 if [ -z "$WORK" ]; then
   ROUTED=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --no-assignee --status=open,in_progress \
     --exclude-type=epic --has-metadata-key=branch \
-    --metadata-field gc.routed_to="$REFINERY_SELF" --limit=1 --json | jq -r '.[0].id // empty')
+    --metadata-field gc.routed_to="$REFINERY_SELF" --limit=0 --json |
+    jq -r 'sort_by(.priority, (.metadata.first_submitted_at // .created_at)) | .[0].id // empty')
   if [ -n "$ROUTED" ]; then
     gc bd update "$ROUTED" --assignee="$GC_AGENT" --status=in_progress \
       --set-metadata gc.routed_to=""
@@ -233,6 +235,18 @@ database. Without it, `gc bd list` routes to the HQ database and never
 sees rig-scoped work beads — the `assignee` field alone does not route
 by namespace. For HQ-only refineries `$GC_RIG` is empty and the flag
 expands to nothing.
+
+**Order: priority first, then earliest first handoff (gcp-et7g).** Each query
+fetches every candidate (`--limit=0`) and picks in jq, never `--limit=1`. The
+store's default order is priority ascending, then created_at DESCENDING, so a
+server-side limit of one serves every priority band newest-first and old merge
+requests starve while new same-priority work keeps arriving (winnow, 2026-09-24:
+47 same-band overtakes, one bead waited ~9h). `--sort` cannot fix it: it takes a
+single key, and every single key drops priority. `first_submitted_at` is
+stamped by the polecat's refinery handoff and kept across rejections, so a
+resubmitted bead goes back to its original place in line rather than the back
+of the band. A bead handed over without the stamp — before the stamp existed,
+or by hand — falls back to `created_at`.
 
 **`--status=open,in_progress`, never `--status=open` alone (gcp-s14g).** A
 bead that is `in_progress`, assigned to this refinery, and carrying

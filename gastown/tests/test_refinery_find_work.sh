@@ -28,6 +28,14 @@
 # ~31min). The step now converts routed -> assigned itself. The stub models the
 # write and the read-back, so "found it" and "claimed it under the identity the
 # primary scan can see" are separate, executed assertions.
+#
+# The third is gcp-et7g: each query took `.[0]` of `--limit=1` with no sort,
+# and the store's default order is priority ascending, then created_at
+# DESCENDING, so every priority band was served newest-first and old merge
+# requests starved (winnow, 2026-09-24: 47 same-band overtakes, one bead
+# waited ~9h). The stub orders its matches the way the store does BEFORE it
+# applies --limit, which is what makes that starvation visible here; the old
+# stub returned fixture order and the defect passed.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -100,6 +108,11 @@ PY
 # --has-metadata-key, --metadata-field, --exclude-type and --limit. Anything
 # else is an error, so a query that grows a flag this stub does not model fails
 # loudly instead of passing vacuously.
+#
+# Matches come back in the store's default order — priority ascending, then
+# created_at descending (measured on the live store for gcp-et7g) — and
+# --limit truncates AFTER that order, never in fixture order. --limit=0 means no
+# limit, as it does in gc.
 #
 # The write really mutates the fixture, so the read-back the shipped block
 # performs is a genuine read of what the write left behind — not a stub that
@@ -211,6 +224,10 @@ if verb == "list":
         )
         and bead.get("issue_type") not in excluded_types
     ]
+    # Two stable passes give (priority asc, created_at desc). A bead with no
+    # priority is P2, the store's default.
+    matched.sort(key=lambda bead: bead.get("created_at", ""), reverse=True)
+    matched.sort(key=lambda bead: bead.get("priority", 2))
     if limit:
         matched = matched[:limit]
     emit(matched)
@@ -342,6 +359,34 @@ claimed_metadata() {
 
 fixture() {
     python3 -c 'import json,sys; print(json.dumps([json.loads(a) for a in sys.argv[1:]]))' "$@"
+}
+
+queued() {
+    # queued <id> <priority> <created_at> <first_submitted_at> <assignee> [routed_to]
+    # A merge candidate with the fields the store orders on. An empty
+    # first_submitted_at leaves the key off, as on a bead handed over before
+    # the handoff stamp existed.
+    python3 - "$@" <<'PY'
+import json
+import sys
+
+bead_id, priority, created_at, first_submitted_at, assignee = sys.argv[1:6]
+routed_to = sys.argv[6] if len(sys.argv) > 6 else ""
+metadata = {"branch": f"polecat/{bead_id}"}
+if first_submitted_at:
+    metadata["first_submitted_at"] = first_submitted_at
+if routed_to:
+    metadata["gc.routed_to"] = routed_to
+print(json.dumps({
+    "id": bead_id,
+    "status": "open",
+    "assignee": assignee,
+    "issue_type": "task",
+    "priority": int(priority),
+    "created_at": created_at,
+    "metadata": metadata,
+}))
+PY
 }
 
 test_in_progress_bead_with_branch_is_found() {
@@ -598,6 +643,94 @@ test_polecat_handoff_verifies_the_status_it_writes() {
         fail "a status that will not settle must not abort a handoff whose branch is already pushed"
 }
 
+# ── gcp-et7g: each priority band is served oldest-first-handoff ──────────────
+# The store returns a band newest-created first, so a server-side --limit=1
+# took the newest bead every pass. Each case below names the bead the old query
+# would have taken.
+
+test_same_band_is_served_oldest_first() {
+    # (a) The starvation itself. The old query took winnow-new, and kept taking
+    # whatever arrived after it, while winnow-old waited.
+    local got
+    got=$(run_find_work \
+        "$(fixture \
+            "$(queued winnow-old 2 2026-09-01T06:00:00Z 2026-09-20T06:00:00Z "$REFINERY")" \
+            "$(queued winnow-new 2 2026-09-10T06:00:00Z 2026-09-24T06:00:00Z "$REFINERY")")" \
+        "$REFINERY" winnow "$BOUND_ONLY")
+    [[ "$got" == "winnow-old" ]] ||
+        fail "same priority: the bead handed over first must be served first, got '$got'"
+}
+
+test_band_order_keys_on_first_handoff_not_creation() {
+    # (a2) Queue fairness is about when a bead joined the queue, not when it was
+    # filed. winnow-early-handoff was created later but handed over first; a
+    # created_at-only sort would take winnow-early-filed.
+    local got
+    got=$(run_find_work \
+        "$(fixture \
+            "$(queued winnow-early-filed 2 2026-06-16T06:00:00Z 2026-09-24T06:35:00Z "$REFINERY")" \
+            "$(queued winnow-early-handoff 2 2026-09-20T06:00:00Z 2026-09-21T06:00:00Z "$REFINERY")")" \
+        "$REFINERY" winnow "$BOUND_ONLY")
+    [[ "$got" == "winnow-early-handoff" ]] ||
+        fail "the band must order on first_submitted_at, not created_at, got '$got'"
+}
+
+test_priority_stays_primary() {
+    # (b) FIFO is within a band. A P1 handed over today still beats a P2 that
+    # has waited since the start of the month.
+    local got
+    got=$(run_find_work \
+        "$(fixture \
+            "$(queued winnow-old-p2 2 2026-09-01T06:00:00Z 2026-09-01T07:00:00Z "$REFINERY")" \
+            "$(queued winnow-new-p1 1 2026-09-24T06:00:00Z 2026-09-24T07:00:00Z "$REFINERY")")" \
+        "$REFINERY" winnow "$BOUND_ONLY")
+    [[ "$got" == "winnow-new-p1" ]] ||
+        fail "a newer P1 must beat an older P2, got '$got'"
+}
+
+test_unstamped_bead_falls_back_to_created_at() {
+    # (c) Work handed over before the stamp existed, or assigned by hand, has no
+    # first_submitted_at. It queues by created_at, and the oldest still wins.
+    # winnow-stamped was created earliest of all, so this also shows its
+    # created_at is not the key once a stamp exists.
+    local got
+    got=$(run_find_work \
+        "$(fixture \
+            "$(queued winnow-stamped 2 2026-08-01T06:00:00Z 2026-09-15T06:00:00Z "$REFINERY")" \
+            "$(queued winnow-unstamped-old 2 2026-09-01T06:00:00Z "" "$REFINERY")" \
+            "$(queued winnow-unstamped-new 2 2026-09-10T06:00:00Z "" "$REFINERY")")" \
+        "$REFINERY" winnow "$BOUND_ONLY")
+    [[ "$got" == "winnow-unstamped-old" ]] ||
+        fail "an unstamped bead must queue by created_at, got '$got'"
+
+    # And a stamped bead that joined the queue before an unstamped one was even
+    # filed goes first: both keys sit on one timeline.
+    got=$(run_find_work \
+        "$(fixture \
+            "$(queued winnow-stamped 2 2026-08-01T06:00:00Z 2026-09-15T06:00:00Z "$REFINERY")" \
+            "$(queued winnow-unstamped-new 2 2026-09-20T06:00:00Z "" "$REFINERY")")" \
+        "$REFINERY" winnow "$BOUND_ONLY")
+    [[ "$got" == "winnow-stamped" ]] ||
+        fail "the stamped and unstamped keys must compare as one timeline, got '$got'"
+}
+
+test_routed_scan_is_served_oldest_first() {
+    # (d) The routed scan had the same --limit=1 and starved the same way. The
+    # oldest is the one claimed; the newer bead is left for a later pass.
+    local got
+    got=$(run_find_work \
+        "$(fixture \
+            "$(queued winnow-old 2 2026-09-01T06:00:00Z 2026-09-20T06:00:00Z "" "$REFINERY")" \
+            "$(queued winnow-new 2 2026-09-10T06:00:00Z 2026-09-24T06:00:00Z "" "$REFINERY")")" \
+        "$REFINERY" winnow "$BOUND_ONLY")
+    [[ "$got" == "winnow-old" ]] ||
+        fail "the routed scan must take the bead handed over first, got '$got'"
+    [[ "$(claimed_assignee winnow-old)" == "$REFINERY" ]] ||
+        fail "the routed scan must claim the bead it selected"
+    [[ -z "$(claimed_assignee winnow-new)" ]] ||
+        fail "the routed scan must leave the newer bead unclaimed this pass"
+}
+
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/gastown-find-work.XXXXXX") || exit 1
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/bin"
@@ -625,6 +758,11 @@ test_routed_bead_without_branch_is_not_merge_work
 test_assigned_work_wins_and_the_routed_scan_is_not_consulted
 test_routed_scan_composes_its_identity_from_the_binding
 test_routed_scan_is_rig_scoped_when_gc_rig_is_set
+test_same_band_is_served_oldest_first
+test_band_order_keys_on_first_handoff_not_creation
+test_priority_stays_primary
+test_unstamped_bead_falls_back_to_created_at
+test_routed_scan_is_served_oldest_first
 test_open_only_scans_are_not_reintroduced
 test_prompt_points_at_the_step_instead_of_restating_it
 test_polecat_handoff_verifies_the_status_it_writes
