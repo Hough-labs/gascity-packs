@@ -1648,7 +1648,7 @@ merge_ff_push_cleanup_wt() {
     git worktree remove --force "$mfp_wt" >/dev/null 2>&1 || true
   fi
   if [ -n "${mfp_parent:-}" ]; then
-    rm -rf "$mfp_parent"
+    rmdir "$mfp_parent" 2>/dev/null || echo "WARN left temp dir $mfp_parent: git worktree remove did not empty it."
   fi
   mfp_wt=""
   mfp_parent=""
