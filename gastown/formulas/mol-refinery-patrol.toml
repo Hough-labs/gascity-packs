@@ -107,6 +107,16 @@ default = "false"
 description = "Seconds to sleep before re-checking for work. Replaces former event-watch loop which hot-spun on cache-reconcile firehose."
 default = "60"
 
+[vars.restart_after_iterations]
+description = """
+Patrol iterations one conversation completes before check-inbox requests a
+restart at the clean seam. 2 fits the refinery's 200k window: a conversation
+starts at ~64k and grows ~55k per bead. 1 restarts after every bead; 0 disables
+the counter. A non-integer value is treated as 0 with a WARN line. Inert under
+wake_mode = "fresh": the controller already starts a new conversation after
+every burn, so the count never passes 1."""
+default = "2"
+
 [[steps]]
 id = "validate-identity"
 title = "Validate canonical agent identity"
@@ -142,9 +152,60 @@ needs = ["validate-identity"]
 description = """
 **1. Context check (FIRST — before any work):**
 
-If context feels heavy (multi-hour session, large recent diffs, or you notice
-yourself taking shortcuts or summarizing prematurely), pour and assign the next
-wisp, burn the current wisp, then request a restart:
+Run the restart cadence check first. It counts the patrol iterations this
+conversation has already completed and prints exactly one verdict line:
+```bash
+# --- restart-cadence-check:begin ---
+# The count rides the wisp chain. Every successor wisp poured without a restart
+# is stamped with this conversation's GC_CONTINUATION_EPOCH and the running
+# iteration count (see the session-iteration-stamp blocks). gc bumps the epoch
+# exactly when the conversation is reset, and keeps it across a resume wake, so
+# a wisp stamped under another epoch was poured by an earlier conversation and
+# this one has completed none yet.
+CURRENT_WISP=${GC_BEAD_ID:-}
+if [ -z "$CURRENT_WISP" ]; then
+  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json | jq -r '.[0].id // empty')
+fi
+CADENCE_N="{{restart_after_iterations}}"
+case "$CADENCE_N" in
+  ''|*[!0-9]*)
+    echo "WARN: restart_after_iterations='$CADENCE_N' is not a non-negative integer; treating it as 0."
+    CADENCE_N=0
+    ;;
+esac
+CADENCE_EPOCH=${GC_CONTINUATION_EPOCH:-}
+if [ "$CADENCE_N" -eq 0 ]; then
+  echo "restart cadence: off (restart_after_iterations=0)"
+elif [ -z "$CADENCE_EPOCH" ]; then
+  echo "restart cadence: off (GC_CONTINUATION_EPOCH is unset, so this conversation cannot be told from the last)"
+elif [ -z "$CURRENT_WISP" ]; then
+  echo "restart cadence: off (could not resolve the current refinery wisp)"
+elif ! CADENCE_JSON=$(gc bd show "$CURRENT_WISP" --json 2>/dev/null); then
+  echo "restart cadence: off (could not read $CURRENT_WISP)"
+else
+  CADENCE_STAMPED_EPOCH=$(printf '%s' "$CADENCE_JSON" | jq -r '.[0].metadata.session_epoch // empty' 2>/dev/null)
+  CADENCE_K=$(printf '%s' "$CADENCE_JSON" | jq -r '.[0].metadata.session_iterations // empty' 2>/dev/null)
+  case "$CADENCE_K" in ''|*[!0-9]*) CADENCE_K=0 ;; esac
+  if [ "$CADENCE_STAMPED_EPOCH" != "$CADENCE_EPOCH" ]; then
+    CADENCE_K=0
+  fi
+  if [ "$CADENCE_K" -ge "$CADENCE_N" ]; then
+    echo "RESTART DUE: $CADENCE_K iterations in conversation epoch $CADENCE_EPOCH (restart_after_iterations=$CADENCE_N)"
+  else
+    echo "restart cadence: $CADENCE_K/$CADENCE_N in epoch $CADENCE_EPOCH"
+  fi
+fi
+# --- restart-cadence-check:end ---
+```
+
+Then pour and assign the next wisp, burn the current wisp, and request a
+restart with the block below when ANY of these holds:
+- the cadence check printed `RESTART DUE`;
+- gc's context advisory has told this session to plan a handoff;
+- context feels heavy (multi-hour session, large recent diffs, or you notice
+  yourself taking shortcuts or summarizing prematurely).
+
+Otherwise skip the block and go to step 2.
 ```bash
 CURRENT_WISP=${GC_BEAD_ID:-}
 if [ -z "$CURRENT_WISP" ]; then
@@ -379,11 +440,34 @@ if [ -z "$NEXT" ]; then
   gc runtime drain-ack
   exit 1
 fi
-if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+# --- session-iteration-stamp:begin ---
+# Carry the conversation's iteration count onto NEXT in the same write that
+# assigns it, so check-inbox can restart at restart_after_iterations. The count
+# continues only while CURRENT was stamped under this GC_CONTINUATION_EPOCH;
+# any other epoch was an earlier conversation, so NEXT starts again at 1. With
+# the epoch unset nothing is stamped and the cadence check reads "off".
+set -- --assignee="$GC_AGENT"
+if [ -n "${GC_CONTINUATION_EPOCH:-}" ]; then
+  if ! STAMP_JSON=$(gc bd show "$CURRENT_WISP" --json 2>/dev/null); then
+    echo "WARN: could not read $CURRENT_WISP; the next wisp's iteration count restarts at 1."
+    STAMP_JSON=""
+  fi
+  STAMP_EPOCH=$(printf '%s' "$STAMP_JSON" | jq -r '.[0].metadata.session_epoch // empty' 2>/dev/null)
+  STAMP_K=$(printf '%s' "$STAMP_JSON" | jq -r '.[0].metadata.session_iterations // empty' 2>/dev/null)
+  case "$STAMP_K" in ''|*[!0-9]*) STAMP_K=0 ;; esac
+  if [ "$STAMP_EPOCH" = "$GC_CONTINUATION_EPOCH" ]; then
+    STAMP_K=$((STAMP_K + 1))
+  else
+    STAMP_K=1
+  fi
+  set -- "$@" --set-metadata session_epoch="$GC_CONTINUATION_EPOCH" --set-metadata session_iterations="$STAMP_K"
+fi
+if ! gc bd update "$NEXT" "$@"; then
   echo "Could not assign next refinery wisp; not burning."
   gc runtime drain-ack
   exit 1
 fi
+# --- session-iteration-stamp:end ---
 if [ -n "$CURRENT_WISP" ]; then
   gc bd mol burn "$CURRENT_WISP" --force
 else
@@ -502,11 +586,34 @@ TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_bran
        gc runtime drain-ack
        exit 1
      fi
-     if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+     # --- session-iteration-stamp:begin ---
+     # Carry the conversation's iteration count onto NEXT in the same write that
+     # assigns it, so check-inbox can restart at restart_after_iterations. The count
+     # continues only while CURRENT was stamped under this GC_CONTINUATION_EPOCH;
+     # any other epoch was an earlier conversation, so NEXT starts again at 1. With
+     # the epoch unset nothing is stamped and the cadence check reads "off".
+     set -- --assignee="$GC_AGENT"
+     if [ -n "${GC_CONTINUATION_EPOCH:-}" ]; then
+       if ! STAMP_JSON=$(gc bd show "$CURRENT_WISP" --json 2>/dev/null); then
+         echo "WARN: could not read $CURRENT_WISP; the next wisp's iteration count restarts at 1."
+         STAMP_JSON=""
+       fi
+       STAMP_EPOCH=$(printf '%s' "$STAMP_JSON" | jq -r '.[0].metadata.session_epoch // empty' 2>/dev/null)
+       STAMP_K=$(printf '%s' "$STAMP_JSON" | jq -r '.[0].metadata.session_iterations // empty' 2>/dev/null)
+       case "$STAMP_K" in ''|*[!0-9]*) STAMP_K=0 ;; esac
+       if [ "$STAMP_EPOCH" = "$GC_CONTINUATION_EPOCH" ]; then
+         STAMP_K=$((STAMP_K + 1))
+       else
+         STAMP_K=1
+       fi
+       set -- "$@" --set-metadata session_epoch="$GC_CONTINUATION_EPOCH" --set-metadata session_iterations="$STAMP_K"
+     fi
+     if ! gc bd update "$NEXT" "$@"; then
        echo "Could not assign next refinery wisp; not burning."
        gc runtime drain-ack
        exit 1
      fi
+     # --- session-iteration-stamp:end ---
      if [ -n "$CURRENT_WISP" ]; then
        gc bd mol burn "$CURRENT_WISP" --force
      else
@@ -827,11 +934,34 @@ Target: $TARGET"
     gc runtime drain-ack
     exit 1
   fi
-  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+  # --- session-iteration-stamp:begin ---
+  # Carry the conversation's iteration count onto NEXT in the same write that
+  # assigns it, so check-inbox can restart at restart_after_iterations. The count
+  # continues only while CURRENT was stamped under this GC_CONTINUATION_EPOCH;
+  # any other epoch was an earlier conversation, so NEXT starts again at 1. With
+  # the epoch unset nothing is stamped and the cadence check reads "off".
+  set -- --assignee="$GC_AGENT"
+  if [ -n "${GC_CONTINUATION_EPOCH:-}" ]; then
+    if ! STAMP_JSON=$(gc bd show "$CURRENT_WISP" --json 2>/dev/null); then
+      echo "WARN: could not read $CURRENT_WISP; the next wisp's iteration count restarts at 1."
+      STAMP_JSON=""
+    fi
+    STAMP_EPOCH=$(printf '%s' "$STAMP_JSON" | jq -r '.[0].metadata.session_epoch // empty' 2>/dev/null)
+    STAMP_K=$(printf '%s' "$STAMP_JSON" | jq -r '.[0].metadata.session_iterations // empty' 2>/dev/null)
+    case "$STAMP_K" in ''|*[!0-9]*) STAMP_K=0 ;; esac
+    if [ "$STAMP_EPOCH" = "$GC_CONTINUATION_EPOCH" ]; then
+      STAMP_K=$((STAMP_K + 1))
+    else
+      STAMP_K=1
+    fi
+    set -- "$@" --set-metadata session_epoch="$GC_CONTINUATION_EPOCH" --set-metadata session_iterations="$STAMP_K"
+  fi
+  if ! gc bd update "$NEXT" "$@"; then
     echo "Could not assign next refinery wisp; not burning."
     gc runtime drain-ack
     exit 1
   fi
+  # --- session-iteration-stamp:end ---
   if [ -n "$CURRENT_WISP" ]; then
     gc bd mol burn "$CURRENT_WISP" --force
   else
@@ -2022,11 +2152,34 @@ if [ -z "$NEXT" ]; then
   gc runtime drain-ack
   exit 1
 fi
-if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+# --- session-iteration-stamp:begin ---
+# Carry the conversation's iteration count onto NEXT in the same write that
+# assigns it, so check-inbox can restart at restart_after_iterations. The count
+# continues only while CURRENT was stamped under this GC_CONTINUATION_EPOCH;
+# any other epoch was an earlier conversation, so NEXT starts again at 1. With
+# the epoch unset nothing is stamped and the cadence check reads "off".
+set -- --assignee="$GC_AGENT"
+if [ -n "${GC_CONTINUATION_EPOCH:-}" ]; then
+  if ! STAMP_JSON=$(gc bd show "$CURRENT_WISP" --json 2>/dev/null); then
+    echo "WARN: could not read $CURRENT_WISP; the next wisp's iteration count restarts at 1."
+    STAMP_JSON=""
+  fi
+  STAMP_EPOCH=$(printf '%s' "$STAMP_JSON" | jq -r '.[0].metadata.session_epoch // empty' 2>/dev/null)
+  STAMP_K=$(printf '%s' "$STAMP_JSON" | jq -r '.[0].metadata.session_iterations // empty' 2>/dev/null)
+  case "$STAMP_K" in ''|*[!0-9]*) STAMP_K=0 ;; esac
+  if [ "$STAMP_EPOCH" = "$GC_CONTINUATION_EPOCH" ]; then
+    STAMP_K=$((STAMP_K + 1))
+  else
+    STAMP_K=1
+  fi
+  set -- "$@" --set-metadata session_epoch="$GC_CONTINUATION_EPOCH" --set-metadata session_iterations="$STAMP_K"
+fi
+if ! gc bd update "$NEXT" "$@"; then
   echo "Could not assign next refinery wisp; not burning."
   gc runtime drain-ack
   exit 1
 fi
+# --- session-iteration-stamp:end ---
 if [ -n "$CURRENT_WISP" ]; then
   gc bd mol burn "$CURRENT_WISP" --force
 else
