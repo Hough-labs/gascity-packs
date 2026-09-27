@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Wed, 2 Sep 2026 16:22:10 -0400
-Subject: [PATCH 072/103] ci: drop actions/setup-python and use the runner
+Subject: [PATCH 072/104] ci: drop actions/setup-python and use the runner
  image's system Python (gcp-gtux)
 
 actions/setup-python installs a portable CPython from actions/python-versions
@@ -126,5 +126,5 @@ index db7e496d..a38034c7 100644
          if: steps.subset.outputs.run_gate == 'true'
          uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 6 Sep 2026 20:09:50 -0400
-Subject: [PATCH 082/103] fix(witness): keep an unanswered publication probe
+Subject: [PATCH 082/104] fix(witness): keep an unanswered publication probe
  out of the lost-work finding (gcp-9ql4)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -446,5 +446,5 @@ index 114be5e7..c0d01d87 100644
  test_a_non_agent_worktree_named_like_a_bead_is_not_reaped
  test_the_budget_cutoff_rotates_instead_of_dropping_the_same_tail
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 31 Jul 2026 20:03:07 -0400
-Subject: [PATCH 007/103] fix(refinery): scope the merge-approval gate's PR
+Subject: [PATCH 007/104] fix(refinery): scope the merge-approval gate's PR
  lookup to origin (gcp-3ty)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -439,5 +439,5 @@ index 5a3a5eeb..cf3003aa 100755
  test_gate_resolves_pr_without_gh_cli
  test_refinery_patrol_consumes_the_gate
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

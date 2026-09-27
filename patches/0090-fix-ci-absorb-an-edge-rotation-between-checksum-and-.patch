@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 10 Sep 2026 14:54:27 -0400
-Subject: [PATCH 090/103] fix(ci): absorb an edge rotation between checksum and
+Subject: [PATCH 090/104] fix(ci): absorb an edge rotation between checksum and
  download (gcp-kinb)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -487,5 +487,5 @@ index 00000000..706f5e99
 +    assert result["gc_bin"] == ""
 +    assert list(result["cache"].rglob("gc")) == []
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

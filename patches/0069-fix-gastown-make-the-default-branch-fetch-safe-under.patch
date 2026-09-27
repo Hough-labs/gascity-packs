@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Wed, 2 Sep 2026 14:52:20 -0400
-Subject: [PATCH 069/103] fix(gastown): make the default-branch fetch safe
+Subject: [PATCH 069/104] fix(gastown): make the default-branch fetch safe
  under set -e (gcp-5ddt)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -42,5 +42,5 @@ index 53a0cbcb..46066ffc 100644
     ! git rev-parse --verify --quiet "origin/$DEFAULT_BRANCH" >/dev/null; then
    # FAIL CLOSED: skip this bead entirely, do not recover it. Step 3's
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

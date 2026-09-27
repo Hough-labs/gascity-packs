@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 14 Aug 2026 17:56:52 -0400
-Subject: [PATCH 029/103] fix(refinery): let the duplicate check see
+Subject: [PATCH 029/104] fix(refinery): let the duplicate check see
  in_progress duplicates (gcp-h98d)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -263,5 +263,5 @@ index f0ec3197..88648364 100644
 +        "`gc bd search` takes no useful `--status=open` filter; drop the flag.",
 +    )
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

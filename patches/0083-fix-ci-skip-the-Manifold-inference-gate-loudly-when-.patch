@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Mon, 7 Sep 2026 13:46:01 -0400
-Subject: [PATCH 083/103] fix(ci): skip the Manifold inference gate loudly when
+Subject: [PATCH 083/104] fix(ci): skip the Manifold inference gate loudly when
  config is absent (gcp-oz57)
 
 Four consecutive scheduled Supported Pack Nightly runs (34128826579,
@@ -470,5 +470,5 @@ index 604a4551..ca97403b 100644
      readme = (gascity_pack_inference_gate.REPO_ROOT / "README.md").read_text(encoding="utf-8")
      readme_lines = {line.strip() for line in readme.splitlines()}
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

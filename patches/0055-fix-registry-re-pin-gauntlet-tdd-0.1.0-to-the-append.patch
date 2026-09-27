@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 28 Aug 2026 19:01:00 -0400
-Subject: [PATCH 055/103] fix(registry): re-pin gauntlet-tdd 0.1.0 to the
+Subject: [PATCH 055/104] fix(registry): re-pin gauntlet-tdd 0.1.0 to the
  append-notes subtree (gcp-dnxq)
 
 25a61a8 changed the pack subtree (the --append-notes fix plus its two
@@ -30,5 +30,5 @@ index e715e735..161c6366 100644
 +    hash = "sha256:729ecab80288f93f026383c6235c24f71330191d46213376e1e726c056f7bea0"
      description = "Initial gauntlet-tdd release: the RED-to-GREEN contract loop as one formula (mol-tdd-red-green) plus a wrapper command, pinned to the bats lane with gauntlet lint as the red gate."
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

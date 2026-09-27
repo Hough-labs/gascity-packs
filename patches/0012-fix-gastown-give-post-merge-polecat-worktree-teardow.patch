@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 31 Jul 2026 04:22:36 -0400
-Subject: [PATCH 012/103] fix(gastown): give post-merge polecat worktree
+Subject: [PATCH 012/104] fix(gastown): give post-merge polecat worktree
  teardown an owner (gcp-z2z)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -818,5 +818,5 @@ index 00000000..86b871c9
 +
 +echo "polecat worktree reap tests passed"
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 10 Sep 2026 13:07:49 -0400
-Subject: [PATCH 088/103] fix(witness): make the worktree reap survive its own
+Subject: [PATCH 088/104] fix(witness): make the worktree reap survive its own
  SIGKILL (gcp-mves)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -1137,5 +1137,5 @@ index 6df954c9..e4b2698d 100644
          fail "reaper exited non-zero on a slow session roster: $(cat "$tmp/slowsess.txt")"
  
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 13 Sep 2026 16:31:01 -0400
-Subject: [PATCH 094/103] docs(patrol): explain the new reaper refusals in the
+Subject: [PATCH 094/104] docs(patrol): explain the new reaper refusals in the
  log-review table (gcp-jxtc)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -56,5 +56,5 @@ index 4536b2b8..d1bdc3fd 100644
  | `worktree_residue_git_view_absent` | A residue directory the disk walk found that git cannot administer at all — no `.git`, or one pointing at an admin entry that is gone. Gate 3 is UNEVALUABLE for it, and the line says so rather than reporting a clean tree it never inspected. The reap stands on gates 2 and 4 instead | Log only, and expected on any rig that ran an armed reaper before `gcp-mves`. It is the tail of an authorised removal that was killed; the gate-2/gate-4 line for the same path says what actually happened to it |
  | `worktree_residue_no_bead_kept` | A residue directory with NO bead (`reason: residue_no_bead_unverifiable`). Gate 5 carries the no-such-bead path and needs a `git rev-parse HEAD` this directory cannot answer, so no evidence exists either way. Nothing was removed | A real finding that will not resolve on its own — inspect by hand, like `worktree_unpublished_kept`. The content is there; git's view of it is not. Mail the mayor if you cannot tell what it was |
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

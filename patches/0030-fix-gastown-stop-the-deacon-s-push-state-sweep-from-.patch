@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 14 Aug 2026 22:49:08 -0400
-Subject: [PATCH 030/103] fix(gastown): stop the deacon's push-state sweep from
+Subject: [PATCH 030/104] fix(gastown): stop the deacon's push-state sweep from
  gating session start (gcp-oo0v)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -613,5 +613,5 @@ index 2d656b87..794a4140 100755
      # the MANAGED server only, and the rig that went dark for 18h was pinned to
      # its own explicit endpoint — so the detector must reach each scope by that
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

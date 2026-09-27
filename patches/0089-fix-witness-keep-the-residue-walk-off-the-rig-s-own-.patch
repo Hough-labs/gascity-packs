@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 10 Sep 2026 13:43:17 -0400
-Subject: [PATCH 089/103] fix(witness): keep the residue walk off the rig's own
+Subject: [PATCH 089/104] fix(witness): keep the residue walk off the rig's own
  main worktree (gcp-mves)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -162,5 +162,5 @@ index e4b2698d..f0818b56 100644
          fail "a non-agent-home per-bead worktree was reaped; the witness owns agent-home worktrees only"
  
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

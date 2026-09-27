@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 16 Aug 2026 21:56:39 -0400
-Subject: [PATCH 040/103] fix(github-pr-review): abort the comment steps when
+Subject: [PATCH 040/104] fix(github-pr-review): abort the comment steps when
  the review scope fails (gcp-m7dn)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -210,5 +210,5 @@ index aca4fd45..6b813e9d 100755
          root = pathlib.Path(__file__).resolve().parents[1]
          text = effective_formula_text(root, "github-issue-fix")
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

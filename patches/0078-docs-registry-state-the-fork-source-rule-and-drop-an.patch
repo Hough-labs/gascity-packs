@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 3 Sep 2026 22:34:47 -0400
-Subject: [PATCH 078/103] docs(registry): state the fork-source rule and drop
+Subject: [PATCH 078/104] docs(registry): state the fork-source rule and drop
  an unused constant (gcp-kk4l)
 
 Self-review follow-ups to the gauntlet-tdd fork-source fix.
@@ -69,5 +69,5 @@ index b972c183..daaa58bd 100755
  ACCEPTED_REPOS = (
      (CANONICAL_REPO_OWNER, CANONICAL_REPO_NAME),
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

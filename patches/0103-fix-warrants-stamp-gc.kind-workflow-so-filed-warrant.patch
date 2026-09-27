@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Mon, 14 Sep 2026 13:53:24 -0400
-Subject: [PATCH 103/103] fix(warrants): stamp gc.kind=workflow so filed
+Subject: [PATCH 103/104] fix(warrants): stamp gc.kind=workflow so filed
  warrants actually pour (gcp-w310)
 
 Pool demand detection polls for a ready, unassigned bead carrying BOTH
@@ -256,5 +256,5 @@ index fa61f557..03d02f48 100644
      assert not bail_without_drain_violations(
          fixture, "```bash\necho no\ngc runtime drain-ack\nexit 1\n```"
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

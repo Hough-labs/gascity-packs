@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Wed, 12 Aug 2026 18:11:41 -0400
-Subject: [PATCH 018/103] fix(refinery): prove the ff-merge landed before
+Subject: [PATCH 018/104] fix(refinery): prove the ff-merge landed before
  closing the bead as merged (gcp-p87)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -865,5 +865,5 @@ index 48f7ec2c..6ed5cc67 100644
      assert "gc bd close $WORK --reason \"Pull request ready: $PR_URL\"" in contracts["mol-refinery-patrol"]
      assert "FAIL-SAFE: empty liveness map" in contracts["mol-witness-patrol"]
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

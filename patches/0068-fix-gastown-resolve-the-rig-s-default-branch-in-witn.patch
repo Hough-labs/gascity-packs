@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Wed, 2 Sep 2026 14:44:25 -0400
-Subject: [PATCH 068/103] fix(gastown): resolve the rig's default branch in
+Subject: [PATCH 068/104] fix(gastown): resolve the rig's default branch in
  witness orphan recovery (gcp-5ddt)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -342,5 +342,5 @@ index 88648364..fa61f557 100644
      # backslash-n immediately before `gc` reads as a bare `bd` invocation to
      # tests/test_no_bare_bd_commands.py, whose gc-prefix check is line-based.
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Wed, 2 Sep 2026 18:01:13 -0400
-Subject: [PATCH 073/103] fix(refinery): find-work scans gc.routed_to=<self>,
+Subject: [PATCH 073/104] fix(refinery): find-work scans gc.routed_to=<self>,
  not assignee alone (gcp-mi9t)
 
 mol-refinery-patrol's find-work step scanned by assignee only, so a work bead
@@ -722,5 +722,5 @@ index 81684e13..4b036b79 100755
  
  if [ "$FAILURES" -ne 0 ]; then
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

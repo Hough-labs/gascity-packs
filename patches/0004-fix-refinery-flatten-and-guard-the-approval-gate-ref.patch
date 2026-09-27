@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 31 Jul 2026 15:19:41 -0400
-Subject: [PATCH 004/103] fix(refinery): flatten and guard the approval-gate
+Subject: [PATCH 004/104] fix(refinery): flatten and guard the approval-gate
  refusal metadata write (gcp-dc8)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -46,5 +46,5 @@ index 82f784c4..18a0b17b 100644
      gc session nudge "${GC_RIG:+$GC_RIG/}{{review_agent}}" "REVIEW NEEDED: $WORK — ${PR_URL:-$BRANCH} awaiting merge approval. Record a verdict with record-merge-approval.sh (--pr + --sha of the live head)."
    fi
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

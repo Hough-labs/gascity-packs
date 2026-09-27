@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 28 Aug 2026 19:18:52 -0400
-Subject: [PATCH 058/103] docs(gauntlet-tdd): document the append-notes
+Subject: [PATCH 058/104] docs(gauntlet-tdd): document the append-notes
  contract (gcp-dnxq)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -56,5 +56,5 @@ index 515bdbc4..ae254e69 100644
  list — that list is explicit, not a glob, so a new pack's suite is invisible
  to CI until it is added there.
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

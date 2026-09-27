@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 31 Jul 2026 16:26:45 -0400
-Subject: [PATCH 015/103] fix(hooks): enforce the patches/ export on every
+Subject: [PATCH 015/104] fix(hooks): enforce the patches/ export on every
  branch push (gcp-2qk)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -531,5 +531,5 @@ index 00000000..d30208fd
 +fi
 +echo "test_fork_patch_guard: $PASS passed"
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

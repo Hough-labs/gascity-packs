@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 14 Aug 2026 13:10:09 -0400
-Subject: [PATCH 025/103] fix(refinery): make the duplicate check use a verb
+Subject: [PATCH 025/104] fix(refinery): make the duplicate check use a verb
  that exists and fail closed (gcp-ex1s)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -260,5 +260,5 @@ index 133fbb34..573d3413 100644
 +        fixture, "`gc bd list` has no `--search` flag; use `gc bd search` instead."
 +    )
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

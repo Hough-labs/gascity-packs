@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 13 Aug 2026 13:07:46 -0400
-Subject: [PATCH 021/103] fix(deacon): make the queue-starvation-check able to
+Subject: [PATCH 021/104] fix(deacon): make the queue-starvation-check able to
  see a queue (gcp-wzhy)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -156,5 +156,5 @@ index c0721894..de23a53f 100644
          "\"gc.routed_to\":\"{{binding_prefix}}dog\"",
      ),
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

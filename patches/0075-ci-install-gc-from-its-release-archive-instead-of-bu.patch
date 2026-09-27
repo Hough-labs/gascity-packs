@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 3 Sep 2026 20:14:40 -0400
-Subject: [PATCH 075/103] ci: install gc from its release archive instead of
+Subject: [PATCH 075/104] ci: install gc from its release archive instead of
  building it (gcp-m0ei)
 
 Seven runner pods were evicted in 36 minutes on 2026-09-03, every one of them
@@ -616,5 +616,5 @@ index 3448ddcf..604a4551 100644
      readme = (gascity_pack_inference_gate.REPO_ROOT / "README.md").read_text(encoding="utf-8")
      readme_lines = {line.strip() for line in readme.splitlines()}
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

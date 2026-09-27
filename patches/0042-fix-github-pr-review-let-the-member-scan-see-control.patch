@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 16 Aug 2026 22:13:38 -0400
-Subject: [PATCH 042/103] fix(github-pr-review): let the member scan see
+Subject: [PATCH 042/104] fix(github-pr-review): let the member scan see
  control beads (gcp-m7dn)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -77,5 +77,5 @@ index 65ee8cf8..fbb65c7d 100644
  
  class ReviewGateTest(unittest.TestCase):
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

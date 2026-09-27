@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 14 Aug 2026 22:57:24 -0400
-Subject: [PATCH 031/103] test(gastown): report the real file line in the
+Subject: [PATCH 031/104] test(gastown): report the real file line in the
  pre_start bound check (gcp-oo0v)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -55,5 +55,5 @@ index 770f070f..b39ccb1b 100755
      [[ -z "$unbounded" ]] ||
          fail "$script calls a remote without a deadline: ${unbounded//$'\n'/ | }"
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

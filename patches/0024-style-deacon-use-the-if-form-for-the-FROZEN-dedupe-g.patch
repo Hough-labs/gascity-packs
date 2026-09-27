@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 14 Aug 2026 13:11:01 -0400
-Subject: [PATCH 024/103] style(deacon): use the if-form for the FROZEN dedupe
+Subject: [PATCH 024/104] style(deacon): use the if-form for the FROZEN dedupe
  guard (gcp-llja)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -31,5 +31,5 @@ index 297e9b21..baaed4b5 100644
      gc session nudge mayor/ "Dolt push-state watermark frozen on $SCOPE (pushes ARE landing; bd is recording success as failure). Raise dolt.auto-push-timeout in $SCOPE's .beads/config.yaml — until then auto-push outage detection is blind on that store. $DETAIL"
      date -u +"%Y-%m-%dT%H:%M:%SZ" >"$MARK"
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

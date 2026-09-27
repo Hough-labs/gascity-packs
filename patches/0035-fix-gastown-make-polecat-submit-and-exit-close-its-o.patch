@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Mon, 17 Aug 2026 08:56:10 -0400
-Subject: [PATCH 035/103] fix(gastown): make polecat submit-and-exit close its
+Subject: [PATCH 035/104] fix(gastown): make polecat submit-and-exit close its
  own step bead (gcp-rz8a)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -559,5 +559,5 @@ index 97201dbe..24d14261 100755
  test_dolt_push_outage_detection_is_wired
  test_shutdown_dance_contracts_are_executable
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

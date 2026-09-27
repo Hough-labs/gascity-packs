@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 31 Jul 2026 23:23:19 -0400
-Subject: [PATCH 017/103] test: build drift-suite fixtures line-by-line, not
+Subject: [PATCH 017/104] test: build drift-suite fixtures line-by-line, not
  with embedded escapes (gcp-co9)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -69,5 +69,5 @@ index f7981834..133fbb34 100644
      assert not warrant_dedup_violations(fixture, guarded_warrant)
      # A quick-reference table row is outside any fenced block, so it can never
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

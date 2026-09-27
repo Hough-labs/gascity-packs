@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 6 Sep 2026 19:07:05 -0400
-Subject: [PATCH 081/103] fix(witness): rotate the reaper's cutoff and evidence
+Subject: [PATCH 081/104] fix(witness): rotate the reaper's cutoff and evidence
  the promotion criterion (gcp-schs)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -493,5 +493,5 @@ index 44c84f0b..114be5e7 100644
  
  echo "polecat worktree reap tests passed"
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

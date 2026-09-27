@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 28 Aug 2026 19:16:08 -0400
-Subject: [PATCH 057/103] fix(registry): re-pin gauntlet-tdd 0.1.0 to the
+Subject: [PATCH 057/104] fix(registry): re-pin gauntlet-tdd 0.1.0 to the
  bare-bd-guard subtree (gcp-dnxq)
 
 29b2205 changed the pack subtree again (the note-write guard's own `bd`
@@ -28,5 +28,5 @@ index 161c6366..74d56e59 100644
 +    hash = "sha256:0a79997472f09d45bb7a0c22d7357d3558594157e25ac359d336c4189a19e683"
      description = "Initial gauntlet-tdd release: the RED-to-GREEN contract loop as one formula (mol-tdd-red-green) plus a wrapper command, pinned to the bats lane with gauntlet lint as the red gate."
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

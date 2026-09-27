@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 27 Aug 2026 16:42:34 -0400
-Subject: [PATCH 045/103] test(gastown): keep the home-audit no-bead assertion
+Subject: [PATCH 045/104] test(gastown): keep the home-audit no-bead assertion
  off the bare-bd guard (gcp-actg)
 
 The new no-bead assertion wrote its grep pattern positionally, which put the
@@ -34,5 +34,5 @@ index 91789b4e..dc6ff41a 100755
      [[ "$(grep -cx session "$calls")" == "1" ]] ||
          fail "the session roster was read $(grep -cx session "$calls") times; it must be fetched once per run"
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 16 Aug 2026 22:19:20 -0400
-Subject: [PATCH 043/103] fix(github-pr-review): teach finalize how to record
+Subject: [PATCH 043/104] fix(github-pr-review): teach finalize how to record
  an aborted run (gcp-m7dn)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -77,5 +77,5 @@ index 6b813e9d..b966d438 100755
          root = pathlib.Path(__file__).resolve().parents[1]
          text = effective_formula_text(root, "github-issue-fix")
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

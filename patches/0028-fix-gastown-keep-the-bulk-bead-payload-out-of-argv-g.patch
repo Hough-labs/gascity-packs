@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 14 Aug 2026 14:56:26 -0400
-Subject: [PATCH 028/103] fix(gastown): keep the bulk bead payload out of argv
+Subject: [PATCH 028/104] fix(gastown): keep the bulk bead payload out of argv
  (gcp-ntbf)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -154,5 +154,5 @@ index 569b5a40..bcd3911e 100644
  
  echo "polecat worktree reap tests passed"
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

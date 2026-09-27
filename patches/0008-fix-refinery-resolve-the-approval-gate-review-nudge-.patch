@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 31 Jul 2026 18:50:02 -0400
-Subject: [PATCH 008/103] fix(refinery): resolve the approval-gate review nudge
+Subject: [PATCH 008/104] fix(refinery): resolve the approval-gate review nudge
  across both agent scopes (gcp-a22)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -340,5 +340,5 @@ index cf3003aa..1cec0c90 100755
  
  echo "merge approval gate tests passed"
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

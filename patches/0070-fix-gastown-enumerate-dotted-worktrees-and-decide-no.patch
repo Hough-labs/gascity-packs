@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Wed, 2 Sep 2026 14:58:24 -0400
-Subject: [PATCH 070/103] fix(gastown): enumerate dotted worktrees and decide
+Subject: [PATCH 070/104] fix(gastown): enumerate dotted worktrees and decide
  no-such-bead paths once (gcp-ac59)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -717,5 +717,5 @@ index bec111ff..2910ac35 100644
  
  echo "polecat worktree reap tests passed"
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

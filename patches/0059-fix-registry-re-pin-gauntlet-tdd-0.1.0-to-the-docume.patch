@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 28 Aug 2026 19:19:06 -0400
-Subject: [PATCH 059/103] fix(registry): re-pin gauntlet-tdd 0.1.0 to the
+Subject: [PATCH 059/104] fix(registry): re-pin gauntlet-tdd 0.1.0 to the
  documented subtree (gcp-dnxq)
 
 62de331 added the README's append-notes section, the last commit to change
@@ -27,5 +27,5 @@ index 74d56e59..1f815e8c 100644
 +    hash = "sha256:851ea09226728eb4e34ddbbf98186495516059af96ac8787c9921db070630f86"
      description = "Initial gauntlet-tdd release: the RED-to-GREEN contract loop as one formula (mol-tdd-red-green) plus a wrapper command, pinned to the bats lane with gauntlet lint as the red gate."
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

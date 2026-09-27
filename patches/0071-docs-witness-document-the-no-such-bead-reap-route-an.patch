@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Wed, 2 Sep 2026 15:16:40 -0400
-Subject: [PATCH 071/103] docs(witness): document the no-such-bead reap route
+Subject: [PATCH 071/104] docs(witness): document the no-such-bead reap route
  and its two new events (gcp-ac59)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -144,5 +144,5 @@ index 2910ac35..efd52159 100644
  # error class and a stub that silently omits an id would test a bd that does not
  # exist (gcp-0u14):
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

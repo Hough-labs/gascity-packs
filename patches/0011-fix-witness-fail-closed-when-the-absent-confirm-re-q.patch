@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 31 Jul 2026 11:12:42 -0400
-Subject: [PATCH 011/103] fix(witness): fail closed when the absent-confirm
+Subject: [PATCH 011/104] fix(witness): fail closed when the absent-confirm
  re-query cannot be parsed (gcp-g98)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -58,5 +58,5 @@ index 81fada94..ba999c9e 100644
       rm -f "$CONFIRM_SESSIONS" "$CONFIRM_BEADS"
     fi
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 

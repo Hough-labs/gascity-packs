@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 27 Aug 2026 16:15:30 -0400
-Subject: [PATCH 044/103] fix(gastown): give polecat agent-home worktrees a
+Subject: [PATCH 044/104] fix(gastown): give polecat agent-home worktrees a
  teardown owner (gcp-actg)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -1677,5 +1677,5 @@ index 00000000..91789b4e
 +
 +echo "polecat home audit tests passed"
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 
