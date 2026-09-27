@@ -1425,7 +1425,25 @@ HUMAN_HALT
     gc runtime drain-ack
     exit 0
 fi
-gc bd update "$WORK_BEAD_ID" --status=open --assignee="$REFINERY_TARGET" --set-metadata gc.routed_to=""
+# --- handoff-stamp:begin ---
+# Stamp the handoff in THIS write, never a later one: once the assignee names
+# the refinery, find-work can take the bead, and it orders each priority band
+# by first_submitted_at (gcp-et7g). first_submitted_at is written once and kept
+# across rejections, so a resubmitted bead keeps its place in line;
+# last_submitted_at moves on every handoff and is for observability only.
+# Only a read that returned this bead proves the key is absent. An unreadable
+# bead gets no first stamp, so a transient read failure cannot overwrite an
+# original stamp and send a resubmit to the back of its band.
+HANDOFF_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+HANDOFF_STAMP=(--set-metadata last_submitted_at="$HANDOFF_AT")
+STAMP_JSON=$(gc bd show "$WORK_BEAD_ID" --json 2>/dev/null)
+if [ "$(printf '%s' "$STAMP_JSON" | jq -r '.[0].id // empty' 2>/dev/null)" = "$WORK_BEAD_ID" ] &&
+   [ -z "$(printf '%s' "$STAMP_JSON" | jq -r '.[0].metadata.first_submitted_at // empty' 2>/dev/null)" ]; then
+    HANDOFF_STAMP+=(--set-metadata first_submitted_at="$HANDOFF_AT")
+fi
+gc bd update "$WORK_BEAD_ID" --status=open --assignee="$REFINERY_TARGET" --set-metadata gc.routed_to="" \
+    "${HANDOFF_STAMP[@]}"
+# --- handoff-stamp:end ---
 # The handoff is the assignee write; `--status=open` is bookkeeping that has
 # been observed not to stick (gcp-s14g). Read it back and correct it once, so
 # the bead does not sit in_progress with nobody working it. This is best-effort

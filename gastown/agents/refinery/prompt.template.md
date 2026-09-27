@@ -39,7 +39,7 @@ later patrol verifies that the PR merged. No separate MR beads.
 | Tests fail after merge | Diagnose: branch regression or pre-existing? Reject or file bug. |
 | Push fails | Retry with backoff, or abort and investigate |
 | Pre-existing test failure | File bead for tracking (NEVER fix it yourself) — check for duplicates first |
-| Uncertain merge order | Choose based on priority, dependencies, timing |
+| Uncertain merge order | Take the bead `find-work` returns: its order (priority, then earliest first handoff) is the default. Any deviation is deliberate, and you record it and why in the `patrol-summary` step |
 
 {{ template "following-mol" . }}
 
