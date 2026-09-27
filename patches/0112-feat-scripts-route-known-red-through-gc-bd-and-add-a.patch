@@ -1,0 +1,2038 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sun, 27 Sep 2026 19:30:38 -0400
+Subject: [PATCH 112/112] feat(scripts): route known-red through gc bd and add
+ a pytest id rule (gcp-4ngf)
+
+Adapts the vendored matcher so it can ship in the gastown pack and see
+this rig's own base reds (gc-cgxps phase 2, first half of gcp-oczc).
+
+a. Every ledger call runs ["gc", "bd", *args] instead of a bare binary,
+   so it reads the store gc resolves rather than whatever store the
+   caller stands in. The timeout and fail-closed contract are unchanged:
+   gc missing or erroring makes every failure NEW and files nothing
+   (exit 2). git calls are untouched.
+b. Docstring, comment and error-message mentions of ledger verbs now say
+   `gc bd ...`, so tests/test_no_bare_bd_commands.py passes with no
+   allowlist entry for the script.
+c. A pytest rule in extract_segment. `FAILED <nodeid>` / `ERROR <nodeid>`
+   with `::` in the nodeid, optionally followed by ` - <message>`, yields
+   pytest:<nodeid> as pytest printed it, one id per line, deduped. Before
+   this every pytest red was raw: (always NEW), and extract() kept only
+   the segment's first red line, so four FAILED lines became one raw id.
+   `ERROR <path>.py - ...` with no `::` (a collection error) stays raw:.
+   It is emitted explicitly rather than left to the raw fallback, because
+   a pytest id elsewhere in the segment would otherwise suppress that
+   fallback and hide it. `^ERROR \S+\.py` also joins INDICATORS, since no
+   existing indicator marked a pytest error line red.
+d. A header comment records the provenance (dotmill d674c68, sha256
+   5567aa79...), the adaptations, and the rule to port id-rule changes
+   both ways.
+
+Tests: the 27 mill cases are ported to tests/test_known_red.py, with the
+fixtures under tests/fixtures/known_red/ and fake_bd.py reworked into
+fake_gc.py. The fake is installed on PATH as `gc`, logs the full argv and
+refuses any call whose first argument is not "bd". Five cases are new:
+the four-FAILED-line fixture gives exactly four pytest ids; a message
+suffix does not change the id; a collection error stays raw/NEW, even
+next to a pytest id; a `bd` shim that logs and exits 99 is never invoked
+across the module (checked per test and in tearDownClass), and every
+fake-gc argv starts with "bd"; and match reports gcp-98gh's pytest id
+KNOWN. Subprocess envs drop the GC_*/BEADS_* namespace, per
+test_env_hermeticity.
+
+Validation: pytest tests/test_known_red.py passes 32 tests. Pointed at the
+provenance commit 37ab7d5e via KNOWN_RED_SCRIPT, the new cases for the
+four-line fixture, gc-bd routing and gcp-98gh all FAIL for the right
+reasons (one raw id; bare config call; lookup failed).
+test_no_bare_bd_commands shows only gcp-98gh's two lines in
+docs/design/reaper-budget-starvation.md.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ gastown/assets/scripts/known-red              |  65 ++-
+ tests/fixtures/known_red/fake_gc.py           | 132 +++++
+ tests/fixtures/known_red/go-mixed.txt         |  48 ++
+ tests/fixtures/known_red/green-typecheck.txt  |  18 +
+ tests/fixtures/known_red/jest-mobile.txt      |  77 +++
+ tests/fixtures/known_red/lint.txt             |  47 ++
+ .../known_red/lqft1-gate-all-test.txt         | 505 ++++++++++++++++++
+ tests/fixtures/known_red/masked-by-lane.txt   |   9 +
+ .../known_red/playwright-contrast.txt         | 266 +++++++++
+ tests/fixtures/known_red/pytest-gcp-98gh.txt  |  13 +
+ .../known_red/pytest-short-summary.txt        |   5 +
+ tests/fixtures/known_red/vitest-web.txt       |  46 ++
+ tests/fixtures/known_red/vn65m-go-timeout.txt |  41 ++
+ tests/test_known_red.py                       | 499 +++++++++++++++++
+ 14 files changed, 1753 insertions(+), 18 deletions(-)
+ create mode 100755 tests/fixtures/known_red/fake_gc.py
+ create mode 100644 tests/fixtures/known_red/go-mixed.txt
+ create mode 100644 tests/fixtures/known_red/green-typecheck.txt
+ create mode 100644 tests/fixtures/known_red/jest-mobile.txt
+ create mode 100644 tests/fixtures/known_red/lint.txt
+ create mode 100644 tests/fixtures/known_red/lqft1-gate-all-test.txt
+ create mode 100644 tests/fixtures/known_red/masked-by-lane.txt
+ create mode 100644 tests/fixtures/known_red/playwright-contrast.txt
+ create mode 100644 tests/fixtures/known_red/pytest-gcp-98gh.txt
+ create mode 100644 tests/fixtures/known_red/pytest-short-summary.txt
+ create mode 100644 tests/fixtures/known_red/vitest-web.txt
+ create mode 100644 tests/fixtures/known_red/vn65m-go-timeout.txt
+ create mode 100644 tests/test_known_red.py
+
+diff --git a/gastown/assets/scripts/known-red b/gastown/assets/scripts/known-red
+index d88cff7e..3aba613a 100755
+--- a/gastown/assets/scripts/known-red
++++ b/gastown/assets/scripts/known-red
+@@ -1,4 +1,19 @@
+ #!/usr/bin/env python3
++# VENDORED from dotmill d674c68, library/skills/gascity/known-red/scripts/
++# known-red (sha256 5567aa7917be956d9b0b2c7e6e0b8cae5b10c6c00db89fe7c7577a9ea43ccb78),
++# so the gastown pack ships its own matcher (gc-cgxps Q2, gcp-4ngf).
++# Adaptations from the mill copy:
++#   a. Every ledger call runs `gc bd ...`, never a bare binary, so it reads the
++#      store gc resolves for this directory. Timeout and fail-closed behaviour
++#      are unchanged: gc missing or erroring means every failure is NEW and
++#      nothing is filed (exit 2). The git calls are unchanged.
++#   b. Docstring, comment and message mentions of ledger verbs say `gc bd`, so
++#      tests/test_no_bare_bd_commands.py passes without an allowlist entry.
++#   c. A pytest id rule: `FAILED <nodeid>` / `ERROR <nodeid>` with `::` in the
++#      nodeid, optionally followed by ` - <message>`, yields pytest:<nodeid> as
++#      pytest printed it. `ERROR <path>.py ...` with no `::` (a collection
++#      error) stays raw:, and marks its segment red.
++# Keep in step with the mill copy: port id-rule changes both ways.
+ """known-red — is this red already known on the base branch?
+ 
+ Matches the failures in a gate log against the rig's base-red ledger by EXACT
+@@ -23,13 +38,13 @@ RULES THIS SCRIPT ENCODES
+   let a known red mask a new one in the same lane.
+ - A red segment of the log that yields no id becomes raw:<line>, which is
+   always NEW. So a known red in one lane cannot hide an unparsed red in another.
+-- The lookup fails closed: if bd or git cannot answer, every failure is NEW and
+-  nothing is filed (exit 2).
+-- One status per `bd list` call. A repeated --status is not a union; the last
+-  one wins and the query returns a confident zero.
+-- Metadata is written only with `bd update --set-metadata key=value`, and every
+-  write is read back: a bead whose metadata column is not a JSON object freezes
+-  every pool create in its rig.
++- The lookup fails closed: if `gc bd` or git cannot answer, every failure is
++  NEW and nothing is filed (exit 2).
++- One status per `gc bd list` call. A repeated --status is not a union; the
++  last one wins and the query returns a confident zero.
++- Metadata is written only with `gc bd update --set-metadata key=value`, and
++  every write is read back: a bead whose metadata column is not a JSON object
++  freezes every pool create in its rig.
+ 
+ Exit codes
+   match: 0 every id KNOWN; 1 any id NEW (or no id found); 2 lookup failed;
+@@ -50,7 +65,7 @@ from datetime import datetime, timedelta, timezone
+ 
+ LABEL = "base-red"
+ # A deferred or blocked base-red bead is still red on base. Each status is its
+-# own `bd list` call (see the header).
++# own `gc bd list` call (see the header).
+ ACTIVE_STATUSES = ("open", "in_progress", "blocked", "deferred")
+ STALE_AFTER = timedelta(hours=72)
+ CLOSED_WINDOW = timedelta(days=7)
+@@ -94,6 +109,7 @@ INDICATORS = [re.compile(p) for p in (
+     r"^In \S+ line \d+:\s*$",                    # shellcheck
+     r"^SHELL LINT FAILED",
+     r"(?i)exited with code [1-9]",               # bun script / filter exit
++    r"^ERROR \S+\.py\b",                         # pytest error (FAILED is above)
+ )]
+ 
+ GO_FAIL_TEST = re.compile(r"^\s*--- FAIL: (\S+)")
+@@ -102,6 +118,9 @@ GO_PKG_FAIL = re.compile(r"^FAIL\t(\S+)")
+ GO_PKG_DONE = re.compile(r"^(ok|\?)\s+\S")
+ BATS_NOT_OK = re.compile(r"^not ok \d+ (.+?)\s*$")
+ BATS_FILE = re.compile(r"in test file (.+?), line \d+")
++# pytest's short summary. The lazy nodeid stops at the first " - <message>".
++PYTEST_ID = re.compile(r"^(?:FAILED|ERROR) (\S+?::.+?)(?: - .*)?\s*$")
++PYTEST_ERROR = re.compile(r"^ERROR \S+\.py\b")   # no nodeid: a collection error
+ VITEST_CASE = re.compile(r"^ ?FAIL\s+(\S+) > (.+?)\s*$")
+ VITEST_SUITE = re.compile(r"^ ?FAIL\s+(\S+) \[ .+ \]\s*$")
+ JEST_FILE = re.compile(r"^ ?(FAIL|PASS) +(\S+?)(?: +\(.*\))?\s*$")
+@@ -250,6 +269,16 @@ def extract_segment(seg, paths):
+             else:
+                 add(f"raw:{line.strip()}", line)
+             continue
++        # pytest. A collection error has no nodeid, so it is raw: here rather
++        # than dropped: a pytest id elsewhere in the segment would otherwise
++        # stop extract() falling back to raw for it.
++        m = PYTEST_ID.match(line)
++        if m:
++            add(f"pytest:{m.group(1)}", line)
++            continue
++        if PYTEST_ERROR.match(line):
++            add(f"raw:{line.strip()}", line)
++            continue
+         # vitest (before jest: both start with FAIL)
+         m = VITEST_CASE.match(line)
+         if m:
+@@ -341,7 +370,7 @@ def git_out(args):
+ 
+ def bd(args):
+     try:
+-        r = subprocess.run(["bd", *args], capture_output=True, text=True, timeout=BD_TIMEOUT)
++        r = subprocess.run(["gc", "bd", *args], capture_output=True, text=True, timeout=BD_TIMEOUT)
+     except (OSError, subprocess.TimeoutExpired) as e:
+         return 127, "", str(e)
+     return r.returncode, r.stdout, r.stderr
+@@ -350,18 +379,18 @@ def bd(args):
+ def bd_json(args):
+     rc, out, err = bd(args)
+     if rc != 0:
+-        raise LookupFailed(f"`bd {' '.join(args)}` exited {rc}: {err.strip()[:300]}")
++        raise LookupFailed(f"`gc bd {' '.join(args)}` exited {rc}: {err.strip()[:300]}")
+     try:
+         return json.loads(out)
+     except ValueError:
+-        raise LookupFailed(f"`bd {' '.join(args)}` did not return JSON: {out.strip()[:200]}")
++        raise LookupFailed(f"`gc bd {' '.join(args)}` did not return JSON: {out.strip()[:200]}")
+ 
+ 
+ def bd_list(status, extra=()):
+     rows = bd_json(["list", "--label", LABEL, "--status", status, *extra,
+                     "--json", "--brief", "--limit", "0"])
+     if not isinstance(rows, list):
+-        raise LookupFailed(f"`bd list --status {status}` returned {type(rows).__name__}, not a list")
++        raise LookupFailed(f"`gc bd list --status {status}` returned {type(rows).__name__}, not a list")
+     return rows
+ 
+ 
+@@ -369,7 +398,7 @@ def ledger(include_closed):
+     rc, out, err = bd(["config", "get", "issue_prefix"])
+     scope = out.strip().splitlines()[-1] if rc == 0 and out.strip() else ""
+     if not scope:
+-        raise LookupFailed(f"cannot name this directory's ledger (`bd config get issue_prefix` exited {rc}: {err.strip()[:200]})")
++        raise LookupFailed(f"cannot name this directory's ledger (`gc bd config get issue_prefix` exited {rc}: {err.strip()[:200]})")
+     active = []
+     for st in ACTIVE_STATUSES:
+         active += bd_list(st)
+@@ -519,7 +548,7 @@ def show_bead(bid):
+     data = bd_json(["show", bid, "--json"])
+     rec = data[0] if isinstance(data, list) and data else data
+     if not isinstance(rec, dict) or not rec.get("id"):
+-        raise LookupFailed(f"`bd show {bid}` returned no bead")
++        raise LookupFailed(f"`gc bd show {bid}` returned no bead")
+     return rec
+ 
+ 
+@@ -530,11 +559,11 @@ def write_meta(bid, kv, add_label, dry):
+     for k, v in kv.items():
+         args += ["--set-metadata", f"{k}={v}"]
+     if dry:
+-        print(f"  (dry-run) bd {' '.join(repr(x) if ' ' in x or chr(10) in x else x for x in args)}")
++        print(f"  (dry-run) gc bd {' '.join(repr(x) if ' ' in x or chr(10) in x else x for x in args)}")
+         return
+     rc, out, err = bd(args)
+     if rc != 0:
+-        raise WriteFailed(f"`bd update {bid}` exited {rc}: {err.strip()[:300]}")
++        raise WriteFailed(f"`gc bd update {bid}` exited {rc}: {err.strip()[:300]}")
+     # Read it back. A non-object metadata column freezes every pool create in
+     # the rig, and --set-metadata turns number-like values into numbers.
+     try:
+@@ -648,7 +677,7 @@ def cmd_file(a):
+             args = ["create", "--type", "bug", "-p", "1", "--labels", LABEL,
+                     "--title", ttl, "--body-file", body_file, "--silent"]
+             if a.dry_run:
+-                print(f"  (dry-run) bd create --type bug -p 1 --labels {LABEL} --title {ttl!r} --body-file <{len(new)} ids>")
++                print(f"  (dry-run) gc bd create --type bug -p 1 --labels {LABEL} --title {ttl!r} --body-file <{len(new)} ids>")
+                 bid = "<new>"
+             else:
+                 rc, out, err = bd(args)
+@@ -656,7 +685,7 @@ def cmd_file(a):
+                 bid = lines[-1].strip() if lines else ""
+                 if rc != 0 or not re.fullmatch(r"[A-Za-z0-9]+-[A-Za-z0-9.]+", bid):
+                     raise WriteFailed(
+-                        f"`bd create` exited {rc} ({(err or out).strip()[:200]}). A create can land and still "
++                        f"`gc bd create` exited {rc} ({(err or out).strip()[:200]}). A create can land and still "
+                         f"fail here: run `known-red list` before filing again, or you file a duplicate.")
+             os.unlink(body_file)
+             print(f"known-red: filed {bid} for {len(new)} new id(s)")
+diff --git a/tests/fixtures/known_red/fake_gc.py b/tests/fixtures/known_red/fake_gc.py
+new file mode 100755
+index 00000000..da9cd4b9
+--- /dev/null
++++ b/tests/fixtures/known_red/fake_gc.py
+@@ -0,0 +1,132 @@
++#!/usr/bin/env python3
++"""A stand-in `gc` for known-red's tests. It never touches a real ledger.
++
++It is installed on PATH as `gc` and answers only `gc bd ...`: any other first
++argument is logged and refused, so a test sees a call that was not routed
++through `gc bd`. Past that it models the ledger verbs known-red uses.
++
++State lives in $FAKE_GC_DB (JSON); every call is appended to $FAKE_GC_LOG as a
++JSON argv line (including the leading "bd"), so tests can assert on exactly
++what known-red asked for.
++
++  FAKE_GC_FAIL=1             every call exits 1 (ledger unreachable)
++  FAKE_GC_FAIL_ON=<cmd>      only calls to that ledger verb exit 1
++  FAKE_GC_CORRUPT_METADATA=1 update stores metadata as a JSON *string*, the
++                             shape that freezes a rig's pool creates
++"""
++import json
++import os
++import sys
++from datetime import datetime, timezone
++
++with open(os.environ["FAKE_GC_LOG"], "a") as fh:
++    fh.write(json.dumps(sys.argv[1:]) + "\n")
++if len(sys.argv) < 2 or sys.argv[1] != "bd":
++    print(f"fake gc: known-red must call `gc bd ...`, got {sys.argv[1:]}", file=sys.stderr)
++    sys.exit(64)
++argv = sys.argv[2:]
++if os.environ.get("FAKE_GC_FAIL") or (argv and argv[0] == os.environ.get("FAKE_GC_FAIL_ON")):
++    print("Error: failed to connect to dolt server at 127.0.0.1:3307", file=sys.stderr)
++    sys.exit(1)
++
++DB = os.environ["FAKE_GC_DB"]
++with open(DB) as fh:
++    db = json.load(fh)
++
++
++def save():
++    with open(DB, "w") as fh:
++        json.dump(db, fh, indent=1)
++
++
++def opt(name, default=None):
++    """Last occurrence wins, as in the real ledger CLI (a repeated --status is NOT a union)."""
++    val = default
++    for i, a in enumerate(argv):
++        if a == name and i + 1 < len(argv):
++            val = argv[i + 1]
++        elif a.startswith(name + "="):
++            val = a.split("=", 1)[1]
++    return val
++
++
++def opts(name):
++    return [argv[i + 1] for i, a in enumerate(argv) if a == name and i + 1 < len(argv)]
++
++
++def to_json_value(s):
++    """toJSONValue: numbers, booleans and null lose their string type."""
++    if s in ("null", "true", "false"):
++        return json.loads(s)
++    try:
++        return json.loads(s) if isinstance(json.loads(s), (int, float)) else s
++    except ValueError:
++        return s
++
++
++def ts(s):
++    return datetime.fromisoformat(s.replace("Z", "+00:00"))
++
++
++cmd = argv[0] if argv else ""
++if cmd == "config" and argv[1:3] == ["get", "issue_prefix"]:
++    print(db.get("prefix", "winnow"))
++elif cmd == "list":
++    label, status = opt("--label"), opt("--status")
++    after = opt("--closed-after")
++    rows = []
++    for b in db["beads"].values():
++        if label and label not in (b.get("labels") or []):
++            continue
++        if status and b["status"] not in status.split(","):
++            continue
++        if after and not (b.get("closed_at") and ts(b["closed_at"]) > ts(after)):
++            continue
++        rows.append(b)
++    print(json.dumps(rows))
++elif cmd == "show":
++    b = db["beads"].get(argv[1])
++    if not b:
++        print(f"Error: no issue found matching {argv[1]!r}", file=sys.stderr)
++        sys.exit(1)
++    print(json.dumps([b]))
++elif cmd == "create":
++    db["next"] = db.get("next", 0) + 1
++    bid = f"{db.get('prefix', 'winnow')}-fk{db['next']}"
++    body = ""
++    if opt("--body-file"):
++        with open(opt("--body-file")) as fh:
++            body = fh.read()
++    db["beads"][bid] = {
++        "id": bid, "title": opt("--title"), "status": "open",
++        "priority": int(opt("-p", "2")), "issue_type": opt("--type", "task"),
++        "labels": [x for x in (opt("--labels") or "").split(",") if x],
++        "metadata": None, "description": body,
++        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
++    }
++    save()
++    print(bid if "--silent" in argv else f"✓ Created issue: {bid}")
++elif cmd == "update":
++    b = db["beads"].get(argv[1])
++    if not b:
++        print(f"Error: no issue found matching {argv[1]!r}", file=sys.stderr)
++        sys.exit(1)
++    if "--metadata" in argv:
++        print("Error: known-red must never write whole-object --metadata", file=sys.stderr)
++        sys.exit(3)
++    md = b.get("metadata")
++    if isinstance(md, str):
++        print(f"Error: metadata edit failed for {argv[1]}: existing metadata is not a JSON object", file=sys.stderr)
++        sys.exit(1)
++    md = dict(md or {})
++    for kv in opts("--set-metadata"):
++        k, v = kv.split("=", 1)
++        md[k] = to_json_value(v)
++    b["metadata"] = json.dumps(md) if os.environ.get("FAKE_GC_CORRUPT_METADATA") else md
++    for lab in opts("--add-label"):
++        b["labels"] = sorted(set((b.get("labels") or []) + [lab]))
++    save()
++    print(f"✓ Updated issue: {argv[1]}")
++else:
++    print(f"fake gc: unsupported ledger call {argv}", file=sys.stderr)
++    sys.exit(64)
+diff --git a/tests/fixtures/known_red/go-mixed.txt b/tests/fixtures/known_red/go-mixed.txt
+new file mode 100644
+index 00000000..1579030f
+--- /dev/null
++++ b/tests/fixtures/known_red/go-mixed.txt
+@@ -0,0 +1,48 @@
++gate(test): RUN  make test
++# github.com/ferth-ai/winnow/internal/broken [github.com/ferth-ai/winnow/internal/broken.test]
++internal/broken/b_test.go:5:28: undefined: undefinedThing
++--- FAIL: TestLogThrottle_ConcurrentCallersAdmitOne (0.00s)
++    messages_test.go:6: next window allow = (54, true), want (63, true)
++--- FAIL: TestGroundingMap (0.00s)
++    --- FAIL: TestGroundingMap/drops_citation (0.00s)
++        messages_test.go:10: dropped
++FAIL
++FAIL	github.com/ferth-ai/winnow/api	0.185s
++FAIL	github.com/ferth-ai/winnow/internal/broken [build failed]
++panic: test timed out after 3s
++	running tests:
++		TestResolutionKeepsTheEntityLayerLoadable (3s)
++
++goroutine 17 [running]:
++testing.(*M).startAlarm.func1()
++	/opt/homebrew/Cellar/go/1.27.1/libexec/src/testing/testing.go:2959 +0x2c4
++created by time.goFunc
++	/opt/homebrew/Cellar/go/1.27.1/libexec/src/time/sleep.go:182 +0x38
++
++goroutine 1 [chan receive]:
++testing.(*T).Run(0x788242336008, {0x10077ecda?, 0x78824227ca88?}, 0x1008df3e8)
++	/opt/homebrew/Cellar/go/1.27.1/libexec/src/testing/testing.go:2266 +0x3cc
++testing.runTests.func1(0x788242336008)
++	/opt/homebrew/Cellar/go/1.27.1/libexec/src/testing/testing.go:2742 +0x38
++testing.tRunner(0x788242336008, 0x78824227cbb8)
++	/opt/homebrew/Cellar/go/1.27.1/libexec/src/testing/testing.go:2193 +0xc4
++testing.runTests({0x10077a7e8, 0x1a}, {0x100780b41, 0x34}, 0x7882421ec180, {0x1008f9608, 0x1, 0x1}, {0x78824227cc58?, 0x78824226e1e0?, ...})
++	/opt/homebrew/Cellar/go/1.27.1/libexec/src/testing/testing.go:2740 +0x400
++testing.(*M).Run(0x788242304320)
++	/opt/homebrew/Cellar/go/1.27.1/libexec/src/testing/testing.go:2600 +0x578
++main.main()
++	_testmain.go:46 +0x80
++
++goroutine 6 [sleep]:
++time.Sleep(0x2540be400)
++	/opt/homebrew/Cellar/go/1.27.1/libexec/src/runtime/time.go:368 +0x150
++github.com/ferth-ai/winnow/internal/ingest/entityres.TestResolutionKeepsTheEntityLayerLoadable(0x788242336248?)
++	/Users/hunter/gc/.gc/worktrees/winnow/polecats/gastown.slit/worktrees/winnow-vn65m/internal/ingest/entityres/res_test.go:5 +0x28
++testing.tRunner(0x788242336248, 0x1008df3e8)
++	/opt/homebrew/Cellar/go/1.27.1/libexec/src/testing/testing.go:2193 +0xc4
++created by testing.(*T).Run in goroutine 1
++	/opt/homebrew/Cellar/go/1.27.1/libexec/src/testing/testing.go:2258 +0x3b8
++FAIL	github.com/ferth-ai/winnow/internal/ingest/entityres	3.498s
++ok  	github.com/ferth-ai/winnow/internal/okpkg	0.340s
++FAIL
++make: *** [test] Error 1
+diff --git a/tests/fixtures/known_red/green-typecheck.txt b/tests/fixtures/known_red/green-typecheck.txt
+new file mode 100644
+index 00000000..682fb00d
+--- /dev/null
++++ b/tests/fixtures/known_red/green-typecheck.txt
+@@ -0,0 +1,18 @@
++gate(typecheck): GATE_ALL — verify-everything mode. Every lane runs;
++    the diff against origin/dev is ignored. A SKIP is not possible here,
++    so this phase's exit status is a real verdict.
++gate(typecheck): RUN  make vet
++gate(typecheck): RUN  make agent-vet
++gate(typecheck): RUN  bash -c cd client && bun run typecheck
++$ bun run --filter '*' typecheck
++@winnow/core typecheck: Exited with code 0
++@winnow/mobile typecheck: generate-route-types: 26 route patterns -> .expo/types/router.d.ts, expo-env.d.ts
++@winnow/mobile typecheck: Exited with code 0
++@winnow/web typecheck: Exited with code 0
++gate(typecheck): RUN  bats --count over 86 .gauntlet contract files
++1061
++gate(typecheck): .gauntlet suite collected 1061 tests from 86 contract files.
++gate(typecheck): RUN  make app-migrate-validate
++gate(typecheck): RUN  go tool goose -dir <staged copy of 54 corpus migrations> validate
++gate(typecheck): goose validated 54 corpus migrations.
++gate(typecheck): OK — all applicable checks passed.
+diff --git a/tests/fixtures/known_red/jest-mobile.txt b/tests/fixtures/known_red/jest-mobile.txt
+new file mode 100644
+index 00000000..8b31f0f5
+--- /dev/null
++++ b/tests/fixtures/known_red/jest-mobile.txt
+@@ -0,0 +1,77 @@
++gate(test): RUN  bash -c 'cd client/apps/mobile && bun run test --runInBand'
++$ jest --runInBand
++PASS features/reading/word-sheet.test.tsx (41.656 s)
++PASS app/read/[book]/[chapter].test.tsx (69.336 s)
++  ● Console
++
++    console.error
++      The current testing environment is not configured to support act(...)
++
++      64 |     let cancelled = false;
++      65 |     void loadStoredToken().then((token) => {
++    > 66 |       if (!cancelled) setHasToken(token !== null);
++         |                       ^
++      67 |     });
++      68 |     return () => {
++      69 |       cancelled = true;
++
++      at isConcurrentActEnvironment (../../node_modules/react-reconciler/cjs/react-reconciler.development.js:15344:17)
++      at warnIfUpdatesNotWrappedWithActDEV (../../node_modules/react-reconciler/cjs/react-reconciler.development.js:17861:7)
++      at scheduleUpdateOnFiber (../../node_modules/react-reconciler/cjs/react-reconciler.development.js:15445:11)
++      at dispatchSetStateInternal (../../node_modules/react-reconciler/cjs/react-reconciler.development.js:7016:13)
++      at dispatchSetState (../../node_modules/react-reconciler/cjs/react-reconciler.development.js:6973:7)
++      at setHasToken (features/auth/session-provider.tsx:66:23)
++
++    console.error
++
++FAIL features/reader/header.test.js
++  ✕ top-level contrast floor (2 ms)
++  reader header
++    ✓ keeps the verse in view (4 ms)
++    ✕ lands the cross-ref on its verse (21 ms)
++
++  ● Console
++
++    console.error
++      The current testing environment is not configured to support act(...)
++
++      at setHasToken (features/auth/session-provider.tsx:66:23)
++
++  ● reader header › lands the cross-ref on its verse
++
++    expect(received).toBeLessThanOrEqual(expected)
++
++    Expected: <= 2
++    Received:    4
++
++      1 | describe('reader header', () => {
++      2 |   test('keeps the verse in view', () => { expect(1).toBe(1); });
++    > 3 |   test('lands the cross-ref on its verse', () => { expect(4).toBeLessThanOrEqual(2); });
++        |                                                              ^
++      4 | });
++      5 | test('top-level contrast floor', () => { expect('a').toBe('b'); });
++      6 |
++
++      at Object.toBeLessThanOrEqual (features/reader/header.test.js:3:62)
++
++  ● top-level contrast floor
++
++    expect(received).toBe(expected) // Object.is equality
++
++    Expected: "b"
++    Received: "a"
++
++      3 |   test('lands the cross-ref on its verse', () => { expect(4).toBeLessThanOrEqual(2); });
++      4 | });
++    > 5 | test('top-level contrast floor', () => { expect('a').toBe('b'); });
++        |                                                      ^
++      6 |
++
++      at Object.toBe (features/reader/header.test.js:5:54)
++
++Test Suites: 1 failed, 1 total
++Tests:       2 failed, 1 passed, 3 total
++Snapshots:   0 total
++Time:        0.979 s
++Ran all test suites.
++gate(test): FAIL — mobile lane ran 3 tests and exited 1.
+diff --git a/tests/fixtures/known_red/lint.txt b/tests/fixtures/known_red/lint.txt
+new file mode 100644
+index 00000000..ff3e8140
+--- /dev/null
++++ b/tests/fixtures/known_red/lint.txt
+@@ -0,0 +1,47 @@
++gate(lint): GATE_ALL — verify-everything mode. Every lane runs;
++gate(lint): RUN  make lint
++internal/store/store.go:7:9: Error return value of `f.Close` is not checked (errcheck)
++	f.Close()
++	       ^
++1 issues:
++* errcheck: 1
++make: *** [lint] Error 1
++gate(lint): RUN  make agent-lint
++level=error msg="Timeout exceeded: try increasing it by passing --timeout option"
++make: *** [agent-lint] Error 4
++gate(lint): RUN  bash -c cd client && bun run lint
++$ bun run --filter '*' lint
++@winnow/web lint: 
++@winnow/web lint: /Users/hunter/gc/.gc/worktrees/winnow/polecats/gastown.slit/worktrees/winnow-vn65m/client/apps/web/features/account/avatar.tsx
++@winnow/web lint:   52:7  warning  Using `<img>` could result in slower LCP and higher bandwidth.  @next/next/no-img-element
++@winnow/web lint: /Users/hunter/gc/.gc/worktrees/winnow/polecats/gastown.slit/worktrees/winnow-vn65m/client/apps/web/features/auth/use-sign-out.ts
++@winnow/web lint:   47:7  error  'router' is assigned a value but never used  @typescript-eslint/no-unused-vars
++@winnow/web lint: 
++@winnow/web lint: ✖ 2 problems (1 error, 1 warning)
++@winnow/web lint: 
++@winnow/web lint: Exited with code 1
++gate(lint): RUN  make shellcheck
++shell-lint: shellcheck 0.11.0 over 24 script(s) under scripts/
++
++In scripts/prune.sh line 2:
++rm -rf $1/tmp
++       ^-- SC2086 (info): Double quote to prevent globbing and word splitting.
++
++Did you mean:
++rm -rf "$1"/tmp
++
++
++In scripts/prune.sh line 3:
++echo `date`
++     ^----^ SC2046 (warning): Quote this to prevent word splitting.
++     ^----^ SC2005 (style): Useless echo? Instead of 'echo $(cmd)', just use 'cmd'.
++     ^----^ SC2006 (style): Use $(...) notation instead of legacy backticks `...`.
++
++Did you mean:
++echo $(date)
++
++For more information:
++  https://www.shellcheck.net/wiki/SC2046 -- Quote this to prevent word splitt...
++  https://www.shellcheck.net/wiki/SC2086 -- Double quote to prevent globbing ...
++  https://www.shellcheck.net/wiki/SC2005 -- Useless echo? Instead of 'echo $(...
++SHELL LINT FAILED: shellcheck reported findings in scripts/.
+diff --git a/tests/fixtures/known_red/lqft1-gate-all-test.txt b/tests/fixtures/known_red/lqft1-gate-all-test.txt
+new file mode 100644
+index 00000000..f9094607
+--- /dev/null
++++ b/tests/fixtures/known_red/lqft1-gate-all-test.txt
+@@ -0,0 +1,505 @@
++gate(test): GATE_ALL — verify-everything mode. Every lane runs;
++    the diff against origin/dev is ignored. A SKIP is not possible here,
++    so this phase's exit status is a real verdict.
++gate(test): RUN  make test
++ok  	github.com/ferth-ai/winnow/api	33.263s	coverage: 85.6% of statements
++?   	github.com/ferth-ai/winnow/bible	[no test files]
++?   	github.com/ferth-ai/winnow/bible/ingest	[no test files]
++?   	github.com/ferth-ai/winnow/bible/ingest/jsonapi	[no test files]
++?   	github.com/ferth-ai/winnow/bible/ingest/macula	[no test files]
++?   	github.com/ferth-ai/winnow/bible/ingest/osis	[no test files]
++?   	github.com/ferth-ai/winnow/bible/ingest/tei	[no test files]
++?   	github.com/ferth-ai/winnow/bible/ingest/tsv	[no test files]
++?   	github.com/ferth-ai/winnow/bible/ingest/usfm	[no test files]
++ok  	github.com/ferth-ai/winnow/bible/license	2.535s	coverage: 100.0% of statements
++?   	github.com/ferth-ai/winnow/capability	[no test files]
++ok  	github.com/ferth-ai/winnow/cmd/evaldata	4.282s	coverage: 80.7% of statements
++ok  	github.com/ferth-ai/winnow/cmd/winnow	9.672s	coverage: 51.1% of statements
++?   	github.com/ferth-ai/winnow/grounding	[no test files]
++ok  	github.com/ferth-ai/winnow/internal/agent	5.045s	coverage: 94.0% of statements
++ok  	github.com/ferth-ai/winnow/internal/answer	4.530s	coverage: 96.0% of statements
++ok  	github.com/ferth-ai/winnow/internal/ciguard	29.779s	coverage: [no statements]
++ok  	github.com/ferth-ai/winnow/internal/citation	1.581s	coverage: 78.8% of statements
++ok  	github.com/ferth-ai/winnow/internal/citeverify	2.787s	coverage: 88.6% of statements
++ok  	github.com/ferth-ai/winnow/internal/dense	3.159s	coverage: 93.5% of statements
++ok  	github.com/ferth-ai/winnow/internal/doltretry	4.724s	coverage: 87.7% of statements
++ok  	github.com/ferth-ai/winnow/internal/embed	3.204s	coverage: 91.8% of statements
++ok  	github.com/ferth-ai/winnow/internal/eval	2.806s	coverage: 98.3% of statements
++?   	github.com/ferth-ai/winnow/internal/exitcode	[no test files]
++ok  	github.com/ferth-ai/winnow/internal/ingest/crossref	4.002s	coverage: 94.6% of statements
++ok  	github.com/ferth-ai/winnow/internal/ingest/entityres	476.627s	coverage: 93.3% of statements
++ok  	github.com/ferth-ai/winnow/internal/ingest/figures	2.308s	coverage: 88.5% of statements
++ok  	github.com/ferth-ai/winnow/internal/ingest/geography	349.723s	coverage: 90.6% of statements
++ok  	github.com/ferth-ai/winnow/internal/ingest/html	3.155s	coverage: 94.1% of statements
++ok  	github.com/ferth-ai/winnow/internal/ingest/lexicon	3.109s	coverage: 86.3% of statements
++ok  	github.com/ferth-ai/winnow/internal/ingest/loader	3.143s	coverage: 41.8% of statements
++ok  	github.com/ferth-ai/winnow/internal/ingest/macula	3.161s	coverage: 80.3% of statements
++ok  	github.com/ferth-ai/winnow/internal/ingest/morphcodes	5.243s	coverage: 89.3% of statements
++ok  	github.com/ferth-ai/winnow/internal/ingest/orchestrate	7.108s	coverage: 10.4% of statements
++ok  	github.com/ferth-ai/winnow/internal/ingest/osis	65.690s	coverage: 87.7% of statements
++ok  	github.com/ferth-ai/winnow/internal/ingest/plaintextlat	2.557s	coverage: 94.9% of statements
++ok  	github.com/ferth-ai/winnow/internal/ingest/records	2.494s	coverage: 58.3% of statements
++ok  	github.com/ferth-ai/winnow/internal/ingest/speaker	2.374s	coverage: 86.7% of statements
++ok  	github.com/ferth-ai/winnow/internal/ingest/tei	2.320s	coverage: 87.1% of statements
++ok  	github.com/ferth-ai/winnow/internal/ingest/teil2	1.985s	coverage: 98.1% of statements
++ok  	github.com/ferth-ai/winnow/internal/ingest/thml	131.362s	coverage: 90.9% of statements
++ok  	github.com/ferth-ai/winnow/internal/ingest/tipnr	13.449s	coverage: 90.0% of statements
++ok  	github.com/ferth-ai/winnow/internal/ingest/topical	5.282s	coverage: 95.8% of statements
++ok  	github.com/ferth-ai/winnow/internal/ingest/translationacademy	1.388s	coverage: 85.7% of statements
++ok  	github.com/ferth-ai/winnow/internal/ingest/tsvwords	55.394s	coverage: 90.8% of statements
++ok  	github.com/ferth-ai/winnow/internal/ingest/tvtms	1.864s	coverage: 74.7% of statements
++ok  	github.com/ferth-ai/winnow/internal/ingest/tyndale	187.769s	coverage: 89.8% of statements
++ok  	github.com/ferth-ai/winnow/internal/ingest/ubsdict	1.788s	coverage: 63.5% of statements
++ok  	github.com/ferth-ai/winnow/internal/ingest/usfm	214.028s	coverage: 82.4% of statements
++ok  	github.com/ferth-ai/winnow/internal/ingest/uwtn	1.503s	coverage: 78.8% of statements
++ok  	github.com/ferth-ai/winnow/internal/ingest/wordsense	1.481s	coverage: 81.6% of statements
++ok  	github.com/ferth-ai/winnow/internal/library	1.514s	coverage: 100.0% of statements
++ok  	github.com/ferth-ai/winnow/internal/logging	1.404s	coverage: 100.0% of statements
++ok  	github.com/ferth-ai/winnow/internal/morph	1.406s	coverage: 82.3% of statements
++	github.com/ferth-ai/winnow/internal/out		coverage: 0.0% of statements
++ok  	github.com/ferth-ai/winnow/internal/passage	1.602s	coverage: 93.2% of statements
++ok  	github.com/ferth-ai/winnow/internal/recurrence	1.294s	coverage: 97.2% of statements
++ok  	github.com/ferth-ai/winnow/internal/resolve/articlebridge	1.423s	coverage: 87.3% of statements
++ok  	github.com/ferth-ai/winnow/internal/resolve/entitybridge	1.473s	coverage: 41.0% of statements
++ok  	github.com/ferth-ai/winnow/internal/resolve/l2authors	1.737s	coverage: 86.4% of statements
++ok  	github.com/ferth-ai/winnow/internal/resolve/language	1.832s	coverage: 80.5% of statements
++ok  	github.com/ferth-ai/winnow/internal/resolve/quotetokens	1.692s	coverage: 86.6% of statements
++ok  	github.com/ferth-ai/winnow/internal/retrieval	2.022s	coverage: 94.7% of statements
++ok  	github.com/ferth-ai/winnow/internal/sources	1.880s	coverage: 82.2% of statements
++ok  	github.com/ferth-ai/winnow/internal/storage	1.847s	coverage: 20.0% of statements
++ok  	github.com/ferth-ai/winnow/internal/store/app	1.632s	coverage: 89.6% of statements
++ok  	github.com/ferth-ai/winnow/internal/store/app/postgres	1.763s	coverage: 21.7% of statements
++ok  	github.com/ferth-ai/winnow/internal/store/corpus	8.643s	coverage: 85.6% of statements
++ok  	github.com/ferth-ai/winnow/internal/telemetry	1.787s	coverage: 81.6% of statements
++	github.com/ferth-ai/winnow/internal/testutil		coverage: 0.0% of statements
++ok  	github.com/ferth-ai/winnow/internal/testutil/dbgate	1.620s	coverage: 100.0% of statements
++ok  	github.com/ferth-ai/winnow/internal/testutil/vendored	2.030s	coverage: 82.4% of statements
++ok  	github.com/ferth-ai/winnow/internal/tokenmeter	1.503s	coverage: 95.0% of statements
++ok  	github.com/ferth-ai/winnow/internal/version	1.459s	coverage: 45.8% of statements
++ok  	github.com/ferth-ai/winnow/migrations/corpus	1.430s	coverage: 77.3% of statements
++?   	github.com/ferth-ai/winnow/module	[no test files]
++?   	github.com/ferth-ai/winnow/study	[no test files]
++?   	github.com/ferth-ai/winnow/studyctx	[no test files]
++ok  	github.com/ferth-ai/winnow/toolpack	4.822s	coverage: 93.5% of statements
++	github.com/ferth-ai/winnow/tools/openapi-emit		coverage: 0.0% of statements
++gate(test): RUN  make agent-test
++ok  	github.com/ferth-ai/winnow/agent	2.582s
++gate(test): .gauntlet lane EXCLUDED 1 red-by-design contract file(s):
++    .gauntlet/winnow-make-deploy-local.bats
++    Each carries '# bats file_tags=red-by-design' — it asserts on a feature
++    that is not built. 'make smoke' reports these red_expected and CI does
++    not fail on them; run it to see them framed. Un-tag the file when the
++    feature lands.
++gate(test): .gauntlet lane implicated 0 contract file(s) in the diff and 35 by declared subject; EXECUTING 34 after red-by-design exclusions.
++gate(test): RUN  bats --formatter tap .gauntlet/answer.bats .gauntlet/avatar-harness-limit.bats .gauntlet/beads-replication-lag.bats .gauntlet/ci-dsn-wiring.bats .gauntlet/client-codegen-smoke-wired.bats .gauntlet/corpus-build-empty-seal.bats .gauntlet/corpus-build-mem-report.bats .gauntlet/corpus-lane-wired.bats .gauntlet/corpus-write-guard.bats .gauntlet/data-queue-supersede.bats .gauntlet/dead-test-guards.bats .gauntlet/embed-egress-wired.bats .gauntlet/go-test-timeout.bats .gauntlet/golangci-cache-scoping.bats .gauntlet/grounded-e2e-lane-wired.bats .gauntlet/hurl-lane-wired.bats .gauntlet/layering-guard.bats .gauntlet/local-dev-onboarding.bats .gauntlet/local-loop-parity.bats .gauntlet/local-traefik-extraction.bats .gauntlet/mktemp-templates.bats .gauntlet/pin-currency.bats .gauntlet/pre-commit-chain.bats .gauntlet/promote-lag-alert.bats .gauntlet/promote-sha-resolution.bats .gauntlet/shell-lint.bats .gauntlet/sources-cache-order.bats .gauntlet/toolreach-lane-wired.bats .gauntlet/traceability-clean.bats .gauntlet/winnow-13dg-gate-matches.bats .gauntlet/winnow-m69eh-gate-setup-installs.bats .gauntlet/winnow-make-parse.bats .gauntlet/winnow-make-serve-agent.bats .gauntlet/winnow-y3w3g-gate-receipt.bats
++1..368
++ok 1 answer path cites only retrieved verses (grounding invariant)
++ok 2 serve-env: gauntlet-e2e-up.sh has a serve invocation with an env block
++ok 3 serve-env: WINNOW_AVATAR_MAX_BYTES is set ON the serve invocation, not merely somewhere in the file
++ok 4 serve-env: a commented-out export does not satisfy the gate
++ok 5 fixture-coupling: oversize.bin is larger than the exported ceiling
++ok 6 fixture-coupling: upload.hurl still POSTs that fixture and asserts 413
++ok 7 alerts when the ref is stale AND dev was busy — the measured 18h outage
++ok 8 the alert names the swallowed push as the reason bd still reads healthy
++ok 9 the alert names a remediation and forbids force-pushing refs/dolt/*
++ok 10 the alert admits the dev-commit bound is a proxy, not a measurement
++ok 11 the alert links the frozen commit by its full sha
++ok 12 SILENT on a busy afternoon: 40 commits, but the ref is fresh
++ok 13 SILENT on a quiet weekend: ref 30h old, but dev took only 2 commits
++ok 14 SILENT when the ref is fresh and nothing was pushed either
++ok 15 a raised hour threshold suppresses the alert the default would fire
++ok 16 a raised commit threshold suppresses the alert the default would fire
++ok 17 exactly at both thresholds counts as exceeded
++ok 18 one hour under the age bound stays silent even with a busy dev
++ok 19 dev commits are counted since the ref's own committer date
++ok 20 the measurement is echoed even on a silent run, so a quiet log still has the numbers
++ok 21 a failing ls-remote warns instead of reporting replication healthy
++ok 22 a ref present but with an unreadable commit date warns, naming the sha
++ok 23 an unusable dev-commit count warns instead of alerting on a stale ref
++ok 24 a malformed commit timestamp warns AND the block survives, so A/B/C still post
++ok 25 a non-numeric dev-commit count warns rather than crashing the step
++ok 26 app-dsn-exported-in-ci: the gauntlet job exports WINNOW_APP_DSN via GITHUB_ENV
++ok 27 app-dsn-exported-in-ci: the exported DSN is a postgres:// URL
++ok 28 migrations-step-present: an atlas migrate apply step targets migrations/app
++ok 29 migrations-step-present: a Postgres service container is provisioned for the gauntlet job
++ok 30 ordering: the WINNOW_APP_DSN export step precedes 'Run bats contract lane'
++ok 31 loud-failure: the DSN-provisioning step runs under set -euo pipefail
++ok 32 scripts-present: both halves of the smoke exist and are executable
++ok 33 scripts-present: make client-codegen-smoke invokes the script
++ok 34 scripts-present: make ci runs the smoke alongside the drift check
++ok 35 ci-runs-smoke: CI has a step that invokes the smoke
++ok 36 ci-runs-smoke: the step lives in client-codegen-check, not client-quality
++ok 37 ci-runs-smoke: the smoke runs after the drift check in that job
++ok 38 fails-loudly: a missing bun REDS the gate, it does not skip it
++ok 39 self-test-present: the script falsifies itself before checking the artifact
++ok 40 self-test-present: the fixtures are cleaned up, so the preflight leaves no litter
++ok 41 self-test-present: the checker evaluates the module rather than typechecking it
++ok 42 a full build with a known sha seals with --allow-empty
++ok 43 a scoped build does NOT advance the marker on a no-op
++ok 44 a build with a failed L2 source does NOT advance the marker
++ok 45 an unidentifiable build does NOT overwrite a good marker with 'unknown'
++ok 46 an unset BUILD_SHA is treated as unknown, not as a full build
++ok 47 the precedence is scoped > L2-failure > unknown-sha
++ok 48 mem_report states peak against the cgroup limit
++ok 49 mem_report stays SILENT when the peak has not grown
++ok 50 mem_report prints again on a new high-water mark
++ok 51 mem_report warns near the ceiling and names OUR bug rather than ARC
++ok 52 mem_report does not warn well under the ceiling
++ok 53 mem_report surfaces a non-zero kernel oom_kill count
++ok 54 mem_report force prints a closing number even without growth
++ok 55 mem_report handles an unlimited cgroup
++ok 56 mem_report is silent and non-fatal where cgroup v2 is absent
++ok 57 corpus-dsn-exported-in-chosen-lane: the ephemeral lane workflow file exists
++ok 58 corpus-dsn-exported-in-chosen-lane: the lane exports WINNOW_CORPUS_EPHEMERAL_DSN for the job
++ok 59 corpus-dsn-exported-in-chosen-lane: the lane NEVER exports plain WINNOW_CORPUS_DSN (that would wake the real-corpus readers against an empty ephemeral DB)
++ok 60 corpus-dsn-exported-in-chosen-lane: an ephemeral Dolt service is provisioned
++ok 61 corpus-dsn-exported-in-chosen-lane: DOLT_ROOT_HOST is widened past the image's localhost-only default
++ok 62 corpus-dsn-exported-in-chosen-lane: corpus migrations are applied via goose before the tests run
++ok 63 corpus-dsn-exported-in-chosen-lane: ci.yml never WIRES the ephemeral DSN — this lane owns its own workflow file
++ok 64 roundtrip-files-not-skipped: the test step passes -v (skip reasons only print under -v)
++ok 65 roundtrip-files-not-skipped: the writer-test run pattern covers every known writer function
++ok 66 roundtrip-files-not-skipped: a post-run check greps for the skip message and fails the job if any writer skipped
++ok 67 roundtrip-files-not-skipped: the post-run check also asserts each writer explicitly PASSed, not just 'ran'
++ok 68 roundtrip-files-not-skipped: the test step and the verification step both fail loud under pipefail
++ok 69 roundtrip-files-not-skipped: the job carries a timeout so a wedged ephemeral Dolt cannot hang the runner
++ok 70 enforced-split-in-code: WINNOW_CORPUS_EPHEMERAL_DSN is a real, distinct constant in the corpus store package
++ok 71 enforced-split-in-code: the ephemeral DSN constant is not the same string as the reader DSN constant
++ok 72 enforced-split-in-code: a known writer test file reads the ephemeral DSN, not the plain one
++ok 73 derived-enumeration-gate: a Go gate derives the gated-test set from the AST, so the two hand-maintained lists cannot drift unnoticed
++ok 74 every corpus-mutating @test opts in to corpus writes
++ok 75 the scan actually reports an unguarded invocation
++ok 76 require_corpus_write still skips unless WINNOW_CORPUS_WRITE_OK is set
++ok 77 require_corpus_write is a distinct opt-in from WINNOW_CORPUS_DSN
++ok 78 of two queued runs on one ref, the newer survives and the older is cancelled
++ok 79 with three queued runs, only the newest is left standing
++ok 80 a concurrency-blocked 'pending' run counts as never-started, both ways
++ok 81 a single queued run is never self-cancelled, and says so out loud
++ok 82 an empty run list still logs the no-op line
++ok 83 a queued run on master is not cancelled by a newer queued run on dev
++ok 84 runs of different workflows on the same ref do not cancel each other
++ok 85 an in_progress run is NEVER cancelled, even with a newer queued run behind it
++ok 86 an in_progress run is not cancelled even when two queued runs surround it
++ok 87 a completed run is never cancelled
++ok 88 a run that STARTS between the listing and the cancel is left alone
++ok 89 an unrecognised status is left alone rather than assumed cancellable
++ok 90 each cancellation is logged with run id, sha and age
++ok 91 a cancel that fails reddens the run instead of passing quietly
++ok 92 --dry-run reports the plan without cancelling anything
++ok 93 the raw GitHub API envelope is accepted, not just a bare array
++ok 94 data-watchdog.yml invokes the guard
++ok 95 the guard's job carries actions: write, and the workflow default stays read
++ok 96 data.yml still refuses to cancel in-progress runs
++ok 97 actionlint is clean on the workflows this change touches
++ok 98 shellcheck is clean on the guard
++ok 99 no round-trip file has an unjustified unconditional skip
++ok 100 every dead-test-allowed marker names a bead id
++ok 101 go test with a non-matching -run pattern exits 0 and still prints ok
++ok 102 answer.bats fails when its go test pattern matches nothing
++ok 103 embed-endpoint: winnow-api dials routr.ai-inference.svc.cluster.local:11435
++ok 104 embed-model: winnow-api leaves WINNOW_EMBED_MODEL unset, and the default is routr's model
++ok 105 embed-env-names: the names deploy sets are the ones the binary reads
++ok 106 embed-egress: a NetworkPolicy selecting winnow-api allows egress to ai-inference on TCP 11435
++ok 107 embed-egress-peer: the ai-inference peer is namespaceSelector-only, no podSelector
++ok 108 every go test invocation in the Makefile carries an explicit -timeout
++ok 109 make -n test expands a go test carrying -timeout
++ok 110 make -n agent-test expands a go test carrying -timeout
++ok 111 make -n cover expands a go test carrying -timeout
++ok 112 make -n cover-check expands a go test carrying -timeout
++ok 113 make -n bench expands a go test carrying -timeout
++ok 114 make -n bench-cpu expands a go test carrying -timeout
++ok 115 make -n audit expands a go test carrying -timeout
++ok 116 the -timeout budget clears the worst measured package with headroom
++ok 117 the Makefile records the measurement the budget is derived from
++ok 118 every go test invocation in .github/workflows carries an explicit -timeout
++ok 119 make lint hands the recipe the scoped cache and --allow-serial-runners
++ok 120 make fix hands the recipe the scoped cache and --allow-serial-runners
++ok 121 the exported cache dir is inside this checkout, not a shared location
++ok 122 .cache/ is gitignored
++ok 123 the golangci-lint hook is declared locally, not as the upstream repo
++ok 124 the golangci-lint hook reaches golangci-lint with --allow-serial-runners
++ok 125 the golangci-lint hook lints with a cache scoped to the checkout it runs in
++ok 126 the golangci-lint hook does not mutate source: no --fix at commit time
++ok 127 skip-is-loud: no AGENT_PERSONAS skips the grounded lane by name, exit 0
++ok 128 skip-is-loud: an AGENT_PERSONAS without winnow/ names the path it looked at
++ok 129 skip-is-loud: a missing codex credential names the auth.json it looked for
++ok 130 skip-is-loud: the preflight can say YES — it is a decision, not a permanent skip
++ok 131 skip-is-loud: a non-codex provider does not demand a codex credential
++ok 132 flags-are-shared: exactly one --personas-root definition across the Makefile and scripts/
++ok 133 flags-are-shared: the harness launches the assembly through the serve-agent target
++ok 134 flags-are-shared: the Makefile exports AGENT_PERSONAS so the harness reads the resolved value
++ok 135 sut-is-wired: the harness sets WINNOW_FERYN_DAEMON_URL for the SUT
++ok 136 sut-is-wired: the harness strips WINNOW_FERYN_DAEMON_URL when the lane is skipped
++ok 137 post-message.hurl is no longer red-by-design
++ok 138 post-message.hurl gates its grounded turn on {{grounded_skip}}
++ok 139 post-message.hurl asserts the answer was actually grounded, not merely shaped
++ok 140 the hurl lane runner passes grounded_skip through to hurl
++ok 141 the hurl lane runner defaults to SKIPPING when the harness said nothing
++ok 142 no-todo-placeholders: no literal TODO markers remain under .gauntlet/hurl/
++ok 143 no-todo-placeholders: no unresolved {{book}}/{{chapter}} placeholders remain in request/header lines
++ok 144 ci-runs-hurl-lane: the gauntlet CI job has a step that invokes the hurl E2E lane
++ok 145 ci-runs-hurl-lane: the step sits after the bats lane in the same job (ownership: xg39/ez22 adjacent slot)
++ok 146 ci-runs-hurl-lane: the harness's SKIP-guard is loud, not silent, when dev DSNs are absent
++ok 147 value-asserts-present: get-corpus-sources.hurl no longer asserts bare existence
++ok 148 value-asserts-present: get-corpus-sources.hurl asserts discriminating content (count + specific codes)
++ok 149 clean-tree: the guard passes on the real repo and reports what it scanned
++ok 150 faithful-copy: an unplanted copy of the working tree passes too
++ok 151 planted-runtime-library: importing feryn's root package from product code fails
++ok 152 planted-internal-runtime: the guard's own diagnostic, not the toolchain's
++ok 153 carve-out-is-explicit: the same feryn/toolkit import fails outside toolpack and passes inside it
++ok 154 planted-import-in-a-test-file: _test.go is not an escape hatch
++ok 155 carve-out-bound-must-exist: deleting toolpack/deps_test.go is a hard error
++ok 156 agent-module-boundary-must-exist: flattening agent/ into the winnow module is a hard error
++ok 157 agent-guard-must-exist: deleting the agent-side guard is a hard error
++ok 158 not-vacuous: the guard refuses to report OK on a graph it cannot really see
++ok 159 non-skippable-wiring: the guard is a prerequisite of make audit and the audit job cannot soft-fail
++ok 160 winnow/Makefile no longer references 'bastion launchd'
++ok 161 winnow/README.md exists
++ok 162 winnow/README.md has a 'Local dev' H2 header
++ok 163 winnow/README.md mentions local/traefik (post-ferth-z07.1 path)
++ok 164 winnow/README.md mentions the .env hard requirement
++ok 165 ferth/README.md exists
++ok 166 ferth/README.md has a 'Local dev' H2 header
++ok 167 ferth/README.md points at winnow's make serve
++ok 168 winnow/.env exists (needed for make -n serve gate) # skip .env is a gitignored local-dev secret — absent in CI
++ok 169 make -n serve parses without env-missing errors
++ok 170 smoke-invokes-gauntlet: make smoke's recipe drives the gauntlet CLI, not raw bats
++ok 171 smoke-invokes-gauntlet: smoke fails loudly (does not silently fall back to raw bats) when gauntlet is absent
++ok 172 smoke-invokes-gauntlet: the raw-bats path survives only under a distinctly-named, clearly-unframed target
++ok 173 invocation-matches-ci: smoke's gauntlet invocation is byte-identical to the CI gauntlet job's
++ok 174 pre-push-decision-documented: pre-push either runs the contract lane or explains the exclusion at the target
++ok 175 winnow local/traefik/services.yml exists
++ok 176 winnow services.yml has winnow-local-web router
++ok 177 winnow services.yml has winnow-local-api router
++ok 178 winnow services.yml does NOT own the ferth-auth-local router (extracted to ferth)
++ok 179 winnow services.yml routers keys are exactly the two product routers
++ok 180 winnow services.yml service backends point at host.docker.internal
++ok 181 bastion services.yml no longer contains product routers (negative grep)
++ok 182 bastion docker-compose mounts winnow traefik dir into daemon
++ok 183 bastion local-ferth-tls cert file exists
++ok 184 bastion local-ferth-tls cert SAN covers *.local.ferth.ai
++ok 185 winnow Makefile has unchanged serve target (no shape-2 edit needed)
++ok 186 this box's mktemp: non-trailing X is platform-dependent, trailing X is not
++ok 187 every mktemp template in the tree ends in its X-run
++ok 188 GAUNTLET_VERSION pin equals the recorded floor SHA (gaunt-8ycs + gaunt-adh6 ancestor)
++ok 189 a bump-policy comment sits beside the pin
++ok 190 tools/dolt.version exists and is a bare semver
++ok 191 every deploy/databases dolt-sql-server tag equals tools/dolt.version
++ok 192 all four dolt servers run the SAME version (no dev/prod skew)
++ok 193 every .github/workflows dolt-sql-server image tag equals tools/dolt.version
++ok 194 chain-is-present: the tracked hook reaches the pre-commit framework
++ok 195 chain-is-outside-the-beads-markers: it survives a beads re-scaffold
++ok 196 beads-half-intact: the managed block is whole and still invokes bd
++ok 197 hook-is-tracked: the fix actually ships to other clones
++ok 198 falsification-clean: a clean commit succeeds and BOTH halves ran
++ok 199 falsification-reject: a violating commit is REJECTED
++ok 200 beads-runs-first: the beads half is not skipped by the framework half
++ok 201 missing-tool: no pre-commit on PATH is a hard failure, not a skip
++ok 202 no-silent-skip-on-missing-config: --skip-on-missing-config is not used
++ok 203 make-target-tells-the-truth: pre-commit-install no longer claims scaffold-time composition
++ok 204 ci-installs-pre-commit: the bats lane provisions the tool it cannot skip
++ok 205 alerts when master is BOTH far behind and stale — the measured 2026-08-12 state
++ok 206 the stalled alert names the promote PR as the remediation
++ok 207 the stalled alert does NOT resurrect the closed winnow-d7fl precondition
++ok 208 SILENT on a busy afternoon: 30 commits, but master's tip is fresh
++ok 209 SILENT on a quiet weekend: master 5 days old, but only 3 commits behind
++ok 210 SILENT when nothing is unpromoted at all
++ok 211 a raised commit threshold suppresses the alert the default would fire
++ok 212 a raised hour threshold suppresses the alert the default would fire
++ok 213 exactly at both thresholds counts as exceeded
++ok 214 behind_by > 0 emits the distinct divergence line
++ok 215 the divergence line prescribes a BACK-MERGE, not a promote
++ok 216 divergence fires independently of the promote-lag bounds
++ok 217 both lines appear together when master is stale AND diverged
++ok 218 a failing compare API warns instead of reporting the promote healthy
++ok 219 dev pin present + all prod images present => resolves to the dev pin
++ok 220 the dev pin wins even when it is NOT in the ancestor candidate list
++ok 221 dev pin present + one prod image MISSING => does NOT resolve to it
++ok 222 a partially-built dev pin does not silently fall through to an older sha
++ok 223 dev pin absent => falls back to the walk, which rejects a sha lacking the dev-baked winnow-web
++ok 224 the walk also requires the full prod set, not just the dev-baked web
++ok 225 resolution is fail-closed when nothing is promotable
++ok 226 the failure names the specific missing image AND the sha dev is running
++ok 227 the failure says so out loud when no dev pin was readable at all
++ok 228 the resolved sha is the ONLY thing on stdout
++ok 229 a rollback push does NOT promote prod forward to dev's tip
++ok 230 the on-branch guard does not reject a normal promote
++ok 231 an off-branch dev pin with nothing else promotable fails loudly, naming why
++ok 232 --list-missing reports every absent prod image and nothing else
++ok 233 --list-missing prints nothing when the prod set is complete
++ok 234 the prod image set is read from the overlay, so a new workload is covered for free
++ok 235 deploy.yml invokes the resolver instead of an inline probe
++ok 236 deploy.yml checks out enough history for the resolved sha to exist locally
++ok 237 Gate B is not weakened -- it still requires Synced + Healthy AT the resolved sha
++ok 238 actionlint is clean on deploy.yml
++ok 239 shellcheck is clean on the resolver
++ok 240 clean-tree: the lint passes on the real repo and reports what it scanned
++ok 241 faithful-copy: an unplanted copy of scripts/ passes too
++ok 242 gate-script-is-covered: a defect planted in gate.sh itself is caught
++ok 243 planted-defect: a defective script anywhere under scripts/ is caught
++ok 244 no-hand-listed-subset: a brand-new script in a brand-new subdirectory is scanned
++ok 245 count-matches-the-tree: every .sh under scripts/ is scanned, not a subset
++ok 246 suppressions-are-honoured: inline disable= directives still pass
++ok 247 not-vacuous-empty: a tree with no scripts is an error, not a pass
++ok 248 not-vacuous-sentinel: losing sight of gate.sh is an error, not a pass
++ok 249 missing-tool: no shellcheck on PATH is an error, not a skip
++ok 250 print-version: the pin is machine-readable and CI reads it from here
++ok 251 non-skippable-wiring: the lint is wired into make, CI and the polecat gate
++ok 252 unchanged-manifests-pass
++ok 253 added-source-without-declaration-is-rejected
++ok 254 version-bump-without-declaration-is-rejected
++ok 255 l2-manifest-is-checked-too
++ok 256 disabled-add-is-exempt
++ok 257 declared-successful-refresh-run-passes
++ok 258 declared-run-url-is-accepted
++ok 259 declared-run-from-another-workflow-is-rejected
++ok 260 declared-refresh-run-that-failed-is-rejected
++ok 261 unverifiable-run-is-accepted-but-says-so
++ok 262 not-needed-requires-a-reason
++ok 263 not-needed-with-a-reason-is-exempt
++ok 264 trailer-on-an-earlier-commit-in-the-range-counts
++ok 265 manifest-absent-at-base-treats-its-entries-as-added
++ok 266 unparseable-manifest-is-a-failure-not-an-empty-diff
++ok 267 missing-yq-is-a-failure-not-a-skip
++ok 268 unresolvable-base-is-a-failure-not-a-skip
++ok 269 gate-sh-runs-the-check-on-the-sources-lane
++ok 270 the harness exports both process logs so a lane can copy them out
++ok 271 those log paths are unique per run, not one shared literal (winnow-5zfip)
++ok 272 the logs are exported BEFORE the lane command runs
++ok 273 the probe copies the logs out rather than reading them after teardown
++ok 274 the probe slices the log per question rather than grepping the whole file
++ok 275 the probe requires a study tool by namespace, not just tool_calls > 0
++ok 276 internal/answer emits the tool names on the cost line the probe parses
++ok 277 the claim-marker list exists and is not all comments
++ok 278 both readers point at the same claim-marker file
++ok 279 skip-is-loud: no daemon behind the SUT skips by name, exit 0
++ok 280 fail-closed: a missing serve log aborts instead of asserting on nothing
++ok 281 make gauntlet-e2e-toolreach exists and runs through the shared harness
++ok 282 gauntlet lint reports 0 invalid_covers outside evals/, on a real scan
++ok 283 no stale scaffold summary.json remains under .gauntlet
++ok 284 test_helper/common.bash carries no leftover scaffold TODOs
++ok 285 sanity: the shipped gate.sh still has a matches() and lane patterns to test
++ok 286 no-pipeline: matches() does not pipe into grep
++ok 287 filler-matches-no-lane: the negative control is actually negative
++ok 288 lane-arms-large-list: every lane pattern is detected in a 20000-line list
++ok 289 lane-arms-small-list: the same patterns still match a short list
++not ok 290 gate-end-to-end-large: a large Go diff selects the Go lane, not SKIP
++# (in test file .gauntlet/winnow-13dg-gate-matches.bats, line 430)
++#   `[[ "$output" != *"SKIP"* ]]' failed
++not ok 291 gate-end-to-end-small: a one-file Go diff still selects the Go lane
++# (in test file .gauntlet/winnow-13dg-gate-matches.bats, line 448)
++#   `[[ "$output" != *"SKIP"* ]]' failed
++not ok 292 gate-end-to-end-large-shell: a large diff does not hide the shell lane
++# (in test file .gauntlet/winnow-13dg-gate-matches.bats, line 465)
++#   `[[ "$output" != *"SKIP"* ]]' failed
++not ok 293 gate-end-to-end-empty: an empty diff still takes the loud SKIP
++# (in test file .gauntlet/winnow-13dg-gate-matches.bats, line 478)
++#   `[[ "$output" == *"SKIP — no changes detected"* ]]' failed
++not ok 294 lane-gauntlet: a .gauntlet-only diff collects the suite and executes the changed contract
++# (in test file .gauntlet/winnow-13dg-gate-matches.bats, line 516)
++#   `[[ "$output" != *"SKIP"* ]]' failed
++ok 295 lane-gauntlet: a suite that collects zero tests is FATAL, not a pass
++ok 296 lane-gauntlet: all-skip contracts FAIL the lane, they do not green it
++ok 297 lane-gauntlet: a failing contract is a FAILURE, not a vacuum
++not ok 298 lane-gauntlet: a helper-only diff has no execute subject and says so
++# (in test file .gauntlet/winnow-13dg-gate-matches.bats, line 592)
++#   `[ "$status" -eq 0 ]' failed
++not ok 299 lane-sources: a sources manifest diff runs the Go lane and notice-check
++# (in test file .gauntlet/winnow-13dg-gate-matches.bats, line 616)
++#   `[[ "$output" != *"SKIP"* ]]' failed
++not ok 300 lane-migrations-app: an app-migration diff replays atlas and re-hashes atlas.sum
++# (in test file .gauntlet/winnow-13dg-gate-matches.bats, line 635)
++#   `[[ "$output" != *"SKIP"* ]]' failed
++ok 301 lane-migrations-app: a stale atlas.sum FAILS the build phase
++ok 302 lane-migrations-app: an absent Docker daemon is a LOUD failure, not a skip
++not ok 303 lane-migrations-corpus: a corpus-migration diff parses the SQL and runs the Go lane
++# (in test file .gauntlet/winnow-13dg-gate-matches.bats, line 695)
++#   `[[ "$output" != *"SKIP"* ]]' failed
++ok 304 lane-prereq: a selected lane whose tool is missing FAILS, it does not skip
++not ok 305 no-regression: a Go-only diff selects exactly the Go lane and nothing new
++# (in test file .gauntlet/winnow-13dg-gate-matches.bats, line 725)
++#   `[[ "$output" != *"bats"* ]]' failed
++not ok 306 no-regression: a client-only diff selects exactly the client lane and nothing new
++# (in test file .gauntlet/winnow-13dg-gate-matches.bats, line 745)
++#   `[[ "$output" != *"STUB-MAKE vet"* ]]' failed
++not ok 307 skip-banner: the SKIP names every lane flag, including the new ones
++# (in test file .gauntlet/winnow-13dg-gate-matches.bats, line 762)
++#   `[[ "$output" == *"NOTHING WAS VERIFIED"* ]]' failed
++ok 308 gate-all: verify-everything mode forces the new lanes on too
++ok 309 subjects-declared: every contract in the real suite declares its subjects
++ok 310 subjects-resolve: every declared pattern is valid and matches a tracked path
++ok 311 subjects-sentinel: live-db is declared alone, never mixed with patterns
++not ok 312 subject-selection: a diff touching only a SUBJECT runs the contract that asserts about it
++# (in test file .gauntlet/winnow-13dg-gate-matches.bats, line 957)
++#   `[ "$status" -eq 0 ]' failed
++not ok 313 subject-selection: the sentinel is never subject-selected, but its own edit still runs it
++# (in test file .gauntlet/winnow-13dg-gate-matches.bats, line 982)
++#   `[ "$status" -eq 0 ]' failed
++ok 314 subject-selection: a contract with no declaration is FATAL, not a quiet under-select
++not ok 315 subject-selection: a red-by-design contract is excluded from the run and NAMED
++# (in test file .gauntlet/winnow-13dg-gate-matches.bats, line 1030)
++#   `[ "$status" -eq 0 ]' failed
++ok 316 gate-all: verify-everything mode EXECUTES contracts instead of zero of them
++ok 317 sanity: the shipped gate.sh still has a setup phase with a no-lane-matched branch
++not ok 318 setup-empty-diff: an empty diff installs BOTH toolchains, not Go only
++# (in test file .gauntlet/winnow-m69eh-gate-setup-installs.bats, line 134)
++#   `[[ "$output" != *"SKIP"* ]]' failed
++ok 319 setup-empty-diff: the phase never reports a bare workspace as verified
++not ok 320 setup-go-only: a Go-only diff does NOT install client deps
++# (from function `ran_client_deps' in file .gauntlet/winnow-m69eh-gate-setup-installs.bats, line 106,
++#  in test file .gauntlet/winnow-m69eh-gate-setup-installs.bats, line 166)
++#   `! ran_client_deps "$output"' failed
++not ok 321 setup-client-only: a client-only diff does NOT install Go deps
++# (in test file .gauntlet/winnow-m69eh-gate-setup-installs.bats, line 187)
++#   `run ! ran_go_deps "${gate_output}"' failed, expected nonzero exit code!
++ok 322 setup-unmatched-diff: a diff matching no toolchain lane still installs both
++ok 323 setup-gate-all: GATE_ALL=1 still installs both toolchains
++ok 324 setup-installer-failure: a failing installer fails the phase, it does not continue
++not ok 325 other-phases-empty-diff: the exemption is setup-only; verify phases still SKIP
++# (in test file .gauntlet/winnow-m69eh-gate-setup-installs.bats, line 262)
++#   `[ "$status" -eq 0 ]' failed
++ok 326 make -n deploy-local resolves without parse errors
++ok 327 make -n deploy-local-api resolves without parse errors
++ok 328 make -n deploy-local-web resolves without parse errors
++ok 329 serve-agent target is defined
++ok 330 serve-agent is in .PHONY
++ok 331 serve-agent appears in 'make help' output
++ok 332 AGENT_PERSONAS is derived from AGENT_DIR, not a sibling checkout path
++ok 333 the Makefile carries no ACTIVE path to the decommissioned sibling checkout
++ok 334 serve-agent passes an explicit --personas-root derived from AGENT_PERSONAS
++ok 335 serve-agent never points --personas-root at the ~/.feryn default
++ok 336 serve-agent guards on winnow/ existing under AGENT_PERSONAS
++ok 337 serve-agent with a missing bundle exits non-zero and names the path
++ok 338 the winnow persona bundle is tracked in this repo
++ok 339 serve-agent passes --study-backend direct
++ok 340 serve-agent binds 127.0.0.1 on AGENT_PORT, which defaults to 17787
++ok 341 serve-agent's port matches internal/agent's defaultDaemonURL
++ok 342 serve-agent selects the codex provider
++ok 343 serve-agent sources .env through the shared load_envfile helper
++ok 344 serve-agent never puts a DSN on the assembly's command line
++ok 345 .env.sample defines exactly the three WINNOW_FERYN_ vars
++ok 346 .env.sample names each WINNOW_FERYN_ var agent.go reads
++ok 347 .env.sample's daemon URL matches what serve-agent binds
++ok 348 .env.sample's persona id is the bundle serve-agent actually registers
++ok 349 .env.sample sets FERYN_PROVIDER to codex
++ok 350 .env.sample carries no ACTIVE pointer to the decommissioned sibling repo
++ok 351 the local-dev docs describe the serve-agent process
++ok 352 sanity: the shipped gate.sh has the receipt path and its re-exec sentinel
++ok 353 one-run-per-tree: two worktrees at one clean commit run the suite ONCE
++ok 354 red-reused: a red is recorded, reused with its status, and names its failures
++ok 355 red-reused-bats: a reused bats red prints its 'not ok' lines
++ok 356 never-for-a-change-unstaged: an unstaged edit runs the suite and records nothing
++ok 357 never-for-a-change-untracked: an untracked file runs the suite and records nothing
++ok 358 never-for-a-change-commit: a commit beyond the base runs the suite and records nothing
++ok 359 no-gate-all: without GATE_ALL the empty-diff SKIP is byte-identical and exits 0
++ok 360 setup-never-cached: GATE_ALL setup installs in BOTH worktrees
++ok 361 fatal-not-cached: a FATAL writes no receipt, and the next run executes
++ok 362 fatal-waiters: a worker waiting on a run that FATALs runs its own, unqueued
++ok 363 stale-lock: a lock whose owner pid has exited does not block
++ok 364 stale-lock-recycled-pid: a live pid that is not gate.sh does not block either
++ok 365 receipt-unwritable: a receipt that cannot be written costs the receipt, never the verdict
++ok 366 receipt-off: GATE_RECEIPT=off neither reads nor writes a receipt
++ok 367 env-in-key: runs differing only in WINNOW_VENDORED_SOURCES do not share a receipt
++ok 368 hermetic: inherited GATE_* knobs never reach the gates this file drives
++gate(test): FAIL — the .gauntlet lane executed 367 assertions and exited 1.
++    The lane reported a real executed count, so the contracts ran:
++    these are contract failures. Read the 'not ok' lines above.
+diff --git a/tests/fixtures/known_red/masked-by-lane.txt b/tests/fixtures/known_red/masked-by-lane.txt
+new file mode 100644
+index 00000000..ca4e13a7
+--- /dev/null
++++ b/tests/fixtures/known_red/masked-by-lane.txt
+@@ -0,0 +1,9 @@
++gate(test): RUN  bats --formatter tap .gauntlet/winnow-13dg-gate-matches.bats
++1..2
++ok 1 lane-arms-small-list: the same patterns still match a short list
++not ok 2 lane-prereq: a selected lane whose tool is missing FAILS, it does not skip
++# (in test file .gauntlet/winnow-13dg-gate-matches.bats, line 686)
++#   `[ "$status" -eq 2 ]' failed
++gate(test): FAIL — the .gauntlet lane executed 2 assertions and exited 1.
++gate(test): RUN  bash -c 'cd client/apps/mobile && CONTRAST_PORT=5179 bun run contrast'
++gate(test): FATAL — the contrast lane could not bind port 5179; another worktree holds it.
+diff --git a/tests/fixtures/known_red/playwright-contrast.txt b/tests/fixtures/known_red/playwright-contrast.txt
+new file mode 100644
+index 00000000..85bc6579
+--- /dev/null
++++ b/tests/fixtures/known_red/playwright-contrast.txt
+@@ -0,0 +1,266 @@
++gate(test): RUN  bash -c 'cd client/apps/mobile && CONTRAST_PORT=5179 bun run contrast'
++$ playwright test
++[WebServer] [contrast] no export found — building (expo export --platform web, ~3min)
++[WebServer] React Compiler enabled
++[WebServer] Starting Metro Bundler
++[WebServer] Static rendering is enabled. Learn more: https://docs.expo.dev/router/reference/static-rendering/
++[WebServer] Web node_modules/expo-router/entry.js ░░░░░░░░░░░░░░░░  0.0% (0/1)
++[WebServer] λ node_modules/expo-router/node/render.js ░░░░░░░░░░░░░░░░  0.0% (0/1)
++[WebServer] Web node_modules/expo-router/entry.js ░░░░░░░░░░░░░░░░  0.0% (0/1)
++[WebServer] λ node_modules/expo-router/node/render.js ░░░░░░░░░░░░░░░░  1.0% (1/1)
++[WebServer] Web node_modules/expo-router/entry.js ▓░░░░░░░░░░░░░░░  9.0% (3/5)
++[WebServer] λ node_modules/expo-router/node/render.js ▓▓░░░░░░░░░░░░░░ 15.5% ( 64/187)
++[WebServer] Web node_modules/expo-router/entry.js ▓░░░░░░░░░░░░░░░  9.0% (3/5)
++[WebServer] λ node_modules/expo-router/node/render.js ▓▓▓▓░░░░░░░░░░░░ 30.4% (227/412)
++[WebServer] Web node_modules/expo-router/entry.js ▓▓▓▓▓░░░░░░░░░░░ 32.7% (15/42)
++[WebServer] λ node_modules/expo-router/node/render.js ▓▓▓▓▓▓░░░░░░░░░░ 42.0% (496/765)
++[WebServer] Web node_modules/expo-router/entry.js ▓▓▓▓▓░░░░░░░░░░░ 32.7% ( 39/192)
++[WebServer] λ node_modules/expo-router/node/render.js ▓▓▓▓▓▓▓▓░░░░░░░░ 52.5% ( 793/1102)
++[WebServer] Web node_modules/expo-router/entry.js ▓▓▓▓▓░░░░░░░░░░░ 32.7% (209/405)
++[WebServer] λ node_modules/expo-router/node/render.js ▓▓▓▓▓▓▓▓▓▓▓░░░░░ 70.8% (1044/1241)
++[WebServer] Web node_modules/expo-router/entry.js ▓▓▓▓▓▓░░░░░░░░░░ 37.6% (301/521)
++[WebServer] λ node_modules/expo-router/node/render.js ▓▓▓▓▓▓▓▓▓▓▓▓▓░░░ 82.0% (1171/1455)
++[WebServer] Web node_modules/expo-router/entry.js ▓▓▓▓▓▓░░░░░░░░░░ 43.0% (483/751)
++[WebServer] λ node_modules/expo-router/node/render.js ▓▓▓▓▓▓▓▓▓▓▓▓▓░░░ 82.0% (1257/1533)
++[WebServer] Web node_modules/expo-router/entry.js ▓▓▓▓▓▓▓░░░░░░░░░ 48.0% (633/914)
++[WebServer] λ node_modules/expo-router/node/render.js ▓▓▓▓▓▓▓▓▓▓▓▓▓░░░ 85.8% (1552/1676)
++[WebServer] Web node_modules/expo-router/entry.js ▓▓▓▓▓▓▓▓▓▓▓▓░░░░ 75.1% (1084/1251)
++[WebServer] λ node_modules/expo-router/node/render.js ▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░ 93.4% (1713/1775)
++[WebServer] Web node_modules/expo-router/entry.js ▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░ 88.7% (1325/1590)
++[WebServer] λ node_modules/expo-router/node/render.js ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░ 98.1% (1841/1872)
++[WebServer] Web node_modules/expo-router/entry.js ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░ 96.2% (1784/1819)
++[WebServer] λ node_modules/expo-router/node/render.js ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░ 99.9% (1940/1940)
++[WebServer] λ Bundled 44217ms node_modules/expo-router/node/render.js (1940 modules)
++[WebServer] (node:29003) ExperimentalWarning: localStorage is not available because --localstorage-file was not provided.
++[WebServer] (Use `node --trace-warnings ...` to show where the warning was created)
++[WebServer] Web Bundled 47166ms node_modules/expo-router/entry.js (1852 modules)
++[WebServer] 
++[WebServer] › web bundles (2):
++[WebServer] _expo/static/css/web-050345bf5977c13d6f5548e22076604c.css (18.4 kB)
++[WebServer] _expo/static/js/web/entry-c59591a9da6511a3f50596b78311afe0.js (3.55 MB)
++[WebServer] 
++[WebServer] › Static routes (21):
++[WebServer] /you (26.4 kB)
++[WebServer] / (index) (25.4 kB)
++[WebServer] /login (26.1 kB)
++[WebServer] /saved (26 kB)
++[WebServer] /search (26.5 kB)
++[WebServer] /signup (26.3 kB)
++[WebServer] /pricing (37.2 kB)
++[WebServer] /settings (26 kB)
++[WebServer] /_sitemap (19.2 kB)
++[WebServer] /bookmarks (26 kB)
++[WebServer] /plans/new (24.1 kB)
++[WebServer] /+not-found (26.3 kB)
++[WebServer] /highlights (26 kB)
++[WebServer] /chats/[id] (24 kB)
++[WebServer] /plans/[id] (24.1 kB)
++[WebServer] /chats (26 kB)
++[WebServer] /plans (26 kB)
++[WebServer] /plans/today (26.1 kB)
++[WebServer] /billing/cancel (26.9 kB)
++[WebServer] /billing/success (26.4 kB)
++[WebServer] /read/[book]/[chapter] (25.9 kB)
++[WebServer] 
++[WebServer] Exported: dist
++[WebServer] [contrast] serving /Users/hunter/gc/.gc/worktrees/winnow/polecats/gastown.rictus/worktrees/winnow-re3fw.2/client/apps/mobile/dist on http://localhost:5179
++
++Running 161 tests using 1 worker
++
++  ✓    1 [chromium] › e2e/aria-state.spec.ts:301:9 › rendered ARIA state › valid state attributes · route.index (666ms)
++  ✓    2 [chromium] › e2e/aria-state.spec.ts:301:9 › rendered ARIA state › valid state attributes · route.read (513ms)
++  ✓    3 [chromium] › e2e/aria-state.spec.ts:301:9 › rendered ARIA state › valid state attributes · route.read-anon (552ms)
++  ✓    4 [chromium] › e2e/aria-state.spec.ts:301:9 › rendered ARIA state › valid state attributes · route.you (460ms)
++  ✓    5 [chromium] › e2e/aria-state.spec.ts:301:9 › rendered ARIA state › valid state attributes · route.you-anon (665ms)
++  ✓    6 [chromium] › e2e/aria-state.spec.ts:301:9 › rendered ARIA state › valid state attributes · route.settings (989ms)
++  ✓    7 [chromium] › e2e/aria-state.spec.ts:301:9 › rendered ARIA state › valid state attributes · route.search (682ms)
++  ✓    8 [chromium] › e2e/aria-state.spec.ts:301:9 › rendered ARIA state › valid state attributes · route.saved (467ms)
++  ✓    9 [chromium] › e2e/aria-state.spec.ts:301:9 › rendered ARIA state › valid state attributes · route.bookmarks (434ms)
++  ✓   10 [chromium] › e2e/aria-state.spec.ts:301:9 › rendered ARIA state › valid state attributes · route.highlights (526ms)
++  ✓   11 [chromium] › e2e/aria-state.spec.ts:301:9 › rendered ARIA state › valid state attributes · route.plans (503ms)
++  ✓   12 [chromium] › e2e/aria-state.spec.ts:301:9 › rendered ARIA state › valid state attributes · route.plans-today (534ms)
++  ✓   13 [chromium] › e2e/aria-state.spec.ts:301:9 › rendered ARIA state › valid state attributes · route.plans-new (579ms)
++  ✓   14 [chromium] › e2e/aria-state.spec.ts:301:9 › rendered ARIA state › valid state attributes · route.chats (977ms)
++  ✓   15 [chromium] › e2e/aria-state.spec.ts:301:9 › rendered ARIA state › valid state attributes · route.login (1.1s)
++  ✓   16 [chromium] › e2e/aria-state.spec.ts:301:9 › rendered ARIA state › valid state attributes · route.signup (1.4s)
++  ✓   17 [chromium] › e2e/aria-state.spec.ts:301:9 › rendered ARIA state › valid state attributes · route.pricing (1.2s)
++  ✓   18 [chromium] › e2e/aria-state.spec.ts:301:9 › rendered ARIA state › valid state attributes · route.not-found (594ms)
++  ✓   19 [chromium] › e2e/aria-state.spec.ts:301:9 › rendered ARIA state › valid state attributes · sheet.version-switcher (802ms)
++  ✓   20 [chromium] › e2e/aria-state.spec.ts:301:9 › rendered ARIA state › valid state attributes · sheet.book-picker (1.2s)
++  ✓   21 [chromium] › e2e/aria-state.spec.ts:301:9 › rendered ARIA state › valid state attributes · sheet.chapter-picker (1.1s)
++  ✓   22 [chromium] › e2e/aria-state.spec.ts:301:9 › rendered ARIA state › valid state attributes · sheet.display (1.7s)
++  ✓   23 [chromium] › e2e/aria-state.spec.ts:301:9 › rendered ARIA state › valid state attributes · sheet.settings-translation-picker (905ms)
++  ✓   24 [chromium] › e2e/aria-state.spec.ts:301:9 › rendered ARIA state › valid state attributes · sheet.sign-in-prompt (827ms)
++  ✓   25 [chromium] › e2e/aria-state.spec.ts:301:9 › rendered ARIA state › valid state attributes · sheet.word-sheet (1.0s)
++  ✓   26 [chromium] › e2e/aria-state.spec.ts:301:9 › rendered ARIA state › valid state attributes · sheet.entity-card (1.4s)
++  ✓   27 [chromium] › e2e/aria-state.spec.ts:301:9 › rendered ARIA state › valid state attributes · sheet.notes (1.2s)
++  ✓   28 [chromium] › e2e/aria-state.spec.ts:301:9 › rendered ARIA state › valid state attributes · sheet.compare (1.6s)
++  ✓   29 [chromium] › e2e/aria-state.spec.ts:327:9 › rendered ARIA state › declares its state · route.read #0 (1.1s)
++  ✓   30 [chromium] › e2e/aria-state.spec.ts:327:9 › rendered ARIA state › declares its state · sheet.word-sheet #1 (1.3s)
++  ✓   31 [chromium] › e2e/aria-state.spec.ts:327:9 › rendered ARIA state › declares its state · route.saved #2 (485ms)
++  ✓   32 [chromium] › e2e/aria-state.spec.ts:327:9 › rendered ARIA state › declares its state · sheet.display #3 (1.3s)
++  ✓   33 [chromium] › e2e/aria-state.spec.ts:327:9 › rendered ARIA state › declares its state · sheet.version-switcher #4 (836ms)
++  ✓   34 [chromium] › e2e/aria-state.spec.ts:327:9 › rendered ARIA state › declares its state · sheet.settings-translation-picker #5 (685ms)
++  ✓   35 [chromium] › e2e/aria-state.spec.ts:327:9 › rendered ARIA state › declares its state · sheet.chapter-picker #6 (823ms)
++  ✓   36 [chromium] › e2e/aria-state.spec.ts:327:9 › rendered ARIA state › declares its state · sheet.book-picker #7 (733ms)
++  ✓   37 [chromium] › e2e/aria-state.spec.ts:327:9 › rendered ARIA state › declares its state · route.saved #8 (666ms)
++  ✓   38 [chromium] › e2e/aria-state.spec.ts:327:9 › rendered ARIA state › declares its state · route.read #9 (818ms)
++  ✓   39 [chromium] › e2e/aria-state.spec.ts:346:7 › the lane itself › reproduces the measurement that filed the bead (773ms)
++  ✓   40 [chromium] › e2e/aria-state.spec.ts:362:7 › the lane itself › would notice the app going mute (841ms)
++  ✓   41 [chromium] › e2e/back-navigation.spec.ts:97:7 › Back, from the reader › a chapter change is a place the reader can come back from (1.8s)
++  ✓   42 [chromium] › e2e/back-navigation.spec.ts:110:7 › Back, from the reader › Back never skips the reading session for the page that preceded the app (2.1s)
++  ✓   43 [chromium] › e2e/back-navigation.spec.ts:137:7 › Back, from the reader › a pushed destination still comes back to the reader (1.7s)
++  ✓   44 [chromium] › e2e/back-navigation.spec.ts:153:7 › Back, from the reader › pressing the tab you are already on banks no dead Back press (2.8s)
++  ✓   45 [chromium] › e2e/back-navigation.spec.ts:174:7 › Back, from the reader › with the word reveal open, Back pops one frame and then closes it, without leaving the route (4.5s)
++  ✓   46 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › paper · route.index (868ms)
++  ✓   47 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › paper · route.read (742ms)
++  ✓   48 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › paper · route.read-anon (998ms)
++  ✓   49 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › paper · route.you (884ms)
++  ✓   50 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › paper · route.you-anon (764ms)
++  ✓   51 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › paper · route.settings (637ms)
++  ✓   52 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › paper · route.search (635ms)
++  ✓   53 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › paper · route.saved (848ms)
++  ✓   54 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › paper · route.bookmarks (918ms)
++  ✓   55 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › paper · route.highlights (1.0s)
++  ✓   56 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › paper · route.plans (1.3s)
++  ✓   57 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › paper · route.plans-today (1.1s)
++  ✓   58 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › paper · route.plans-new (1.0s)
++  ✓   59 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › paper · route.chats (1.7s)
++  ✓   60 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › paper · route.login (1.5s)
++  ✓   61 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › paper · route.signup (1.1s)
++  ✓   62 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › paper · route.pricing (1.3s)
++  ✓   63 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › paper · route.not-found (1.6s)
++  ✓   64 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › paper · sheet.version-switcher (2.3s)
++  ✓   65 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › paper · sheet.book-picker (2.9s)
++  ✓   66 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › paper · sheet.chapter-picker (1.9s)
++  ✓   67 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › paper · sheet.display (2.6s)
++  ✓   68 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › paper · sheet.settings-translation-picker (2.0s)
++  ✓   69 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › paper · sheet.sign-in-prompt (2.3s)
++  ✓   70 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › paper · sheet.word-sheet (1.5s)
++  ✓   71 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › paper · sheet.entity-card (2.5s)
++  ✓   72 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › paper · sheet.notes (1.4s)
++  ✓   73 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › paper · sheet.compare (1.5s)
++  ✓   74 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › sepia · route.index (1.3s)
++  ✓   75 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › sepia · route.read (1.4s)
++  ✓   76 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › sepia · route.read-anon (1.7s)
++  ✓   77 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › sepia · route.you (1.2s)
++  ✓   78 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › sepia · route.you-anon (1.3s)
++  ✓   79 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › sepia · route.settings (1.3s)
++  ✓   80 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › sepia · route.search (892ms)
++  ✓   81 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › sepia · route.saved (960ms)
++  ✓   82 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › sepia · route.bookmarks (809ms)
++  ✓   83 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › sepia · route.highlights (755ms)
++  ✓   84 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › sepia · route.plans (746ms)
++  ✓   85 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › sepia · route.plans-today (785ms)
++  ✓   86 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › sepia · route.plans-new (808ms)
++  ✓   87 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › sepia · route.chats (511ms)
++  ✓   88 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › sepia · route.login (565ms)
++  ✓   89 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › sepia · route.signup (438ms)
++  ✓   90 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › sepia · route.pricing (464ms)
++  ✓   91 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › sepia · route.not-found (605ms)
++  ✓   92 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › sepia · sheet.version-switcher (1.3s)
++  ✓   93 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › sepia · sheet.book-picker (1.4s)
++  ✓   94 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › sepia · sheet.chapter-picker (1.4s)
++  ✓   95 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › sepia · sheet.display (1.6s)
++  ✓   96 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › sepia · sheet.settings-translation-picker (1.2s)
++  ✓   97 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › sepia · sheet.sign-in-prompt (1.6s)
++  ✓   98 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › sepia · sheet.word-sheet (2.3s)
++  ✓   99 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › sepia · sheet.entity-card (1.1s)
++  ✓  100 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › sepia · sheet.notes (882ms)
++  ✓  101 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › sepia · sheet.compare (1.9s)
++  ✓  102 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › night · route.index (526ms)
++  ✓  103 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › night · route.read (479ms)
++  ✓  104 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › night · route.read-anon (545ms)
++  ✓  105 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › night · route.you (424ms)
++  ✓  106 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › night · route.you-anon (514ms)
++  ✓  107 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › night · route.settings (411ms)
++  ✓  108 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › night · route.search (450ms)
++  ✓  109 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › night · route.saved (448ms)
++  ✓  110 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › night · route.bookmarks (400ms)
++  ✓  111 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › night · route.highlights (403ms)
++  ✓  112 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › night · route.plans (401ms)
++  ✓  113 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › night · route.plans-today (458ms)
++  ✓  114 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › night · route.plans-new (460ms)
++  ✓  115 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › night · route.chats (425ms)
++  ✓  116 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › night · route.login (528ms)
++  ✓  117 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › night · route.signup (687ms)
++  ✓  118 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › night · route.pricing (649ms)
++  ✓  119 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › night · route.not-found (572ms)
++  ✓  120 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › night · sheet.version-switcher (1.6s)
++  ✓  121 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › night · sheet.book-picker (1.2s)
++  ✓  122 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › night · sheet.chapter-picker (1.4s)
++  ✓  123 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › night · sheet.display (1.8s)
++  ✓  124 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › night · sheet.settings-translation-picker (1.0s)
++  ✓  125 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › night · sheet.sign-in-prompt (949ms)
++  ✓  126 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › night · sheet.word-sheet (1.7s)
++  ✓  127 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › night · sheet.entity-card (1.4s)
++  ✓  128 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › night · sheet.notes (885ms)
++  ✓  129 [chromium] › e2e/contrast.spec.ts:339:11 › rendered contrast (WCAG 2.2 AA) › night · sheet.compare (2.1s)
++  ✓  130 [chromium] › e2e/contrast.spec.ts:355:7 › the sweep itself › drives every modal / sheet component in features/** (173ms)
++  ✓  131 [chromium] › e2e/contrast.spec.ts:366:7 › the sweep itself › names only components that exist (25ms)
++  ✓  132 [chromium] › e2e/contrast.spec.ts:375:7 › the sweep itself › sweeps every theme tokens.ts declares (0ms)
++  ✓  133 [chromium] › e2e/contrast.spec.ts:379:7 › the sweep itself › scores a known-bad style as a failure (0ms)
++  ✓  134 [chromium] › e2e/contrast.spec.ts:410:7 › the sweep itself › scores the same style as a pass once it is large enough (0ms)
++  ✓  135 [chromium] › e2e/contrast.spec.ts:436:7 › the sweep itself › pins the wells this sweep exists for to a surface that renders them (0ms)
++  ✓  136 [chromium] › e2e/contrast.spec.ts:531:7 › the stub fixtures › every stub body parses through the schema the app reads it with (2ms)
++  ✓  137 [chromium] › e2e/contrast.spec.ts:549:7 › the stub fixtures › serves no body the schema guard has not parsed (0ms)
++  ✓  138 [chromium] › e2e/theme-sync.spec.ts:162:7 › the shell and a portaled sheet resolve one theme › default install (`system`) on a device in dark mode (483ms)
++  ✓  139 [chromium] › e2e/theme-sync.spec.ts:193:7 › the shell and a portaled sheet resolve one theme › a pinned light theme on a device in dark mode (444ms)
++  ✓  140 [chromium] › e2e/theme-sync.spec.ts:204:7 › the shell and a portaled sheet resolve one theme › a pinned dark theme on a device in light mode (399ms)
++  ✓  141 [chromium] › e2e/translation-picker-layout.spec.ts:232:7 › translation picker · long codes › every row in the reader sheet is one line, at one height (594ms)
++  ✓  142 [chromium] › e2e/translation-picker-layout.spec.ts:258:7 › translation picker · long codes › rows hold at a large OS font scale (699ms)
++  ✓  143 [chromium] › e2e/translation-picker-layout.spec.ts:272:7 › translation picker · long codes › the trigger chip stays on one line inside its pill and inside the header (756ms)
++  ✓  144 [chromium] › e2e/translation-picker-layout.spec.ts:296:7 › translation picker · long codes › the selected long row keeps its accent well, lifted name and full label (898ms)
++  ✓  145 [chromium] › e2e/translation-picker-layout.spec.ts:331:7 › translation picker · long codes › the settings translation picker holds too (664ms)
++  ✓  146 [chromium] › e2e/verse-landing.spec.ts:203:7 › landing a link on its verse › a ?verse= link lands that verse where verse 1 rests (1.4s)
++  ✓  147 [chromium] › e2e/verse-landing.spec.ts:221:7 › landing a link on its verse › a ?verse= link lands that verse where verse 1 rests even when the reading face arrives late (1.2s)
++  ✓  148 [chromium] › e2e/verse-landing.spec.ts:240:7 › landing a link on its verse › an unreadable verse param opens at the top of the chapter (839ms)
++  ✘  149 [chromium] › e2e/verse-landing.spec.ts:251:7 › landing a link on its verse › a cross-ref into the chapter already showing scrolls to its verse and banks no history (1.7s)
++  ✓  150 [chromium] › e2e/verse-landing.spec.ts:272:7 › landing a link on its verse › a cross-ref into another chapter lands on its verse, and Back returns (1.5s)
++  ✓  151 [chromium] › e2e/word-sheet-scale.spec.ts:225:9 › word sheet type scale — hebrew headword › renders the declared type at the default scale (hebrew) (1.7s)
++  ✓  152 [chromium] › e2e/word-sheet-scale.spec.ts:237:9 › word sheet type scale — hebrew headword › grows with the reader's scale, leading included (hebrew) (1.9s)
++  ✓  153 [chromium] › e2e/word-sheet-scale.spec.ts:225:9 › word sheet type scale — greek headword › renders the declared type at the default scale (greek) (2.0s)
++  ✓  154 [chromium] › e2e/word-sheet-scale.spec.ts:237:9 › word sheet type scale — greek headword › grows with the reader's scale, leading included (greek) (2.2s)
++  ✓  155 [chromium] › e2e/word-sheet-scale.spec.ts:262:7 › the pointed Hebrew headword clears the reference line at scale 0.85 (HeaderClearsDescenders) (1.9s)
++  ✓  156 [chromium] › e2e/word-sheet-scale.spec.ts:262:7 › the pointed Hebrew headword clears the reference line at scale 0.925 (HeaderClearsDescenders) (1.9s)
++  ✓  157 [chromium] › e2e/word-sheet-scale.spec.ts:262:7 › the pointed Hebrew headword clears the reference line at scale 1 (HeaderClearsDescenders) (2.2s)
++  ✓  158 [chromium] › e2e/word-sheet-scale.spec.ts:262:7 › the pointed Hebrew headword clears the reference line at scale 1.1 (HeaderClearsDescenders) (1.9s)
++  ✓  159 [chromium] › e2e/word-sheet-scale.spec.ts:262:7 › the pointed Hebrew headword clears the reference line at scale 1.25 (HeaderClearsDescenders) (1.7s)
++  ✓  160 [chromium] › e2e/word-sheet-scale.spec.ts:262:7 › the pointed Hebrew headword clears the reference line at scale 1.4 (HeaderClearsDescenders) (2.0s)
++  ✓  161 [chromium] › e2e/word-sheet-scale.spec.ts:297:5 › leaves the translation picker geometry untouched at the largest scale (844ms)
++
++
++  1) [chromium] › e2e/verse-landing.spec.ts:251:7 › landing a link on its verse › a cross-ref into the chapter already showing scrolls to its verse and banks no history 
++
++    Error: verse 30 at 130px, verse 1 rests at 134px
++
++    expect(received).toBeLessThanOrEqual(expected)
++
++    Expected: <= 2
++    Received:    4
++
++      197 |   expect(top, `verse ${verse} is below the fold`).toBeLessThan(viewport);
++      198 |   expect(top, `verse ${verse} landed under the reader header`).toBeGreaterThanOrEqual(headerBottom);
++    > 199 |   expect(Math.abs(top - rest), `verse ${verse} at ${top}px, verse 1 rests at ${rest}px`).toBeLessThanOrEqual(2);
++          |                                                                                          ^
++      200 | }
++      201 |
++      202 | test.describe('landing a link on its verse', () => {
++        at expectLandedAt (/Users/hunter/gc/.gc/worktrees/winnow/polecats/gastown.rictus/worktrees/winnow-re3fw.2/client/apps/mobile/e2e/verse-landing.spec.ts:199:90)
++        at /Users/hunter/gc/.gc/worktrees/winnow/polecats/gastown.rictus/worktrees/winnow-re3fw.2/client/apps/mobile/e2e/verse-landing.spec.ts:265:5
++
++    Error Context: test-results/verse-landing-landing-a-li-46615--verse-and-banks-no-history-chromium/error-context.md
++
++  1 failed
++    [chromium] › e2e/verse-landing.spec.ts:251:7 › landing a link on its verse › a cross-ref into the chapter already showing scrolls to its verse and banks no history 
++  160 passed (4.4m)
++error: script "contrast" exited with code 1
++gate(test): FAIL — contrast lane ran 160 tests and exited 1.
++    These are real measurements against the rendered app, not a lint
++    heuristic: each finding names the element, its classes, its type size,
++    the backdrop it composites on and the ratio it missed. Re-run one
++    surface with (same port this run used, so it stays out of the way of
++    other worktrees):
++      cd client/apps/mobile && CONTRAST_PORT=5179 bunx playwright test --grep '<surface-id>'
++    Do not raise a floor to make this green — see the AA thresholds in
++    client/apps/mobile/features/theme/contrast-math.ts.
+diff --git a/tests/fixtures/known_red/pytest-gcp-98gh.txt b/tests/fixtures/known_red/pytest-gcp-98gh.txt
+new file mode 100644
+index 00000000..a735bca5
+--- /dev/null
++++ b/tests/fixtures/known_red/pytest-gcp-98gh.txt
+@@ -0,0 +1,13 @@
++gate(test): RUN  PYTHONPATH=. python3 -m pytest tests/ -q
++........................................................................ [ 42%]
++..........................................F............................. [ 84%]
++...........................                                              [100%]
++=================================== FAILURES ===================================
++__________ test_shipped_pack_assets_route_beads_commands_through_gc ___________
++E   AssertionError: bare bd commands bypass store-aware routing:
++E     docs/design/reaper-budget-starvation.md:392: serialized argv starts with bd
++E     docs/design/reaper-budget-starvation.md:399: serialized argv starts with bd
++=========================== short test summary info ============================
++FAILED tests/test_no_bare_bd_commands.py::test_shipped_pack_assets_route_beads_commands_through_gc - AssertionError: bare bd commands bypass store-aware routing:
++1 failed, 170 passed in 41.02s
++gate(test): FAIL — the pytest lane exited 1.
+diff --git a/tests/fixtures/known_red/pytest-short-summary.txt b/tests/fixtures/known_red/pytest-short-summary.txt
+new file mode 100644
+index 00000000..bd212e5b
+--- /dev/null
++++ b/tests/fixtures/known_red/pytest-short-summary.txt
+@@ -0,0 +1,5 @@
++FAILED gascity/tests/test_formula_assets.py::FormulaAssetTests::test_city_claim_command_bounds_ambiguous_hook_failures_without_drain_ack
++FAILED gascity/tests/test_formula_assets.py::FormulaAssetTests::test_city_claim_command_preserves_unreadable_claim_after_bounded_retries
++FAILED tests/test_env_hermeticity.py::EnvironmentHermeticityTests::test_guarded_modules_ignore_agent_session_environment
++FAILED tests/test_no_bare_bd_commands.py::test_shipped_pack_assets_route_beads_commands_through_gc
++4 failed, 1198 passed, 12 skipped in 214.37s (0:03:34)
+diff --git a/tests/fixtures/known_red/vitest-web.txt b/tests/fixtures/known_red/vitest-web.txt
+new file mode 100644
+index 00000000..e9414260
+--- /dev/null
++++ b/tests/fixtures/known_red/vitest-web.txt
+@@ -0,0 +1,46 @@
++gate(test): RUN  bash -c 'cd client/apps/web && bun run test'
++$ vitest run
++
++ RUN  v5.0.0 /Users/hunter/gc/.gc/worktrees/winnow/polecats/gastown.slit/worktrees/winnow-vn65m/client/apps/web
++
++ ❯ src/reader.test.ts (3 tests | 2 failed) 12ms
++   ❯ reader header (2)
++     × lands the cross-ref on its verse 3ms
++   × top-level contrast floor 5ms
++
++⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
++
++ FAIL  src/reader.test.ts > reader header > lands the cross-ref on its verse
++AssertionError: expected 4 to be less than or equal to 2
++ ❯ src/reader.test.ts:4:60
++      2| describe('reader header', () => {
++      3|   it('keeps the verse in view', () => { expect(1).toBe(1); });
++      4|   it('lands the cross-ref on its verse', () => { expect(4).toBeLessTha…
++       |                                                            ^
++      5| });
++      6| it('top-level contrast floor', () => { expect('a').toBe('b'); });
++
++⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
++
++ FAIL  src/reader.test.ts > top-level contrast floor
++AssertionError: expected 'a' to be 'b' // Object.is equality
++
++Expected: "b"
++Received: "a"
++
++ ❯ src/reader.test.ts:6:52
++      4|   it('lands the cross-ref on its verse', () => { expect(4).toBeLessTha…
++      5| });
++      6| it('top-level contrast floor', () => { expect('a').toBe('b'); });
++       |                                                    ^
++      7|
++
++⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
++
++
++ Test Files  1 failed (1)
++      Tests  2 failed | 1 passed (3)
++   Start at  18:25:58
++   Duration  423ms (transform 42%, import 30%, tests 19%, worker 8%)
++
++gate(test): FAIL — web lane ran 3 tests and exited 1.
+diff --git a/tests/fixtures/known_red/vn65m-go-timeout.txt b/tests/fixtures/known_red/vn65m-go-timeout.txt
+new file mode 100644
+index 00000000..89fa91ac
+--- /dev/null
++++ b/tests/fixtures/known_red/vn65m-go-timeout.txt
+@@ -0,0 +1,41 @@
++gate(test): GATE_ALL — verify-everything mode. Every lane runs;
++gate(test): RUN  make test
++ok  	github.com/ferth-ai/winnow/api	212.410s
++ok  	github.com/ferth-ai/winnow/internal/ingest/geography	402.118s
++panic: test timed out after 30m0s
++	running tests:
++		TestResolutionKeepsTheEntityLayerLoadable (10m57s)
++
++goroutine 17 [running]:
++testing.(*M).startAlarm.func1()
++	/opt/homebrew/Cellar/go/1.27.1/libexec/src/testing/testing.go:2959 +0x2c4
++created by time.goFunc
++	/opt/homebrew/Cellar/go/1.27.1/libexec/src/time/sleep.go:182 +0x38
++
++goroutine 1 [chan receive]:
++testing.(*T).Run(0x788242336008, {0x10077ecda?, 0x78824227ca88?}, 0x1008df3e8)
++	/opt/homebrew/Cellar/go/1.27.1/libexec/src/testing/testing.go:2266 +0x3cc
++testing.runTests.func1(0x788242336008)
++	/opt/homebrew/Cellar/go/1.27.1/libexec/src/testing/testing.go:2742 +0x38
++testing.tRunner(0x788242336008, 0x78824227cbb8)
++	/opt/homebrew/Cellar/go/1.27.1/libexec/src/testing/testing.go:2193 +0xc4
++testing.runTests({0x10077a7e8, 0x1a}, {0x100780b41, 0x34}, 0x7882421ec180, {0x1008f9608, 0x1, 0x1}, {0x78824227cc58?, 0x78824226e1e0?, ...})
++	/opt/homebrew/Cellar/go/1.27.1/libexec/src/testing/testing.go:2740 +0x400
++testing.(*M).Run(0x788242304320)
++	/opt/homebrew/Cellar/go/1.27.1/libexec/src/testing/testing.go:2600 +0x578
++main.main()
++	_testmain.go:46 +0x80
++
++goroutine 6 [sleep]:
++time.Sleep(0x2540be400)
++	/opt/homebrew/Cellar/go/1.27.1/libexec/src/runtime/time.go:368 +0x150
++github.com/ferth-ai/winnow/internal/ingest/entityres.TestResolutionKeepsTheEntityLayerLoadable(0x788242336248?)
++	/Users/hunter/gc/.gc/worktrees/winnow/polecats/gastown.slit/worktrees/winnow-vn65m/internal/ingest/entityres/res_test.go:5 +0x28
++testing.tRunner(0x788242336248, 0x1008df3e8)
++	/opt/homebrew/Cellar/go/1.27.1/libexec/src/testing/testing.go:2193 +0xc4
++created by testing.(*T).Run in goroutine 1
++	/opt/homebrew/Cellar/go/1.27.1/libexec/src/testing/testing.go:2258 +0x3b8
++FAIL	github.com/ferth-ai/winnow/internal/ingest/entityres	1803.007s
++ok  	github.com/ferth-ai/winnow/internal/okpkg	0.340s
++FAIL
++make: *** [test] Error 1
+diff --git a/tests/test_known_red.py b/tests/test_known_red.py
+new file mode 100644
+index 00000000..db4fe474
+--- /dev/null
++++ b/tests/test_known_red.py
+@@ -0,0 +1,499 @@
++"""Tests for gastown/assets/scripts/known-red, the vendored base-red matcher.
++
++Ported from the mill suite (dotmill d674c68, library/skills/gascity/known-red/
++tests/test_known_red.py). Every ledger call goes to fixtures/known_red/fake_gc.py
++through a `gc` shim on PATH; no test touches a real bead. A second shim named
++`bd` sits beside it and logs any call that reaches it: the vendored script must
++route every ledger call through `gc bd`, so that log stays empty for the whole
++module.
++
++Fixtures (tests/fixtures/known_red/) are real gate output where it exists:
++  lqft1-gate-all-test.txt  the GATE_ALL receipt log behind winnow-lqft1 (19 bats ids)
++  playwright-contrast.txt  a real red contrast lane (winnow-re3fw.2's receipt)
++  green-typecheck.txt      a real green receipt log
++  vn65m-go-timeout.txt, go-mixed.txt, vitest-web.txt, jest-mobile.txt, lint.txt
++                           real go test / vitest / jest / golangci-lint / shellcheck
++                           output, wrapped in the gate.sh lane lines that carry it
++  masked-by-lane.txt       a known bats red, then a lane that is red with no id
++  pytest-short-summary.txt four pytest FAILED lines seen on this rig, and a footer
++  pytest-gcp-98gh.txt      this rig's tracked pytest base red (gcp-98gh) in a gate lane
++
++KNOWN_RED_SCRIPT overrides the script under test (the red-check points it at the
++verbatim provenance copy).
++"""
++import json
++import os
++import shutil
++import subprocess
++import sys
++import tempfile
++import unittest
++from datetime import datetime, timedelta, timezone
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++REPO_ROOT = os.path.dirname(HERE)
++FIX = os.path.join(HERE, "fixtures", "known_red")
++SCRIPT = os.environ.get("KNOWN_RED_SCRIPT") or os.path.join(
++    REPO_ROOT, "gastown", "assets", "scripts", "known-red")
++NOW = datetime.now(timezone.utc)
++
++PYTEST_IDS = [
++    ("pytest:gascity/tests/test_formula_assets.py::FormulaAssetTests::"
++     "test_city_claim_command_bounds_ambiguous_hook_failures_without_drain_ack"),
++    ("pytest:gascity/tests/test_formula_assets.py::FormulaAssetTests::"
++     "test_city_claim_command_preserves_unreadable_claim_after_bounded_retries"),
++    ("pytest:tests/test_env_hermeticity.py::EnvironmentHermeticityTests::"
++     "test_guarded_modules_ignore_agent_session_environment"),
++    "pytest:tests/test_no_bare_bd_commands.py::test_shipped_pack_assets_route_beads_commands_through_gc",
++]
++GCP_98GH_ID = PYTEST_IDS[3]
++
++
++def z(dt):
++    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
++
++
++def hermetic_environ():
++    """os.environ without the agent-session namespace (see test_env_hermeticity)."""
++    return {k: v for k, v in os.environ.items() if not k.startswith(("GC_", "BEADS_"))}
++
++
++def lqft1_ids():
++    """The 19 ids, derived independently of known-red: each `not ok` line plus
++    the first `in test file` in the comment lines under it."""
++    with open(os.path.join(FIX, "lqft1-gate-all-test.txt")) as fh:
++        lines = fh.read().splitlines()
++    ids = []
++    for i, line in enumerate(lines):
++        if line.startswith("not ok "):
++            name = line.split(" ", 3)[3]
++            j = i + 1
++            while "in test file" not in lines[j]:
++                j += 1
++            f = lines[j].split("in test file ", 1)[1].split(",")[0]
++            ids.append(f"bats:{f}::{name}")
++    return ids
++
++
++def bead(bid, sigs=(), status="open", phase="test", last_seen=None, closed_at=None, labels=("base-red",)):
++    md = {"gc.routed_to": ""}
++    if sigs:
++        md["base_red_sigs"] = "\n".join(sigs)
++        md["base_red_phase"] = phase
++    if last_seen:
++        md["base_red_last_seen"] = last_seen
++    b = {"id": bid, "title": f"Pre-existing failure: {bid}", "status": status, "priority": 1,
++         "labels": list(labels), "metadata": md, "created_at": z(NOW - timedelta(hours=1))}
++    if closed_at:
++        b["closed_at"] = closed_at
++    return b
++
++
++class KnownRed(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.tmp = tempfile.mkdtemp(prefix="known-red-test.")
++        cls.repo = os.path.join(cls.tmp, "repo")
++        os.makedirs(os.path.join(cls.repo, "client/apps/web/features/auth"))
++        open(os.path.join(cls.repo, "client/apps/web/features/auth/use-sign-out.ts"), "w").close()
++        git = ["git", "-C", cls.repo, "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]
++        subprocess.run(["git", "init", "-q", cls.repo], check=True, env=hermetic_environ())
++        subprocess.run(git + ["add", "-A"], check=True, env=hermetic_environ())
++        for msg in ("feat(api): ground replies (winnow-re3fw.2)",
++                    "fix(api): count suppressed calls under contention (winnow-fx1)",
++                    "fix(gate): child bead only (winnow-fx3.1)"):
++            subprocess.run(git + ["commit", "-q", "--allow-empty", "-m", msg], check=True, env=hermetic_environ())
++        cls.bin = os.path.join(cls.tmp, "bin")
++        os.makedirs(cls.bin)
++        shim = os.path.join(cls.bin, "gc")
++        with open(shim, "w") as fh:
++            fh.write(f'#!/bin/sh\nexec "{sys.executable}" "{os.path.join(FIX, "fake_gc.py")}" "$@"\n')
++        os.chmod(shim, 0o755)
++        # A bare-binary ledger call would bypass gc's store routing. Record it
++        # and fail it, so it can never succeed quietly against a real ledger.
++        cls.bare_log = os.path.join(cls.tmp, "bare-ledger-calls.log")
++        open(cls.bare_log, "w").close()
++        bare = os.path.join(cls.bin, "bd")
++        with open(bare, "w") as fh:
++            fh.write(f'#!/bin/sh\necho "$*" >> "{cls.bare_log}"\nexit 99\n')
++        os.chmod(bare, 0o755)
++
++    @classmethod
++    def tearDownClass(cls):
++        with open(cls.bare_log) as fh:
++            bare = fh.read()
++        shutil.rmtree(cls.tmp, ignore_errors=True)
++        if bare:
++            raise AssertionError(f"known-red called the ledger without gc during this module:\n{bare}")
++
++    def setUp(self):
++        self.db = os.path.join(self.tmp, f"db-{self._testMethodName}.json")
++        self.log = os.path.join(self.tmp, f"calls-{self._testMethodName}.jsonl")
++        open(self.log, "w").close()
++        self.seed([])
++
++    def seed(self, beads):
++        with open(self.db, "w") as fh:
++            json.dump({"prefix": "winnow", "beads": {b["id"]: b for b in beads}}, fh)
++
++    def state(self):
++        with open(self.db) as fh:
++            return json.load(fh)["beads"]
++
++    def gc_calls(self):
++        """Every argv the fake gc received, as given (the leading "bd" included)."""
++        with open(self.log) as fh:
++            return [json.loads(x) for x in fh if x.strip()]
++
++    def calls(self):
++        """The ledger verbs: each routed call with its leading "bd" dropped."""
++        return [c[1:] for c in self.gc_calls() if c and c[0] == "bd"]
++
++    def run_kr(self, *args, stdin=None, **env):
++        e = dict(hermetic_environ(), PATH=self.bin + os.pathsep + os.environ["PATH"],
++                 FAKE_GC_DB=self.db, FAKE_GC_LOG=self.log)
++        e.update({k: str(v) for k, v in env.items()})
++        r = subprocess.run([sys.executable, SCRIPT, *args], cwd=self.repo, env=e, input=stdin,
++                           capture_output=True, text=True, timeout=120, check=False)
++        return r.returncode, r.stdout, r.stderr
++
++    def lines(self, out, cls):
++        return [ln for ln in out.splitlines() if ln.startswith(cls + " ")]
++
++    # ---- extraction -------------------------------------------------------
++
++    def sigs(self, fixture):
++        rc, out, _ = self.run_kr("sigs", os.path.join(FIX, fixture))
++        return rc, out.splitlines()
++
++    def test_lqft1_log_gives_its_19_bats_ids(self):
++        rc, got = self.sigs("lqft1-gate-all-test.txt")
++        self.assertEqual(rc, 0)
++        self.assertEqual(len(lqft1_ids()), 19)
++        self.assertEqual(got, lqft1_ids())
++        self.assertFalse(any("gate(" in s for s in got), "a lane line must never be a signature")
++
++    def test_vn65m_log_gives_the_package_timeout(self):
++        self.assertEqual(self.sigs("vn65m-go-timeout.txt"), (0, ["go-timeout:internal/ingest/entityres"]))
++
++    def test_go_tests_subtests_and_unparsed_package_failures(self):
++        self.assertEqual(self.sigs("go-mixed.txt")[1], [
++            "go:api.TestLogThrottle_ConcurrentCallersAdmitOne",
++            "go:api.TestGroundingMap",
++            "go:api.TestGroundingMap/drops_citation",
++            "raw:FAIL github.com/ferth-ai/winnow/internal/broken [build failed]",
++            "go-timeout:internal/ingest/entityres",
++        ])
++
++    def test_vitest_ids_are_repo_relative_through_the_lane_dir(self):
++        self.assertEqual(self.sigs("vitest-web.txt")[1], [
++            "js:client/apps/web/src/reader.test.ts::reader header > lands the cross-ref on its verse",
++            "js:client/apps/web/src/reader.test.ts::top-level contrast floor",
++        ])
++
++    def test_jest_ids_skip_console_blocks(self):
++        self.assertEqual(self.sigs("jest-mobile.txt")[1], [
++            "js:client/apps/mobile/features/reader/header.test.js::reader header > lands the cross-ref on its verse",
++            "js:client/apps/mobile/features/reader/header.test.js::top-level contrast floor",
++        ])
++
++    def test_playwright_id_from_a_real_red_contrast_lane(self):
++        self.assertEqual(self.sigs("playwright-contrast.txt")[1], [
++            ("js:client/apps/mobile/e2e/verse-landing.spec.ts::landing a link on its verse > "
++             "a cross-ref into the chapter already showing scrolls to its verse and banks no history"),
++        ])
++
++    def test_lint_ids_errors_only_worktree_paths_made_relative(self):
++        self.assertEqual(self.sigs("lint.txt")[1], [
++            "lint:errcheck:internal/store/store.go",
++            "lint-timeout:golangci-lint",
++            "lint:eslint:client/apps/web/features/auth/use-sign-out.ts",   # the warning-only file is absent
++            "lint:shellcheck:scripts/prune.sh",
++        ])
++
++    def test_green_log_has_no_ids_and_match_is_not_vacuously_known(self):
++        self.assertEqual(self.sigs("green-typecheck.txt"), (1, []))
++        rc, out, _ = self.run_kr("match", os.path.join(FIX, "green-typecheck.txt"))
++        self.assertEqual(rc, 1)
++        self.assertIn("no failure id found", out)
++
++    # ---- pytest -----------------------------------------------------------
++
++    def test_pytest_short_summary_gives_one_id_per_failed_line(self):
++        self.assertEqual(self.sigs("pytest-short-summary.txt"), (0, PYTEST_IDS))
++
++    def test_pytest_message_suffix_does_not_change_the_id(self):
++        node = "tests/test_x.py::XTests::test_y"
++        _, bare, _ = self.run_kr("sigs", "-", stdin=f"FAILED {node}\n")
++        _, suffixed, _ = self.run_kr("sigs", "-", stdin=f"FAILED {node} - AssertionError: x\n")
++        self.assertEqual(bare.splitlines(), [f"pytest:{node}"])
++        self.assertEqual(suffixed.splitlines(), bare.splitlines())
++        rc, both, _ = self.run_kr("sigs", "-", stdin=f"FAILED {node}\nFAILED {node} - AssertionError: x\n")
++        self.assertEqual((rc, both.splitlines()), (0, [f"pytest:{node}"]), "dedup by id")
++
++    def test_pytest_collection_error_without_a_nodeid_stays_raw_and_new(self):
++        err = "ERROR tests/x.py - ImportError: y"
++        rc, out, _ = self.run_kr("sigs", "-", stdin=err + "\n")
++        self.assertEqual((rc, out.splitlines()), (0, [f"raw:{err}"]))
++        rc, out, _ = self.run_kr("match", "-", stdin=err + "\n")
++        self.assertEqual(rc, 1)
++        self.assertEqual(len(self.lines(out, "NEW")), 1)
++        self.assertIn(f"raw:{err}", self.lines(out, "NEW")[0])
++        # A pytest id in the same segment must not hide it.
++        self.seed([bead("gcp-98gh", [GCP_98GH_ID])])
++        rc, out, _ = self.run_kr("match", "-", stdin=f"FAILED {GCP_98GH_ID[len('pytest:'):]}\n{err}\n")
++        self.assertEqual(rc, 1)
++        self.assertEqual(len(self.lines(out, "KNOWN")), 1)
++        self.assertIn(f"raw:{err}", self.lines(out, "NEW")[0])
++
++    def test_every_ledger_call_is_routed_through_gc_bd(self):
++        # Exercise every subcommand that reaches the ledger, then check both
++        # sides: the bare shim saw nothing, and every call gc saw was `gc bd`.
++        self.seed([bead("winnow-vn65m", ["go-timeout:internal/ingest/entityres"])])
++        self.run_kr("list")
++        self.run_kr("match", os.path.join(FIX, "go-mixed.txt"))
++        self.run_kr("file", os.path.join(FIX, "go-mixed.txt"), "--summary", "x", "--sha", "a" * 40)
++        with open(self.bare_log) as fh:
++            self.assertEqual(fh.read(), "", "a ledger call bypassed gc")
++        routed = self.gc_calls()
++        self.assertTrue(routed, "known-red made no ledger call at all")
++        self.assertTrue(all(c and c[0] == "bd" for c in routed), routed)
++        self.assertIn("create", [c[0] for c in self.calls()])
++
++    def test_match_the_rigs_tracked_pytest_base_red_is_known(self):
++        self.seed([bead("gcp-98gh", [GCP_98GH_ID])])
++        rc, out, err = self.run_kr("match", os.path.join(FIX, "pytest-gcp-98gh.txt"))
++        self.assertEqual(rc, 0, out + err)
++        self.assertEqual(self.lines(out, "KNOWN"), [f"{'KNOWN':<15} {'gcp-98gh':<14} {GCP_98GH_ID}"])
++        self.assertEqual(self.lines(out, "NEW"), [])
++
++    # ---- match ------------------------------------------------------------
++
++    def test_match_lqft1_all_19_known(self):
++        self.seed([bead("winnow-lqft1", lqft1_ids())])
++        rc, out, err = self.run_kr("match", os.path.join(FIX, "lqft1-gate-all-test.txt"))
++        self.assertEqual(rc, 0, err)
++        known = self.lines(out, "KNOWN")
++        self.assertEqual(len(known), 19)
++        self.assertTrue(all(" winnow-lqft1 " in ln for ln in known))
++        self.assertEqual(self.lines(out, "NEW"), [])
++
++    def test_match_names_exactly_the_one_id_missing_from_the_bead(self):
++        ids = lqft1_ids()
++        dropped = ids[6]
++        self.seed([bead("winnow-lqft1", [i for i in ids if i != dropped])])
++        rc, out, _ = self.run_kr("match", os.path.join(FIX, "lqft1-gate-all-test.txt"))
++        self.assertEqual(rc, 1)
++        new = self.lines(out, "NEW")
++        self.assertEqual(len(new), 1)
++        self.assertTrue(new[0].endswith(dropped), new[0])
++        self.assertEqual(len(self.lines(out, "KNOWN")), 18)
++
++    def test_a_known_red_cannot_mask_an_unparsed_red_lane(self):
++        self.seed([bead("winnow-jhyik", [
++            "bats:.gauntlet/winnow-13dg-gate-matches.bats::lane-prereq: a selected lane whose tool is missing FAILS, it does not skip"])])
++        rc, out, _ = self.run_kr("match", os.path.join(FIX, "masked-by-lane.txt"))
++        self.assertEqual(rc, 1)
++        self.assertEqual(len(self.lines(out, "KNOWN")), 1)
++        self.assertIn("raw:gate(test): FATAL — the contrast lane could not bind port", self.lines(out, "NEW")[0])
++
++    def test_a_raw_id_is_new_even_if_a_bead_carries_it(self):
++        raw = "raw:FAIL github.com/ferth-ai/winnow/internal/broken [build failed]"
++        self.seed([bead("winnow-b1", [raw, "go:api.TestLogThrottle_ConcurrentCallersAdmitOne", "go:api.TestGroundingMap",
++                                      "go:api.TestGroundingMap/drops_citation", "go-timeout:internal/ingest/entityres"])])
++        rc, out, _ = self.run_kr("match", os.path.join(FIX, "go-mixed.txt"))
++        self.assertEqual(rc, 1)
++        self.assertEqual(len(self.lines(out, "KNOWN")), 4)
++        self.assertEqual(len(self.lines(out, "NEW")), 1)
++        self.assertIn(raw, self.lines(out, "NEW")[0])
++
++    def test_ledger_unreachable_fails_closed(self):
++        rc, out, err = self.run_kr("match", os.path.join(FIX, "lqft1-gate-all-test.txt"), FAKE_GC_FAIL=1)
++        self.assertEqual(rc, 2)
++        self.assertEqual(len(self.lines(out, "NEW")), 19)
++        self.assertEqual(self.lines(out, "KNOWN"), [])
++        self.assertIn("LOOKUP FAILED", err)
++
++    def test_a_failed_list_fails_closed_even_when_the_ledger_answers_config(self):
++        self.seed([bead("winnow-vn65m", ["go-timeout:internal/ingest/entityres"])])
++        rc, out, _ = self.run_kr("match", os.path.join(FIX, "vn65m-go-timeout.txt"), FAKE_GC_FAIL_ON="list")
++        self.assertEqual(rc, 2)
++        self.assertEqual(self.lines(out, "KNOWN"), [])
++        rc, _, _ = self.run_kr("file", os.path.join(FIX, "vn65m-go-timeout.txt"), "--summary", "x",
++                               FAKE_GC_FAIL_ON="list")
++        self.assertEqual(rc, 2)
++        self.assertEqual([c for c in self.calls() if c[0] in ("create", "update")], [])
++
++    def test_gc_missing_from_path_fails_closed(self):
++        e = dict(hermetic_environ(), PATH="/usr/bin:/bin")
++        r = subprocess.run([sys.executable, SCRIPT, "match", os.path.join(FIX, "vn65m-go-timeout.txt")],
++                           cwd=self.repo, env=e, capture_output=True, text=True, check=False)
++        self.assertEqual(r.returncode, 2, r.stderr)
++
++    def test_closed_bead_fixed_upstream_unless_the_fix_is_on_head(self):
++        recent = z(NOW - timedelta(days=2))
++        ids = lqft1_ids()
++        self.seed([bead("winnow-fx1", ids[0:1], status="closed", closed_at=recent),   # fix commit on HEAD
++                   bead("winnow-fx2", ids[1:2], status="closed", closed_at=recent),   # no fix commit
++                   bead("winnow-fx3", ids[2:3], status="closed", closed_at=recent),   # only winnow-fx3.1 cited
++                   bead("winnow-old", ids[3:4], status="closed", closed_at=z(NOW - timedelta(days=9))),
++                   bead("winnow-open", ids[4:], status="open")])
++        rc, out, _ = self.run_kr("match", os.path.join(FIX, "lqft1-gate-all-test.txt"))
++        by_sig = {ln.split("   [")[0].split(None, 2)[2]: ln for ln in out.splitlines() if ln.strip()}
++        self.assertTrue(by_sig[ids[0]].startswith("NEW "), by_sig[ids[0]])          # regression
++        self.assertIn("regression", by_sig[ids[0]])
++        self.assertTrue(by_sig[ids[1]].startswith("FIXED-UPSTREAM  winnow-fx2"), by_sig[ids[1]])
++        self.assertTrue(by_sig[ids[2]].startswith("FIXED-UPSTREAM  winnow-fx3"), by_sig[ids[2]])
++        self.assertTrue(by_sig[ids[3]].startswith("NEW "), "closed >7 days ago is out of the window")
++        self.assertEqual(rc, 1)
++        # Without the NEW ones, FIXED-UPSTREAM alone exits 3 (rebase).
++        self.seed([bead("winnow-fx2", ids[1:2], status="closed", closed_at=recent),
++                   bead("winnow-open", ids[:1] + ids[2:], status="open")])
++        rc, out, _ = self.run_kr("match", os.path.join(FIX, "lqft1-gate-all-test.txt"))
++        self.assertEqual(rc, 3)
++
++    def test_one_status_per_list_call(self):
++        self.run_kr("match", os.path.join(FIX, "lqft1-gate-all-test.txt"))
++        lists = [c for c in self.calls() if c[0] == "list"]
++        statuses = []
++        for c in lists:
++            self.assertEqual(c.count("--status"), 1, c)
++            st = c[c.index("--status") + 1]
++            self.assertNotIn(",", st, c)
++            self.assertEqual(c[c.index("--limit") + 1], "0", "the default limit of 50 would truncate")
++            self.assertEqual(c[c.index("--label") + 1], "base-red")
++            statuses.append(st)
++            if st == "closed":
++                self.assertIn("--closed-after", c)
++        self.assertEqual(sorted(statuses), sorted(["open", "in_progress", "blocked", "deferred", "closed"]))
++
++    # ---- file -------------------------------------------------------------
++
++    def test_file_twice_leaves_one_bead_and_moves_last_seen(self):
++        d = tempfile.mkdtemp(dir=self.tmp)
++        log = os.path.join(d, "test-50ec6fa2-f8a0.log")
++        shutil.copy(os.path.join(FIX, "lqft1-gate-all-test.txt"), log)
++        with open(log[:-4] + ".receipt", "w") as fh:
++            fh.write("phase=test\nstatus=1\nhead=29a8ca154820e4ea5fdbe82dadffa68ab14da6c8\n"
++                     f"finished={z(NOW - timedelta(hours=5))}\n")
++        rc, out, err = self.run_kr("file", log, "--summary", "gate self-tests inherit GATE_ALL", "--from", "winnow-9rd6s")
++        self.assertEqual(rc, 0, err)
++        beads = [b for b in self.state().values() if "base-red" in b["labels"]]
++        self.assertEqual(len(beads), 1)
++        b = beads[0]
++        self.assertIsInstance(b["metadata"], dict)
++        self.assertEqual(b["metadata"]["base_red_sigs"].split("\n"), lqft1_ids())
++        self.assertEqual(b["metadata"]["base_red_phase"], "test")
++        self.assertEqual(b["metadata"]["base_red_first_sha"], "29a8ca154820e4ea5fdbe82dadffa68ab14da6c8")
++        self.assertEqual(b["metadata"]["base_red_from"], "winnow-9rd6s")
++        self.assertTrue(b["title"].startswith("Pre-existing failure: bats:.gauntlet/winnow-13dg-gate-matches.bats::"))
++        self.assertIn("(+18 more) — gate self-tests inherit GATE_ALL", b["title"])
++        self.assertEqual((b["issue_type"], b["priority"]), ("bug", 1))
++        first_seen = b["metadata"]["base_red_last_seen"]
++        self.assertEqual(first_seen, "29a8ca154820e4ea5fdbe82dadffa68ab14da6c8@" + z(NOW - timedelta(hours=5)),
++                         "sha and time come from the receipt beside the log")
++
++        n_before = len(self.calls())
++        rc, out, err = self.run_kr("file", os.path.join(FIX, "lqft1-gate-all-test.txt"),
++                                   "--summary", "again", "--sha", "b" * 40)
++        self.assertEqual(rc, 0, err)
++        beads = [x for x in self.state().values() if "base-red" in x["labels"]]
++        self.assertEqual(len(beads), 1, "the second file must not create a duplicate")
++        self.assertNotIn("create", [c[0] for c in self.calls()[n_before:]])
++        seen = beads[0]["metadata"]["base_red_last_seen"]
++        self.assertTrue(seen.startswith("b" * 40 + "@"), seen)
++        self.assertGreater(seen.split("@")[1], first_seen.split("@")[1])
++        self.assertEqual(len(self.lines(out, "KNOWN")), 19)
++
++        # An older sighting never moves last-seen back.
++        rc, out, err = self.run_kr("file", os.path.join(FIX, "lqft1-gate-all-test.txt"), "--summary", "old",
++                                   "--sha", "d" * 40, "--seen-at", z(NOW - timedelta(days=3)))
++        self.assertEqual(rc, 0, err)
++        self.assertEqual(self.state()[beads[0]["id"]]["metadata"]["base_red_last_seen"], seen)
++        self.assertIn("not moving last-seen back", out)
++
++    def test_file_never_writes_whole_object_metadata(self):
++        self.run_kr("file", os.path.join(FIX, "vn65m-go-timeout.txt"), "--summary", "entityres overruns 30m")
++        writes = [c for c in self.calls() if c[0] in ("update", "create")]
++        self.assertTrue(writes)
++        self.assertFalse(any("--metadata" in c for c in writes), writes)
++
++    def test_file_with_the_ledger_unreachable_writes_nothing(self):
++        rc, _, err = self.run_kr("file", os.path.join(FIX, "vn65m-go-timeout.txt"),
++                                 "--summary", "x", FAKE_GC_FAIL=1)
++        self.assertEqual(rc, 2)
++        self.assertIn("filed nothing", err)
++        self.assertEqual([c for c in self.calls() if c[0] in ("create", "update")], [])
++        self.assertEqual(self.state(), {})
++
++    def test_file_detects_metadata_that_is_not_an_object(self):
++        self.seed([bead("winnow-vn65m", ["go-timeout:internal/ingest/entityres"])])
++        rc, _, err = self.run_kr("file", os.path.join(FIX, "vn65m-go-timeout.txt"), "--summary", "x",
++                                 FAKE_GC_CORRUPT_METADATA=1)
++        self.assertEqual(rc, 2)
++        self.assertIn("not an object", err)
++
++    def test_file_does_not_file_raw_lines(self):
++        rc, _, err = self.run_kr("file", os.path.join(FIX, "masked-by-lane.txt"), "--summary", "lane-prereq flake")
++        self.assertEqual(rc, 1)
++        self.assertIn("no stable id", err)
++        beads = list(self.state().values())
++        self.assertEqual(len(beads), 1)
++        self.assertEqual(beads[0]["metadata"]["base_red_sigs"],
++                         "bats:.gauntlet/winnow-13dg-gate-matches.bats::lane-prereq: a selected lane whose tool is missing FAILS, it does not skip")
++
++    def test_file_into_an_existing_bead_labels_it_and_then_it_matches(self):
++        self.seed([bead("winnow-vn65m", labels=())])
++        rc, _, err = self.run_kr("file", os.path.join(FIX, "vn65m-go-timeout.txt"), "--summary", "x",
++                                 "--into", "winnow-vn65m", "--sha", "c" * 40)
++        self.assertEqual(rc, 0, err)
++        b = self.state()["winnow-vn65m"]
++        self.assertIn("base-red", b["labels"])
++        self.assertEqual(b["metadata"]["base_red_sigs"], "go-timeout:internal/ingest/entityres")
++        self.assertEqual(b["metadata"]["gc.routed_to"], "", "--set-metadata must keep existing keys")
++        self.assertEqual(len(self.state()), 1)
++        rc, out, _ = self.run_kr("match", os.path.join(FIX, "vn65m-go-timeout.txt"))
++        self.assertEqual(rc, 0)
++        self.assertIn("KNOWN           winnow-vn65m", out)
++
++    def test_file_into_a_closed_bead_refuses(self):
++        self.seed([bead("winnow-done", status="closed", closed_at=z(NOW - timedelta(days=30)))])
++        rc, _, _ = self.run_kr("file", os.path.join(FIX, "vn65m-go-timeout.txt"), "--summary", "x", "--into", "winnow-done")
++        self.assertEqual(rc, 2)
++        self.assertEqual([c for c in self.calls() if c[0] in ("create", "update")], [])
++
++    def test_dry_run_writes_nothing(self):
++        rc, out, _ = self.run_kr("file", os.path.join(FIX, "lqft1-gate-all-test.txt"), "--summary", "x", "--dry-run")
++        self.assertEqual(rc, 0)
++        self.assertIn("(dry-run) gc bd create", out)
++        self.assertEqual([c for c in self.calls() if c[0] in ("create", "update")], [])
++
++    # ---- list -------------------------------------------------------------
++
++    def test_list_marks_stale_and_filters_by_phase(self):
++        self.seed([bead("winnow-a", ["go:api.TestA"], last_seen="abcdef1234@" + z(NOW - timedelta(hours=100))),
++                   bead("winnow-b", ["go:api.TestB"], last_seen="1234abcdef@" + z(NOW - timedelta(hours=2))),
++                   bead("winnow-c", ["lint:errcheck:x.go"], phase="lint", status="in_progress",
++                        last_seen="99@" + z(NOW - timedelta(hours=1))),
++                   bead("winnow-d", [], status="deferred")])
++        rc, out, _ = self.run_kr("list")
++        self.assertEqual(rc, 0)
++        rows = {ln.split()[0]: ln for ln in out.splitlines() if ln.startswith("winnow-")}
++        self.assertEqual(sorted(rows), ["winnow-a", "winnow-b", "winnow-c", "winnow-d"])
++        self.assertTrue(rows["winnow-a"].endswith("STALE"))
++        self.assertFalse(rows["winnow-b"].endswith("STALE"))
++        self.assertIn("no base_red_sigs", out)
++        rc, out, _ = self.run_kr("list", "--phase", "lint")
++        self.assertEqual([ln.split()[0] for ln in out.splitlines() if ln.startswith("winnow-")], ["winnow-c"])
++        rc, out, _ = self.run_kr("list", "--stale")
++        self.assertEqual([ln.split()[0] for ln in out.splitlines() if ln.startswith("winnow-")], ["winnow-a"])
++        self.assertIn("1 STALE", out)
++
++    def test_list_fails_closed(self):
++        rc, _, err = self.run_kr("list", FAKE_GC_FAIL=1)
++        self.assertEqual(rc, 2)
++        self.assertIn("LOOKUP FAILED", err)
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
+-- 
+2.54.0 (Apple Git-157)
+
