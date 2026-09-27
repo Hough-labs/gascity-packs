@@ -1409,6 +1409,46 @@ def test_validate_methodology_flow_contracts_accept_current_packs() -> None:
         )
 
 
+def write_methodology_formula(pack_source: Path, header: str) -> None:
+    formulas = pack_source / "formulas"
+    formulas.mkdir(parents=True)
+    (formulas / "demo-build.formula.toml").write_text(
+        f'formula = "demo-build"\nversion = 1\n{header}\n[[steps]]\nid = "run"\ntitle = "Run"\n',
+        encoding="utf-8",
+    )
+
+
+def test_load_methodology_formula_accepts_requires_table(tmp_path) -> None:
+    write_methodology_formula(tmp_path, '[requires]\nformula_compiler = ">=2.0.0"\n')
+    missing: list[str] = []
+
+    payload = gascity_pack_inference_gate.load_methodology_formula(tmp_path, "demo-build", missing)
+
+    assert payload is not None
+    assert missing == []
+
+
+def test_load_methodology_formula_accepts_deprecated_contract_alias(tmp_path) -> None:
+    write_methodology_formula(tmp_path, 'contract = "graph.v2"\n')
+    missing: list[str] = []
+
+    payload = gascity_pack_inference_gate.load_methodology_formula(tmp_path, "demo-build", missing)
+
+    assert payload is not None
+    assert missing == []
+
+
+def test_load_methodology_formula_rejects_formula_without_compiler_requirement(tmp_path) -> None:
+    write_methodology_formula(tmp_path, "")
+    missing: list[str] = []
+
+    gascity_pack_inference_gate.load_methodology_formula(tmp_path, "demo-build", missing)
+
+    assert len(missing) == 1
+    assert "formula_compiler = '>=2.0.0'" in missing[0]
+    assert "contract = 'graph.v2'" in missing[0]
+
+
 def test_validate_methodology_flow_contract_rejects_missing_specialist_review_lane(tmp_path) -> None:
     spec = gascity_pack_inference_gate.PACK_SPECS["superpowers"]
     pack_source = tmp_path / "superpowers"
