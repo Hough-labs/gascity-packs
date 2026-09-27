@@ -1,0 +1,5 @@
+FAILED gascity/tests/test_formula_assets.py::FormulaAssetTests::test_city_claim_command_bounds_ambiguous_hook_failures_without_drain_ack
+FAILED gascity/tests/test_formula_assets.py::FormulaAssetTests::test_city_claim_command_preserves_unreadable_claim_after_bounded_retries
+FAILED tests/test_env_hermeticity.py::EnvironmentHermeticityTests::test_guarded_modules_ignore_agent_session_environment
+FAILED tests/test_no_bare_bd_commands.py::test_shipped_pack_assets_route_beads_commands_through_gc
+4 failed, 1198 passed, 12 skipped in 214.37s (0:03:34)

@@ -1,0 +1,13 @@
+gate(test): RUN  PYTHONPATH=. python3 -m pytest tests/ -q
+........................................................................ [ 42%]
+..........................................F............................. [ 84%]
+...........................                                              [100%]
+=================================== FAILURES ===================================
+__________ test_shipped_pack_assets_route_beads_commands_through_gc ___________
+E   AssertionError: bare bd commands bypass store-aware routing:
+E     docs/design/reaper-budget-starvation.md:392: serialized argv starts with bd
+E     docs/design/reaper-budget-starvation.md:399: serialized argv starts with bd
+=========================== short test summary info ============================
+FAILED tests/test_no_bare_bd_commands.py::test_shipped_pack_assets_route_beads_commands_through_gc - AssertionError: bare bd commands bypass store-aware routing:
+1 failed, 170 passed in 41.02s
+gate(test): FAIL — the pytest lane exited 1.

@@ -1,0 +1,18 @@
+gate(typecheck): GATE_ALL — verify-everything mode. Every lane runs;
+    the diff against origin/dev is ignored. A SKIP is not possible here,
+    so this phase's exit status is a real verdict.
+gate(typecheck): RUN  make vet
+gate(typecheck): RUN  make agent-vet
+gate(typecheck): RUN  bash -c cd client && bun run typecheck
+$ bun run --filter '*' typecheck
+@winnow/core typecheck: Exited with code 0
+@winnow/mobile typecheck: generate-route-types: 26 route patterns -> .expo/types/router.d.ts, expo-env.d.ts
+@winnow/mobile typecheck: Exited with code 0
+@winnow/web typecheck: Exited with code 0
+gate(typecheck): RUN  bats --count over 86 .gauntlet contract files
+1061
+gate(typecheck): .gauntlet suite collected 1061 tests from 86 contract files.
+gate(typecheck): RUN  make app-migrate-validate
+gate(typecheck): RUN  go tool goose -dir <staged copy of 54 corpus migrations> validate
+gate(typecheck): goose validated 54 corpus migrations.
+gate(typecheck): OK — all applicable checks passed.

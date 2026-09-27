@@ -1,0 +1,46 @@
+gate(test): RUN  bash -c 'cd client/apps/web && bun run test'
+$ vitest run
+
+ RUN  v5.0.0 /Users/hunter/gc/.gc/worktrees/winnow/polecats/gastown.slit/worktrees/winnow-vn65m/client/apps/web
+
+ ❯ src/reader.test.ts (3 tests | 2 failed) 12ms
+   ❯ reader header (2)
+     × lands the cross-ref on its verse 3ms
+   × top-level contrast floor 5ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/reader.test.ts > reader header > lands the cross-ref on its verse
+AssertionError: expected 4 to be less than or equal to 2
+ ❯ src/reader.test.ts:4:60
+      2| describe('reader header', () => {
+      3|   it('keeps the verse in view', () => { expect(1).toBe(1); });
+      4|   it('lands the cross-ref on its verse', () => { expect(4).toBeLessTha…
+       |                                                            ^
+      5| });
+      6| it('top-level contrast floor', () => { expect('a').toBe('b'); });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+
+ FAIL  src/reader.test.ts > top-level contrast floor
+AssertionError: expected 'a' to be 'b' // Object.is equality
+
+Expected: "b"
+Received: "a"
+
+ ❯ src/reader.test.ts:6:52
+      4|   it('lands the cross-ref on its verse', () => { expect(4).toBeLessTha…
+      5| });
+      6| it('top-level contrast floor', () => { expect('a').toBe('b'); });
+       |                                                    ^
+      7|
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  2 failed | 1 passed (3)
+   Start at  18:25:58
+   Duration  423ms (transform 42%, import 30%, tests 19%, worker 8%)
+
+gate(test): FAIL — web lane ran 3 tests and exited 1.

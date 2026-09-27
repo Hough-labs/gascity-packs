@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+# VENDORED from dotmill d674c68, library/skills/gascity/known-red/scripts/
+# known-red (sha256 5567aa7917be956d9b0b2c7e6e0b8cae5b10c6c00db89fe7c7577a9ea43ccb78),
+# so the gastown pack ships its own matcher (gc-cgxps Q2, gcp-4ngf).
+# Adaptations from the mill copy:
+#   a. Every ledger call runs `gc bd ...`, never a bare binary, so it reads the
+#      store gc resolves for this directory. Timeout and fail-closed behaviour
+#      are unchanged: gc missing or erroring means every failure is NEW and
+#      nothing is filed (exit 2). The git calls are unchanged.
+#   b. Docstring, comment and message mentions of ledger verbs say `gc bd`, so
+#      tests/test_no_bare_bd_commands.py passes without an allowlist entry.
+#   c. A pytest id rule: `FAILED <nodeid>` / `ERROR <nodeid>` with `::` in the
+#      nodeid, optionally followed by ` - <message>`, yields pytest:<nodeid> as
+#      pytest printed it. `ERROR <path>.py ...` with no `::` (a collection
+#      error) stays raw:, and marks its segment red.
+# Keep in step with the mill copy: port id-rule changes both ways.
 """known-red — is this red already known on the base branch?
 
 Matches the failures in a gate log against the rig's base-red ledger by EXACT
@@ -23,13 +38,13 @@ RULES THIS SCRIPT ENCODES
   let a known red mask a new one in the same lane.
 - A red segment of the log that yields no id becomes raw:<line>, which is
   always NEW. So a known red in one lane cannot hide an unparsed red in another.
-- The lookup fails closed: if bd or git cannot answer, every failure is NEW and
-  nothing is filed (exit 2).
-- One status per `bd list` call. A repeated --status is not a union; the last
-  one wins and the query returns a confident zero.
-- Metadata is written only with `bd update --set-metadata key=value`, and every
-  write is read back: a bead whose metadata column is not a JSON object freezes
-  every pool create in its rig.
+- The lookup fails closed: if `gc bd` or git cannot answer, every failure is
+  NEW and nothing is filed (exit 2).
+- One status per `gc bd list` call. A repeated --status is not a union; the
+  last one wins and the query returns a confident zero.
+- Metadata is written only with `gc bd update --set-metadata key=value`, and
+  every write is read back: a bead whose metadata column is not a JSON object
+  freezes every pool create in its rig.
 
 Exit codes
   match: 0 every id KNOWN; 1 any id NEW (or no id found); 2 lookup failed;
@@ -50,7 +65,7 @@ from datetime import datetime, timedelta, timezone
 
 LABEL = "base-red"
 # A deferred or blocked base-red bead is still red on base. Each status is its
-# own `bd list` call (see the header).
+# own `gc bd list` call (see the header).
 ACTIVE_STATUSES = ("open", "in_progress", "blocked", "deferred")
 STALE_AFTER = timedelta(hours=72)
 CLOSED_WINDOW = timedelta(days=7)
@@ -94,6 +109,7 @@ INDICATORS = [re.compile(p) for p in (
     r"^In \S+ line \d+:\s*$",                    # shellcheck
     r"^SHELL LINT FAILED",
     r"(?i)exited with code [1-9]",               # bun script / filter exit
+    r"^ERROR \S+\.py\b",                         # pytest error (FAILED is above)
 )]
 
 GO_FAIL_TEST = re.compile(r"^\s*--- FAIL: (\S+)")
@@ -102,6 +118,9 @@ GO_PKG_FAIL = re.compile(r"^FAIL\t(\S+)")
 GO_PKG_DONE = re.compile(r"^(ok|\?)\s+\S")
 BATS_NOT_OK = re.compile(r"^not ok \d+ (.+?)\s*$")
 BATS_FILE = re.compile(r"in test file (.+?), line \d+")
+# pytest's short summary. The lazy nodeid stops at the first " - <message>".
+PYTEST_ID = re.compile(r"^(?:FAILED|ERROR) (\S+?::.+?)(?: - .*)?\s*$")
+PYTEST_ERROR = re.compile(r"^ERROR \S+\.py\b")   # no nodeid: a collection error
 VITEST_CASE = re.compile(r"^ ?FAIL\s+(\S+) > (.+?)\s*$")
 VITEST_SUITE = re.compile(r"^ ?FAIL\s+(\S+) \[ .+ \]\s*$")
 JEST_FILE = re.compile(r"^ ?(FAIL|PASS) +(\S+?)(?: +\(.*\))?\s*$")
@@ -250,6 +269,16 @@ def extract_segment(seg, paths):
             else:
                 add(f"raw:{line.strip()}", line)
             continue
+        # pytest. A collection error has no nodeid, so it is raw: here rather
+        # than dropped: a pytest id elsewhere in the segment would otherwise
+        # stop extract() falling back to raw for it.
+        m = PYTEST_ID.match(line)
+        if m:
+            add(f"pytest:{m.group(1)}", line)
+            continue
+        if PYTEST_ERROR.match(line):
+            add(f"raw:{line.strip()}", line)
+            continue
         # vitest (before jest: both start with FAIL)
         m = VITEST_CASE.match(line)
         if m:
@@ -341,7 +370,7 @@ def git_out(args):
 
 def bd(args):
     try:
-        r = subprocess.run(["bd", *args], capture_output=True, text=True, timeout=BD_TIMEOUT)
+        r = subprocess.run(["gc", "bd", *args], capture_output=True, text=True, timeout=BD_TIMEOUT)
     except (OSError, subprocess.TimeoutExpired) as e:
         return 127, "", str(e)
     return r.returncode, r.stdout, r.stderr
@@ -350,18 +379,18 @@ def bd(args):
 def bd_json(args):
     rc, out, err = bd(args)
     if rc != 0:
-        raise LookupFailed(f"`bd {' '.join(args)}` exited {rc}: {err.strip()[:300]}")
+        raise LookupFailed(f"`gc bd {' '.join(args)}` exited {rc}: {err.strip()[:300]}")
     try:
         return json.loads(out)
     except ValueError:
-        raise LookupFailed(f"`bd {' '.join(args)}` did not return JSON: {out.strip()[:200]}")
+        raise LookupFailed(f"`gc bd {' '.join(args)}` did not return JSON: {out.strip()[:200]}")
 
 
 def bd_list(status, extra=()):
     rows = bd_json(["list", "--label", LABEL, "--status", status, *extra,
                     "--json", "--brief", "--limit", "0"])
     if not isinstance(rows, list):
-        raise LookupFailed(f"`bd list --status {status}` returned {type(rows).__name__}, not a list")
+        raise LookupFailed(f"`gc bd list --status {status}` returned {type(rows).__name__}, not a list")
     return rows
 
 
@@ -369,7 +398,7 @@ def ledger(include_closed):
     rc, out, err = bd(["config", "get", "issue_prefix"])
     scope = out.strip().splitlines()[-1] if rc == 0 and out.strip() else ""
     if not scope:
-        raise LookupFailed(f"cannot name this directory's ledger (`bd config get issue_prefix` exited {rc}: {err.strip()[:200]})")
+        raise LookupFailed(f"cannot name this directory's ledger (`gc bd config get issue_prefix` exited {rc}: {err.strip()[:200]})")
     active = []
     for st in ACTIVE_STATUSES:
         active += bd_list(st)
@@ -519,7 +548,7 @@ def show_bead(bid):
     data = bd_json(["show", bid, "--json"])
     rec = data[0] if isinstance(data, list) and data else data
     if not isinstance(rec, dict) or not rec.get("id"):
-        raise LookupFailed(f"`bd show {bid}` returned no bead")
+        raise LookupFailed(f"`gc bd show {bid}` returned no bead")
     return rec
 
 
@@ -530,11 +559,11 @@ def write_meta(bid, kv, add_label, dry):
     for k, v in kv.items():
         args += ["--set-metadata", f"{k}={v}"]
     if dry:
-        print(f"  (dry-run) bd {' '.join(repr(x) if ' ' in x or chr(10) in x else x for x in args)}")
+        print(f"  (dry-run) gc bd {' '.join(repr(x) if ' ' in x or chr(10) in x else x for x in args)}")
         return
     rc, out, err = bd(args)
     if rc != 0:
-        raise WriteFailed(f"`bd update {bid}` exited {rc}: {err.strip()[:300]}")
+        raise WriteFailed(f"`gc bd update {bid}` exited {rc}: {err.strip()[:300]}")
     # Read it back. A non-object metadata column freezes every pool create in
     # the rig, and --set-metadata turns number-like values into numbers.
     try:
@@ -648,7 +677,7 @@ def cmd_file(a):
             args = ["create", "--type", "bug", "-p", "1", "--labels", LABEL,
                     "--title", ttl, "--body-file", body_file, "--silent"]
             if a.dry_run:
-                print(f"  (dry-run) bd create --type bug -p 1 --labels {LABEL} --title {ttl!r} --body-file <{len(new)} ids>")
+                print(f"  (dry-run) gc bd create --type bug -p 1 --labels {LABEL} --title {ttl!r} --body-file <{len(new)} ids>")
                 bid = "<new>"
             else:
                 rc, out, err = bd(args)
@@ -656,7 +685,7 @@ def cmd_file(a):
                 bid = lines[-1].strip() if lines else ""
                 if rc != 0 or not re.fullmatch(r"[A-Za-z0-9]+-[A-Za-z0-9.]+", bid):
                     raise WriteFailed(
-                        f"`bd create` exited {rc} ({(err or out).strip()[:200]}). A create can land and still "
+                        f"`gc bd create` exited {rc} ({(err or out).strip()[:200]}). A create can land and still "
                         f"fail here: run `known-red list` before filing again, or you file a duplicate.")
             os.unlink(body_file)
             print(f"known-red: filed {bid} for {len(new)} new id(s)")
