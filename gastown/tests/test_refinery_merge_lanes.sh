@@ -22,6 +22,15 @@
 # a formula it is not really executing. Point FORMULA at another copy to check
 # that.
 #
+# Every case runs twice, once per ADAPTER (gcp-l8td.5, B1.2a). The formula
+# adapter stitches the blocks as described here. The script adapter runs
+# gastown/assets/scripts/refinery/merge-push.sh, the same lane as one process,
+# then applies the merge-push step's status table through the same gc stub, so
+# both adapters meet identical assertions. The suite fails unless each adapter
+# ran all 23 cases. Point SCRIPT at another copy to check that equivalence can
+# fail. A handful of script-only cases (config resolution, invariants) run once,
+# after both passes.
+#
 # The stitching glue is the adapter's transcription of the step's prose, and
 # each branch cites the line it follows. The lane is chosen by running the
 # shared prefix and reading MERGE_STRATEGY, never by the test naming it, so the
@@ -53,6 +62,11 @@ FORMULA="${FORMULA:-$ROOT/gastown/formulas/mol-refinery-patrol.toml}"
 # `gc formula list`. That is always the real pack, even when FORMULA points at
 # a scratch copy.
 PACK_FORMULA="$ROOT/gastown/formulas/mol-refinery-patrol.toml"
+SCRIPT="${SCRIPT:-$ROOT/gastown/assets/scripts/refinery/merge-push.sh}"
+# formula | script: which adapter run_lane drives. The runner sets it per pass.
+ADAPTER=formula
+# Cases finished in the current pass.
+PASS_CASES=0
 
 WORK_ID=gcp-work
 WISP_ID=gcp-wisp
@@ -361,7 +375,7 @@ make_bin() {
 git_q() { git "$@" >/dev/null 2>&1; }
 
 new_case() {
-    CASE="$1"
+    CASE="$ADAPTER:$1"
     CASE_START_FAILURES=$FAILURES
     T=$(mktemp -d "${TMPDIR:-/tmp}/merge-lanes.XXXXXX")
     ORIGIN="$T/origin.git"
@@ -409,6 +423,7 @@ end_case() {
         } >&2
     fi
     rm -rf "$T"
+    PASS_CASES=$((PASS_CASES + 1))
 }
 
 # build_rig <shape> — the rig at the moment merge-push runs. Shapes:
@@ -594,9 +609,11 @@ compose_second() {
     } >"$T/lane2.sh"
 }
 
-# Runs one lane script inside the refinery clone, as the patrol does. The cd
-# fails closed: a lane run anywhere else would fetch and push the origin of
-# whatever checkout the suite was started from.
+# run_process <script> [arg ...] — runs one lane script inside the refinery
+# clone, as the patrol does. The cd fails closed: a lane run anywhere else would
+# fetch and push the origin of whatever checkout the suite was started from.
+# SCRIPT_ENV (the script adapter's) and then LANE_ENV_EXTRA (the case's) add
+# to the environment; a case's entry wins over the adapter's.
 run_process() {
     (
         cd "$REFINERY" || exit 90
@@ -614,18 +631,28 @@ run_process() {
             STUB_REST_CREATED="$T/rest-created" \
             STUB_ORIGIN_URL="$ORIGIN_URL_GITHUB" STUB_UNEXPECTED="$T/unexpected" \
             LANE_STRATEGY_FILE="$T/lane" \
+            ${SCRIPT_ENV[@]+"${SCRIPT_ENV[@]}"} \
             ${LANE_ENV_EXTRA[@]+"${LANE_ENV_EXTRA[@]}"} \
-            "$BASH" "$1"
+            "$BASH" "$@"
     ) >>"$T/lane.out" 2>&1
 }
 
-# run_lane [var=value ...] — run merge-push against the rig and bead. Sets
-# LANE_STATUS (the exit status of the last process run) and LANE (the strategy
-# the prefix chose, empty if the prefix itself stopped).
+# run_lane [var=value ...] — run merge-push against the rig and bead through
+# the current ADAPTER. Sets LANE_STATUS (the exit status of the last process
+# run, or for the script the status the merge-push step's table leaves) and LANE
+# (the strategy the lane chose, empty if it stopped before choosing).
+#
+# The formula adapter renders binding_prefix=gastown., the value the patrol
+# really pours with for testrig/gastown.refinery; the script derives the same
+# value from GC_AGENT.
 run_lane() {
     LANE_STATUS=""
     LANE=""
-    if ! extract_blocks "$T/blocks" rig_name=testrig "$@" 2>>"$T/lane.out"; then
+    if [ "$ADAPTER" = script ]; then
+        run_script_lane "$@"
+        return
+    fi
+    if ! extract_blocks "$T/blocks" rig_name=testrig binding_prefix=gastown. "$@" 2>>"$T/lane.out"; then
         fail "could not extract the merge-push blocks from $FORMULA"
         LANE_STATUS=70
         return
@@ -643,6 +670,82 @@ run_lane() {
         run_process "$T/lane2.sh"
         LANE_STATUS=$?
     fi
+}
+
+# --- the script adapter -----------------------------------------------------
+
+# write_config_json <file> [var=value ...] — the city config the script reads
+# through MERGE_PUSH_CONFIG_JSON, with run_lane's overrides as testrig's
+# FormulaVars. rig_name maps to nothing, because GC_RIG supplies the rig.
+write_config_json() {
+    local file="$1" kv vars='{}'
+    shift
+    for kv in "$@"; do
+        case "${kv%%=*}" in
+        rig_name) ;;
+        require_merge_approval | review_agent | delete_merged_branches | target_branch | binding_prefix)
+            vars=$(jq -c --arg k "${kv%%=*}" --arg v "${kv#*=}" '. + {($k): $v}' <<<"$vars")
+            ;;
+        *)
+            fail "the script adapter has no FormulaVars mapping for ${kv%%=*}"
+            return 1
+            ;;
+        esac
+    done
+    jq -n --argjson vars "$vars" \
+        '{config: {Rigs: [{Name: "testrig", DefaultBranch: "integration", FormulaVars: $vars}]}}' >"$file"
+}
+
+# The merge-push step's status table (gcp-l8td.3 DESIGN § Exit status
+# contract). STAND-IN for B1.2b's step table (gcp-l8td.6), which has not been
+# written yet: it runs through the same gc stub, so the journal and LANE_STATUS
+# assertions every case makes hold unchanged.
+#   0, 4, 11            continue: LANE_STATUS 0
+#   1, 2, 3, 5, 6, 7, 8 drain-ack, stop: LANE_STATUS 1
+#   9                   next-iteration's pour/assign/burn, drain-ack: 1
+# shellcheck disable=SC2016 # the step script's $GC_AGENT etc. expand in the step
+step_table() {
+    case "$1" in
+    0 | 4 | 11)
+        LANE_STATUS=0
+        return
+        ;;
+    1 | 2 | 3 | 5 | 6 | 7 | 8)
+        printf '%s\n' 'gc runtime drain-ack' >"$T/step.sh"
+        ;;
+    9)
+        printf '%s\n' \
+            'NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch=integration --var rig_name=testrig --var binding_prefix=gastown. --json | jq -r ".new_epic_id // empty")' \
+            'gc bd update "$NEXT" --assignee="$GC_AGENT"' \
+            'gc bd mol burn "$GC_BEAD_ID" --force' \
+            'gc runtime drain-ack' >"$T/step.sh"
+        ;;
+    *)
+        fail "the script exited $1, a status the merge-push step's table does not have"
+        LANE_STATUS=$1
+        return
+        ;;
+    esac
+    run_process "$T/step.sh" || fail "the step table's gc calls failed"
+    LANE_STATUS=1
+}
+
+# Runs merge-push.sh once, under run_process's exact environment plus the
+# config fixture. Sets SCRIPT_STATUS (the script's own exit status), LANE (from
+# its `merge-push: LANE` line) and LANE_STATUS (via step_table).
+run_script_lane() {
+    local SCRIPT_ENV=(MERGE_PUSH_CONFIG_JSON="$T/config.json")
+    SCRIPT_STATUS=""
+    if ! write_config_json "$T/config.json" "$@"; then
+        LANE_STATUS=70
+        return
+    fi
+    run_process "$SCRIPT" --work "$WORK_ID"
+    SCRIPT_STATUS=$?
+    LANE=$(sed -n 's/^merge-push: LANE //p' "$T/lane.out" | tail -n 1)
+    tail -n 1 "$T/lane.out" | grep -qE '^merge-push: RESULT [0-9]+ ' ||
+        fail "the script's last line is not its RESULT line: $(tail -n 1 "$T/lane.out")"
+    step_table "$SCRIPT_STATUS"
 }
 
 # --- assertions -------------------------------------------------------------
@@ -700,8 +803,8 @@ expect_false_completion_halt() {
     expect "session nudges" "$(count_logged gc "gc session nudge ")" 2
     grep -F "gc session nudge mayor " "$T/gc.log" | grep -qF "FALSE-COMPLETION HALT" ||
         fail "no FALSE-COMPLETION HALT nudge to mayor"
-    grep -F "gc session nudge testrig/witness " "$T/gc.log" | grep -qF "FALSE-COMPLETION HALT" ||
-        fail "no FALSE-COMPLETION HALT nudge to the witness (testrig/witness)"
+    grep -F "gc session nudge testrig/gastown.witness " "$T/gc.log" | grep -qF "FALSE-COMPLETION HALT" ||
+        fail "no FALSE-COMPLETION HALT nudge to the witness (testrig/gastown.witness)"
     expect_drained
     expect_status 1
     expect_target_unchanged
@@ -1130,12 +1233,189 @@ test_lane_local_mails_mayor() {
     end_case
 }
 
+# --- cases: the script only -------------------------------------------------
+
+# resolve_in_source_mode <config-json> <GC_AGENT> [flag ...] — source the script
+# in source-only mode, run resolve_config, and print the resolved values one
+# key=value per line. Exits with resolve_config's status.
+resolve_in_source_mode() {
+    local config="$1" agent="$2"
+    shift 2
+    (
+        # The script is written for, and characterized under, a plain shell.
+        set +uo pipefail
+        unset REFINERY_GH
+        export GC_RIG=testrig GC_AGENT="$agent" MERGE_PUSH_CONFIG_JSON="$config"
+        export MERGE_PUSH_SOURCE_ONLY=1
+        # shellcheck source=/dev/null # the script under test, chosen at run time
+        . "$SCRIPT" || exit 91
+        resolve_config --work "$WORK_ID" "$@" >/dev/null || exit
+        printf '%s\n' "require=$CFG_REQUIRE_MERGE_APPROVAL" "review=$CFG_REVIEW_AGENT" \
+            "delete=$CFG_DELETE_MERGED_BRANCHES" "target=$CFG_TARGET_DEFAULT" \
+            "prefix=$CFG_BINDING_PREFIX" "rig=$CFG_RIG"
+    )
+}
+
+# resolved <output> <key> — one value from resolve_in_source_mode's output.
+resolved() {
+    printf '%s\n' "$1" | sed -n "s/^$2=//p"
+}
+
+# write_rig_config <file> <FormulaVars-json> — testrig (and a decoy rig whose
+# values must never be read) with the given FormulaVars.
+write_rig_config() {
+    jq -n --argjson vars "$2" '{config: {Rigs: [
+        {Name: "otherrig", DefaultBranch: "decoy", FormulaVars: {review_agent: "decoy", target_branch: "decoy"}},
+        {Name: "testrig", DefaultBranch: "integration", FormulaVars: $vars}]}}' >"$1"
+}
+
+test_script_invariants() {
+    new_case script_invariants
+    [ -x "$SCRIPT" ] || fail "$SCRIPT is not executable"
+    expect "template placeholders in the script" "$(grep -c '{{' "$SCRIPT")" 0
+    expect "patrol-loop control in the script" "$(grep -cE 'drain-ack|gc bd mol (wisp|burn)' "$SCRIPT")" 0
+    end_case
+}
+
+test_config_precedence() {
+    local out
+    new_case config_precedence
+    write_rig_config "$T/vars.json" '{"review_agent": "specialists.iris", "require_merge_approval": "true",
+        "delete_merged_branches": "false", "target_branch": "develop", "binding_prefix": "vars."}'
+    write_rig_config "$T/bare.json" '{}'
+    write_rig_config "$T/empty.json" '{"review_agent": "", "target_branch": "", "require_merge_approval": ""}'
+
+    # A flag beats FormulaVars.
+    out=$(resolve_in_source_mode "$T/vars.json" testrig/gastown.refinery \
+        --require-approval off --review-agent flag.agent --delete-merged-branches maybe \
+        --target-default main --binding-prefix flag.) || fail "resolve_config failed with flags"
+    expect "require_merge_approval (flag over FormulaVars)" "$(resolved "$out" require)" off
+    expect "review_agent (flag over FormulaVars)" "$(resolved "$out" review)" flag.agent
+    expect "delete_merged_branches (flag over FormulaVars)" "$(resolved "$out" delete)" maybe
+    expect "target default (flag over FormulaVars)" "$(resolved "$out" target)" main
+    expect "binding_prefix (flag over FormulaVars)" "$(resolved "$out" prefix)" flag.
+
+    # FormulaVars beat derived values and the embedded defaults.
+    out=$(resolve_in_source_mode "$T/vars.json" testrig/gastown.refinery) ||
+        fail "resolve_config failed with FormulaVars"
+    expect "require_merge_approval (FormulaVars over default)" "$(resolved "$out" require)" true
+    expect "review_agent (FormulaVars over default)" "$(resolved "$out" review)" specialists.iris
+    expect "delete_merged_branches (FormulaVars over default)" "$(resolved "$out" delete)" false
+    expect "target default (FormulaVars over DefaultBranch)" "$(resolved "$out" target)" develop
+    expect "binding_prefix (FormulaVars over GC_AGENT)" "$(resolved "$out" prefix)" vars.
+    expect "rig (GC_RIG)" "$(resolved "$out" rig)" testrig
+
+    # Derived values beat the defaults; the defaults apply when nothing speaks.
+    out=$(resolve_in_source_mode "$T/bare.json" testrig/gastown.refinery) ||
+        fail "resolve_config failed with empty FormulaVars"
+    expect "target default (derived from DefaultBranch)" "$(resolved "$out" target)" integration
+    expect "binding_prefix (derived from GC_AGENT)" "$(resolved "$out" prefix)" gastown.
+    expect "require_merge_approval (default)" "$(resolved "$out" require)" false
+    expect "review_agent (default)" "$(resolved "$out" review)" ""
+    expect "delete_merged_branches (default)" "$(resolved "$out" delete)" true
+
+    # A FormulaVars key that is PRESENT wins even when empty.
+    out=$(resolve_in_source_mode "$T/empty.json" testrig/gastown.refinery) ||
+        fail "resolve_config failed with present-but-empty FormulaVars"
+    expect "review_agent (present but empty)" "$(resolved "$out" review)" ""
+    expect "target default (present but empty, not DefaultBranch)" "$(resolved "$out" target)" ""
+    expect "require_merge_approval (present but empty)" "$(resolved "$out" require)" ""
+    end_case
+}
+
+test_config_binding_prefix_derivation() {
+    local out status
+    new_case config_binding_prefix_derivation
+    write_rig_config "$T/bare.json" '{}'
+    out=$(resolve_in_source_mode "$T/bare.json" testrig/gastown.refinery) ||
+        fail "resolve_config failed for testrig/gastown.refinery"
+    expect "binding_prefix for testrig/gastown.refinery" "$(resolved "$out" prefix)" gastown.
+    out=$(resolve_in_source_mode "$T/bare.json" testrig/refinery) ||
+        fail "resolve_config failed for testrig/refinery"
+    expect "binding_prefix for testrig/refinery" "$(resolved "$out" prefix)" ""
+    # Underivable: the whole script exits 1 before it touches anything.
+    (
+        cd "$T" || exit 90
+        env -i PATH="$HARNESS/bin-gh" HOME="$T/home" TMPDIR="$T/tmp" \
+            GC_RIG=testrig GC_AGENT=other/gastown.refinery \
+            MERGE_PUSH_CONFIG_JSON="$T/bare.json" \
+            GC_STUB_LOG="$T/gc.log" STUB_UNEXPECTED="$T/unexpected" \
+            "$BASH" "$SCRIPT" --work "$WORK_ID"
+    ) >"$T/lane.out" 2>&1
+    status=$?
+    expect "the script's exit status for GC_AGENT=other/gastown.refinery" "$status" 1
+    output_has 'cannot derive binding_prefix' || fail "no 'cannot derive binding_prefix' in the output"
+    tail -n 1 "$T/lane.out" | grep -qE '^merge-push: RESULT 1 ' ||
+        fail "the last line is not 'merge-push: RESULT 1 ...': $(tail -n 1 "$T/lane.out")"
+    [ ! -s "$T/gc.log" ] || fail "the script called gc before rejecting its config: $(tr '\n' ';' <"$T/gc.log")"
+    end_case
+}
+
+test_config_unreadable_turns_gate_on() {
+    local ADAPTER=script
+    new_case config_unreadable_turns_gate_on
+    build_rig unmerged
+    write_bead
+    LANE_ENV_EXTRA=(MERGE_PUSH_CONFIG_JSON="$T/no-such-config.json")
+    run_lane
+    expect_lane mr
+    expect "the script's exit status" "$SCRIPT_STATUS" 4
+    output_has 'require_merge_approval resolves ON \(fail closed\)' || fail "no fail-closed line in the output"
+    output_has 'APPROVAL GATE REFUSED' || fail "no 'APPROVAL GATE REFUSED' in the output"
+    expect_not_closed
+    expect_target_unchanged
+    end_case
+}
+
+test_config_defaults_match_formula_vars() {
+    local out name key want
+    new_case config_defaults_match_formula_vars
+    write_rig_config "$T/bare.json" '{}'
+    out=$(resolve_in_source_mode "$T/bare.json" testrig/gastown.refinery) ||
+        fail "resolve_config failed with empty FormulaVars"
+    for name in require_merge_approval:require review_agent:review delete_merged_branches:delete; do
+        key="${name#*:}"
+        name="${name%%:*}"
+        want=$(python3 - "$FORMULA" "$name" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as handle:
+    print(str(tomllib.load(handle)["vars"][sys.argv[2]].get("default", "")))
+PY
+        ) || fail "could not read [vars.$name].default from $FORMULA"
+        expect "the script's embedded default for $name vs [vars.$name].default" "$(resolved "$out" "$key")" "$want"
+    done
+    end_case
+}
+
+test_script_honors_refinery_gh() {
+    local ADAPTER=script
+    new_case script_honors_refinery_gh
+    build_rig unmerged
+    write_bead merge_strategy=mr
+    LANE_BIN="$HARNESS/bin-refinery-gh"
+    LANE_ENV_EXTRA=(REFINERY_GH=refinery-gh)
+    run_lane
+    expect_lane mr
+    expect_status 0
+    grep -qE '^gh pr (create|view) ' "$T/gh.log" ||
+        fail "refinery-gh received no pull request call; its calls: $(tr '\n' ';' <"$T/gh.log")"
+    expect "pr_url" "$(meta pr_url)" "$PR_URL"
+    expect "close reason" "$(bead close_reason)" "Pull request ready: $PR_URL"
+    end_case
+}
+
 # --- runner -----------------------------------------------------------------
 
 HARNESS=$(mktemp -d "${TMPDIR:-/tmp}/merge-lanes-harness.XXXXXX")
 trap 'rm -rf "$HARNESS"' EXIT
 make_bin "$HARNESS/bin-gh" with-gh
 make_bin "$HARNESS/bin-nogh"
+# No gh at all, only the gh stub installed under another name.
+make_bin "$HARNESS/bin-refinery-gh"
+write_gh_stub "$HARNESS"
+mv -f "$HARNESS/gh" "$HARNESS/bin-refinery-gh/refinery-gh"
 
 # Fail fast and loudly if the formula no longer carries every block.
 if ! extract_blocks "$HARNESS/probe" rig_name=testrig; then
@@ -1143,29 +1423,51 @@ if ! extract_blocks "$HARNESS/probe" rig_name=testrig; then
     exit 1
 fi
 
-test_lane_direct_lands_and_closes
-test_lane_direct_already_merged_ancestor
-test_lane_direct_already_merged_patch_id
-test_lane_direct_false_completion_halts
-test_lane_direct_lost_race_then_lands
-test_lane_direct_push_veto_status_7
-test_lane_direct_approval_on_promotes_to_mr
-test_lane_mr_creates_pr_via_gh
-test_lane_mr_reuses_existing_pr
-test_lane_mr_rest_fallback_without_gh
-test_lane_mr_existing_pr_not_found_blocks
-test_lane_mr_existing_pr_not_open_blocks
-test_lane_mr_existing_pr_wrong_head_blocks
-test_lane_mr_existing_pr_wrong_base_blocks
-test_lane_mr_existing_pr_wrong_repo_blocks
-test_lane_mr_existing_pr_wrong_head_repo_blocks
-test_lane_mr_4a_closes_pull_request_ready
-test_lane_mr_4b_refused_parks
-test_lane_mr_4b_approved_lands_and_closes
-test_lane_mr_zero_diff_halts
-test_lane_local_mails_mayor
-test_lane_direct_cleanup_with_target_in_second_worktree
-test_lane_mr_cleanup_with_target_in_second_worktree
+run_all_cases() {
+    PASS_CASES=0
+    test_lane_direct_lands_and_closes
+    test_lane_direct_already_merged_ancestor
+    test_lane_direct_already_merged_patch_id
+    test_lane_direct_false_completion_halts
+    test_lane_direct_lost_race_then_lands
+    test_lane_direct_push_veto_status_7
+    test_lane_direct_approval_on_promotes_to_mr
+    test_lane_mr_creates_pr_via_gh
+    test_lane_mr_reuses_existing_pr
+    test_lane_mr_rest_fallback_without_gh
+    test_lane_mr_existing_pr_not_found_blocks
+    test_lane_mr_existing_pr_not_open_blocks
+    test_lane_mr_existing_pr_wrong_head_blocks
+    test_lane_mr_existing_pr_wrong_base_blocks
+    test_lane_mr_existing_pr_wrong_repo_blocks
+    test_lane_mr_existing_pr_wrong_head_repo_blocks
+    test_lane_mr_4a_closes_pull_request_ready
+    test_lane_mr_4b_refused_parks
+    test_lane_mr_4b_approved_lands_and_closes
+    test_lane_mr_zero_diff_halts
+    test_lane_local_mails_mayor
+    test_lane_direct_cleanup_with_target_in_second_worktree
+    test_lane_mr_cleanup_with_target_in_second_worktree
+    echo "$ADAPTER: $PASS_CASES cases"
+}
+
+ADAPTER=formula
+run_all_cases
+FORMULA_CASES=$PASS_CASES
+ADAPTER=script
+run_all_cases
+SCRIPT_CASES=$PASS_CASES
+if [ "$FORMULA_CASES" -ne 23 ] || [ "$SCRIPT_CASES" -ne 23 ]; then
+    echo "FAIL: want 23 cases through each adapter; formula ran $FORMULA_CASES, script ran $SCRIPT_CASES" >&2
+    FAILURES=$((FAILURES + 1))
+fi
+
+test_script_invariants
+test_config_precedence
+test_config_binding_prefix_derivation
+test_config_unreadable_turns_gate_on
+test_config_defaults_match_formula_vars
+test_script_honors_refinery_gh
 
 if [ "$FAILURES" -ne 0 ]; then
     echo "refinery merge-lane characterization: $FAILURES failure(s)" >&2
