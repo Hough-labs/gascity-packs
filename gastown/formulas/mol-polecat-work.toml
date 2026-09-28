@@ -351,6 +351,213 @@ on latest {{base_branch}}, deps installed, worktree and branch recorded
 on the bead."""
 
 [[steps]]
+id = "preflight-tests"
+title = "Verify pre-flights pass on base branch"
+needs = ["workspace-setup"]
+description = """
+Check if the codebase is healthy BEFORE starting your work. Override of
+mol-polecat-base `preflight-tests`: every phase runs through one gate log, and
+the pack's `known-red` matcher (`assets/scripts/known-red`) reads that log
+against the rig's base-red ledger. A red an open base-red bead already carries
+is cited, not re-diagnosed and not re-filed (gc-cgxps).
+
+**Config: typecheck_command = {{typecheck_command}}**
+**Config: lint_command = {{lint_command}}**
+**Config: test_command = {{test_command}}**
+
+**Skip this step if resuming a rejected branch** — pre-flights were
+already verified on the prior attempt. Close this step and proceed.
+
+**1. Run pre-flights (skip empty commands silently).** Run this whole block
+in ONE shell. §2 and §3 need the functions and variables it sets, so they sit
+at its end instead of in blocks of their own.
+
+A phase that an open base-red bead already covers is not re-run on base: all
+that run could do is confirm a red the ledger already holds. A NEW red in that
+phase is still caught at self-review, which runs every phase and re-runs each
+new failure on base. The skip fails closed: when `known-red list` errors or its
+answer does not parse, the phase runs.
+
+A phase is named after the formula var that holds its command: `setup`,
+`typecheck`, `lint`, `build`, `test`, `affected-tests`. A configured command's
+red is never filed under any other name, because the skip keys on the name: a
+pytest red filed as `phase=test` would silently skip `go test` on a rig whose
+test_command is `go test` (gcp-98gh).
+
+```bash
+# --- resolve-known-red:begin ---
+# resolve_known_red <formula> prints the path of the pack's known-red and
+# returns 0, or returns 1. Located the way mol-refinery-patrol's
+# resolve_approval_gate is: the named formula's own source anchors the pack, so
+# the matcher is always the copy shipped beside the formula being run.
+# GC_PACK_DIR is only a fallback, because gc exports it to pack commands and
+# not to agent shells.
+resolve_known_red() {
+    rkr_rel="assets/scripts/known-red"
+    rkr_city="${GC_CITY:-${GC_CITY_PATH:-}}"
+    if [ -n "$rkr_city" ]; then
+        rkr_json=$(gc formula list --city "$rkr_city" --json 2>/dev/null)
+    else
+        rkr_json=$(gc formula list --json 2>/dev/null)
+    fi
+    rkr_src=$(printf '%s' "$rkr_json" |
+        jq -r --arg f "$1" '.formulas[]? | select(.name == $f) | .source // empty' 2>/dev/null |
+        head -1)
+    if [ -n "$rkr_src" ]; then
+        # <pack>/formulas/<formula>.toml -> <pack>
+        rkr_pack=$(dirname "$(dirname "$rkr_src")")
+        if [ -x "$rkr_pack/$rkr_rel" ]; then
+            echo "$rkr_pack/$rkr_rel"
+            return 0
+        fi
+    fi
+    if [ -n "${GC_PACK_DIR:-}" ] && [ -x "$GC_PACK_DIR/$rkr_rel" ]; then
+        echo "$GC_PACK_DIR/$rkr_rel"
+        return 0
+    fi
+    return 1
+}
+# --- resolve-known-red:end ---
+# --- gate-run:begin ---
+# gate_run <phase> '<command>' appends one segment known-red can read to
+# $GATE_LOG: a `gate(<phase>): RUN` header, the command's output, then
+# `gate(<phase>): PASS` or `gate(<phase>): FAIL`. An empty command is a phase
+# the rig does not configure: it writes nothing and returns 0. The command is
+# passed single-quoted and eval'd, so double quotes and $(...) in it work.
+gate_run() {
+    gr_phase="$1"
+    gr_cmd="$2"
+    [ -n "${gr_cmd//[[:space:]]/}" ] || return 0
+    echo "gate($gr_phase): RUN $(printf '%s' "$gr_cmd" | tr -s '[:space:]' ' ')" | tee -a "$GATE_LOG"
+    if ( eval "$gr_cmd" ) </dev/null >>"$GATE_LOG" 2>&1; then
+        echo "gate($gr_phase): PASS" | tee -a "$GATE_LOG"
+        return 0
+    fi
+    echo "gate($gr_phase): FAIL" >>"$GATE_LOG"
+    tail -n 40 "$GATE_LOG"
+    return 1
+}
+# --- gate-run:end ---
+# --- known-red-phase-skip:begin ---
+# kr_phase_covered <phase> prints the ids of the open base-red beads covering
+# that phase and returns 0, or returns 1. It returns 1 for no covering bead, a
+# failed lookup, and output it cannot parse: a phase is never skipped on an
+# answer nobody verified. Needs KR set to the known-red path.
+kr_phase_covered() {
+    kpc_out=$("$KR" list --phase "$1" 2>/dev/null) || return 1
+    printf '%s' "$kpc_out" | awk '
+        NR == 1 {
+            if ($0 !~ /^known-red: [0-9]+ base-red bead[(]s[)] in ledger /) { bad = 1; exit }
+            want = $2 + 0
+            next
+        }
+        /^[A-Za-z0-9]+-[A-Za-z0-9.]+ / { ids = ids (ids == "" ? "" : " ") $1; n++ }
+        END {
+            if (bad || NR == 0 || want == 0 || n != want) exit 1
+            print ids
+        }'
+}
+# --- known-red-phase-skip:end ---
+# --- preflight-phases:begin ---
+KR=$(resolve_known_red mol-polecat-work) || KR=""
+GATE_LOG="$(git rev-parse --git-dir)/preflight-gate.log"
+: > "$GATE_LOG"
+[ -n "$KR" ] || echo "WARN known-red not found; running every phase and filing by hand"
+preflight_phase() {
+    [ -n "${2//[[:space:]]/}" ] || return 0
+    if [ -n "$KR" ] && pp_ids=$(kr_phase_covered "$1"); then
+        echo "phase $1 not re-run on base: known red $pp_ids" | tee -a "$GATE_LOG"
+        return 0
+    fi
+    gate_run "$1" "$2"
+}
+preflight_phase typecheck '{{typecheck_command}}'
+preflight_phase lint '{{lint_command}}'
+preflight_phase test '{{test_command}}'
+# --- preflight-phases:end ---
+# --- preflight-red:begin ---
+if ! grep -q '^gate([A-Za-z0-9_-]*): FAIL' "$GATE_LOG"; then
+    echo "PRE-FLIGHTS GREEN on {{base_branch}} (log: $GATE_LOG)"
+else
+    CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
+    WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
+    WITNESS_TARGET="${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness"
+    if [ -z "$KR" ]; then
+        echo "PRE-FLIGHTS RED and known-red is unavailable: file by hand with the fallback block in §3."
+    else
+        KR_OUT=$("$KR" match "$GATE_LOG" 2>&1)
+        KR_CODE=$?
+        printf '%s\\n' "$KR_OUT"
+        case "$KR_CODE" in
+        0|3)
+            KNOWN_IDS=$(printf '%s\\n' "$KR_OUT" | awk '$1 == "KNOWN" { print $2 }' | sort -u | paste -sd ' ' -)
+            FIXED_IDS=$(printf '%s\\n' "$KR_OUT" | awk '$1 == "FIXED-UPSTREAM" { print $2 }' | sort -u | paste -sd ' ' -)
+            gc bd note "$WORK_BEAD_ID" --stdin <<KNOWN_RED_NOTE
+Pre-flight on {{base_branch}}: every red is already known (known-red match exit $KR_CODE). Filed nothing.
+KNOWN: ${KNOWN_IDS:-none}
+FIXED-UPSTREAM (the next rebase picks these up): ${FIXED_IDS:-none}
+KNOWN_RED_NOTE
+            echo "PRE-FLIGHTS RED, all KNOWN: ${KNOWN_IDS:-none}; FIXED-UPSTREAM: ${FIXED_IDS:-none}. Filed nothing. Proceed."
+            ;;
+        1)
+            FILE_OUT=$("$KR" file "$GATE_LOG" --summary "red in pre-flight on {{base_branch}} at $(git rev-parse --short HEAD)" --from "$WORK_BEAD_ID" 2>&1)
+            FILE_CODE=$?
+            printf '%s\\n' "$FILE_OUT"
+            FILED=$(printf '%s\\n' "$FILE_OUT" | awk '$1 == "known-red:" && $2 == "filed" { print $3 }' | paste -sd ' ' -)
+            UNFILED=$(printf '%s\\n' "$FILE_OUT" | awk '$1 ~ /^raw:/')
+            case "$FILE_CODE" in
+            0) FILE_NOTE="" ;;
+            1) FILE_NOTE="These reds have no stable id, so known-red cannot file them; quote them on $WORK_BEAD_ID: $UNFILED" ;;
+            *) FILE_NOTE="known-red file exited $FILE_CODE, so nothing may be filed. A create can land and still fail: run known-red list before filing again." ;;
+            esac
+            gc mail send "$WITNESS_TARGET" -s "NOTICE: {{base_branch}} has failing pre-flights" -m "Filed: ${FILED:-none}. Proceeding with $WORK_BEAD_ID. $FILE_NOTE"
+            echo "PRE-FLIGHTS RED, NEW reds filed: ${FILED:-none}. Proceed. $FILE_NOTE"
+            ;;
+        *)
+            gc mail send "$WITNESS_TARGET" -s "NOTICE: {{base_branch}} has failing pre-flights" -m "known-red lookup failed; not filed (match exit $KR_CODE). Log: $GATE_LOG. Proceeding with $WORK_BEAD_ID."
+            echo "PRE-FLIGHTS RED, known-red lookup failed (exit $KR_CODE); filed nothing. Proceed."
+            ;;
+        esac
+    fi
+fi
+# --- preflight-red:end ---
+```
+
+**2. If pre-flights pass:** proceed. The block prints `PRE-FLIGHTS GREEN`
+when `$GATE_LOG` has no `gate(...): FAIL` line. A phase it skipped as known
+red does not count as a failure.
+
+**3. If pre-flights fail on {{base_branch}}:** the end of the block has already
+run `known-red match` on the log and acted on its exit code:
+
+- **0 or 3** — every red is KNOWN. It notes the KNOWN bead ids on your work
+  bead, plus, for 3, the FIXED-UPSTREAM ids the next rebase picks up. It files
+  nothing.
+- **1** — some red is NEW. `known-red file` records it (a new base-red bead, or
+  a refreshed last-seen on a known one), and the witness NOTICE names the bead
+  id it filed.
+- **2** — the ledger lookup failed. Nothing is filed, and the witness NOTICE
+  says "known-red lookup failed; not filed".
+
+Every branch proceeds. Do NOT fix pre-existing failures — that's not your
+assignment.
+
+FORBIDDEN: Pushing to {{base_branch}}. FORBIDDEN: Fixing pre-existing failures.
+
+Only when the block printed `WARN known-red not found`, file by hand as
+before:
+
+```bash
+CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
+WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
+gc bd create --title "Pre-existing failure: <description>" --type bug --priority 1
+gc mail send <rig>/witness -s "NOTICE: {{base_branch}} has failing pre-flights" \\
+  -m "Filed: <bead-id>. Proceeding with $WORK_BEAD_ID."
+```
+
+**Exit criteria:** Pre-flights pass (or pre-existing bug filed), ready to implement."""
+
+[[steps]]
 id = "self-review"
 title = "Self-review and run tests"
 needs = ["implement"]
@@ -378,33 +585,151 @@ git diff --stat origin/{{base_branch}}...HEAD
 Check for: bugs, security issues, style violations, missing error handling,
 debug cruft, unintended file changes. Fix anything you find.
 
-**2. Run quality checks (skip empty commands):**
+**2. Run quality checks, then tests (skip empty commands).** One block, in ONE
+shell: every check and the test run append to the same gate log, which
+`known-red` reads in §3. Tests are the rig's `affected_tests_command` when it
+sets one, else its `test_command` as configured (which may itself select by
+diff). Each phase is named after the formula var that holds its command.
 ```bash
-{{setup_command}}
-{{typecheck_command}}
-{{lint_command}}
-{{build_command}}
-```
-
-**3. Run tests — the rig's `affected_tests_command` when it sets one, else its
-`test_command` as configured (which may itself select by diff):**
-```bash
+# --- resolve-known-red:begin ---
+# resolve_known_red <formula> prints the path of the pack's known-red and
+# returns 0, or returns 1. Located the way mol-refinery-patrol's
+# resolve_approval_gate is: the named formula's own source anchors the pack, so
+# the matcher is always the copy shipped beside the formula being run.
+# GC_PACK_DIR is only a fallback, because gc exports it to pack commands and
+# not to agent shells.
+resolve_known_red() {
+    rkr_rel="assets/scripts/known-red"
+    rkr_city="${GC_CITY:-${GC_CITY_PATH:-}}"
+    if [ -n "$rkr_city" ]; then
+        rkr_json=$(gc formula list --city "$rkr_city" --json 2>/dev/null)
+    else
+        rkr_json=$(gc formula list --json 2>/dev/null)
+    fi
+    rkr_src=$(printf '%s' "$rkr_json" |
+        jq -r --arg f "$1" '.formulas[]? | select(.name == $f) | .source // empty' 2>/dev/null |
+        head -1)
+    if [ -n "$rkr_src" ]; then
+        # <pack>/formulas/<formula>.toml -> <pack>
+        rkr_pack=$(dirname "$(dirname "$rkr_src")")
+        if [ -x "$rkr_pack/$rkr_rel" ]; then
+            echo "$rkr_pack/$rkr_rel"
+            return 0
+        fi
+    fi
+    if [ -n "${GC_PACK_DIR:-}" ] && [ -x "$GC_PACK_DIR/$rkr_rel" ]; then
+        echo "$GC_PACK_DIR/$rkr_rel"
+        return 0
+    fi
+    return 1
+}
+# --- resolve-known-red:end ---
+# --- gate-run:begin ---
+# gate_run <phase> '<command>' appends one segment known-red can read to
+# $GATE_LOG: a `gate(<phase>): RUN` header, the command's output, then
+# `gate(<phase>): PASS` or `gate(<phase>): FAIL`. An empty command is a phase
+# the rig does not configure: it writes nothing and returns 0. The command is
+# passed single-quoted and eval'd, so double quotes and $(...) in it work.
+gate_run() {
+    gr_phase="$1"
+    gr_cmd="$2"
+    [ -n "${gr_cmd//[[:space:]]/}" ] || return 0
+    echo "gate($gr_phase): RUN $(printf '%s' "$gr_cmd" | tr -s '[:space:]' ' ')" | tee -a "$GATE_LOG"
+    if ( eval "$gr_cmd" ) </dev/null >>"$GATE_LOG" 2>&1; then
+        echo "gate($gr_phase): PASS" | tee -a "$GATE_LOG"
+        return 0
+    fi
+    echo "gate($gr_phase): FAIL" >>"$GATE_LOG"
+    tail -n 40 "$GATE_LOG"
+    return 1
+}
+# --- gate-run:end ---
+KR=$(resolve_known_red mol-polecat-work) || KR=""
+GATE_LOG="$(git rev-parse --git-dir)/self-review-gate.log"
+: > "$GATE_LOG"
+gate_run setup '{{setup_command}}'
+gate_run typecheck '{{typecheck_command}}'
+gate_run lint '{{lint_command}}'
+gate_run build '{{build_command}}'
 if [ -n "{{affected_tests_command}}" ]; then
     # Rig has an affected-tests detector. Run only the tests our diff
     # touches — same logic the rig's CI uses to dispatch test workflows.
     # The command must read `git diff --name-only origin/{{base_branch}}...HEAD`
     # internally and execute the relevant test subset.
-    {{affected_tests_command}}
+    gate_run affected-tests '{{affected_tests_command}}'
 else
     # No affected detector — run test_command as the rig configured it.
     # That is not necessarily the full suite: a rig's test_command may
     # itself select by diff.
-    {{test_command}}
+    gate_run test '{{test_command}}'
+fi
+if ! grep -q '^gate([A-Za-z0-9_-]*): FAIL' "$GATE_LOG"; then
+    echo "SELF-REVIEW GATES GREEN (log: $GATE_LOG)"
+elif [ -z "$KR" ]; then
+    echo "SELF-REVIEW RED (log: $GATE_LOG). known-red not found: attribute by hand, §3."
+else
+    echo "SELF-REVIEW RED (log: $GATE_LOG). known-red: $KR"
+    "$KR" match "$GATE_LOG"
+    echo "known-red match exit $?"
 fi
 ```
 
-**ALL CHECKS MUST PASS.** If your change caused the failure, fix it.
-If pre-existing, file a bead.
+**3. ALL CHECKS MUST PASS.** If your change caused the failure, fix it. A red
+is only "not yours" when it is red on {{base_branch}} too, and the block above
+has already asked `known-red` about every red in the log. Act on the match exit
+it printed. Blocks in this section run in a fresh shell, so each one sets
+`GATE_LOG` again; where one needs `KR`, paste the path the block printed after
+`known-red:`.
+
+- **0 or 3** — every red is KNOWN on {{base_branch}} (3: some are fixed
+  upstream, and the refinery's rebase picks the fix up). Not yours. Name the
+  KNOWN bead ids in a note on your work bead and proceed:
+```bash
+CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
+WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
+gc bd note "$WORK_BEAD_ID" --stdin <<'KNOWN_RED_NOTE'
+Self-review red is KNOWN on {{base_branch}}: <the KNOWN / FIXED-UPSTREAM bead ids known-red printed>.
+KNOWN_RED_NOTE
+```
+- **1** — some id is NEW. Re-run each NEW id on origin/{{base_branch}}, one
+  id per run, in a detached worktree. The block maps the id to the narrowest
+  re-run: `go:<pkg>.<Test>` runs `go test ./<pkg> -run '^<Test>$' -count=1`,
+  `bats:<file>::<name>` runs `bats -f '<name>' <file>`, `pytest:<nodeid>` runs
+  `python3 -m pytest '<nodeid>'`, and any other id (`raw:` included) re-runs
+  that phase's whole command from the Config lines above:
+```bash
+ID='<one NEW id, exactly as known-red printed it>'
+PHASE_CMD='<the red phase command, for an id that is not go:, bats: or pytest:>'
+git fetch origin {{base_branch}}
+T=$(mktemp -d "${TMPDIR:-/tmp}/base-rerun.XXXXXX")
+git worktree add --detach "$T" origin/{{base_branch}}
+case "$ID" in
+go:*.Test*) GO_REST=${ID#go:}; GO_PKG=${GO_REST%%.Test*}; ( cd "$T" && go test "./$GO_PKG" -run "^${GO_REST#"$GO_PKG".}$" -count=1 ) ;;
+bats:*::*) BATS_REST=${ID#bats:}; ( cd "$T" && bats -f "${BATS_REST#*::}" "${BATS_REST%%::*}" ) ;;
+pytest:*) ( cd "$T" && python3 -m pytest "${ID#pytest:}" ) ;;
+*) ( cd "$T" && eval "$PHASE_CMD" ) ;;
+esac
+echo "re-run on base exit $? for $ID"
+git worktree remove --force "$T"
+```
+  Exit 0 means **green on base: the red is yours.** Fix it and re-run
+  self-review from §2. Non-zero means red on base; read the output to confirm
+  it is the same failure and not a re-run that could not start. Once every
+  NEW id that remains is red on base too, record them, then proceed:
+```bash
+KR='<the known-red path the §2 block printed>'
+GATE_LOG="$(git rev-parse --git-dir)/self-review-gate.log"
+CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
+WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
+"$KR" file "$GATE_LOG" --summary "<one line: what is red on {{base_branch}}>" --from "$WORK_BEAD_ID"
+```
+  `file` takes each id's phase from the log's gate headers. Never pass
+  `--phase` for a configured command's red: the preflight skip keys on the
+  phase name.
+- **2, or known-red not found** — the ledger could not answer. Attribute each
+  red with the same re-run on base, then file only the ones that are really
+  pre-existing, by hand:
+  `gc bd create --title "Pre-existing failure: <id> — <summary>" --type bug --priority 1`.
 
 Refusing to push on local failure is a feature: a change that fails locally
 fails again downstream, at the refinery gate or in CI — wasting reviewer
