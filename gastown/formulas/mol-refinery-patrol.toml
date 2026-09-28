@@ -1104,10 +1104,12 @@ delete_merged_branches = {{delete_merged_branches}}**
 
 Read the merge target and merge strategy from the work bead metadata:
 ```bash
+# --- merge-lane:read-metadata:begin ---
 BRANCH=$(gc bd show $WORK --json | jq -r '.[0].metadata.branch')
 TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_branch}}"')
 MERGE_STRATEGY=$(gc bd show $WORK --json | jq -r '.[0].metadata.merge_strategy // "direct"')
 EXISTING_PR=$(gc bd show $WORK --json | jq -r '.[0].metadata.existing_pr // empty')
+# --- merge-lane:read-metadata:end ---
 # --- origin-repo-resolution:begin ---
 # The repository that matters here is the one this worktree PUSHES to: origin.
 # `gh repo view` answers with gh's own base-repo heuristic, which on a fork that
@@ -1138,6 +1140,7 @@ if [ -z "$ORIGIN_REPO" ]; then
   fi
 fi
 # --- origin-repo-resolution:end ---
+# --- merge-lane:strategy:begin ---
 if [ "$MERGE_STRATEGY" = "pr" ]; then
   MERGE_STRATEGY="mr"
 fi
@@ -1161,6 +1164,7 @@ if [ "$APPROVAL_REQUIRED" -eq 1 ] && [ "$MERGE_STRATEGY" = "direct" ]; then
   echo "require_merge_approval is on; a reviewed merge needs a pull request — using merge_strategy=mr."
   MERGE_STRATEGY="mr"
 fi
+# --- merge-lane:strategy:end ---
 # >>> merge-approval-gate-wiring >>>
 # Everything between these markers is executed verbatim by
 # gastown/tests/test_merge_approval_gate.sh, so the resolution and refusal
@@ -1317,6 +1321,7 @@ park_awaiting_review() {
 }
 # <<< merge-approval-gate-wiring <<<
 
+# --- merge-lane:block-existing-pr:begin ---
 block_existing_pr() {
   reason="$1"
   gc bd update $WORK \
@@ -1388,6 +1393,7 @@ Target: $TARGET"
   gc runtime drain-ack
   exit 1
 }
+# --- merge-lane:block-existing-pr:end ---
 
 # --- merge-state-helpers:begin ---
 branch_has_real_change() {
@@ -1548,6 +1554,7 @@ close_already_merged() {
 }
 # --- merge-state-helpers:end ---
 
+# --- merge-lane:github-helpers:begin ---
 pr_lookup_missing() {
   case "$1" in
     *"Could not resolve to a PullRequest"*|*"could not resolve to a PullRequest"*|*"no pull requests found"*|*"Not Found"*|*"not found"*|*"404"*) return 0 ;;
@@ -1714,6 +1721,7 @@ if [ "$MERGE_STRATEGY" = "mr" ] && [ -z "$ORIGIN_REPO" ]; then
   gc runtime drain-ack
   exit 1
 fi
+# --- merge-lane:github-helpers:end ---
 ```
 
 **Approval-gated merge lane (`require_merge_approval = {{require_merge_approval}}`)**
@@ -2130,6 +2138,7 @@ merge_ff_push() {
 }
 # --- merge-ff-push:end ---
 
+# --- merge-lane:direct-close:begin ---
 merge_ff_push
 MERGE_LAND_STATUS=$?
 case "$MERGE_LAND_STATUS" in
@@ -2145,6 +2154,7 @@ case "$MERGE_LAND_STATUS" in
     exit 1
     ;;
 esac
+# --- merge-lane:direct-close:end ---
 ```
 
 If `merge_ff_push` returns anything but 0 or 4: STOP. Debug and retry. Do NOT
@@ -2173,8 +2183,10 @@ runs. Keep the block self-contained and keep the sentinels intact.
 
 **2. Cleanup:**
 ```bash
+# --- merge-lane:direct-cleanup:begin ---
 git checkout --detach "origin/$TARGET" >/dev/null 2>&1 || true
 git branch -d temp || git branch -D temp || true
+# --- merge-lane:direct-cleanup:end ---
 ```
 Run **Successful task-artifact cleanup** below, then leave
 `origin/$BRANCH` intact. The exact remote source ref is the durable
@@ -2196,6 +2208,7 @@ empty PR cannot satisfy the work bead and must not enter the pending-merge
 gate. A tool error (status 2) is not an empty branch — stop without mutating
 bead state rather than halt-escalating a healthy branch.
 ```bash
+# --- merge-lane:mr-zero-diff:begin ---
 branch_has_real_change "origin/$TARGET" temp
 BHRC_STATUS=$?
 case "$BHRC_STATUS" in
@@ -2207,12 +2220,15 @@ case "$BHRC_STATUS" in
     exit 1
     ;;
 esac
+# --- merge-lane:mr-zero-diff:end ---
 ```
 
 **1. Push the branch back to origin:**
 ```bash
+# --- merge-lane:mr-push:begin ---
 git checkout temp
 git push origin HEAD:$BRANCH --force-with-lease
+# --- merge-lane:mr-push:end ---
 ```
 If `--force-with-lease` fails, the existing PR branch moved after your fetch and
 `temp` is stale. STOP. Do NOT rebase `temp` in place and retry the push: `mr` is
@@ -2253,6 +2269,7 @@ markdown). The body always carries the bead's full description (the
 when present.
 
 ```bash
+# --- merge-lane:mr-pr:begin ---
 WORK_JSON=$(gc bd show $WORK --json)
 EXISTING_PR=$(printf '%s' "$WORK_JSON" | jq -r '.[0].metadata.existing_pr // empty')
 ISSUE_TITLE=$(printf '%s' "$WORK_JSON" | jq -r '.[0].title')
@@ -2368,10 +2385,12 @@ else
 fi
 
 rm -f "$PR_BODY_FILE"
+# --- merge-lane:mr-pr:end ---
 ```
 
 **3. Verify the pull request exists:**
 ```bash
+# --- merge-lane:mr-verify:begin ---
 PR_ERR=$(mktemp)
 PR_INFO=$(lookup_pr_info "$PR_REF" "$PR_ERR")
 PR_STATUS=$?
@@ -2441,6 +2460,7 @@ if [ "$PR_HEAD_REPO" != "$ORIGIN_REPO" ]; then
   gc runtime drain-ack
   exit 1
 fi
+# --- merge-lane:mr-verify:end ---
 ```
 If this command fails or prints empty output: STOP. Debug and retry. Do NOT continue.
 
@@ -2456,6 +2476,7 @@ It also clears stale rejection/routing metadata so the blocked handoff cannot
 be mistaken for pool demand.
 
 ```bash
+# --- merge-lane:mr-handoff:begin ---
 if ! gc gastown pr-merge-reconcile record \
     "$WORK" "$PR_URL" "$PR_NUMBER" "$TARGET" "$PR_HEAD_SHA"; then
   echo "Failed to record pending PR state. STOP. Do not close $WORK."
@@ -2469,6 +2490,7 @@ Pull request: $PR_URL
  The bead and its dependents remain blocked until a refinery patrol verifies the merge."; then
   echo "Pending PR state is safe, but mayor notification failed; report the delivery failure."
 fi
+# --- merge-lane:mr-handoff:end ---
 ```
 
 If the metadata transition fails: STOP. Do not close the bead or describe the
@@ -2491,22 +2513,26 @@ reviewer approved THIS PR — so the write must land before the gate runs.
 earlier rejected/reworked attempt.
 
 ```bash
+# --- merge-lane:mr-record:begin ---
 gc bd update $WORK \
   --set-metadata pr_url="$PR_URL" \
   --set-metadata pr_number="$PR_NUMBER" \
   --set-metadata merged_target="$TARGET" \
   --unset-metadata rejection_reason
+# --- merge-lane:mr-record:end ---
 ```
 
 Then run the gate:
 
 ```bash
+# --- merge-lane:mr-gate:begin ---
 APPROVAL_GATE_OUTPUT=$(run_approval_gate "$(git rev-parse temp)" 2>&1)
 APPROVAL_GATE_STATUS=$?
 echo "$APPROVAL_GATE_OUTPUT"
 if [ "$APPROVAL_GATE_STATUS" -ne 0 ]; then
   park_awaiting_review "$APPROVAL_GATE_OUTPUT"
 fi
+# --- merge-lane:mr-gate:end ---
 ```
 
 If `APPROVAL_GATE_STATUS` is non-zero the bead is parked awaiting review: do
@@ -2520,9 +2546,11 @@ If `APPROVAL_GATE_STATUS` is 0 the live PR head is the exact commit a reviewer
 approved. Land it:
 
 ```bash
+# --- merge-lane:mr-approved:begin ---
 gc bd update "$WORK" \
   --set-metadata merge_approval_state=approved \
   --unset-metadata merge_approval_gate_reason
+# --- merge-lane:mr-approved:end ---
 ```
 
 Then run the direct path's **1. Merge, push, verify, and close work bead**
@@ -2547,8 +2575,10 @@ next patrol.
 
 **5. Cleanup:**
 ```bash
+# --- merge-lane:mr-cleanup:begin ---
 git checkout "$TARGET"
 git branch -d temp
+# --- merge-lane:mr-cleanup:end ---
 ```
 Do not invoke task-artifact cleanup on this publication path. The artifact and
 its durable `pending` marker remain intact until reconciliation verifies and
@@ -2622,10 +2652,12 @@ captures a fresh one.
 STOP. Local-only merge handoff is not implemented in the Gastown example pack.
 Leave the work bead assigned to refinery and escalate to mayor for manual handling:
 ```bash
+# --- merge-lane:local:begin ---
 gc mail send mayor/ -s "ESCALATION: unsupported merge_strategy=local" -m "Work bead: $WORK
 Branch: $BRANCH
 Target: $TARGET
 The Gastown example refinery supports direct and mr/pr merge strategies only."
+# --- merge-lane:local:end ---
 ```
 Do NOT close the bead, delete the branch, or burn the wisp until a human decides how to proceed.
 
