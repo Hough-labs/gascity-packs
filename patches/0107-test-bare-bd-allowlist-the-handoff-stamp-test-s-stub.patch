@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 27 Sep 2026 17:32:55 -0400
-Subject: [PATCH 107/115] test(bare-bd): allowlist the handoff-stamp test's
+Subject: [PATCH 107/116] test(bare-bd): allowlist the handoff-stamp test's
  stub call-log grep (gcp-et7g.1)
 
 test_polecat_handoff_stamp.sh:193 greps the stub's argv log for
