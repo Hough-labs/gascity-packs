@@ -731,20 +731,49 @@ description = """
 **Config: lint_command = {{lint_command}}**
 **Config: build_command = {{build_command}}**
 
-Run each configured check in order (skip empty ones silently):
-```bash
-{{setup_command}}
-{{typecheck_command}}
-{{lint_command}}
-{{build_command}}
-```
+Run each configured check in order through `gate_run`, in ONE shell (empty
+commands are skipped silently). Every gate runs even after one FAILs, and the
+tests run only when run_tests = "true". Each gate writes a segment of one gate
+log, named after the formula var that holds its command (setup, typecheck,
+lint, build, test), and handle-failures reads that log with the pack's
+`known-red`. A configured command's red is never logged under any other name:
+known-red files a red under its gate's phase, and a polecat's preflight skips a
+phase that an open base-red bead covers.
 
-If run_tests = "true":
 ```bash
-{{test_command}}
+# --- gate-run:begin ---
+# gate_run <phase> '<command>' appends one segment known-red can read to
+# $GATE_LOG: a `gate(<phase>): RUN` header, the command's output, then
+# `gate(<phase>): PASS` or `gate(<phase>): FAIL`. An empty command is a phase
+# the rig does not configure: it writes nothing and returns 0. The command is
+# passed single-quoted and eval'd, so double quotes and $(...) in it work.
+gate_run() {
+    gr_phase="$1"
+    gr_cmd="$2"
+    [ -n "${gr_cmd//[[:space:]]/}" ] || return 0
+    echo "gate($gr_phase): RUN $(printf '%s' "$gr_cmd" | tr -s '[:space:]' ' ')" | tee -a "$GATE_LOG"
+    if ( eval "$gr_cmd" ) </dev/null >>"$GATE_LOG" 2>&1; then
+        echo "gate($gr_phase): PASS" | tee -a "$GATE_LOG"
+        return 0
+    fi
+    echo "gate($gr_phase): FAIL" >>"$GATE_LOG"
+    tail -n 40 "$GATE_LOG"
+    return 1
+}
+# --- gate-run:end ---
+# --- refinery-gates:begin ---
+# One log per merge attempt: truncated first, so a FAIL from an earlier
+# attempt is never read as this one's.
+GATE_LOG="$(git rev-parse --git-dir)/refinery-gate.log"
+: > "$GATE_LOG"
+gate_run setup '{{setup_command}}' || true
+gate_run typecheck '{{typecheck_command}}' || true
+gate_run lint '{{lint_command}}' || true
+gate_run build '{{build_command}}' || true
+if [ "{{run_tests}}" = "true" ]; then gate_run test '{{test_command}}' || true; fi
+grep -E '^gate\\([A-Za-z0-9_-]*\\): (PASS|FAIL)$' "$GATE_LOG"
+# --- refinery-gates:end ---
 ```
-
-If run_tests = "false": skip tests entirely.
 
 **Fallback when this wisp has no quality-gate commands configured** (all of
 setup_command, typecheck_command, lint_command, build_command, test_command
@@ -753,9 +782,12 @@ empty): do not silently skip. Read the repo's project-instructions file
 agent prompt lists the exact filename) and run the quality gates it
 documents. Treat their failures the same way you would treat failures
 from configured commands. The fallback preserves the quality-gate intent
-when pack-specific guidance is missing.
+when pack-specific guidance is missing. Run those gates through `gate_run` in
+the same shell as the block above, after it has truncated `$GATE_LOG`, each
+named after the var it stands in for (setup, typecheck, lint, build, test).
 
-Track results: which checks ran, pass/fail, specific failures.
+The gate log at `"$(git rev-parse --git-dir)/refinery-gate.log"` is the record
+handle-failures reads.
 Close this step when all checks complete (pass or fail)."""
 
 [[steps]]
@@ -773,7 +805,90 @@ BRANCH=$(gc bd show $WORK --json | jq -r '.[0].metadata.branch')
 TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_branch}}"')
 ```
 
-1. Diagnose: branch regression or pre-existing on target?
+0. Classify through known-red. Run this whole block in ONE shell, with `$WORK`
+   and `$TARGET` set as above. It reads the gate log run-tests wrote and asks
+   the pack's `known-red` whether each red is already carried by an open
+   base-red bead. Only exit 0, every red KNOWN, merges past without a
+   diagnosis. Exit 3 (nothing NEW, some FIXED-UPSTREAM) is diagnosed like exit
+   1 here, unlike at a polecat's preflight: this branch is already rebased
+   onto `$TARGET`, so a FIXED-UPSTREAM row means no commit citing the fix bead
+   is on `$TARGET` at all. A rebase cannot clear that, and the red may be this
+   branch regressing a fixed test.
+
+```bash
+# --- resolve-known-red:begin ---
+# resolve_known_red <formula> prints the path of the pack's known-red and
+# returns 0, or returns 1. Located the way mol-refinery-patrol's
+# resolve_approval_gate is: the named formula's own source anchors the pack, so
+# the matcher is always the copy shipped beside the formula being run.
+# GC_PACK_DIR is only a fallback, because gc exports it to pack commands and
+# not to agent shells.
+resolve_known_red() {
+    rkr_rel="assets/scripts/known-red"
+    rkr_city="${GC_CITY:-${GC_CITY_PATH:-}}"
+    if [ -n "$rkr_city" ]; then
+        rkr_json=$(gc formula list --city "$rkr_city" --json 2>/dev/null)
+    else
+        rkr_json=$(gc formula list --json 2>/dev/null)
+    fi
+    rkr_src=$(printf '%s' "$rkr_json" |
+        jq -r --arg f "$1" '.formulas[]? | select(.name == $f) | .source // empty' 2>/dev/null |
+        head -1)
+    if [ -n "$rkr_src" ]; then
+        # <pack>/formulas/<formula>.toml -> <pack>
+        rkr_pack=$(dirname "$(dirname "$rkr_src")")
+        if [ -x "$rkr_pack/$rkr_rel" ]; then
+            echo "$rkr_pack/$rkr_rel"
+            return 0
+        fi
+    fi
+    if [ -n "${GC_PACK_DIR:-}" ] && [ -x "$GC_PACK_DIR/$rkr_rel" ]; then
+        echo "$GC_PACK_DIR/$rkr_rel"
+        return 0
+    fi
+    return 1
+}
+# --- resolve-known-red:end ---
+# --- refinery-known-red-match:begin ---
+KR=$(resolve_known_red mol-refinery-patrol) || KR=""
+GATE_LOG="$(git rev-parse --git-dir)/refinery-gate.log"
+# §3 runs in a later fence, after the diagnosis, and shell state does not
+# survive between fences. This file hands it the known-red that ran here, so
+# §3 needs no resolve of its own. Empty means known-red did not run.
+KR_PATH_FILE="$(git rev-parse --git-dir)/refinery-known-red.path"
+: > "$KR_PATH_FILE"
+if [ -z "$KR" ] || [ ! -s "$GATE_LOG" ]; then
+    echo "WARN known-red unavailable; diagnose and file by hand (§1-§3 without known-red)"
+else
+    printf '%s\\n' "$KR" > "$KR_PATH_FILE"
+    KR_OUT=$("$KR" match "$GATE_LOG" 2>&1)
+    KR_CODE=$?
+    printf '%s\\n' "$KR_OUT"
+    case "$KR_CODE" in
+    0)
+        KNOWN_IDS=$(printf '%s\\n' "$KR_OUT" | awk '$1 == "KNOWN" { print $2 }' | sort -u | paste -sd ' ' -)
+        gc bd note "$WORK" --stdin <<KNOWN_RED_NOTE
+Refinery merge onto $TARGET: every red is already known (known-red match exit 0). Filed nothing.
+KNOWN: $KNOWN_IDS
+KNOWN_RED_NOTE
+        echo "ALL REDS KNOWN: $KNOWN_IDS. Filed nothing. Close this step and proceed to merge-push."
+        ;;
+    1|3)
+        echo "DIAGNOSE these reds (branch versus $TARGET):"
+        printf '%s\\n' "$KR_OUT" | awk '$1 == "NEW" || $1 == "FIXED-UPSTREAM"'
+        echo "KNOWN reds in the same log need no diagnosis."
+        ;;
+    *)
+        echo "WARN known-red lookup failed (exit $KR_CODE); diagnose every red"
+        ;;
+    esac
+fi
+# --- refinery-known-red-match:end ---
+```
+
+1. Diagnose ONLY the reds step 0 listed under DIAGNOSE; when it printed a
+   WARN, diagnose every red. Is each one a branch regression or pre-existing
+   on target?
 
 2. If branch caused it:
    - Clean up the existing workflow and reopen the source bead:
@@ -866,7 +981,60 @@ TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_bran
      ```
    - Close this step after the current wisp is burned.
 
-3. If pre-existing on target:
+3. If pre-existing on target (every diagnosed red is on `$TARGET` too):
+   - File through known-red FIRST, in a fence of its own. It reads the
+     known-red path step 0 left in the git dir and never resolves one itself.
+     known-red dedups by exact failure id: it refreshes last-seen on a KNOWN
+     id, files every NEW id with a stable id as ONE base-red bead under its
+     gate's phase, and files nothing for a FIXED-UPSTREAM id. That red
+     reproduces on `$TARGET` although its bead is closed, so the witness is
+     told.
+     ```bash
+     # --- refinery-known-red-file:begin ---
+     GATE_LOG="$(git rev-parse --git-dir)/refinery-gate.log"
+     KR=$(cat "$(git rev-parse --git-dir)/refinery-known-red.path" 2>/dev/null)
+     if [ -z "$KR" ]; then
+         echo "known-red did not run in step 0: use the DUP_KEYWORD block below for every red."
+     else
+         FILE_OUT=$("$KR" file "$GATE_LOG" --summary "red on $TARGET at refinery merge of $WORK" --from "$WORK" 2>&1)
+         FILE_CODE=$?
+         printf '%s\\n' "$FILE_OUT"
+         case "$FILE_CODE" in
+         0|1)
+             FIXED=$(printf '%s\\n' "$FILE_OUT" |
+                 sed -nE 's/^known-red: (.+) is fixed upstream by ([^;]+);.*/\\1 (\\2)/p' | paste -sd ' ' -)
+             if [ -n "$FIXED" ]; then
+                 gc session nudge "${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness" \\
+                     "$(printf 'KNOWN-RED: %s reproduce on %s although the bead is closed' "$FIXED" "$TARGET" | cut -c1-200)"
+             fi
+             if [ "$FILE_CODE" -eq 0 ]; then
+                 FILED=$(printf '%s\\n' "$FILE_OUT" | awk '$1 == "known-red:" && $2 == "filed" { print $3 }' | paste -sd ' ' -)
+                 echo "FILED: ${FILED:-none}. Proceed with merge."
+             else
+                 printf '%s\\n' "$FILE_OUT" | awk '$1 ~ /^raw:/'
+                 echo "These reds have no stable id: run the DUP_KEYWORD block below for them only."
+             fi
+             ;;
+         *)
+             # FAIL CLOSED, as the DUP_KEYWORD block does: a failed file may
+             # still have created a bead, so never fall through to filing.
+             gc mail send mayor/ -s "ESCALATION: refinery known-red file failed, not filing [HIGH]" -m "Work bead: $WORK
+     Exit code: $FILE_CODE
+     Output: $FILE_OUT
+     Refused to file a pre-existing-failure bead: known-red file failed, and a create can land and still fail."
+             gc session nudge "${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness" "KNOWN-RED HALT: $WORK — known-red file exited $FILE_CODE; refused to file. Merge not attempted."
+             echo "STOP. known-red file failed. NEVER fall through to filing."
+             gc runtime drain-ack
+             exit 1
+             ;;
+         esac
+     fi
+     # --- refinery-known-red-file:end ---
+     ```
+   - The DUP_KEYWORD block below, its two `DUP_COUNT` bullets and "Proceed
+     with merge" now apply only to the raw lines the known-red block printed
+     at its exit 1, and to every red when it printed `known-red did not run in
+     step 0`.
    - Check for duplicates FIRST, and run the whole block — the check has to
      fail closed. `gc bd list` has no `--search` flag; it exits non-zero with
      `unknown flag: --search`, which piped to jq yields empty output that reads
@@ -921,7 +1089,8 @@ TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_bran
      ```
    - Proceed with merge (failure not caused by this branch)
 
-**GATE**: Cannot merge without all checks passing OR pre-existing bug filed/found.
+**GATE**: Cannot merge without all checks passing, OR every red KNOWN (step 0
+exit 0), OR every pre-existing red filed or found.
 **FORBIDDEN**: Writing code to fix failures. You are a merge processor."""
 
 [[steps]]
