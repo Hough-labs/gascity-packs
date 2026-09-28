@@ -471,8 +471,11 @@ build_rig() {
     # What the `rebase` step leaves behind, including its "skipped previously
     # applied commit" collapse.
     git_q -C "$REFINERY" rebase origin/integration || git_q -C "$REFINERY" rebase --abort
-    TEMP_SHA=$(git -C "$REFINERY" rev-parse temp)
+    TEMP_SHA=$(git -C "$REFINERY" rev-parse --verify -q temp)
     TARGET_BEFORE=$(origin_tip)
+    # The setup above is quiet, so say so plainly when it did not produce a rig.
+    [ -n "$TEMP_SHA" ] && [ -n "$TARGET_BEFORE" ] ||
+        fail "harness bug: build_rig $shape left no temp branch or no origin/integration"
 }
 
 # add_second_worktree — the target branch checked out in another worktree of
