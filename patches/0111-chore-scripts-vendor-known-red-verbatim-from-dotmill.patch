@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 27 Sep 2026 19:24:42 -0400
-Subject: [PATCH 111/116] chore(scripts): vendor known-red verbatim from
+Subject: [PATCH 111/117] chore(scripts): vendor known-red verbatim from
  dotmill d674c68 (gcp-4ngf)
 
 Provenance commit. gc-cgxps Q2 (2026-09-27) ruled that the known-red

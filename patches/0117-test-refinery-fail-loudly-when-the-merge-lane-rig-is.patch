@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sun, 27 Sep 2026 22:42:07 -0400
+Subject: [PATCH 117/117] test(refinery): fail loudly when the merge-lane rig
+ is not built (gcp-l8td.4)
+
+A self-review touch-up. build_rig runs its git setup quietly, so a setup
+that broke (for example a host git that refuses a flag) used to show up
+only as confusing lane failures further down. Such a case never passed
+vacuously, but it did not name the cause. build_rig now fails the case
+with a "harness bug" message when it leaves no temp branch or no
+origin/integration behind.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ gastown/tests/test_refinery_merge_lanes.sh | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/gastown/tests/test_refinery_merge_lanes.sh b/gastown/tests/test_refinery_merge_lanes.sh
+index 2eeb982b..9a0fb7d6 100644
+--- a/gastown/tests/test_refinery_merge_lanes.sh
++++ b/gastown/tests/test_refinery_merge_lanes.sh
+@@ -471,8 +471,11 @@ build_rig() {
+     # What the `rebase` step leaves behind, including its "skipped previously
+     # applied commit" collapse.
+     git_q -C "$REFINERY" rebase origin/integration || git_q -C "$REFINERY" rebase --abort
+-    TEMP_SHA=$(git -C "$REFINERY" rev-parse temp)
++    TEMP_SHA=$(git -C "$REFINERY" rev-parse --verify -q temp)
+     TARGET_BEFORE=$(origin_tip)
++    # The setup above is quiet, so say so plainly when it did not produce a rig.
++    [ -n "$TEMP_SHA" ] && [ -n "$TARGET_BEFORE" ] ||
++        fail "harness bug: build_rig $shape left no temp branch or no origin/integration"
+ }
+ 
+ # add_second_worktree — the target branch checked out in another worktree of
+-- 
+2.54.0 (Apple Git-157)
+
