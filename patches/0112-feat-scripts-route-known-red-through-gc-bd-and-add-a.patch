@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 27 Sep 2026 19:30:38 -0400
-Subject: [PATCH 112/112] feat(scripts): route known-red through gc bd and add
+Subject: [PATCH 112/113] feat(scripts): route known-red through gc bd and add
  a pytest id rule (gcp-4ngf)
 
 Adapts the vendored matcher so it can ship in the gastown pack and see
