@@ -1,0 +1,1355 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 2 Oct 2026 17:01:46 -0400
+Subject: [PATCH 124/124] feat(refinery): add merge-batch.sh select and stack
+ (inert) with a real-repo suite (gcp-l8td.8)
+
+D1.1 of the refinery batch merge (design on gcp-l8td.7). One patrol iteration
+will be able to land several assigned beads behind a single gate run; this adds
+the first half of the mechanics as a checked-in script so the agent never
+hand-renders a batch lane. It is ADDITIVE and INERT: no formula step calls it
+until the wiring bead (gcp-l8td.10), and `land` is gcp-l8td.9.
+
+merge-batch.sh sources merge-push.sh in source-only mode and reuses
+resolve_config, resolve_merge_strategy, resolve_approval_required and the
+merge-state helpers, so a member is eligible by the lane's own rules.
+- select --head <id> --max <K> prints the head plus a prefix of find-work's
+  assignee scan (same sort, never --limit=1), cut at K and at the first
+  ineligible bead. K is forced to 1 when the approval gate resolves ON, and an
+  unreadable config resolves it ON. The head is printed even when it is itself
+  ineligible, in which case the batch is that one bead.
+- stack extends the rebased head `temp` with members 2..k, rebasing each onto
+  the current temp. It ends the batch at the first member that conflicts, is
+  ineligible, or collapses to no change, and leaves that member's bead alone.
+  A collapsed member that passes branch_already_landed is closed
+  already_merged by the existing helper and stacking continues past it. It
+  writes the manifest `$(git rev-parse --git-dir)/refinery-batch.json`
+  (head, target, base, and per member id, branch, tip, commits, patch_id),
+  which `land` will read. Any internal error resets temp to the head tip
+  recorded at entry, writes a one-member manifest, prints WARN and exits 0:
+  batching only ever shortens to the single-bead lane.
+
+Two judgement calls inside the design's room. The head must pass the member
+rules itself, since a head that would hand off as a pull request cannot ride a
+direct batch. And stack's member list comes from --members, else the manifest's
+members, else the head alone, because the design leaves the agent's hand-off of
+select's list to stack open.
+
+gastown/tests/test_refinery_merge_batch.sh runs 9 cases against real temp git
+repos (a bare origin, a polecat clone, the refinery's clone) with a gc stub over
+a fixture directory of beads: select order, truncation, approval, stack clean,
+conflict between members, already landed, degrade, the script's invariants, and
+the merge-push extraction. Mutating the script's sort key or its degrade reset
+fails the suite.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../assets/scripts/refinery/merge-batch.sh    | 540 +++++++++++++
+ gastown/tests/test_refinery_merge_batch.sh    | 748 ++++++++++++++++++
+ 2 files changed, 1288 insertions(+)
+ create mode 100755 gastown/assets/scripts/refinery/merge-batch.sh
+ create mode 100755 gastown/tests/test_refinery_merge_batch.sh
+
+diff --git a/gastown/assets/scripts/refinery/merge-batch.sh b/gastown/assets/scripts/refinery/merge-batch.sh
+new file mode 100755
+index 00000000..0aa9cb18
+--- /dev/null
++++ b/gastown/assets/scripts/refinery/merge-batch.sh
+@@ -0,0 +1,540 @@
++#!/usr/bin/env bash
++# merge-batch.sh — choose and stack a batch of beads for the refinery's direct
++# lane (gcp-l8td D1; this is D1.1, the first half of the mechanics).
++#
++# One patrol iteration may land several assigned beads behind a single gate run.
++# The AGENT decides how long the batch is and what a red means; this checked-in
++# script does the mechanics, so the agent never hand-renders a batch lane. It is
++# a sibling of merge-push.sh and sources it in source-only mode for
++# resolve_config, resolve_merge_strategy, resolve_approval_required and the
++# merge-state helpers. Nothing here copies them, so a batch member is eligible
++# by the single-bead lane's own rules and the two cannot drift.
++#
++# Batching only ever SHORTENS to the single-bead lane. No batch failure may block
++# or reject the head bead: a select or stack error leaves a batch of one, which
++# the merge-push lane then runs exactly as it does without batching.
++#
++# Usage:
++#   merge-batch.sh select --head <id> [--max <K>] [config flags]
++#   merge-batch.sh stack  --head <id> [--members <id,id,...>] [config flags]
++# Config flags are merge-push.sh's (--rig, --target-default, --binding-prefix,
++# --require-approval, --review-agent, --delete-merged-branches, --gh), and the
++# config resolves the way merge-push.sh resolves it, including the fail-closed
++# approval switch. Run inside the refinery's clone.
++#
++# select  Print the batch's member ids, one per line, head first, and exit 0.
++#         The members are a PREFIX of the refinery's assignee scan in
++#         find-work's order (priority, then first_submitted_at // created_at),
++#         cut at the first ineligible bead and at K. The head is printed even
++#         when it is itself ineligible: a batch of one is the single-bead lane.
++#         K is forced to 1 when the approval gate resolves ON, and an unreadable
++#         config resolves it ON. A member is eligible when its strategy is
++#         direct, its target is the head's, metadata.fork_sha is present, it has
++#         no existing_pr, and it has no merge_batch_serial equal to its current
++#         origin/<branch> tip. --max defaults to 1. Any failure after the head is
++#         known prints the head alone and exits 0; exit 1 is a usage or config
++#         error.
++#
++# stack   Extend `temp`, the already-rebased head, with members 2..k in order.
++#         Each member's commits are rebased onto the current `temp`. The member
++#         ids come from --members, else from the manifest's members (written by
++#         the agent after select), else the head alone. The first member that
++#         conflicts, is ineligible, or collapses to no change ends the batch
++#         there: it and every later member are dropped, keep no new metadata and
++#         stay assigned. One exception: a member that collapses AND passes
++#         branch_already_landed is closed as already merged by the existing
++#         helper, and stacking continues past it. Any internal error resets
++#         `temp` to the head tip recorded at entry, writes a one-member manifest,
++#         prints WARN and still exits 0.
++#         Writes the manifest `$(git rev-parse --git-dir)/refinery-batch.json`:
++#           {"head": "<id>", "target": "<branch>", "base": "<head tip sha>",
++#            "members": [{"id", "branch", "tip", "commits", "patch_id"}, ...]}
++#         in batch order, members[0] the head. tip is the member's stacked tip,
++#         commits the count it adds to the stack, patch_id the patch-id of the
++#         tip commit. `land` (gcp-l8td.9) reads exactly these fields.
++#         Needs `temp` rebased onto origin/<target>, as the patrol's rebase step
++#         leaves it. Exit 1 only for a usage or config error, or no `temp`.
++#
++# Warnings go to stderr. select's stdout is the member ids and nothing else.
++#
++# No `set -e`, `set -u` or `set -o pipefail`, for the reason merge-push.sh gives:
++# every command that matters is checked on its own exit status.
++
++MERGE_BATCH_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
++
++# Used when --max is not given: batching off.
++MERGE_BATCH_DEFAULT_MAX=1
++
++# Read by merge-push.sh, not here, and deliberately not exported: a child that
++# ran merge-push.sh would otherwise stop before main.
++# shellcheck disable=SC2034
++MERGE_PUSH_SOURCE_ONLY=1
++# shellcheck source=/dev/null
++. "$MERGE_BATCH_DIR/merge-push.sh" || {
++  echo "merge-batch: cannot source merge-push.sh from $MERGE_BATCH_DIR" >&2
++  exit 1
++}
++
++# The scratch branch a member is rebased on before temp advances to it.
++MERGE_BATCH_SCRATCH=batch-member
++
++batch_usage() {
++  echo "usage: merge-batch.sh select --head <id> [--max <K>] [config flags]"
++  echo "       merge-batch.sh stack  --head <id> [--members <id,id,...>] [config flags]"
++}
++
++mb_warn() {
++  echo "merge-batch: WARN $*" >&2
++}
++
++# mb_load_bead <id> — read the bead into MB_JSON. Returns 1 when it cannot be
++# read, which is not the same thing as the bead being ineligible.
++mb_load_bead() {
++  MB_JSON=$(gc bd show "$1" --json 2>/dev/null) || return 1
++  printf '%s' "$MB_JSON" | jq -e '.[0].id // empty' >/dev/null 2>&1 || return 1
++  return 0
++}
++
++mb_meta() {
++  printf '%s' "$MB_JSON" | jq -r --arg k "$1" '.[0].metadata[$k] // empty'
++}
++
++mb_target() {
++  printf '%s' "$MB_JSON" | jq -r --arg d "$CFG_TARGET_DEFAULT" '.[0].metadata.target // $d'
++}
++
++# mb_check_member <id> <head-target> — is <id> eligible to ride in the head's
++# batch? Returns 0 when it is, with MB_BRANCH, MB_TARGET and MB_FORK set. Returns
++# 1 when it is not and sets MB_WHY; MB_READ_FAILED=1 says the bead store could
++# not be read, which stack treats as an internal error rather than ineligibility.
++mb_check_member() {
++  mc_id="$1"
++  mc_head_target="$2"
++  MB_WHY=""
++  MB_READ_FAILED=0
++  if ! mb_load_bead "$mc_id"; then
++    MB_READ_FAILED=1
++    MB_WHY="cannot read bead $mc_id"
++    return 1
++  fi
++  MB_BRANCH=$(mb_meta branch)
++  MB_TARGET=$(mb_target)
++  MB_FORK=$(mb_meta fork_sha)
++  mc_existing_pr=$(mb_meta existing_pr)
++  mc_serial=$(mb_meta merge_batch_serial)
++
++  mc_strategy=$(resolve_merge_strategy "$mc_id" 2>/dev/null)
++  if [ "$mc_strategy" != direct ]; then
++    MB_WHY="$mc_id has merge_strategy '${mc_strategy:-<unreadable>}', not direct"
++    return 1
++  fi
++  if [ -n "$mc_existing_pr" ]; then
++    MB_WHY="$mc_id has an existing_pr"
++    return 1
++  fi
++  if [ -z "$MB_BRANCH" ]; then
++    MB_WHY="$mc_id has no metadata.branch"
++    return 1
++  fi
++  if [ "$MB_TARGET" != "$mc_head_target" ]; then
++    MB_WHY="$mc_id targets '$MB_TARGET', the head targets '$mc_head_target'"
++    return 1
++  fi
++  if [ -z "$MB_FORK" ]; then
++    MB_WHY="$mc_id has no metadata.fork_sha"
++    return 1
++  fi
++  if ! git fetch -q origin "+refs/heads/${MB_BRANCH}:refs/remotes/origin/${MB_BRANCH}" >/dev/null 2>&1; then
++    MB_WHY="$mc_id: branch $MB_BRANCH could not be fetched from origin"
++    return 1
++  fi
++  if [ -n "$mc_serial" ] && [ "$mc_serial" = "$(git rev-parse --verify -q "origin/$MB_BRANCH" 2>/dev/null)" ]; then
++    MB_WHY="$mc_id already went red in a batch at its current tip (merge_batch_serial)"
++    return 1
++  fi
++  return 0
++}
++
++# --- select -----------------------------------------------------------------
++
++cmd_select() {
++  sel_head=""
++  sel_max="$MERGE_BATCH_DEFAULT_MAX"
++  sel_pass=()
++  while [ "$#" -gt 0 ]; do
++    case "$1" in
++      --head)
++        [ "$#" -ge 2 ] || { echo "merge-batch: --head needs a value." >&2; batch_usage >&2; return 1; }
++        sel_head="$2"
++        shift 2
++        ;;
++      --max)
++        [ "$#" -ge 2 ] || { echo "merge-batch: --max needs a value." >&2; batch_usage >&2; return 1; }
++        sel_max="$2"
++        shift 2
++        ;;
++      *)
++        sel_pass+=("$1")
++        shift
++        ;;
++    esac
++  done
++  if [ -z "$sel_head" ]; then
++    echo "merge-batch: select needs --head <id>." >&2
++    batch_usage >&2
++    return 1
++  fi
++  case "$sel_max" in
++    ''|*[!0-9]*|0)
++      echo "merge-batch: --max must be a positive integer, got '$sel_max'." >&2
++      return 1
++      ;;
++  esac
++  # resolve_config reports on stdout; select's stdout is the ids alone.
++  resolve_config --work "$sel_head" ${sel_pass[@]+"${sel_pass[@]}"} >&2 || return 1
++  resolve_approval_required
++  if [ "$APPROVAL_REQUIRED" -eq 1 ]; then
++    echo "merge-batch: the approval gate is on; a batch of 1." >&2
++    sel_max=1
++  fi
++
++  # The head is always the first line, whatever happens after it.
++  printf '%s\n' "$sel_head"
++  [ "$sel_max" -gt 1 ] || return 0
++
++  if [ -z "${GC_AGENT:-}" ]; then
++    mb_warn "GC_AGENT is not set, so the assignee scan cannot run; a batch of 1."
++    return 0
++  fi
++  if ! mb_load_bead "$sel_head"; then
++    mb_warn "cannot read head bead $sel_head; a batch of 1."
++    return 0
++  fi
++  sel_head_target=$(mb_target)
++  # The head rides the batch's direct lane too, so it must pass the member rules
++  # itself: a head that would hand off as a pull request is a batch of one.
++  if ! mb_check_member "$sel_head" "$sel_head_target"; then
++    echo "merge-batch: the head is not batchable: $MB_WHY; a batch of 1." >&2
++    return 0
++  fi
++
++  sel_rig=()
++  [ -z "${CFG_RIG:-}" ] || sel_rig=(--rig="$CFG_RIG")
++  # find-work's assignee scan, in find-work's sort, never --limit=1: the batch is
++  # a prefix of this queue.
++  if ! sel_list=$(gc bd list ${sel_rig[@]+"${sel_rig[@]}"} --assignee="$GC_AGENT" --status=open,in_progress \
++    --exclude-type=epic --has-metadata-key=branch --limit=0 --json); then
++    mb_warn "the assignee scan failed; a batch of 1."
++    return 0
++  fi
++  if ! sel_ids=$(printf '%s' "$sel_list" |
++    jq -r 'sort_by(.priority, (.metadata.first_submitted_at // .created_at)) | .[].id'); then
++    mb_warn "the assignee scan was not parseable; a batch of 1."
++    return 0
++  fi
++  sel_first=$(printf '%s\n' "$sel_ids" | sed -n 1p)
++  if [ "$sel_first" != "$sel_head" ]; then
++    mb_warn "head $sel_head does not lead the assignee queue (first is '${sel_first:-<empty>}'); a batch of 1."
++    return 0
++  fi
++
++  sel_count=1
++  while IFS= read -r sel_id; do
++    [ -n "$sel_id" ] || continue
++    [ "$sel_id" != "$sel_head" ] || continue
++    [ "$sel_count" -lt "$sel_max" ] || break
++    if ! mb_check_member "$sel_id" "$sel_head_target"; then
++      echo "merge-batch: select stops before $sel_id: $MB_WHY" >&2
++      break
++    fi
++    printf '%s\n' "$sel_id"
++    sel_count=$((sel_count + 1))
++  done <<EOF
++$sel_ids
++EOF
++  return 0
++}
++
++# --- stack ------------------------------------------------------------------
++
++# sb_patch_id <rev> — the stable patch-id of one commit.
++sb_patch_id() {
++  git show "$1" 2>/dev/null | git patch-id --stable 2>/dev/null | cut -d' ' -f1
++}
++
++# sb_entry_json <id> <branch> <tip> <commits> <patch-id>
++sb_entry_json() {
++  jq -nc --arg id "$1" --arg branch "$2" --arg tip "$3" --argjson commits "$4" --arg patch "$5" \
++    '{id: $id, branch: $branch, tip: $tip, commits: $commits, patch_id: $patch}'
++}
++
++# sb_write_manifest <members-json-array>
++sb_write_manifest() {
++  swm_tmp="${SB_MANIFEST}.tmp"
++  if jq -n --arg head "$SB_HEAD" --arg target "$SB_TARGET" --arg base "$SB_ENTRY" --argjson members "$1" \
++    '{head: $head, target: $target, base: $base, members: $members}' >"$swm_tmp" &&
++    mv -f "$swm_tmp" "$SB_MANIFEST"; then
++    return 0
++  fi
++  mb_warn "could not write $SB_MANIFEST."
++  return 1
++}
++
++# sb_drop_scratch — return to temp and delete the scratch branch. Returns 1 when
++# temp cannot be checked out.
++sb_drop_scratch() {
++  git checkout -q temp >/dev/null 2>&1 || return 1
++  git branch -D "$MERGE_BATCH_SCRATCH" >/dev/null 2>&1 || true
++  return 0
++}
++
++# sb_degrade <reason> — the degrade-to-single principle: put temp back on the
++# head tip recorded at entry, write a one-member manifest, and carry on. Exits 0
++# even when a step of the reset fails, because the caller's alternative is the
++# single-bead lane and that must still be reachable.
++sb_degrade() {
++  mb_warn "$1; falling back to a batch of 1."
++  git rebase --abort >/dev/null 2>&1 || true
++  git checkout -q -f temp >/dev/null 2>&1 || mb_warn "could not check temp out while degrading."
++  git reset -q --hard "$SB_ENTRY" >/dev/null 2>&1 || mb_warn "could not reset temp to $SB_ENTRY while degrading."
++  git branch -D "$MERGE_BATCH_SCRATCH" >/dev/null 2>&1 || true
++  sb_write_manifest "[$SB_HEAD_ENTRY]" || true
++  echo "merge-batch: STACK 1 of ${SB_WANTED:-1} head=$SB_HEAD (degraded)"
++  return 0
++}
++
++# sb_stack_member <id> — stack one member onto temp. Returns:
++#   0  stacked: temp advanced and the member is in SB_MEMBERS_JSON
++#   3  collapsed and already landed: closed as already merged, not in the batch
++#   1  the batch ends here; SB_WHY says why
++#   2  an internal error; SB_WHY says what, and the caller degrades
++sb_stack_member() {
++  sm_id="$1"
++  if ! mb_check_member "$sm_id" "$SB_TARGET"; then
++    SB_WHY="$MB_WHY"
++    [ "$MB_READ_FAILED" -eq 0 ] || return 2
++    return 1
++  fi
++  sm_branch="$MB_BRANCH"
++  sm_fork="$MB_FORK"
++
++  if ! git checkout -q -B "$MERGE_BATCH_SCRATCH" "origin/$sm_branch" >/dev/null 2>&1; then
++    SB_WHY="could not check out origin/$sm_branch for $sm_id"
++    return 2
++  fi
++  if ! git rebase -q temp >/dev/null 2>&1; then
++    sm_unmerged=$(git ls-files -u 2>/dev/null)
++    git rebase --abort >/dev/null 2>&1 || true
++    if ! sb_drop_scratch; then
++      SB_WHY="could not return to temp after the rebase of $sm_id failed"
++      return 2
++    fi
++    if [ -n "$sm_unmerged" ]; then
++      SB_WHY="$sm_id conflicts with the batch stacked so far"
++      return 1
++    fi
++    SB_WHY="the rebase of $sm_id failed without a conflict"
++    return 2
++  fi
++  if ! sm_tip=$(git rev-parse --verify -q HEAD) ||
++    ! sm_count=$(git rev-list --count "temp..$sm_tip" 2>/dev/null); then
++    SB_WHY="could not read the rebased tip of $sm_id"
++    return 2
++  fi
++
++  if [ "$sm_count" -eq 0 ] || git diff --quiet temp "$sm_tip" 2>/dev/null; then
++    if ! sb_drop_scratch; then
++      SB_WHY="could not return to temp after $sm_id collapsed"
++      return 2
++    fi
++    # The helpers read WORK, BRANCH and TARGET; they are this member's.
++    # shellcheck disable=SC2034
++    WORK="$sm_id"
++    BRANCH="$sm_branch"
++    TARGET="$SB_TARGET"
++    branch_already_landed "origin/$TARGET" "origin/$BRANCH" "$sm_fork"
++    sm_landed=$?
++    if [ "$sm_landed" -ne 0 ]; then
++      SB_WHY="$sm_id collapses to no change and is not already landed on $TARGET (branch_already_landed status $sm_landed)"
++      return 1
++    fi
++    sm_sha=$(upstream_equivalent_sha "origin/$TARGET" "origin/$BRANCH") ||
++      sm_sha=$(git rev-parse "origin/$TARGET")
++    # The helper's stdout tells the agent to skip the merge script, which is the
++    # lane's advice and not a batch's, so it is held back and summarised here.
++    if ! sm_out=$(close_already_merged "$sm_sha" rebase_patch_id "every commit on origin/$BRANCH since $sm_fork is already upstream in origin/$TARGET by patch-id, and its rebase is empty"); then
++      SB_WHY="$sm_id is already merged but closing it failed: $(printf '%s' "$sm_out" | tr '\n' ' ')"
++      return 1
++    fi
++    echo "merge-batch: $sm_id is already merged to $TARGET at $(git rev-parse --short "$sm_sha" 2>/dev/null); closed it and stacked past it."
++    if [ "$CFG_DELETE_MERGED_BRANCHES" = "true" ]; then
++      git push -q origin --delete "$BRANCH" >/dev/null 2>&1 ||
++        mb_warn "could not delete the merged branch $BRANCH on origin."
++    fi
++    return 3
++  fi
++
++  if ! sb_drop_scratch; then
++    SB_WHY="could not return to temp to advance it to $sm_id"
++    return 2
++  fi
++  if ! git merge -q --ff-only "$sm_tip" >/dev/null 2>&1; then
++    SB_WHY="temp would not fast-forward to the stacked tip of $sm_id"
++    return 2
++  fi
++  sm_patch=$(sb_patch_id "$sm_tip")
++  if ! sm_entry=$(sb_entry_json "$sm_id" "$sm_branch" "$sm_tip" "$sm_count" "$sm_patch"); then
++    SB_WHY="could not record $sm_id in the manifest"
++    return 2
++  fi
++  if ! SB_MEMBERS_JSON=$(printf '%s' "$SB_MEMBERS_JSON" | jq -c --argjson m "$sm_entry" '. + [$m]'); then
++    SB_WHY="could not record $sm_id in the manifest"
++    return 2
++  fi
++  return 0
++}
++
++cmd_stack() {
++  stk_head=""
++  stk_members=""
++  stk_pass=()
++  while [ "$#" -gt 0 ]; do
++    case "$1" in
++      --head)
++        [ "$#" -ge 2 ] || { echo "merge-batch: --head needs a value." >&2; batch_usage >&2; return 1; }
++        stk_head="$2"
++        shift 2
++        ;;
++      --members)
++        [ "$#" -ge 2 ] || { echo "merge-batch: --members needs a value." >&2; batch_usage >&2; return 1; }
++        stk_members="$2"
++        shift 2
++        ;;
++      *)
++        stk_pass+=("$1")
++        shift
++        ;;
++    esac
++  done
++  if [ -z "$stk_head" ]; then
++    echo "merge-batch: stack needs --head <id>." >&2
++    batch_usage >&2
++    return 1
++  fi
++  resolve_config --work "$stk_head" ${stk_pass[@]+"${stk_pass[@]}"} >&2 || return 1
++  resolve_approval_required
++
++  if ! SB_ENTRY=$(git rev-parse --verify -q refs/heads/temp); then
++    echo "merge-batch: there is no temp branch to stack onto." >&2
++    return 1
++  fi
++  if ! SB_GIT_DIR=$(git rev-parse --git-dir 2>/dev/null); then
++    echo "merge-batch: not inside a git repository." >&2
++    return 1
++  fi
++  SB_MANIFEST="$SB_GIT_DIR/refinery-batch.json"
++  SB_HEAD="$stk_head"
++  SB_TARGET=""
++  SB_WANTED=1
++  SB_HEAD_ENTRY=$(sb_entry_json "$SB_HEAD" "" "$SB_ENTRY" 0 "")
++
++  # The members the agent settled on, head first.
++  if [ -n "$stk_members" ]; then
++    stk_ids=$(printf '%s' "$stk_members" | tr ',' '\n')
++    stk_first=$(printf '%s\n' "$stk_ids" | sed -n 1p)
++    if [ "$stk_first" != "$SB_HEAD" ]; then
++      echo "merge-batch: --members must start with the head $SB_HEAD, got '$stk_first'." >&2
++      return 1
++    fi
++  elif [ -f "$SB_MANIFEST" ] && [ "$(jq -r '.head // empty' "$SB_MANIFEST" 2>/dev/null)" = "$SB_HEAD" ]; then
++    stk_ids=$(jq -r '.members[]?.id' "$SB_MANIFEST" 2>/dev/null)
++  else
++    stk_ids="$SB_HEAD"
++  fi
++  [ -n "$stk_ids" ] || stk_ids="$SB_HEAD"
++  SB_WANTED=$(printf '%s\n' "$stk_ids" | grep -c .)
++
++  if ! git checkout -q temp >/dev/null 2>&1; then
++    sb_degrade "could not check temp out"
++    return 0
++  fi
++  if ! mb_load_bead "$SB_HEAD"; then
++    sb_degrade "cannot read head bead $SB_HEAD"
++    return 0
++  fi
++  SB_HEAD_BRANCH=$(mb_meta branch)
++  SB_TARGET=$(mb_target)
++  if [ -z "$SB_TARGET" ] || [ "$SB_TARGET" = null ]; then
++    sb_degrade "head bead $SB_HEAD has no target"
++    return 0
++  fi
++  stk_head_commits=$(git rev-list --count "origin/$SB_TARGET..$SB_ENTRY" 2>/dev/null) || stk_head_commits=0
++  if ! SB_HEAD_ENTRY=$(sb_entry_json "$SB_HEAD" "$SB_HEAD_BRANCH" "$SB_ENTRY" "$stk_head_commits" "$(sb_patch_id "$SB_ENTRY")"); then
++    sb_degrade "could not build the head's manifest entry"
++    return 0
++  fi
++  SB_MEMBERS_JSON="[$SB_HEAD_ENTRY]"
++
++  stk_batchable=1
++  if [ "$APPROVAL_REQUIRED" -eq 1 ]; then
++    echo "merge-batch: the approval gate is on; a batch of 1."
++    stk_batchable=0
++  elif ! mb_check_member "$SB_HEAD" "$SB_TARGET"; then
++    if [ "$MB_READ_FAILED" -eq 1 ]; then
++      sb_degrade "$MB_WHY"
++      return 0
++    fi
++    echo "merge-batch: the head is not batchable: $MB_WHY; a batch of 1."
++    stk_batchable=0
++  fi
++  if [ "$stk_batchable" -eq 1 ]; then
++    while IFS= read -r stk_id; do
++      [ -n "$stk_id" ] || continue
++      [ "$stk_id" != "$SB_HEAD" ] || continue
++      SB_WHY=""
++      sb_stack_member "$stk_id"
++      stk_rc=$?
++      case "$stk_rc" in
++        0) echo "merge-batch: stacked $stk_id." ;;
++        3) ;;
++        1)
++          echo "merge-batch: stack ends before $stk_id: $SB_WHY"
++          break
++          ;;
++        *)
++          sb_degrade "$SB_WHY"
++          return 0
++          ;;
++      esac
++    done <<EOF
++$stk_ids
++EOF
++  fi
++
++  git checkout -q temp >/dev/null 2>&1 || {
++    sb_degrade "could not end on temp"
++    return 0
++  }
++  if ! sb_write_manifest "$SB_MEMBERS_JSON"; then
++    sb_degrade "could not write the manifest"
++    return 0
++  fi
++  stk_final=$(printf '%s' "$SB_MEMBERS_JSON" | jq -r '[.[].id] | join(" ")')
++  stk_size=$(printf '%s' "$SB_MEMBERS_JSON" | jq -r 'length')
++  echo "merge-batch: STACK $stk_size of $SB_WANTED head=$SB_HEAD members=$stk_final tip=$(git rev-parse temp)"
++  return 0
++}
++
++main_batch() {
++  case "${1:-}" in
++    select) shift; cmd_select "$@" ;;
++    stack) shift; cmd_stack "$@" ;;
++    *)
++      batch_usage >&2
++      return 1
++      ;;
++  esac
++}
++
++main_batch "$@"
++exit $?
+diff --git a/gastown/tests/test_refinery_merge_batch.sh b/gastown/tests/test_refinery_merge_batch.sh
+new file mode 100755
+index 00000000..8130595d
+--- /dev/null
++++ b/gastown/tests/test_refinery_merge_batch.sh
+@@ -0,0 +1,748 @@
++#!/usr/bin/env bash
++# Black-box proof of merge-batch.sh `select` and `stack` against real git
++# repositories (gcp-l8td.8, D1.1).
++#
++# merge-batch.sh chooses and stacks a batch of beads for the refinery's direct
++# lane. It is inert until the formula calls it (gcp-l8td.10), so these cases are
++# its whole proof: each one asserts what the script DID, which is the member ids
++# it printed, the manifest it wrote, the commits `temp` ended on, and the bead
++# writes it made or declined to make. None asserts how the script is written,
++# except the invariant case, whose subject is the script's text.
++#
++# The rig is real git: a bare origin, a polecat clone that pushed one branch per
++# bead, and the refinery's clone with `temp` rebased onto the target, which is
++# what the patrol's `rebase` step leaves behind. Only gc is stubbed. The stub is
++# modeled on test_refinery_merge_lanes.sh's, but holds a fixture DIRECTORY with
++# one JSON file per bead, so a batch of beads can be read, listed and written:
++#   bd list           every fixture bead, unsorted, so select's own sort is what
++#                     the cases test; the stub insists on the query's flags
++#   bd show <id>      that bead's file; fails for the ids in GC_STUB_FAIL_SHOW
++#   bd update <id>    --set-metadata, --unset-metadata, --assignee, --status
++#   bd close <id>     status closed and the close reason
++# Every call is journalled to $T/gc.log. A call the model does not know fails
++# loudly (exit 64) and fails the case.
++#
++# Each script run is under `env -i`, so no agent-session GC_* variable can leak
++# in. SCRIPT may point at another copy of merge-batch.sh; it finds merge-push.sh
++# beside itself, so stage a copy as a pack tree.
++#
++# The suite fails unless all 9 cases ran.
++set -uo pipefail
++
++ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
++PACK_DIR="$ROOT/gastown"
++SCRIPT="${SCRIPT:-$PACK_DIR/assets/scripts/refinery/merge-batch.sh}"
++PUSH_SCRIPT="$(dirname "$SCRIPT")/merge-push.sh"
++EXPECTED_CASES=9
++
++AGENT=testrig/gastown.refinery
++TARGET_NAME=integration
++FAILURES=0
++PASS_CASES=0
++CASE=""
++
++fail() {
++    echo "FAIL[$CASE]: $*" >&2
++    FAILURES=$((FAILURES + 1))
++}
++
++assert_eq() {
++    # assert_eq <what> <want> <got>
++    [ "$2" = "$3" ] || fail "$1: want '$2', got '$3'"
++}
++
++# --- stubs ------------------------------------------------------------------
++
++write_gc_stub() {
++    cat >"$1/gc" <<'STUB'
++#!/usr/bin/env bash
++ARGS=("$@")
++printf 'gc %s\n' "$*" >>"$GC_STUB_LOG"
++unexpected() {
++    printf 'gc %s\n' "${ARGS[*]}" >>"$STUB_UNEXPECTED"
++    echo "stub gc: unexpected invocation: gc ${ARGS[*]}" >&2
++    exit 64
++}
++edit_bead() {
++    local file="$1" tmp
++    shift
++    tmp=$(mktemp) || exit 70
++    jq "$@" "$file" >"$tmp" && mv -f "$tmp" "$file"
++}
++case "${1:-}" in
++bd)
++    case "${2:-}" in
++    list)
++        # The assignee scan find-work runs: this agent's, in-flight, beads with a
++        # branch, unlimited. Anything else is a query the model does not know.
++        assignee="" limit="" json="" status="" branch_key=""
++        shift 2
++        while [ "$#" -gt 0 ]; do
++            case "$1" in
++            --assignee=*) assignee="${1#*=}" ;;
++            --limit=*) limit="${1#*=}" ;;
++            --status=*) status="${1#*=}" ;;
++            --has-metadata-key=*) branch_key="${1#*=}" ;;
++            --rig=* | --exclude-type=*) : ;;
++            --json) json=1 ;;
++            *) unexpected ;;
++            esac
++            shift
++        done
++        { [ "$assignee" = "$GC_STUB_AGENT" ] && [ "$limit" = 0 ] && [ -n "$json" ] &&
++            [ "$status" = open,in_progress ] && [ "$branch_key" = branch ]; } || unexpected
++        jq -s 'map(.[0])' "$GC_STUB_BEADS"/*.json
++        ;;
++    show)
++        { [ "$#" -eq 4 ] && [ "$4" = --json ]; } || unexpected
++        case " ${GC_STUB_FAIL_SHOW:-} " in
++        *" $3 "*)
++            echo "stub gc: bd show $3 failed on request" >&2
++            exit 1
++            ;;
++        esac
++        [ -f "$GC_STUB_BEADS/$3.json" ] || {
++            echo "stub gc: no such bead: $3" >&2
++            exit 1
++        }
++        cat "$GC_STUB_BEADS/$3.json"
++        ;;
++    update)
++        id="${3:-}"
++        file="$GC_STUB_BEADS/$id.json"
++        [ -f "$file" ] || unexpected
++        shift 3
++        while [ "$#" -gt 0 ]; do
++            case "$1" in
++            --assignee=*) edit_bead "$file" --arg v "${1#*=}" '.[0].assignee = $v' ;;
++            --status=*) edit_bead "$file" --arg v "${1#*=}" '.[0].status = $v' ;;
++            --set-metadata)
++                edit_bead "$file" --arg k "${2%%=*}" --arg v "${2#*=}" '.[0].metadata[$k] = $v'
++                shift
++                ;;
++            --unset-metadata)
++                edit_bead "$file" --arg k "$2" 'del(.[0].metadata[$k])'
++                shift
++                ;;
++            *) unexpected ;;
++            esac
++            shift
++        done
++        ;;
++    close)
++        file="$GC_STUB_BEADS/${3:-}.json"
++        { [ "$#" -eq 5 ] && [ "$4" = --reason ] && [ -f "$file" ]; } || unexpected
++        edit_bead "$file" --arg r "$5" '.[0].status = "closed" | .[0].close_reason = $r'
++        ;;
++    *) unexpected ;;
++    esac
++    ;;
++*) unexpected ;;
++esac
++exit 0
++STUB
++    chmod +x "$1/gc"
++}
++
++# --- rig --------------------------------------------------------------------
++
++git_q() { git "$@" >/dev/null 2>&1; }
++
++new_case() {
++    CASE="$1"
++    CASE_START_FAILURES=$FAILURES
++    T=$(mktemp -d "${TMPDIR:-/tmp}/merge-batch.XXXXXX")
++    ORIGIN="$T/origin.git"
++    SEED="$T/seed"
++    POLECAT="$T/polecat"
++    REFINERY="$T/refinery"
++    BEADS="$T/beads"
++    mkdir -p "$T/home" "$T/tmp" "$T/bin" "$BEADS"
++    cat >"$T/home/.gitconfig" <<'CFG'
++[init]
++	defaultBranch = integration
++[user]
++	name = refinery
++	email = refinery@example.invalid
++[advice]
++	detachedHead = false
++[protocol "file"]
++	allow = always
++[commit]
++	gpgsign = false
++CFG
++    export HOME="$T/home"
++    export GIT_CONFIG_GLOBAL="$T/home/.gitconfig"
++    export GIT_CONFIG_NOSYSTEM=1
++    export GIT_AUTHOR_NAME=refinery GIT_AUTHOR_EMAIL=refinery@example.invalid
++    export GIT_COMMITTER_NAME=refinery GIT_COMMITTER_EMAIL=refinery@example.invalid
++    write_gc_stub "$T/bin"
++    : >"$T/gc.log"
++    : >"$T/unexpected"
++    : >"$T/out"
++    : >"$T/err"
++    FAIL_SHOW=""
++    EXTRA_ENV=()
++    CONFIG_JSON="$T/config.json"
++    write_config
++}
++
++end_case() {
++    [ ! -s "$T/unexpected" ] || fail "unmodelled stub call(s): $(tr '\n' ';' <"$T/unexpected")"
++    if [ "$FAILURES" -ne "$CASE_START_FAILURES" ]; then
++        {
++            echo "--- $CASE: last run (status $(last_rc 2>/dev/null)) stdout ---"
++            cat "$T/out"
++            echo "--- $CASE: last run stderr ---"
++            cat "$T/err"
++            echo "--- $CASE: gc calls ---"
++            cat "$T/gc.log"
++        } >&2
++    fi
++    trash "$T" 2>/dev/null || rm -rf "$T"
++    PASS_CASES=$((PASS_CASES + 1))
++}
++
++# write_config [require_merge_approval=value] — the city config the script reads
++# through MERGE_PUSH_CONFIG_JSON.
++write_config() {
++    local vars='{}' kv
++    for kv in "$@"; do
++        vars=$(jq -c --arg k "${kv%%=*}" --arg v "${kv#*=}" '. + {($k): $v}' <<<"$vars")
++    done
++    jq -n --argjson vars "$vars" \
++        '{config: {Rigs: [{Name: "testrig", DefaultBranch: "integration", FormulaVars: $vars}]}}' >"$CONFIG_JSON"
++}
++
++# init_rig — a bare origin holding the baseline, and the clone polecats work in.
++init_rig() {
++    git_q init --bare "$ORIGIN"
++    git_q init "$SEED"
++    printf 'alpha\nbeta\ngamma\n' >"$SEED/shared.txt"
++    echo baseline >"$SEED/README.md"
++    git_q -C "$SEED" add -A
++    git_q -C "$SEED" commit -m "chore: baseline"
++    git_q -C "$SEED" remote add origin "$ORIGIN"
++    git_q -C "$SEED" push origin HEAD:integration
++    FORK_SHA=$(git -C "$SEED" rev-parse HEAD)
++    git_q clone "$ORIGIN" "$POLECAT"
++}
++
++# add_branch <bead-id> <file> <content> [commits] — polecat/<bead-id> forks from
++# the baseline and adds <file>, once per commit, then is pushed.
++add_branch() {
++    local id="$1" file="$2" content="$3" n="${4:-1}" i
++    git_q -C "$POLECAT" checkout -B "polecat/$id" "$FORK_SHA"
++    for i in $(seq 1 "$n"); do
++        printf '%s (commit %s)\n' "$content" "$i" >"$POLECAT/$file"
++        git_q -C "$POLECAT" add "$file"
++        git_q -C "$POLECAT" commit -m "feat: $id change $i"
++    done
++    git_q -C "$POLECAT" push -f origin "polecat/$id"
++}
++
++# edit_shared <bead-id> <text> — polecat/<bead-id> rewrites line 1 of shared.txt.
++edit_shared() {
++    local id="$1"
++    git_q -C "$POLECAT" checkout -B "polecat/$id" "$FORK_SHA"
++    printf '%s\nbeta\ngamma\n' "$2" >"$POLECAT/shared.txt"
++    git_q -C "$POLECAT" add shared.txt
++    git_q -C "$POLECAT" commit -m "feat: $id edits the shared line"
++    git_q -C "$POLECAT" push -f origin "polecat/$id"
++}
++
++# move_target <file> — another bead's work lands on the target, so the head's
++# rebase is a real rewrite and not a no-op.
++move_target() {
++    git_q -C "$SEED" pull origin integration
++    echo "someone else" >"$SEED/$1"
++    git_q -C "$SEED" add "$1"
++    git_q -C "$SEED" commit -m "feat: a concurrent bead"
++    git_q -C "$SEED" push origin HEAD:integration
++}
++
++# land_by_patch_id <bead-id> — the bead's branch tip is cherry-picked onto the
++# target: the same patch under a new sha, which is how a rebasing lane lands.
++land_by_patch_id() {
++    git_q -C "$SEED" pull origin integration
++    git_q -C "$SEED" fetch origin "+refs/heads/polecat/$1:refs/remotes/origin/polecat/$1"
++    git_q -C "$SEED" cherry-pick "origin/polecat/$1"
++    git_q -C "$SEED" push origin HEAD:integration
++}
++
++# finish_rig <head-id> — the refinery's clone with `temp` rebased onto the target,
++# as the rebase step leaves it. Sets ENTRY_SHA, the head tip the script records.
++finish_rig() {
++    git_q clone "$ORIGIN" "$REFINERY"
++    git_q -C "$REFINERY" checkout -b temp "origin/polecat/$1"
++    git_q -C "$REFINERY" rebase origin/integration ||
++        fail "harness bug: the head's rebase did not apply cleanly"
++    ENTRY_SHA=$(git -C "$REFINERY" rev-parse --verify -q temp)
++    [ -n "$ENTRY_SHA" ] || fail "harness bug: finish_rig left no temp branch"
++}
++
++# write_bead <id> <priority> <created_at> [key=value ...] — a bead as `bd show`
++# returns it, assigned to the refinery, with the polecat's branch metadata.
++write_bead() {
++    local id="$1" prio="$2" created="$3" kv tmp
++    shift 3
++    jq -n --arg id "$id" --argjson prio "$prio" --arg created "$created" --arg agent "$AGENT" \
++        --arg branch "polecat/$id" --arg target "$TARGET_NAME" --arg fork "$FORK_SHA" \
++        '[{id: $id, title: ("Bead " + $id), priority: $prio, created_at: $created,
++           issue_type: "task", status: "in_progress", assignee: $agent,
++           metadata: {branch: $branch, target: $target, fork_sha: $fork}}]' >"$BEADS/$id.json"
++    for kv in "$@"; do
++        set_meta "$id" "${kv%%=*}" "${kv#*=}"
++    done
++}
++
++set_meta() {
++    local tmp
++    tmp=$(mktemp)
++    jq --arg k "$2" --arg v "$3" '.[0].metadata[$k] = $v' "$BEADS/$1.json" >"$tmp" && mv -f "$tmp" "$BEADS/$1.json"
++}
++
++unset_meta() {
++    local tmp
++    tmp=$(mktemp)
++    jq --arg k "$2" 'del(.[0].metadata[$k])' "$BEADS/$1.json" >"$tmp" && mv -f "$tmp" "$BEADS/$1.json"
++}
++
++bead_meta() { jq -r --arg k "$2" '.[0].metadata[$k] // "<unset>"' "$BEADS/$1.json"; }
++bead_field() { jq -r --arg k "$2" '.[0][$k] // "<unset>"' "$BEADS/$1.json"; }
++bead_sum() { cksum <"$BEADS/$1.json"; }
++
++# --- running the script -----------------------------------------------------
++
++# run_batch <args...> — run merge-batch.sh inside the refinery clone, as the
++# patrol does. Sets RC, and leaves stdout in $T/out and stderr in $T/err. The
++# cd fails closed: a script run anywhere else would fetch and push the origin of
++# whatever checkout the suite started in.
++run_batch() {
++    (
++        cd "$REFINERY" || exit 90
++        env -i \
++            PATH="$T/bin:$PATH" HOME="$T/home" TMPDIR="$T/tmp" \
++            GIT_CONFIG_GLOBAL="$T/home/.gitconfig" GIT_CONFIG_NOSYSTEM=1 \
++            GIT_AUTHOR_NAME=refinery GIT_AUTHOR_EMAIL=refinery@example.invalid \
++            GIT_COMMITTER_NAME=refinery GIT_COMMITTER_EMAIL=refinery@example.invalid \
++            GC_RIG=testrig GC_AGENT="$AGENT" MERGE_PUSH_CONFIG_JSON="$CONFIG_JSON" \
++            GC_STUB_LOG="$T/gc.log" GC_STUB_BEADS="$BEADS" GC_STUB_AGENT="$AGENT" \
++            GC_STUB_FAIL_SHOW="$FAIL_SHOW" STUB_UNEXPECTED="$T/unexpected" \
++            ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"} \
++            "$BASH" "$SCRIPT" "$@"
++    ) >"$T/out" 2>"$T/err"
++    RC=$?
++    # `selected` runs this in a command substitution, where RC would be lost.
++    echo "$RC" >"$T/rc"
++}
++
++last_rc() { cat "$T/rc"; }
++
++# selected <args...> — run `select` and print the ids it chose on stdout,
++# space-separated. It runs in a command substitution, so read the exit status
++# with last_rc.
++selected() {
++    run_batch select "$@"
++    tr '\n' ' ' <"$T/out" | sed 's/ $//'
++}
++
++manifest_path() { echo "$(git -C "$REFINERY" rev-parse --absolute-git-dir)/refinery-batch.json"; }
++mf() { jq -r "$1" "$(manifest_path)"; }
++temp_sha() { git -C "$REFINERY" rev-parse --verify -q temp; }
++patch_id_of() { git -C "$REFINERY" show "$1" | git patch-id --stable | cut -d' ' -f1; }
++current_branch() { git -C "$REFINERY" branch --show-current; }
++db_writes() { grep -cE '^gc bd (update|close) ' "$T/gc.log"; }
++
++# assert_stack_clean_up — the tidy-up every stack run owes: temp checked out, no
++# scratch branch left behind, no rebase in flight.
++assert_tidy() {
++    assert_eq "the clone ends on temp" temp "$(current_branch)"
++    git -C "$REFINERY" rev-parse --verify -q batch-member >/dev/null 2>&1 &&
++        fail "the scratch branch batch-member was left behind"
++    [ ! -d "$(git -C "$REFINERY" rev-parse --absolute-git-dir)/rebase-merge" ] ||
++        fail "a rebase was left in flight"
++}
++
++# --- cases --------------------------------------------------------------------
++
++# The queue the select cases share: five beads whose priorities and creation
++# times disagree with their ids, one with a first_submitted_at that beats its
++# creation time. The stub lists them by file name, so only the sort puts them in
++# order: b2, b4, b3, b1, b5.
++case_select_order() {
++    new_case select-order
++    init_rig
++    local i
++    for i in 1 2 3 4 5; do add_branch "gcp-b$i" "f$i.txt" "bead $i"; done
++    finish_rig gcp-b2
++    write_bead gcp-b1 2 2026-10-02T03:00:00Z
++    write_bead gcp-b2 1 2026-10-02T05:00:00Z first_submitted_at=2026-10-02T01:00:00Z
++    write_bead gcp-b3 2 2026-10-02T01:00:00Z
++    write_bead gcp-b4 1 2026-10-02T02:00:00Z
++    write_bead gcp-b5 3 2026-10-02T00:30:00Z
++
++    assert_eq "K=3 prints the first three in find-work's order, head first" \
++        "gcp-b2 gcp-b4 gcp-b3" "$(selected --head gcp-b2 --max 3)"
++    assert_eq "select exits 0" 0 "$(last_rc)"
++    assert_eq "K=5 prints the whole queue in order" \
++        "gcp-b2 gcp-b4 gcp-b3 gcp-b1 gcp-b5" "$(selected --head gcp-b2 --max 5)"
++    assert_eq "K=1 prints the head alone" gcp-b2 "$(selected --head gcp-b2 --max 1)"
++    assert_eq "no --max means a batch of 1" gcp-b2 "$(selected --head gcp-b2)"
++    # The query is find-work's assignee scan, scoped to the rig and never
++    # limited to one: the batch is a prefix of this queue.
++    grep -q -- "--assignee=$AGENT" "$T/gc.log" || fail "select did not scan the refinery's assigned beads"
++    grep -q -- "--rig=testrig" "$T/gc.log" || fail "select did not scope its scan to the rig"
++    grep -q -- "--limit=1" "$T/gc.log" && fail "select limited its scan to one bead"
++    assert_eq "select wrote no bead" 0 "$(db_writes)"
++    # A head that does not lead the queue is not a prefix: a batch of 1.
++    assert_eq "a head that does not lead the queue is a batch of 1" \
++        gcp-b4 "$(selected --head gcp-b4 --max 3)"
++    end_case
++}
++
++# Four beads in one queue order (q1..q4). Each variant spoils q2 in one way, or
++# q3 in another, and select must stop in front of the spoiled bead.
++case_select_truncation() {
++    new_case select-truncation
++    init_rig
++    local i
++    for i in 1 2 3 4; do add_branch "gcp-q$i" "f$i.txt" "bead $i"; done
++    finish_rig gcp-q1
++    reset_queue() {
++        for i in 1 2 3 4; do write_bead "gcp-q$i" 1 "2026-10-02T0$i:00:00Z"; done
++    }
++    all="gcp-q1 gcp-q2 gcp-q3 gcp-q4"
++    sel() { selected --head gcp-q1 --max 4; }
++
++    reset_queue
++    assert_eq "baseline: an eligible queue batches whole" "$all" "$(sel)"
++
++    reset_queue
++    set_meta gcp-q2 merge_strategy mr
++    assert_eq "q2 with merge_strategy=mr ends the batch at the head" gcp-q1 "$(sel)"
++
++    reset_queue
++    set_meta gcp-q2 merge_strategy pr
++    assert_eq "q2 with merge_strategy=pr (read as mr) ends the batch at the head" gcp-q1 "$(sel)"
++
++    reset_queue
++    set_meta gcp-q2 existing_pr https://github.com/acme/widgets/pull/9
++    assert_eq "q2 with an existing_pr ends the batch at the head" gcp-q1 "$(sel)"
++
++    reset_queue
++    unset_meta gcp-q2 fork_sha
++    assert_eq "q2 without fork_sha ends the batch at the head" gcp-q1 "$(sel)"
++
++    reset_queue
++    set_meta gcp-q2 target release
++    assert_eq "q2 targeting another branch ends the batch at the head" gcp-q1 "$(sel)"
++
++    reset_queue
++    set_meta gcp-q2 merge_batch_serial "$(git -C "$REFINERY" rev-parse origin/polecat/gcp-q2)"
++    assert_eq "q2 whose merge_batch_serial is its branch tip ends the batch at the head" gcp-q1 "$(sel)"
++
++    reset_queue
++    set_meta gcp-q2 merge_batch_serial "$FORK_SHA"
++    assert_eq "q2 whose merge_batch_serial is an OLD sha (the branch moved) is included" "$all" "$(sel)"
++
++    reset_queue
++    set_meta gcp-q3 merge_strategy mr
++    assert_eq "an ineligible q3 keeps q2 and drops q3 and everything behind it" "gcp-q1 gcp-q2" "$(sel)"
++
++    reset_queue
++    set_meta gcp-q1 merge_strategy mr
++    assert_eq "an ineligible HEAD is still printed: a batch of one is the single-bead lane" \
++        gcp-q1 "$(selected --head gcp-q1 --max 4 --require-approval false)"
++
++    # A member whose branch cannot be fetched cannot be shown eligible.
++    reset_queue
++    git_q -C "$REFINERY" push origin --delete polecat/gcp-q3
++    assert_eq "a member whose branch is gone from origin ends the batch" "gcp-q1 gcp-q2" "$(sel)"
++    assert_eq "select writes no bead" 0 "$(db_writes)"
++    end_case
++}
++
++case_select_approval() {
++    new_case select-approval
++    init_rig
++    local i
++    for i in 1 2 3 4; do add_branch "gcp-q$i" "f$i.txt" "bead $i"; done
++    finish_rig gcp-q1
++    for i in 1 2 3 4; do write_bead "gcp-q$i" 1 "2026-10-02T0$i:00:00Z"; done
++    all="gcp-q1 gcp-q2 gcp-q3 gcp-q4"
++
++    write_config require_merge_approval=false
++    assert_eq "baseline: approval off batches whole" "$all" "$(selected --head gcp-q1 --max 4)"
++
++    write_config require_merge_approval=true
++    assert_eq "require_merge_approval=true prints the head only" gcp-q1 "$(selected --head gcp-q1 --max 4)"
++    assert_eq "approval on is not an error" 0 "$(last_rc)"
++
++    write_config require_merge_approval=sometimes
++    assert_eq "an unrecognized approval value counts as ON" gcp-q1 "$(selected --head gcp-q1 --max 4)"
++
++    write_config
++    EXTRA_ENV=(MERGE_PUSH_CONFIG_JSON="$T/missing-config.json")
++    assert_eq "an unreadable config (a missing file) prints the head only" gcp-q1 "$(selected --head gcp-q1 --max 4)"
++    assert_eq "an unreadable config is not an error" 0 "$(last_rc)"
++    grep -q 'fail closed' "$T/err" || fail "select did not say the unreadable config resolved approval ON"
++    EXTRA_ENV=()
++
++    printf 'not json' >"$T/garbled.json"
++    EXTRA_ENV=(MERGE_PUSH_CONFIG_JSON="$T/garbled.json")
++    assert_eq "an unparseable config prints the head only" gcp-q1 "$(selected --head gcp-q1 --max 4)"
++    EXTRA_ENV=()
++    end_case
++}
++
++case_stack_clean() {
++    new_case stack-clean
++    init_rig
++    add_branch gcp-m1 f1.txt "member one"
++    add_branch gcp-m2 f2.txt "member two" 2
++    add_branch gcp-m3 f3.txt "member three"
++    move_target elsewhere.txt
++    finish_rig gcp-m1
++    write_bead gcp-m1 1 2026-10-02T01:00:00Z
++    write_bead gcp-m2 1 2026-10-02T02:00:00Z
++    write_bead gcp-m3 1 2026-10-02T03:00:00Z
++    local before_m2 before_m3
++    before_m2=$(bead_sum gcp-m2)
++    before_m3=$(bead_sum gcp-m3)
++
++    run_batch stack --head gcp-m1 --members gcp-m1,gcp-m2,gcp-m3
++    assert_eq "stack exits 0" 0 "$(last_rc)"
++    assert_eq "the manifest lists the three members in batch order" \
++        "gcp-m1 gcp-m2 gcp-m3" "$(mf '[.members[].id] | join(" ")')"
++    assert_eq "the manifest names the head" gcp-m1 "$(mf .head)"
++    assert_eq "the manifest names the target" integration "$(mf .target)"
++    assert_eq "the manifest's base is the head tip recorded at entry" "$ENTRY_SHA" "$(mf .base)"
++    assert_eq "the head's recorded tip is the head tip" "$ENTRY_SHA" "$(mf '.members[0].tip')"
++    assert_eq "commit counts are 1, 2, 1" "1 2 1" "$(mf '[.members[].commits] | join(" ")')"
++    assert_eq "the manifest records each member's branch" \
++        "polecat/gcp-m1 polecat/gcp-m2 polecat/gcp-m3" "$(mf '[.members[].branch] | join(" ")')"
++    assert_eq "temp ends on the last member's recorded tip" "$(mf '.members[2].tip')" "$(temp_sha)"
++    local i
++    for i in 1 2 3; do
++        git -C "$REFINERY" cat-file -e "temp:f$i.txt" 2>/dev/null || fail "temp's tree lacks member $i's change (f$i.txt)"
++        assert_eq "member $i's recorded patch-id is its branch tip commit's" \
++            "$(patch_id_of "origin/polecat/gcp-m$i")" "$(mf ".members[$((i - 1))].patch_id")"
++        git -C "$REFINERY" merge-base --is-ancestor "$(mf ".members[$((i - 1))].tip")" temp ||
++            fail "member $i's recorded tip is not reachable from temp"
++    done
++    git -C "$REFINERY" cat-file -e "temp:elsewhere.txt" 2>/dev/null || fail "temp lost the target's own commit"
++    assert_eq "stack wrote no bead" 0 "$(db_writes)"
++    assert_eq "member 2's bead is untouched" "$before_m2" "$(bead_sum gcp-m2)"
++    assert_eq "member 3's bead is untouched" "$before_m3" "$(bead_sum gcp-m3)"
++    assert_tidy
++
++    # The members may come from the manifest instead of a flag: the agent writes
++    # the list it settled on, and stack reads it back.
++    git_q -C "$REFINERY" reset --hard "$ENTRY_SHA"
++    jq -n '{head: "gcp-m1", members: [{id: "gcp-m1"}, {id: "gcp-m2"}]}' >"$(manifest_path)"
++    run_batch stack --head gcp-m1
++    assert_eq "stack from a manifest exits 0" 0 "$(last_rc)"
++    assert_eq "stack from a manifest stacks the members it names" \
++        "gcp-m1 gcp-m2" "$(mf '[.members[].id] | join(" ")')"
++    git -C "$REFINERY" cat-file -e "temp:f3.txt" 2>/dev/null && fail "member 3 was stacked though the manifest did not name it"
++    # A manifest left by another head is not this batch's.
++    git_q -C "$REFINERY" reset --hard "$ENTRY_SHA"
++    jq -n '{head: "gcp-other", members: [{id: "gcp-other"}, {id: "gcp-m2"}]}' >"$(manifest_path)"
++    run_batch stack --head gcp-m1
++    assert_eq "a stale manifest for another head leaves a batch of 1" gcp-m1 "$(mf '[.members[].id] | join(" ")')"
++    assert_eq "stack with no members at all leaves temp on the head" "$ENTRY_SHA" "$(temp_sha)"
++    # The head must lead an explicit list.
++    run_batch stack --head gcp-m1 --members gcp-m2,gcp-m1
++    assert_eq "a member list that does not start with the head is a usage error" 1 "$(last_rc)"
++    end_case
++}
++
++case_stack_conflict() {
++    new_case stack-conflict
++    init_rig
++    edit_shared gcp-c1 "from the first member"
++    edit_shared gcp-c2 "from the second member"
++    add_branch gcp-c3 f3.txt "member three"
++    finish_rig gcp-c1
++    write_bead gcp-c1 1 2026-10-02T01:00:00Z
++    write_bead gcp-c2 1 2026-10-02T02:00:00Z
++    write_bead gcp-c3 1 2026-10-02T03:00:00Z
++    local before_c2 before_c3
++    before_c2=$(bead_sum gcp-c2)
++    before_c3=$(bead_sum gcp-c3)
++
++    run_batch stack --head gcp-c1 --members gcp-c1,gcp-c2,gcp-c3
++    assert_eq "stack exits 0 when a member conflicts with an earlier one" 0 "$(last_rc)"
++    assert_eq "the manifest holds the head alone" gcp-c1 "$(mf '[.members[].id] | join(" ")')"
++    assert_eq "temp is member 1's tip" "$ENTRY_SHA" "$(temp_sha)"
++    assert_eq "member 1's recorded tip is the head tip" "$ENTRY_SHA" "$(mf '.members[0].tip')"
++    git -C "$REFINERY" cat-file -e "temp:f3.txt" 2>/dev/null && fail "member 3 was stacked behind the conflicting member"
++    assert_eq "the conflicting member's bead is byte-identical" "$before_c2" "$(bead_sum gcp-c2)"
++    assert_eq "the member behind it is byte-identical" "$before_c3" "$(bead_sum gcp-c3)"
++    assert_eq "the conflicting member is not rejected: no bead write at all" 0 "$(db_writes)"
++    grep -q 'gcp-c2' "$T/out" || fail "stack did not say where the batch ended"
++    assert_tidy
++    end_case
++}
++
++case_stack_already_landed() {
++    new_case stack-already-landed
++    init_rig
++    add_branch gcp-l1 f1.txt "member one"
++    add_branch gcp-l2 f2.txt "member two"
++    add_branch gcp-l3 f3.txt "member three"
++    move_target elsewhere.txt
++    land_by_patch_id gcp-l2
++    finish_rig gcp-l1
++    write_bead gcp-l1 1 2026-10-02T01:00:00Z
++    write_bead gcp-l2 1 2026-10-02T02:00:00Z rejection_reason="an earlier attempt was rejected"
++    write_bead gcp-l3 1 2026-10-02T03:00:00Z
++    local before_l1 before_l3 l2_patch
++    l2_patch=$(patch_id_of origin/polecat/gcp-l2)
++    before_l1=$(bead_sum gcp-l1)
++    before_l3=$(bead_sum gcp-l3)
++
++    run_batch stack --head gcp-l1 --members gcp-l1,gcp-l2,gcp-l3
++    assert_eq "stack exits 0" 0 "$(last_rc)"
++    assert_eq "the manifest skips the member that already landed" \
++        "gcp-l1 gcp-l3" "$(mf '[.members[].id] | join(" ")')"
++    assert_eq "the already-landed member is closed" closed "$(bead_field gcp-l2 status)"
++    assert_eq "its merge_result is already_merged" already_merged "$(bead_meta gcp-l2 merge_result)"
++    assert_eq "it records how that was established" rebase_patch_id "$(bead_meta gcp-l2 already_merged_via)"
++    assert_eq "it records the target" integration "$(bead_meta gcp-l2 merged_target)"
++    assert_eq "its stale rejection_reason is cleared" "<unset>" "$(bead_meta gcp-l2 rejection_reason)"
++    local merged
++    merged=$(bead_meta gcp-l2 merged_sha)
++    git -C "$REFINERY" merge-base --is-ancestor "$merged" origin/integration 2>/dev/null ||
++        fail "merged_sha $merged is not on origin/integration"
++    assert_eq "merged_sha is the target commit that carries the member's patch" \
++        "$l2_patch" "$(patch_id_of "$merged")"
++    case "$(bead_field gcp-l2 close_reason)" in
++    "Already merged to integration at "*) ;;
++    *) fail "unexpected close reason: $(bead_field gcp-l2 close_reason)" ;;
++    esac
++    [ -z "$(git -C "$REFINERY" ls-remote origin refs/heads/polecat/gcp-l2)" ] ||
++        fail "the merged member's branch was not deleted (delete_merged_branches defaults on)"
++    assert_eq "the head's bead is untouched" "$before_l1" "$(bead_sum gcp-l1)"
++    assert_eq "the stacked member's bead is untouched" "$before_l3" "$(bead_sum gcp-l3)"
++    git -C "$REFINERY" cat-file -e "temp:f3.txt" 2>/dev/null || fail "stacking did not continue past the closed member"
++    assert_eq "temp ends on the last stacked member's tip" "$(mf '.members[1].tip')" "$(temp_sha)"
++    assert_eq "the closed member took no place in the commit counts" "1 1" "$(mf '[.members[].commits] | join(" ")')"
++    # The agent is told nothing about skipping the merge script: that advice is
++    # the single-bead lane's.
++    grep -q 'Skip the merge script' "$T/out" && fail "stack leaked the lane's 'skip the merge script' advice"
++    assert_tidy
++    end_case
++}
++
++case_stack_degrade() {
++    new_case stack-degrade
++    init_rig
++    add_branch gcp-d1 f1.txt "member one"
++    add_branch gcp-d2 f2.txt "member two"
++    add_branch gcp-d3 f3.txt "member three"
++    move_target elsewhere.txt
++    finish_rig gcp-d1
++    write_bead gcp-d1 1 2026-10-02T01:00:00Z
++    write_bead gcp-d2 1 2026-10-02T02:00:00Z
++    write_bead gcp-d3 1 2026-10-02T03:00:00Z
++    FAIL_SHOW=gcp-d3
++
++    run_batch stack --head gcp-d1 --members gcp-d1,gcp-d2,gcp-d3
++    assert_eq "stack exits 0 on an internal error" 0 "$(last_rc)"
++    assert_eq "the manifest holds the head alone" gcp-d1 "$(mf '[.members[].id] | join(" ")')"
++    assert_eq "temp is reset to the head tip recorded at entry" "$ENTRY_SHA" "$(temp_sha)"
++    git -C "$REFINERY" cat-file -e "temp:f2.txt" 2>/dev/null && fail "member 2 is still stacked after the degrade"
++    grep -q 'WARN' "$T/err" || fail "stack did not print WARN"
++    assert_eq "the degraded manifest names the head's tip" "$ENTRY_SHA" "$(mf '.members[0].tip')"
++    assert_eq "the working tree is clean" "" "$(git -C "$REFINERY" status --porcelain)"
++    assert_eq "stack wrote no bead" 0 "$(db_writes)"
++    assert_tidy
++    end_case
++}
++
++case_invariants() {
++    new_case invariants
++    init_rig
++    add_branch gcp-i1 f1.txt "member one"
++    finish_rig gcp-i1
++    local count
++    count=$(grep -c '{{' "$SCRIPT")
++    assert_eq "the script carries no template placeholder" 0 "$count"
++    grep -q 'drain-ack' "$SCRIPT" && fail "the script contains drain-ack: patrol-loop control is the step's, not the script's"
++    grep -q 'bd mol wisp' "$SCRIPT" && fail "the script pours a wisp: patrol-loop control is the step's"
++    grep -q 'bd mol burn' "$SCRIPT" && fail "the script burns a wisp: patrol-loop control is the step's"
++
++    run_batch
++    assert_eq "no subcommand exits 1" 1 "$(last_rc)"
++    grep -q '^usage: merge-batch.sh' "$T/err" || fail "no subcommand printed no usage line"
++    run_batch frobnicate
++    assert_eq "an unknown subcommand exits 1" 1 "$(last_rc)"
++    grep -q '^usage: merge-batch.sh' "$T/err" || fail "an unknown subcommand printed no usage line"
++    assert_eq "an unknown subcommand prints nothing on stdout" "" "$(cat "$T/out")"
++    run_batch select
++    assert_eq "select without --head exits 1" 1 "$(last_rc)"
++    run_batch select --head gcp-i1 --max zero
++    assert_eq "select with a non-integer --max exits 1" 1 "$(last_rc)"
++    run_batch stack
++    assert_eq "stack without --head exits 1" 1 "$(last_rc)"
++    assert_eq "usage errors touch no bead" 0 "$(db_writes)"
++
++    # Approval ON: stack leaves a batch of one however many members it was given.
++    write_bead gcp-i1 1 2026-10-02T01:00:00Z
++    write_config require_merge_approval=true
++    run_batch stack --head gcp-i1 --members gcp-i1,gcp-i2
++    assert_eq "stack with approval on exits 0" 0 "$(last_rc)"
++    assert_eq "stack with approval on holds the head alone" gcp-i1 "$(mf '[.members[].id] | join(" ")')"
++
++    # A head that would not ride the direct lane is a batch of one, too.
++    write_config
++    set_meta gcp-i1 merge_strategy mr
++    run_batch stack --head gcp-i1 --members gcp-i1,gcp-i2
++    assert_eq "stack with an mr head exits 0" 0 "$(last_rc)"
++    assert_eq "stack with an mr head holds the head alone" gcp-i1 "$(mf '[.members[].id] | join(" ")')"
++    end_case
++}
++
++# The two functions the batch's eligibility is built on live in merge-push.sh, and
++# main calls them, so the lane and the batch cannot decide differently.
++case_extraction() {
++    new_case extraction
++    local declared
++    declared=$(MERGE_PUSH_SOURCE_ONLY=1 "$BASH" -c ". '$PUSH_SCRIPT'; declare -F resolve_merge_strategy resolve_approval_required" 2>&1)
++    assert_eq "merge-push.sh defines both functions" \
++        "resolve_merge_strategy
++resolve_approval_required" "$declared"
++    local main_body
++    main_body=$(sed -n '/^main() {/,/^}/p' "$PUSH_SCRIPT")
++    # shellcheck disable=SC2016
++    printf '%s\n' "$main_body" | grep -q 'resolve_merge_strategy "\$WORK"' || fail "main does not call resolve_merge_strategy"
++    printf '%s\n' "$main_body" | grep -q '^resolve_approval_required' || fail "main does not call resolve_approval_required"
++    end_case
++}
++
++# --- run ----------------------------------------------------------------------
++
++[ -f "$SCRIPT" ] || { echo "FAIL: no script at $SCRIPT" >&2; exit 1; }
++[ -f "$PUSH_SCRIPT" ] || { echo "FAIL: no merge-push.sh beside $SCRIPT" >&2; exit 1; }
++
++case_select_order
++case_select_truncation
++case_select_approval
++case_stack_clean
++case_stack_conflict
++case_stack_already_landed
++case_stack_degrade
++case_invariants
++case_extraction
++
++if [ "$PASS_CASES" -ne "$EXPECTED_CASES" ]; then
++    echo "FAIL: $PASS_CASES of $EXPECTED_CASES cases ran" >&2
++    exit 1
++fi
++if [ "$FAILURES" -ne 0 ]; then
++    echo "FAIL: $FAILURES assertion(s) failed across $PASS_CASES cases" >&2
++    exit 1
++fi
++echo "OK: $PASS_CASES cases passed"
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 27 Sep 2026 15:51:52 -0400
-Subject: [PATCH 104/122] fix(formulas): drop the two recursive force-removes
+Subject: [PATCH 104/124] fix(formulas): drop the two recursive force-removes
  for rmdir / warn-and-leave (gcp-l8td.1)
 
 The mill safety hook (dotmill-yuk) is closing a gap: once it collapses a

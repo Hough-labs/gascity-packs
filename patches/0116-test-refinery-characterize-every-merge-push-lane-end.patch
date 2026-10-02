@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 27 Sep 2026 22:40:16 -0400
-Subject: [PATCH 116/122] test(refinery): characterize every merge-push lane
+Subject: [PATCH 116/124] test(refinery): characterize every merge-push lane
  end to end (gcp-l8td.4)
 
 B1 phase 3, step 1. Before B1.2a (gcp-l8td.5) moves the refinery's merge
