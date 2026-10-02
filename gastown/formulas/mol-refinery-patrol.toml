@@ -856,1067 +856,155 @@ id = "merge-push"
 title = "Merge and push"
 needs = ["handle-failures"]
 description = """
-**Config: target_branch = {{target_branch}}**
-**Config: delete_merged_branches = {{delete_merged_branches}}**
+Run the merge lane with ONE command. `merge-push.sh` reads the work bead's
+metadata (`branch`, `target`, `merge_strategy`, `existing_pr`), chooses the lane,
+and runs all of it: the already-merged and false-completion gates, the
+fast-forward merge, push and verify, the pull request, the approval gate, every
+bead write and its own cleanup. Every config value it needs (the target default,
+`require_merge_approval`, `review_agent`, `delete_merged_branches`, the binding
+prefix) it resolves itself, from its flags, the rig's `formula_vars` and the
+session, so nothing in this step is rendered and there is nothing to hand-edit.
+Do NOT re-type the lane, run any of its commands yourself, or run a second
+cleanup: the script already ran its own.
 
-Read the merge target and merge strategy from the work bead metadata:
+Run it from the refinery's clone with `temp` rebased onto the target, as the
+`rebase` step left it.
+
+Pack assets install into a content-hashed cache directory this step cannot name,
+so resolve the script from this formula's OWN resolved source path: it ships in
+the same pack tree as this formula, making that the one candidate guaranteed to
+be present whenever the formula is and version-coherent with it (a formula from
+pin X can never reach a script from pin Y). `gc formula list --json` reports
+that path for every formula gc can see, SHA-pinned packs included, and needs no
+environment beyond the city.
+
 ```bash
-# --- merge-lane:read-metadata:begin ---
-BRANCH=$(gc bd show $WORK --json | jq -r '.[0].metadata.branch')
-TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_branch}}"')
-MERGE_STRATEGY=$(gc bd show $WORK --json | jq -r '.[0].metadata.merge_strategy // "direct"')
-EXISTING_PR=$(gc bd show $WORK --json | jq -r '.[0].metadata.existing_pr // empty')
-# --- merge-lane:read-metadata:end ---
-# --- origin-repo-resolution:begin ---
-# The repository that matters here is the one this worktree PUSHES to: origin.
-# `gh repo view` answers with gh's own base-repo heuristic, which on a fork that
-# also carries an `upstream` remote resolves to the PARENT — so a fork-based rig
-# would create and look up its pull requests in a repo its branches were never
-# pushed to (gastownhall/gascity-packs#... — the mr lane could not see PR #1 on
-# the fork). Parse origin directly; gh is a fallback only for remotes this
-# parser cannot read (GitHub Enterprise hosts, ssh config aliases).
-ORIGIN_REPO=""
-ORIGIN_REPO_ERROR=""
-ORIGIN_URL=$(git remote get-url origin 2>/dev/null || true)
-case "$ORIGIN_URL" in
-  git@github.com:*|https://github.com/*|ssh://git@github.com/*)
-    ORIGIN_REPO=$(printf '%s\n' "$ORIGIN_URL" \
-      | sed -E 's#^ssh://git@github.com/##; s#^git@github.com:##; s#^https://github.com/##; s#\\.git$##')
-    ;;
-esac
-if [ -z "$ORIGIN_REPO" ]; then
-  if command -v gh >/dev/null 2>&1; then
-    if ! ORIGIN_REPO=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>&1); then
-      ORIGIN_REPO_ERROR="gh repo view failed while resolving origin repository: $ORIGIN_REPO"
-      ORIGIN_REPO=""
-    fi
-  elif [ -z "$ORIGIN_URL" ]; then
-    ORIGIN_REPO_ERROR="Could not read the origin remote (git remote get-url origin failed); cannot resolve the repository for pull-request handoff."
-  else
-    ORIGIN_REPO_ERROR="GitHub REST fallback supports only github.com origin remotes; install gh for $ORIGIN_URL."
-  fi
+# --- merge-push:invoke:begin ---
+CITY="${GC_CITY:-${GC_CITY_PATH:-}}"
+if [ -n "$CITY" ]; then
+    FORMULA_JSON=$(gc formula list --city "$CITY" --json 2>/dev/null)
+else
+    FORMULA_JSON=$(gc formula list --json 2>/dev/null)
 fi
-# --- origin-repo-resolution:end ---
-# --- merge-lane:strategy:begin ---
-if [ "$MERGE_STRATEGY" = "pr" ]; then
-  MERGE_STRATEGY="mr"
-fi
-if [ -n "$EXISTING_PR" ] && [ "$MERGE_STRATEGY" = "direct" ]; then
-  echo "metadata.existing_pr requires pull-request handoff; using merge_strategy=mr."
-  MERGE_STRATEGY="mr"
-fi
-
-# Approval gate opt-in. Only the recognized off values disable it; anything
-# unrecognized (a typo in the rig's formula_vars) turns it ON, because the
-# failure mode of a mis-read switch must be "review required", never "review
-# silently skipped".
-case "$(printf '%s' "{{require_merge_approval}}" | tr '[:upper:]' '[:lower:]')" in
-  ''|false|0|no|off) APPROVAL_REQUIRED=0 ;;
-  *) APPROVAL_REQUIRED=1 ;;
-esac
-if [ "$APPROVAL_REQUIRED" -eq 1 ] && [ "$MERGE_STRATEGY" = "direct" ]; then
-  # A reviewed merge needs something to review. Without this promotion the
-  # gate would refuse every direct-mode bead forever (fail-closed, but
-  # permanently deadlocked) because no PR would ever exist to approve.
-  echo "require_merge_approval is on; a reviewed merge needs a pull request — using merge_strategy=mr."
-  MERGE_STRATEGY="mr"
-fi
-# --- merge-lane:strategy:end ---
-# >>> merge-approval-gate-wiring >>>
-# Everything between these markers is executed verbatim by
-# gastown/tests/test_merge_approval_gate.sh, so the resolution and refusal
-# behaviour asserted there is the behaviour the refinery actually runs. Keep
-# the block self-contained: its only inputs are APPROVAL_REQUIRED, WORK, and
-# the formula vars.
-#
-# Locate merge-approval-gate.sh from the context this formula actually runs in:
-# the agent's own shell, not a `gc` pack-command invocation.
-#
-# The primary anchor is this formula's own resolved source path. The gate ships
-# beside the formula in the same pack tree, so that path is the one candidate
-# guaranteed to be (a) present whenever the formula itself is and (b) version-
-# coherent with it — a formula from pin X can never reach a gate from pin Y.
-# `gc formula list --json` reports it for every formula gc can see, including
-# packs pinned to a SHA (gc checks the pin out into the pack cache and reports
-# the cache path), and it needs no environment beyond the city.
-#
-# The env-var and city-scripts candidates stay as fallbacks for cities that do
-# materialize checks into `.gc/scripts/checks/`, but none of them can be the
-# primary: GC_PACK_DIR is exported only when gc invokes a *pack command* and is
-# unset in every agent process, and nothing materializes pack check scripts
-# into the city scripts dir today. Depending on them alone made the gate
-# permanently unresolvable, which turned fail-closed into fail-forever
-# (gcp-amo).
-resolve_approval_gate() {
-  rag_rel="assets/scripts/checks/merge-approval-gate.sh"
-  rag_city="${GC_CITY:-${GC_CITY_PATH:-}}"
-  if [ -n "$rag_city" ]; then
-    rag_json=$(gc formula list --city "$rag_city" --json 2>/dev/null)
-  else
-    rag_json=$(gc formula list --json 2>/dev/null)
-  fi
-  rag_src=$(printf '%s' "$rag_json" \
-    | jq -r '.formulas[]? | select(.name == "mol-refinery-patrol") | .source // empty' 2>/dev/null \
+FORMULA_SRC=$(printf '%s' "$FORMULA_JSON" \\
+    | jq -r '.formulas[]? | select(.name == "mol-refinery-patrol") | .source // empty' 2>/dev/null \\
     | head -1)
-  if [ -n "$rag_src" ]; then
-    # <pack>/formulas/mol-refinery-patrol.toml -> <pack>
-    rag_pack=$(dirname "$(dirname "$rag_src")")
-    if [ -f "$rag_pack/$rag_rel" ]; then
-      printf '%s\n' "$rag_pack/$rag_rel"
-      return 0
-    fi
-  fi
-  for rag_cand in \
-    "${GC_PACK_DIR:-}/$rag_rel" \
-    "${GC_CITY:-}/.gc/scripts/checks/merge-approval-gate.sh" \
-    "${GC_CITY_PATH:-}/.gc/scripts/checks/merge-approval-gate.sh" \
-    ".gc/scripts/checks/merge-approval-gate.sh"
-  do
-    if [ -f "$rag_cand" ]; then
-      printf '%s\n' "$rag_cand"
-      return 0
-    fi
-  done
-  return 1
-}
-APPROVAL_GATE=""
-if [ "$APPROVAL_REQUIRED" -eq 1 ]; then
-  APPROVAL_GATE=$(resolve_approval_gate)
-  if [ -z "$APPROVAL_GATE" ]; then
-    echo "require_merge_approval is on but merge-approval-gate.sh was not found. STOP. Do not mutate bead state."
-    echo "An unreadable gate is not an approval."
+MERGE_PUSH=""
+if [ -n "$FORMULA_SRC" ]; then
+    # <pack>/formulas/mol-refinery-patrol.toml -> <pack>/assets/scripts/refinery/merge-push.sh
+    MERGE_PUSH="$(dirname "$(dirname "$FORMULA_SRC")")/assets/scripts/refinery/merge-push.sh"
+fi
+# GC_PACK_DIR is exported only when gc invokes a pack command, so it is a
+# fallback and never the primary (gcp-amo).
+if [ ! -x "$MERGE_PUSH" ] && [ -n "${GC_PACK_DIR:-}" ]; then
+    MERGE_PUSH="$GC_PACK_DIR/assets/scripts/refinery/merge-push.sh"
+fi
+if [ ! -x "$MERGE_PUSH" ]; then
+    echo "merge-push.sh not runnable (resolved '$MERGE_PUSH'). STOP. Do not mutate bead state."
     gc runtime drain-ack
     exit 1
-  fi
 fi
-
-run_approval_gate() {
-  # $1 = the commit the refinery is about to land. Passing it closes the gap
-  # where the local rebased tip has drifted from the reviewed PR head.
-  ag_sha="${1:-}"
-  set -- --bead "$WORK" --required "{{require_merge_approval}}"
-  if [ -n "$ag_sha" ]; then
-    set -- "$@" --merge-sha "$ag_sha"
-  fi
-  bash "$APPROVAL_GATE" "$@"
-}
-
-# Reviewer addressing. review_agent is written unqualified in the rig's
-# formula_vars (`specialists.iris`, `gastown.mayor`) and the rig prefix used to
-# be pasted on unconditionally. That is right for a rig-scoped reviewer and
-# wrong for a town-level one: gascity-packs names `gastown.mayor`, whose only
-# session address is the bare name, so every park nudged
-# `gascity-packs/gastown.mayor`, got "session not found", and — fire-and-forget,
-# with no retry and no marker — never told the reviewer anything. On a rig whose
-# whole point is a review gate, that turns "reviewed merges" into "merges that
-# wait forever" (gcp-a22).
-#
-# So resolve rather than assume. A bare name is tried rig-scoped first and then
-# town-level: the rig attempt stays first so a rig-local reviewer is never
-# shadowed by a town agent that happens to share its name. An address the
-# operator already qualified (`otherrig/agent`) is taken verbatim, and a leading
-# `/` forces town-level and skips the rig attempt.
-nudge_review_agent() {
-  # $1 = message. Echoes the address that accepted it, or — on return 1 — a
-  # flattened diagnostic naming every scope that refused.
-  nra_msg="$1"
-  nra_addr="{{review_agent}}"
-  case "$nra_addr" in
-    /*) set -- "${nra_addr#/}" ;;
-    */*) set -- "$nra_addr" ;;
-    *)
-      if [ -n "${GC_RIG:-}" ]; then
-        set -- "$GC_RIG/$nra_addr" "$nra_addr"
+MP_LOG=$(mktemp)
+"$MERGE_PUSH" --work "$WORK" >"$MP_LOG" 2>&1
+MP_STATUS=$?
+cat "$MP_LOG"
+case "$MP_STATUS" in
+  0|4)
+    echo "merge-push: status $MP_STATUS: continue to patrol-summary."
+    ;;
+  9)
+    # The script blocked an invalid existing_pr and mailed the mayor; it never
+    # pours or burns a wisp, so this step does. The next wisp carries the values
+    # the script resolved, read back from its config line.
+    MP_CFG=$(sed -n 's/^merge-push: config //p' "$MP_LOG" | head -n 1 | tr ' ' '\\n')
+    POUR_RIG=$(printf '%s\\n' "$MP_CFG" | sed -n 's/^rig=//p')
+    POUR_TARGET=$(printf '%s\\n' "$MP_CFG" | sed -n 's/^target_default=//p')
+    POUR_PREFIX=$(printf '%s\\n' "$MP_CFG" | sed -n 's/^binding_prefix=//p')
+    [ "$POUR_TARGET" = "<none>" ] && POUR_TARGET=""
+    CURRENT_WISP=${GC_BEAD_ID:-}
+    if [ -z "$CURRENT_WISP" ]; then
+      CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json | jq -r '.[0].id // empty')
+    fi
+    if [ -z "$CURRENT_WISP" ]; then
+      echo "ERROR: could not resolve the current refinery wisp; not burning. The patrol loop cannot advance — this wisp leaks and no successor runs."
+      echo "STOP. Existing PR metadata needs human correction."
+      gc runtime drain-ack
+      exit 1
+    fi
+    NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch="$POUR_TARGET" --var rig_name="$POUR_RIG" --var binding_prefix="$POUR_PREFIX" --json | jq -r '.new_epic_id // empty')
+    if [ -z "$NEXT" ]; then
+      echo "Could not pour next refinery wisp; not burning."
+      gc runtime drain-ack
+      exit 1
+    fi
+    # --- session-iteration-stamp:begin ---
+    # Carry the conversation's iteration count onto NEXT in the same write that
+    # assigns it, so check-inbox can restart at restart_after_iterations. The count
+    # continues only while CURRENT was stamped under this GC_CONTINUATION_EPOCH;
+    # any other epoch was an earlier conversation, so NEXT starts again at 1. With
+    # the epoch unset nothing is stamped and the cadence check reads "off".
+    set -- --assignee="$GC_AGENT"
+    if [ -n "${GC_CONTINUATION_EPOCH:-}" ]; then
+      if ! STAMP_JSON=$(gc bd show "$CURRENT_WISP" --json 2>/dev/null); then
+        echo "WARN: could not read $CURRENT_WISP; the next wisp's iteration count restarts at 1."
+        STAMP_JSON=""
+      fi
+      STAMP_EPOCH=$(printf '%s' "$STAMP_JSON" | jq -r '.[0].metadata.session_epoch // empty' 2>/dev/null)
+      STAMP_K=$(printf '%s' "$STAMP_JSON" | jq -r '.[0].metadata.session_iterations // empty' 2>/dev/null)
+      case "$STAMP_K" in ''|*[!0-9]*) STAMP_K=0 ;; esac
+      if [ "$STAMP_EPOCH" = "$GC_CONTINUATION_EPOCH" ]; then
+        STAMP_K=$((STAMP_K + 1))
       else
-        set -- "$nra_addr"
+        STAMP_K=1
       fi
-      ;;
-  esac
-  nra_errors=""
-  for nra_try in "$@"; do
-    if nra_out=$(gc session nudge "$nra_try" "$nra_msg" 2>&1); then
-      printf '%s' "$nra_try"
-      return 0
+      set -- "$@" --set-metadata session_epoch="$GC_CONTINUATION_EPOCH" --set-metadata session_iterations="$STAMP_K"
     fi
-    nra_errors="${nra_errors:+$nra_errors; }$nra_try: $(printf '%s' "$nra_out" | tr '\n' ' ')"
-  done
-  printf '%s' "$nra_errors"
-  return 1
-}
-
-park_awaiting_review() {
-  # A refused merge is not a failure and not an incident: the branch is fine,
-  # the reviewer simply has not approved THIS commit. Leave the bead open and
-  # assigned to the refinery with the refusal recorded, nudge the reviewer if
-  # the rig named one, and let the next patrol iteration re-check. Never
-  # close, never escalate, never retry the merge in this iteration.
-  # The gate reports on stderr and can emit more than one line; metadata is a
-  # single-line store, so flatten before writing.
-  ag_reason=$(printf '%s' "$1" | tr '\n' ' ')
-  if ! gc bd update "$WORK" \
-    --set-metadata merge_approval_state=awaiting_review \
-    --set-metadata merge_approval_gate_reason="$ag_reason"; then
-    echo "WARN could not record the gate refusal on $WORK; the bead stays open and unmerged regardless."
-  fi
-  if [ -n "{{review_agent}}" ]; then
-    # The nudge is the only thing that tells the reviewer this bead is waiting,
-    # so its outcome goes into durable state either way — a failure visible only
-    # in a patrol transcript is exactly how gcp-a22 stayed invisible. One field,
-    # rewritten on every park, so a later delivery cannot leave a stale failure
-    # standing behind it.
-    if ag_nudge=$(nudge_review_agent "REVIEW NEEDED: $WORK — ${PR_URL:-$BRANCH} awaiting merge approval. Record a verdict with record-merge-approval.sh (--pr + --sha of the live head)."); then
-      gc bd update "$WORK" --set-metadata merge_approval_nudge="delivered: $ag_nudge" ||
-        echo "WARN could not record the review nudge delivery on $WORK."
+    if ! gc bd update "$NEXT" "$@"; then
+      echo "Could not assign next refinery wisp; not burning."
+      gc runtime drain-ack
+      exit 1
+    fi
+    # --- session-iteration-stamp:end ---
+    if [ -n "$CURRENT_WISP" ]; then
+      gc bd mol burn "$CURRENT_WISP" --force
     else
-      echo "WARN review nudge for $WORK reached no reviewer session: $ag_nudge"
-      gc bd update "$WORK" --set-metadata merge_approval_nudge="failed: $ag_nudge" ||
-        echo "WARN could not record the review nudge failure on $WORK; it is visible only in this transcript."
+      echo "ERROR: could not resolve the current refinery wisp; not burning. The patrol loop cannot advance — this wisp leaks and no successor runs."
+      echo "STOP. Existing PR metadata needs human correction."
+      gc runtime drain-ack
+      exit 1
     fi
-  fi
-  echo "APPROVAL GATE REFUSED: $WORK — $1"
-  echo "Bead left open and assigned to the refinery; skip the merge and run patrol-summary + next-iteration."
-}
-# <<< merge-approval-gate-wiring <<<
-
-# --- merge-lane:block-existing-pr:begin ---
-block_existing_pr() {
-  reason="$1"
-  gc bd update $WORK \
-    --assignee="" \
-    --set-metadata merge_result=blocked \
-    --set-metadata gc.routed_to=human \
-    --set-metadata blocked_reason="$reason"
-  gc mail send mayor/ -s "ESCALATION: invalid existing_pr for $WORK" -m "$reason
-Work bead: $WORK
-Existing PR: $EXISTING_PR
-Branch: $BRANCH
-Target: $TARGET"
-  CURRENT_WISP=${GC_BEAD_ID:-}
-  if [ -z "$CURRENT_WISP" ]; then
-    CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json | jq -r '.[0].id // empty')
-  fi
-  if [ -z "$CURRENT_WISP" ]; then
-    echo "ERROR: could not resolve the current refinery wisp; not burning. The patrol loop cannot advance — this wisp leaks and no successor runs."
-    echo "$reason"
-    echo "STOP. Existing PR metadata needs human correction."
     gc runtime drain-ack
     exit 1
-  fi
-  NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
-  if [ -z "$NEXT" ]; then
-    echo "Could not pour next refinery wisp; not burning."
-    gc runtime drain-ack
-    exit 1
-  fi
-  # --- session-iteration-stamp:begin ---
-  # Carry the conversation's iteration count onto NEXT in the same write that
-  # assigns it, so check-inbox can restart at restart_after_iterations. The count
-  # continues only while CURRENT was stamped under this GC_CONTINUATION_EPOCH;
-  # any other epoch was an earlier conversation, so NEXT starts again at 1. With
-  # the epoch unset nothing is stamped and the cadence check reads "off".
-  set -- --assignee="$GC_AGENT"
-  if [ -n "${GC_CONTINUATION_EPOCH:-}" ]; then
-    if ! STAMP_JSON=$(gc bd show "$CURRENT_WISP" --json 2>/dev/null); then
-      echo "WARN: could not read $CURRENT_WISP; the next wisp's iteration count restarts at 1."
-      STAMP_JSON=""
-    fi
-    STAMP_EPOCH=$(printf '%s' "$STAMP_JSON" | jq -r '.[0].metadata.session_epoch // empty' 2>/dev/null)
-    STAMP_K=$(printf '%s' "$STAMP_JSON" | jq -r '.[0].metadata.session_iterations // empty' 2>/dev/null)
-    case "$STAMP_K" in ''|*[!0-9]*) STAMP_K=0 ;; esac
-    if [ "$STAMP_EPOCH" = "$GC_CONTINUATION_EPOCH" ]; then
-      STAMP_K=$((STAMP_K + 1))
-    else
-      STAMP_K=1
-    fi
-    set -- "$@" --set-metadata session_epoch="$GC_CONTINUATION_EPOCH" --set-metadata session_iterations="$STAMP_K"
-  fi
-  if ! gc bd update "$NEXT" "$@"; then
-    echo "Could not assign next refinery wisp; not burning."
-    gc runtime drain-ack
-    exit 1
-  fi
-  # --- session-iteration-stamp:end ---
-  if [ -n "$CURRENT_WISP" ]; then
-    gc bd mol burn "$CURRENT_WISP" --force
-  else
-    echo "ERROR: could not resolve the current refinery wisp; not burning. The patrol loop cannot advance — this wisp leaks and no successor runs."
-    echo "$reason"
-    echo "STOP. Existing PR metadata needs human correction."
-    gc runtime drain-ack
-    exit 1
-  fi
-  echo "$reason"
-  echo "STOP. Existing PR metadata needs human correction."
-  gc runtime drain-ack
-  exit 1
-}
-# --- merge-lane:block-existing-pr:end ---
-
-# --- merge-state-helpers:begin ---
-branch_has_real_change() {
-  # Shared false-completion predicate (0-diff/0-commit guard). Does
-  # <branch-ref> introduce a real change vs its merge-base with
-  # <target-ref>? Diff is authoritative — commit-count alone is a weaker
-  # proxy because a branch can carry commits that net-zero — so we use
-  # `git diff --quiet` and ALSO require >=1 commit beyond the base.
-  #   exit 0 = real change (safe to merge / open PR)
-  #   exit 1 = empty: no diff, or no commits, vs base (REFUSE close-as-merged)
-  #   exit 2 = base/diff could not be computed: merge-base failed OR `git diff`
-  #           itself errored (exit >1). Fail closed — a tool error is a suspect,
-  #           not a licence to merge — so the caller halts, never improvises.
-  bhrc_target="$1"
-  bhrc_branch="$2"
-  bhrc_base=$(git merge-base "$bhrc_target" "$bhrc_branch" 2>/dev/null) || return 2
-  git diff --quiet "$bhrc_base" "$bhrc_branch"
-  case "$?" in
-    0) return 1 ;;  # no diff -> empty -> refuse
-    1) : ;;         # diff present -> fall through to the commit-count check
-    *) return 2 ;;  # git diff errored -> suspect -> refuse (fail closed)
-  esac
-  [ "$(git rev-list --count "$bhrc_base..$bhrc_branch" 2>/dev/null || echo 0)" -ge 1 ] || return 1
-  return 0
-}
-
-branch_already_landed() {
-  # Rebase-aware already-merged predicate: has <branch-ref> already landed on
-  # <target-ref>, judged by CONTENT rather than by reachability?
-  #
-  # Ancestor-ness is a SUFFICIENT condition for already-merged, never a
-  # necessary one. This lane lands work by rebasing `temp` onto the target and
-  # ff-merging, which REWRITES every commit — so after a successful merge
-  # `origin/$BRANCH` is not an ancestor of `origin/$TARGET`; its pre-rebase sha
-  # is nowhere on the target. The ancestor arm can therefore essentially never
-  # fire here, which made a crash between `git push` and `gc bd close` fall
-  # through to the 0-diff guard: the rebase correctly drops the already-applied
-  # commit, the guard correctly sees 0 commits / 0 diff, and a genuinely merged
-  # bead got halted to a human as a false completion (winnow-zgr2y.6, refiled
-  # gcp-a4e7). Patch-id equality is the axis that survives the rewrite.
-  #   exit 0 = every commit introduced since <fork-sha> is already upstream by
-  #            patch-id -> already merged, safe to close
-  #   exit 1 = NOT already merged. Either the branch still carries a commit the
-  #            target does not have, or it introduced nothing of its own — the
-  #            starved 0-commit polecat, and gcp-duy's branch that was merely
-  #            rebased/reset onto newer target so its "commits since fork" are
-  #            other beads'. Both belong to the false-completion guard.
-  #   exit 2 = cannot evaluate: no fork_sha recorded, the fork commit is not in
-  #            this repo, or a git invocation errored. Fail closed and let the
-  #            false-completion guard decide, exactly as a missing fork_sha
-  #            already does on the ancestor arm.
-  bal_target="$1"
-  bal_branch="$2"
-  bal_fork="$3"
-  [ -n "$bal_fork" ] || return 2
-  git rev-parse --verify --quiet "$bal_fork^{commit}" >/dev/null 2>&1 || return 2
-  # The branch must have introduced something OF ITS OWN since the fork point.
-  # Both halves are load-bearing: a non-empty diff against the fork rules out
-  # the starved 0-commit polecat, and requiring commits the target does not
-  # already contain rules out the rebased zero-change branch whose counted
-  # commits arrived via the rebase (gcp-duy's false positive — do not let this
-  # arm reintroduce it on the content axis).
-  git diff --quiet "$bal_fork" "$bal_branch" 2>/dev/null
-  case "$?" in
-    0) return 1 ;;  # nothing since the fork -> nothing of its own was merged
-    1) : ;;         # real change since the fork -> keep checking
-    *) return 2 ;;  # git diff errored -> suspect -> fail closed
-  esac
-  [ "$(git rev-list --count "$bal_branch" --not "$bal_target" 2>/dev/null || echo 0)" -ge 1 ] || return 1
-  # `git cherry <target> <branch> <fork>` marks each commit since the fork '-'
-  # when an equivalent patch is already upstream and '+' when it is not. All
-  # '-' with no '+' is the rebasing rig's already-merged fingerprint.
-  bal_cherry=$(git cherry "$bal_target" "$bal_branch" "$bal_fork" 2>/dev/null) || return 2
-  [ -n "$bal_cherry" ] || return 1
-  printf '%s\n' "$bal_cherry" | grep -q '^+' && return 1
-  return 0
-}
-
-upstream_equivalent_sha() {
-  # Name the commit ON <target-ref> that carries <branch-ref>'s work, so a
-  # rebase-aware close writes a `merged_sha` that is actually reachable from
-  # the target — the field's whole purpose as the breadcrumb tying a closed
-  # bead to its merge commit. The pre-rebase branch tip is NOT on the target
-  # after a rewrite, so it cannot serve here.
-  #
-  # Scans the bounded range merge-base(target, branch)..target, which on a
-  # crash-after-push is the merge that just landed plus whatever raced it.
-  #   stdout = the matching target commit; exit 0
-  #   exit 1 = no match in the scanned range; the caller falls back rather than
-  #            inventing a sha.
-  ues_target="$1"
-  ues_branch="$2"
-  ues_id=$(git show "$ues_branch" 2>/dev/null | git patch-id --stable 2>/dev/null | cut -d' ' -f1)
-  [ -n "$ues_id" ] || return 1
-  ues_base=$(git merge-base "$ues_target" "$ues_branch" 2>/dev/null) || return 1
-  for ues_commit in $(git rev-list --max-count=500 "$ues_base..$ues_target" 2>/dev/null); do
-    if [ "$(git show "$ues_commit" 2>/dev/null | git patch-id --stable 2>/dev/null | cut -d' ' -f1)" = "$ues_id" ]; then
-      printf '%s\n' "$ues_commit"
-      return 0
-    fi
-  done
-  return 1
-}
-
-halt_false_completion() {
-  # branch_has_real_change tripped: a close-as-merged would assert "work was
-  # merged" for a branch that merges to a no-op, which is definitionally
-  # false. Halt-and-escalate (NEVER silent retry): leave the bead blocked
-  # with a structured note, hand to human, nudge mayor + witness, then stop.
-  # This surfaces the transient cause (e.g. session starvation -> 0-commit
-  # polecat) instead of masking it.
-  fc_branch="$1"
-  fc_base="$2"
-  gc bd update $WORK \
-    --status=blocked \
-    --assignee="" \
-    --set-metadata merge_result=refused_false_completion \
-    --set-metadata gc.routed_to=human \
-    --set-metadata false_completion_suspected="branch $fc_branch no verified change vs $fc_base; refused merge-close"
-  gc session nudge mayor "FALSE-COMPLETION HALT: $WORK — branch $fc_branch no verified change vs $fc_base; refused close-as-merged. Bead left blocked; NEVER silent retry."
-  gc session nudge "${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness" "FALSE-COMPLETION HALT: $WORK — branch $fc_branch no verified change vs $fc_base; refused close-as-merged."
-  echo "REFUSED close-as-merged: $WORK branch $fc_branch introduces no real change vs $fc_base."
-  echo "STOP. Bead left blocked + escalated to mayor/witness. NEVER silent retry."
-  gc runtime drain-ack
-  exit 1
-}
-
-close_already_merged() {
-  # Shared already-merged close, used by BOTH arms of the merge-state gate (the
-  # ancestor short-circuit and the rebase-aware content check) so the two can
-  # never drift on what a merged close records.
-  #   $1 = merged_sha — a commit on $TARGET that carries this bead's work
-  #   $2 = already_merged_via — how it was established: ancestor | rebase_patch_id
-  #   $3 = human-readable evidence for the close reason and the log line
-  # Both the metadata write and the close must land. A partial write would
-  # report merged with the bead still open, so on failure this STOPS and a
-  # later patrol retries instead.
-  cam_sha="$1"
-  cam_via="$2"
-  cam_evidence="$3"
-  cam_short=$(git rev-parse --short "$cam_sha" 2>/dev/null || printf '%s' "$cam_sha")
-  if gc bd update "$WORK" \
-       --set-metadata merge_result=already_merged \
-       --set-metadata merged_sha="$cam_sha" \
-       --set-metadata merged_target="$TARGET" \
-       --set-metadata already_merged_via="$cam_via" \
-       --set-metadata merged_source_sha="$(git rev-parse "origin/$BRANCH" 2>/dev/null || printf '%s' unknown)" \
-       --unset-metadata rejection_reason && \
-     gc bd close "$WORK" --reason "Already merged to $TARGET at $cam_short ($cam_evidence; closed instead of halting)"; then
-    echo "ALREADY_MERGED: $cam_evidence — closed $WORK as merged at $cam_short. Skip the merge script; run Cleanup, then patrol-summary + next-iteration."
-    exit 0
-  fi
-  # The update/close did not land (transient API failure). Do NOT report
-  # merged with the bead still open; STOP so a later patrol retries.
-  echo "ALREADY_MERGED close failed for $WORK; bead still open. STOP; a later patrol will retry."
-  gc runtime drain-ack
-  exit 1
-}
-# --- merge-state-helpers:end ---
-
-# --- merge-lane:github-helpers:begin ---
-pr_lookup_missing() {
-  case "$1" in
-    *"Could not resolve to a PullRequest"*|*"could not resolve to a PullRequest"*|*"no pull requests found"*|*"Not Found"*|*"not found"*|*"404"*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-pr_lookup_repo_mismatch() {
-  case "$1" in
-    *" belongs to repo "*", want "*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-resolve_github_token() {
-  TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-${GIT_TOKEN:-}}}"
-  if [ -n "$TOKEN" ]; then
-    printf '%s\n' "$TOKEN"
-    return
-  fi
-  printf 'protocol=https\nhost=github.com\n\n' \
-    | GIT_TERMINAL_PROMPT=0 git credential fill 2>/dev/null \
-    | sed -n 's/^password=//p' \
-    | head -n 1
-}
-
-init_github_rest() {
-  if [ -n "${API:-}" ] && [ -n "${TOKEN:-}" ]; then
-    return 0
-  fi
-  if [ -n "$ORIGIN_REPO_ERROR" ]; then
-    echo "$ORIGIN_REPO_ERROR" >&2
-    return 1
-  fi
-  TOKEN=$(resolve_github_token)
-  if [ -z "$TOKEN" ]; then
-    echo "GitHub PR mode requires gh or a GitHub token available from env/git credential fill." >&2
-    return 1
-  fi
-  case "$ORIGIN_REPO" in
-    */*)
-      OWNER=${ORIGIN_REPO%%/*}
-      REPO=${ORIGIN_REPO#*/}
-      ;;
-    *)
-      echo "Could not resolve standard github.com origin repository for REST fallback." >&2
-      return 1
-      ;;
-  esac
-  API="https://api.github.com/repos/$OWNER/$REPO"
-}
-
-curl_gh_api() {
-  err_file="$1"
-  shift
-  curl -fsS \
-    -H "Accept: application/vnd.github+json" \
-    -H "Authorization: Bearer $TOKEN" \
-    -H "Content-Type: application/json" \
-    -H "X-GitHub-Api-Version: 2022-11-28" \
-    "$@" 2>"$err_file"
-}
-
-lookup_pr_info() {
-  ref="$1"
-  err_file="$2"
-  # An unscoped lookup is what let this lane read the wrong repository in the
-  # first place. Without a resolved origin there is nothing safe to scope to,
-  # so refuse rather than fall back to gh's base-repo guess.
-  if [ -z "$ORIGIN_REPO" ]; then
-    {
-      [ -n "$ORIGIN_REPO_ERROR" ] && echo "$ORIGIN_REPO_ERROR"
-      echo "Could not resolve the origin repository; refusing an unscoped pull request lookup for $ref."
-    } >"$err_file"
-    return 1
-  fi
-  if command -v gh >/dev/null 2>&1; then
-    gh pr view --repo "$ORIGIN_REPO" --json url,number,state,headRefName,baseRefName,headRepositoryOwner,headRepository -- "$ref" 2>"$err_file"
-    return $?
-  fi
-  if ! init_github_rest 2>"$err_file"; then
-    return 1
-  fi
-  PR_REF_REPO=$(printf '%s\n' "$ref" | sed -nE 's#^[Hh][Tt][Tt][Pp][Ss]://github.com/([^/]+/[^/]+)/pull/[0-9]+/?$#\\1#p' | head -n 1)
-  if [ -n "$PR_REF_REPO" ] && [ "$PR_REF_REPO" != "$ORIGIN_REPO" ]; then
-    echo "Pull request $ref belongs to repo $PR_REF_REPO, want $ORIGIN_REPO." >"$err_file"
-    return 1
-  fi
-  PR_NUMBER=$(printf '%s\n' "$ref" | sed -nE 's#^[Hh][Tt][Tt][Pp][Ss]://github.com/[^/]+/[^/]+/pull/([0-9]+)/?$#\\1#p; s|^#([0-9]+)$|\\1|p; s|^([0-9]+)$|\\1|p' | head -n 1)
-  if [ -z "$PR_NUMBER" ]; then
-    PR_MATCHES=$(curl_gh_api "$err_file" \
-      --get "$API/pulls" \
-      --data-urlencode "state=open" \
-      --data-urlencode "head=$OWNER:$ref" \
-      --data-urlencode "base=$TARGET") || return 1
-    PR_NUMBER=$(printf '%s\n' "$PR_MATCHES" | jq -r '.[0].number // empty')
-  fi
-  if [ -z "$PR_NUMBER" ]; then
-    echo "Pull request $ref was not found." >"$err_file"
-    return 1
-  fi
-  PR_RAW=$(curl_gh_api "$err_file" "$API/pulls/$PR_NUMBER") || return 1
-  printf '%s\n' "$PR_RAW" \
-    | jq '{url:.html_url, number, state:(.state | ascii_upcase), headRefName:.head.ref, baseRefName:.base.ref, headRepositoryOwner:{login:.head.repo.owner.login}, headRepository:{name:.head.repo.name}}'
-}
-
-if [ "$MERGE_STRATEGY" = "mr" ] && [ -n "$EXISTING_PR" ]; then
-  if [ -z "$BRANCH" ] || [ "$BRANCH" = "null" ]; then
-    block_existing_pr "metadata.existing_pr is set but metadata.branch is missing."
-  fi
-
-  if [ -z "$ORIGIN_REPO" ]; then
-    [ -n "$ORIGIN_REPO_ERROR" ] && echo "$ORIGIN_REPO_ERROR"
-    echo "Could not resolve origin repository for existing PR validation. STOP. Debug and retry without mutating bead state."
-    gc runtime drain-ack
-    exit 1
-  fi
-
-  EXISTING_PR_ERR=$(mktemp)
-  EXISTING_PR_INFO=$(lookup_pr_info "$EXISTING_PR" "$EXISTING_PR_ERR")
-  EXISTING_PR_STATUS=$?
-  EXISTING_PR_ERROR=$(cat "$EXISTING_PR_ERR")
-  rm -f "$EXISTING_PR_ERR"
-  if [ "$EXISTING_PR_STATUS" -ne 0 ] || [ -z "$EXISTING_PR_INFO" ]; then
-    if pr_lookup_repo_mismatch "$EXISTING_PR_ERROR"; then
-      block_existing_pr "Existing PR $EXISTING_PR is not in $ORIGIN_REPO. $EXISTING_PR_ERROR"
-    fi
-    if pr_lookup_missing "$EXISTING_PR_ERROR"; then
-      block_existing_pr "Existing PR $EXISTING_PR was not found or is not accessible."
-    fi
-    echo "Could not resolve existing PR $EXISTING_PR. STOP. Debug and retry without mutating bead state."
-    [ -n "$EXISTING_PR_ERROR" ] && echo "$EXISTING_PR_ERROR"
-    gc runtime drain-ack
-    exit 1
-  fi
-
-  EXISTING_PR_STATE=$(printf '%s\n' "$EXISTING_PR_INFO" | jq -r '.state')
-  EXISTING_PR_HEAD=$(printf '%s\n' "$EXISTING_PR_INFO" | jq -r '.headRefName')
-  EXISTING_PR_BASE=$(printf '%s\n' "$EXISTING_PR_INFO" | jq -r '.baseRefName')
-  EXISTING_PR_URL=$(printf '%s\n' "$EXISTING_PR_INFO" | jq -r '.url')
-  EXISTING_PR_REPO=$(printf '%s\n' "$EXISTING_PR_URL" | sed -E 's#^https://github.com/([^/]+/[^/]+)/pull/[0-9]+$#\\1#')
-  EXISTING_PR_HEAD_REPO=$(printf '%s\n' "$EXISTING_PR_INFO" | jq -r '.headRepositoryOwner.login + "/" + .headRepository.name')
-
-  if [ "$EXISTING_PR_STATE" != "OPEN" ]; then
-    block_existing_pr "Existing PR $EXISTING_PR is $EXISTING_PR_STATE, want OPEN."
-  fi
-  if [ "$EXISTING_PR_HEAD" != "$BRANCH" ]; then
-    block_existing_pr "Existing PR $EXISTING_PR targets branch $EXISTING_PR_HEAD, want $BRANCH."
-  fi
-  if [ "$EXISTING_PR_BASE" != "$TARGET" ]; then
-    block_existing_pr "Existing PR $EXISTING_PR targets base $EXISTING_PR_BASE, want $TARGET."
-  fi
-  if [ "$EXISTING_PR_REPO" != "$ORIGIN_REPO" ]; then
-    block_existing_pr "Existing PR $EXISTING_PR belongs to repo $EXISTING_PR_REPO, want $ORIGIN_REPO."
-  fi
-  if [ "$EXISTING_PR_HEAD_REPO" != "$ORIGIN_REPO" ]; then
-    block_existing_pr "Existing PR $EXISTING_PR head repo $EXISTING_PR_HEAD_REPO, want $ORIGIN_REPO."
-  fi
-fi
-
-if [ "$MERGE_STRATEGY" = "mr" ] && [ -z "$ORIGIN_REPO" ]; then
-  [ -n "$ORIGIN_REPO_ERROR" ] && echo "$ORIGIN_REPO_ERROR"
-  echo "Could not resolve origin repository for pull-request handoff. STOP. Debug and retry without mutating bead state."
-  gc runtime drain-ack
-  exit 1
-fi
-# --- merge-lane:github-helpers:end ---
-```
-
-**Approval-gated merge lane (`require_merge_approval = {{require_merge_approval}}`)**
-
-Off by default; when the rig turns it on, the refinery may not land anything
-without a gc-native approval signal recorded on the work bead. The signal lives
-in `merge_approval.*` metadata — verdict, PR number, head SHA, reviewer,
-timestamp — written by a reviewer agent via
-`assets/scripts/record-merge-approval.sh` and read here by
-`assets/scripts/checks/merge-approval-gate.sh`, resolved from this formula's
-own pack tree (see `resolve_approval_gate` above).
-
-The head SHA is the whole point. An approval authorizes one commit, not a
-branch: the gate re-reads the live PR head and refuses anything else, so
-commits pushed after review do not inherit the approval. It refuses just as
-hard when it cannot tell — unreadable bead, PR lookup failure, missing head
-SHA. A tool error is a suspect, not a licence to merge.
-
-Because the gate is keyed to a PR, `direct` was promoted to `mr` above. The
-lane runs: publish/verify the PR, record its metadata, then gate. Approved for
-the live head -> land it with the same ff-only merge script the direct path
-uses. Refused -> park the bead awaiting review and let the next patrol
-iteration re-check. A rebase that moves the branch changes the PR head and
-therefore invalidates a prior approval — that is intended, since what would be
-merged is no longer what was read. For the same reason the merge script's
-lost-race retry is disabled under this gate: it parks instead of re-rebasing.
-
-**If MERGE_STRATEGY = "direct" (default):**
-
-**0. Merge-state gate (already-merged short-circuit + false-completion guard):**
-
-Two failure modes share this gate, so evaluate them in one script that shares
-shell state — an early `exit` in the already-merged branch below then provably
-prevents the false-completion guard in this same script from running on a
-closed bead. That `exit` does NOT drain: an already-merged close is a real
-completion, so it skips the merge script and joins the normal path's
-Cleanup -> patrol-summary -> next-iteration tail (pour next wisp, burn this
-one), exactly like a normal merge. Only genuine errors drain-ack.
-
-- **Already merged (close, do NOT halt):** a previous refinery pass merged this
-  branch and the polecat crashed before the bead closed. That is a real
-  completion, so close it as merged with `merged_sha` forensics rather than let
-  the 0-diff guard escalate a done bead to a human. Two arms detect it, because
-  one predicate cannot cover both merge shapes:
-  - **Reachability (`already_merged_via=ancestor`).** `origin/$BRANCH` is an
-    ancestor of `origin/$TARGET`. Ancestry alone is not enough — a 0-commit
-    branch is trivially an ancestor (its tip is still the fork point) — so
-    gate the close on the branch also carrying >=1 commit since its recorded
-    `metadata.fork_sha`.
-  - **Content (`already_merged_via=rebase_patch_id`).** Ancestry is a
-    *sufficient* condition for already-merged, never a necessary one, and on
-    this lane it is essentially unreachable: the merge script rebases `temp`
-    onto the target and ff-merges, which REWRITES the commits, so after a
-    successful merge the pre-rebase `origin/$BRANCH` sha is nowhere on
-    `$TARGET`. A crash between `git push` and `gc bd close` therefore used to
-    fall straight through to the 0-diff guard — the rebase correctly drops the
-    already-applied commit, the guard correctly sees 0 commits / 0 diff, and a
-    genuinely merged bead got halted to a human (winnow-zgr2y.6, refiled
-    gcp-a4e7). So when the rebase collapses to nothing, ask `git cherry`
-    whether every commit since `fork_sha` is already upstream by patch-id
-    before halting.
-
-  Without `fork_sha` recorded, neither arm can fire: stay conservative and fall
-  through to the false-completion guard.
-- **False completion (halt):** a branch that introduces no change vs its
-  merge-base is definitionally not a merge. Refuse it before touching `$TARGET`.
-  Legit no-op resolutions use wontfix/duplicate/not-planned, never merged — so
-  this never blocks a real merge. The fork point is what keeps the content arm
-  above from swallowing this case: a genuinely empty branch has no diff against
-  its own `fork_sha`, and a branch merely rebased onto newer target carries no
-  commit the target lacks (gcp-duy), so neither reaches the already-merged
-  close.
-
-```bash
-# --- merge-state-gate:begin ---
-FORK_SHA=$(gc bd show "$WORK" --json | jq -r '.[0].metadata.fork_sha // empty')
-if ! git fetch origin "+refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}" "+refs/heads/${TARGET}:refs/remotes/origin/${TARGET}"; then
-  echo "git fetch failed; cannot evaluate merge state. STOP. Do not mutate bead state."
-  gc runtime drain-ack
-  exit 1
-fi
-git merge-base --is-ancestor "origin/$BRANCH" "origin/$TARGET"
-ANCESTOR_STATUS=$?
-case "$ANCESTOR_STATUS" in
-  0)
-    REAL_COMMITS=0
-    if [ -n "$FORK_SHA" ]; then
-      REAL_COMMITS=$(git rev-list --count "$FORK_SHA..origin/$BRANCH" 2>/dev/null || echo 0)
-    fi
-    if [ -n "$FORK_SHA" ] && [ "$REAL_COMMITS" -ge 1 ]; then
-      close_already_merged "$(git rev-parse "origin/$BRANCH")" ancestor \
-        "origin/$BRANCH is an ancestor of origin/$TARGET with $REAL_COMMITS commit(s) since fork"
-    fi
-    # Ancestor but no recorded real commits: a 0-commit branch. Fall through to
-    # the false-completion guard, which refuses to close it as merged.
     ;;
-  1) : ;;  # not an ancestor -> a normal merge candidate; fall through
+  11)
+    echo "merge-push: status 11: merge_strategy=local is unsupported and the mayor was mailed. STOP. Do NOT close the bead, delete the branch, or burn the wisp."
+    ;;
   *)
-    echo "git merge-base --is-ancestor errored (status $ANCESTOR_STATUS); cannot evaluate already-merged. STOP. Do not mutate bead state."
+    echo "merge-push: status $MP_STATUS. STOP. Read the RESULT line above."
     gc runtime drain-ack
     exit 1
     ;;
 esac
-
-branch_has_real_change "origin/$TARGET" temp
-BHRC_STATUS=$?
-case "$BHRC_STATUS" in
-  0) : ;;  # verified real change -> continue to the merge script below
-  1)
-    # The rebase collapsed `temp` to nothing. Two opposite states look
-    # identical from here, and the branch's own fork point is what separates
-    # them: work that already landed (the rebase reports its commits as
-    # previously applied) versus a polecat that produced nothing. Ask the
-    # content-based predicate before halting — on this rebasing lane the
-    # ancestor arm above cannot fire, so this is the ONLY arm that can catch a
-    # crash between `git push` and `gc bd close`.
-    branch_already_landed "origin/$TARGET" "origin/$BRANCH" "$FORK_SHA"
-    BAL_STATUS=$?
-    if [ "$BAL_STATUS" -eq 0 ]; then
-      # merged_sha must name a commit ON the target; the pre-rebase branch tip
-      # is not one after the rewrite. Fall back to the verified target tip only
-      # if the carrying commit cannot be localized — never to the branch tip.
-      ALREADY_SHA=$(upstream_equivalent_sha "origin/$TARGET" "origin/$BRANCH") ||
-        ALREADY_SHA=$(git rev-parse "origin/$TARGET")
-      close_already_merged "$ALREADY_SHA" rebase_patch_id \
-        "every commit on origin/$BRANCH since $FORK_SHA is already upstream in origin/$TARGET by patch-id, and its rebase is empty"
-    fi
-    # Not already landed (status 1), or not evaluable (status 2): a branch that
-    # merges to a no-op and has no evidence of having landed is a false
-    # completion. Halt.
-    halt_false_completion "$BRANCH" "$(git merge-base "origin/$TARGET" temp 2>/dev/null || printf '%s' "origin/$TARGET")"
-    ;;
-  *)
-    echo "branch_has_real_change could not evaluate temp vs origin/$TARGET (tool error, status $BHRC_STATUS). STOP. Do not mutate bead state."
-    gc runtime drain-ack
-    exit 1
-    ;;
-esac
-# --- merge-state-gate:end ---
-```
-If this block closed the bead as already-merged, the merge is already done:
-SKIP the merge script (step 1 below) and go straight to **2. Cleanup**, then
-let this step complete so **patrol-summary** and **next-iteration** run (they
-pour the next wisp and burn this one) — the same tail a normal merge takes. Do
-NOT drain-ack here; that would strand the loop and leak the merged branch.
-Otherwise the branch has a verified real change and you continue to the merge.
-
-**1. Merge, push, verify, and close work bead:**
-
-Run this as one script. It uses a temporary detached worktree for the
-target branch because the real target branch may already be checked out in
-the rig's main worktree. Do not replace this with `git checkout $TARGET`.
-The metadata write happens only after the remote target ref is verified to
-have advanced, by this branch.
-
-`merge_ff_push` replaces a lane that reported `merged` while nothing was
-pushed (gcp-p87, live case winnow-ksyp). Two defects produced that, and both
-are structural rather than incidental — read them before touching this block:
-
-- **The abort depended solely on `set -e`.** The old script opened with
-  `set -e` and relied on it to stop after a failed `git merge --ff-only`. It
-  did not propagate through the refinery's execution harness, so execution
-  continued into the metadata write and `gc bd close`. A step that mutates
-  bead state must never depend on shell-option inheritance across a harness
-  boundary. Every command below is checked on its own exit status, and
-  `set -e` is deliberately NOT set — its absence must not change behaviour.
-- **The push verification was TAUTOLOGICAL on exactly that path.** After a
-  failed ff-merge the worktree HEAD is still the target tip; pushing an
-  unchanged HEAD is a successful no-op; and the old guard — MERGED_SHA read
-  from that HEAD, compared against a REMOTE re-read of the same target ref —
-  then compared the old tip to itself and passed. It never asserted the
-  target ADVANCED, nor that it advanced BY THIS BRANCH. The false
-  `merged_sha` it wrote is a real, reachable commit on the target, so
-  reachability-based audits cannot detect it.
-
-Three properties are therefore asserted before any bead state is written,
-each against state re-read after the push, never against the pre-merge
-snapshot:
-
-1. the ff-merge SUCCEEDED — checked on its exit status;
-2. `origin/$TARGET` ADVANCED — the freshly fetched post-push tip differs
-   from the tip the merge was actually performed on (`BEFORE_SHA`, captured
-   as a SHA and used as the worktree base, so there is no ref-vs-SHA gap);
-3. it advanced BY THIS BRANCH — `$TEMP_SHA` is reachable from that post-push
-   tip.
-
-`merged_sha` is `$TEMP_SHA`, the branch tip that carried the bead — never a
-target tip. That is the second half of the same evidence: winnow-rp57 was
-closed with a `merged_sha` naming a different bead's commit while its own
-work landed elsewhere. Both known bad records share one shape — merge
-bookkeeping recording a target TIP rather than the commit that carried the
-bead — so the ff invariant `MERGED_SHA = TEMP_SHA` is asserted explicitly
-rather than assumed.
-
-**Losing the race is expected, not an incident.** A rig whose CI pushes to
-the target after every merge (a deploy-overlay bump, a version stamp) races
-its own refinery on every cycle. On "Not possible to fast-forward" the lane
-re-rebases `temp` onto the new tip and retries, bounded at three attempts —
-it does not fall through, and it does not escalate. The retry rebases
-mechanically only: a conflicting re-rebase is aborted and the lane stops
-without mutating bead state, so the next patrol iteration re-runs the whole
-path and the **rebase** step's rejection handling deals with the conflict.
-
-Re-rebasing moves the branch, so the commit that lands is not byte-identical
-to the one **run-tests** checked. That is accepted for the mechanical case
-above and capped by the retry bound. It is NOT accepted under the approval
-gate: an approval authorizes one commit, so when `APPROVAL_REQUIRED` is 1 the
-lane refuses to re-rebase and returns the park status instead, and the next
-patrol iteration re-tests, re-publishes the head, and re-gates it.
-
-**A rejected push is not evidence of a race — measure it.** The lane used to
-attribute every push rejection to target movement and retry on that assumption.
-Rejections have a second, more common cause: the rig's pre-push gate
-(`scripts/gate-slot-run`) does a NON-BLOCKING slot acquire by default
-(`PUSH_GATE_MAX_WAIT_SECONDS=0`) and vetoes the push when both test lanes are
-busy. Under the old lane that veto was reported as movement and then retried
-three times, and every retry re-ran the pre-push hook — so the diagnosis was
-wrong AND the response was to add load to the very gate that was saturated
-(gcp-ileo, twin gascity-mfac; a measured 28.2-minute slot queue is what those
-retries queue behind). Two changes follow from that. The push carries its own
-wait budget, exported for that one command, so the refinery queues for a slot
-instead of being refused one. And on a rejection the lane re-reads
-`origin/$TARGET` and compares it to `BEFORE_SHA` — the same comparison the
-success path already makes — so it retries only when the target measurably
-moved, and returns the distinct refusal status when it did not.
-
-```bash
-# --- merge-ff-push:begin ---
-# Land `temp` on $TARGET and prove it landed. Reads BRANCH, TARGET,
-# APPROVAL_REQUIRED; sets TEMP_SHA, MERGED_SHA, MERGED_SHORT on success.
-#
-# Exit status:
-#   0 = landed and verified (MERGED_SHA is $TEMP_SHA, reachable on the target)
-#   2 = hard stop; do not mutate bead state
-#   3 = the re-rebase onto the new tip conflicted
-#   4 = approval-gated and the branch must move; park awaiting review
-#   5 = no-op: origin/$TARGET already contains temp; nothing to land here
-#   6 = retries exhausted while losing the race (measured: the target moved
-#       under every attempt)
-#   7 = the remote REFUSED the push while $TARGET stood still — a push-gate
-#       veto, a receive hook, or permissions. Not a race; retrying cannot help.
-merge_ff_push_cleanup_wt() {
-  if [ -n "${mfp_wt:-}" ]; then
-    git worktree remove --force "$mfp_wt" >/dev/null 2>&1 || true
-  fi
-  if [ -n "${mfp_parent:-}" ]; then
-    rmdir "$mfp_parent" 2>/dev/null || echo "WARN left temp dir $mfp_parent: git worktree remove did not empty it."
-  fi
-  mfp_wt=""
-  mfp_parent=""
-}
-
-merge_ff_push() {
-  mfp_wt=""
-  mfp_parent=""
-  mfp_max=3
-  mfp_attempt=0
-  # Wait budget for the merge push, and for nothing else in this patrol. The
-  # rig's pre-push gate (scripts/gate-slot-run) reads PUSH_GATE_MAX_WAIT_SECONDS
-  # and defaults it to 0 — a NON-BLOCKING slot acquire that vetoes the push
-  # outright whenever the lane is busy. The refinery IS a queue: waiting for a
-  # slot is what it is for, and a measured 28.2-minute queue (gc-wisp-wt5u) is
-  # cheaper than a refused merge. Overridable per rig, exported per push.
-  # A budget long enough to outlive the remote's idle timeout is a DIFFERENT
-  # failure — the push dies mid-flight rather than being refused — so if raising
-  # this starts producing torn pushes instead of merges, that interaction is
-  # what to look at, not the refusal status below.
-  mfp_push_wait="${REFINERY_PUSH_GATE_MAX_WAIT_SECONDS:-3000}"
-
-  while [ "$mfp_attempt" -lt "$mfp_max" ]; do
-    mfp_attempt=$((mfp_attempt + 1))
-
-    if ! git fetch origin "+refs/heads/${TARGET}:refs/remotes/origin/${TARGET}"; then
-      echo "merge-ff-push: fetch of $TARGET failed on attempt $mfp_attempt; cannot establish the pre-merge tip."
-      return 2
-    fi
-    # BEFORE_SHA is resolved once and then used as the worktree base, so the
-    # advance check below compares against the commit the merge was really
-    # performed on rather than re-reading a ref that may have moved since.
-    if ! BEFORE_SHA=$(git rev-parse "origin/$TARGET"); then
-      echo "merge-ff-push: could not resolve origin/$TARGET."
-      return 2
-    fi
-    if ! TEMP_SHA=$(git rev-parse temp); then
-      echo "merge-ff-push: could not resolve the rebased temp branch."
-      return 2
-    fi
-
-    if ! mfp_parent=$(mktemp -d "${TMPDIR:-/tmp}/gascity-refinery-merge.XXXXXX"); then
-      echo "merge-ff-push: could not create a scratch directory for the merge worktree."
-      return 2
-    fi
-    mfp_wt="$mfp_parent/target"
-    if ! git worktree add --detach "$mfp_wt" "$BEFORE_SHA" >/dev/null 2>&1; then
-      echo "merge-ff-push: could not create the merge worktree at $BEFORE_SHA."
-      merge_ff_push_cleanup_wt
-      return 2
-    fi
-
-    # Explicit status check. Do NOT reintroduce a `set -e` dependency here:
-    # this is the branch that reported a false merge when set -e did not
-    # propagate through the execution harness.
-    git -C "$mfp_wt" merge --ff-only "$TEMP_SHA"
-    mfp_merge_status=$?
-    if [ "$mfp_merge_status" -ne 0 ]; then
-      merge_ff_push_cleanup_wt
-      echo "merge-ff-push: ff-merge of $TEMP_SHA onto $BEFORE_SHA failed (status $mfp_merge_status) — origin/$TARGET moved under this patrol."
-      if [ "${APPROVAL_REQUIRED:-0}" -eq 1 ]; then
-        echo "merge-ff-push: approval is keyed to the current head; refusing to re-rebase it. Park for review."
-        return 4
-      fi
-      if [ "$mfp_attempt" -ge "$mfp_max" ]; then
-        break
-      fi
-      if ! git checkout temp >/dev/null 2>&1; then
-        echo "merge-ff-push: could not check out temp to re-rebase it."
-        return 2
-      fi
-      if ! git rebase "$BEFORE_SHA"; then
-        git rebase --abort >/dev/null 2>&1 || true
-        echo "merge-ff-push: re-rebase of temp onto $BEFORE_SHA conflicted; aborted. STOP — a later patrol re-runs the rebase step, which rejects the branch back to the pool."
-        return 3
-      fi
-      echo "merge-ff-push: re-rebased temp onto $BEFORE_SHA; retrying (attempt $mfp_attempt of $mfp_max used)."
-      continue
-    fi
-
-    MERGED_SHA=$(git -C "$mfp_wt" rev-parse HEAD)
-    MERGED_SHORT=$(git -C "$mfp_wt" rev-parse --short HEAD)
-
-    # An "Already up to date" ff-merge leaves HEAD at the target tip. Reporting
-    # that as merged is precisely the target-tip-for-branch-tip mislabel; the
-    # already-merged gate resolves this case from origin/$BRANCH instead.
-    if [ "$MERGED_SHA" = "$BEFORE_SHA" ]; then
-      merge_ff_push_cleanup_wt
-      echo "merge-ff-push: ff-merge was a no-op — origin/$TARGET ($BEFORE_SHA) already contains temp. Nothing to land; not recording a merge."
-      return 5
-    fi
-    # ff-only either fast-forwards HEAD to TEMP_SHA or leaves it alone, so this
-    # cannot fire. Asserted anyway: it is the invariant that keeps merged_sha
-    # the commit that carried the bead.
-    if [ "$MERGED_SHA" != "$TEMP_SHA" ]; then
-      merge_ff_push_cleanup_wt
-      echo "merge-ff-push: ff-merge left HEAD at $MERGED_SHA, not the branch tip $TEMP_SHA. Refusing to record a merge."
-      return 2
-    fi
-
-    PUSH_GATE_MAX_WAIT_SECONDS="$mfp_push_wait" git -C "$mfp_wt" push origin "HEAD:$TARGET"
-    mfp_push_status=$?
-    merge_ff_push_cleanup_wt
-    if [ "$mfp_push_status" -ne 0 ]; then
-      # MEASURE the cause; do not assert it. A rejection is either "the target
-      # advanced under us" — retryable, re-rebase and go again — or "the remote
-      # refused this push" (gate veto, receive hook, permissions), which no
-      # number of retries can fix and which every retry pays for in gate load:
-      # each attempt relaunches the pre-push hook and queues for another slot.
-      # The verification below already draws exactly this comparison against the
-      # freshly fetched tip; the rejection path never learned it, so every veto
-      # was reported as movement and then retried three times (gcp-ileo).
-      if ! git fetch origin "+refs/heads/${TARGET}:refs/remotes/origin/${TARGET}"; then
-        echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status) and the follow-up fetch failed, so the cause cannot be measured. STOP. Do not mutate bead state."
-        return 2
-      fi
-      if ! mfp_reject_sha=$(git rev-parse "origin/$TARGET"); then
-        echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status) and origin/$TARGET could not be resolved, so the cause cannot be measured. STOP. Do not mutate bead state."
-        return 2
-      fi
-      if [ "$mfp_reject_sha" = "$BEFORE_SHA" ]; then
-        echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status) and origin/$TARGET is STILL $BEFORE_SHA — the target did not move, so the remote refused this push (push-gate veto, receive hook, or permissions). This is not a race; retrying re-runs the pre-push gate and cannot succeed. STOP. Do not mutate bead state."
-        return 7
-      fi
-      echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status); origin/$TARGET moved $BEFORE_SHA -> $mfp_reject_sha, so the target really did advance between the fetch and the push."
-      if [ "${APPROVAL_REQUIRED:-0}" -eq 1 ]; then
-        echo "merge-ff-push: approval is keyed to the current head; refusing to re-rebase it. Park for review."
-        return 4
-      fi
-      if [ "$mfp_attempt" -ge "$mfp_max" ]; then
-        break
-      fi
-      continue
-    fi
-
-    # Re-fetch and verify against the FRESH tip. The pre-push snapshot proves
-    # nothing: a no-op push also exits 0.
-    if ! git fetch origin "+refs/heads/${TARGET}:refs/remotes/origin/${TARGET}"; then
-      echo "merge-ff-push: post-push fetch of $TARGET failed; the merge cannot be verified. STOP. Do not mutate bead state."
-      return 2
-    fi
-    if ! AFTER_SHA=$(git rev-parse "origin/$TARGET"); then
-      echo "merge-ff-push: could not resolve origin/$TARGET after the push; the merge cannot be verified."
-      return 2
-    fi
-    if [ "$AFTER_SHA" = "$BEFORE_SHA" ]; then
-      echo "merge-ff-push: origin/$TARGET did not advance — still $BEFORE_SHA after a push that exited 0. STOP. Do not mutate bead state."
-      return 2
-    fi
-    if ! git merge-base --is-ancestor "$TEMP_SHA" "$AFTER_SHA"; then
-      echo "merge-ff-push: origin/$TARGET advanced to $AFTER_SHA but $TEMP_SHA is not reachable from it — the target moved for some other reason. STOP. Do not mutate bead state."
-      return 2
-    fi
-
-    echo "merge-ff-push: landed $BRANCH on $TARGET at $MERGED_SHA (target advanced $BEFORE_SHA -> $AFTER_SHA)."
-    return 0
-  done
-
-  # Only reachable after an attempt MEASURED the target moving — either the
-  # ff-merge failed because origin/$TARGET had advanced, or the push was
-  # rejected and the re-read tip differed from the one merged onto. A veto
-  # against a stationary target returns 7 above and never reaches here, so this
-  # message no longer steers the reader toward retrying harder (gcp-ileo).
-  echo "merge-ff-push: could not land $BRANCH on $TARGET in $mfp_max attempts; the target moved under every attempt. STOP. Do not mutate bead state."
-  return 6
-}
-# --- merge-ff-push:end ---
-
-# --- merge-lane:direct-close:begin ---
-merge_ff_push
-MERGE_LAND_STATUS=$?
-case "$MERGE_LAND_STATUS" in
-  0)
-    gc bd update "$WORK" --set-metadata merge_result=merged --set-metadata merged_sha="$MERGED_SHA" --set-metadata merged_target="$TARGET" --unset-metadata rejection_reason && gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT"
-    ;;
-  4)
-    park_awaiting_review "the approved head no longer fast-forwards $TARGET; the branch must be re-rebased and re-reviewed before it can land"
-    ;;
-  *)
-    echo "merge-ff-push did not land $BRANCH on $TARGET (status $MERGE_LAND_STATUS). STOP. Do not mutate bead state."
-    gc runtime drain-ack
-    exit 1
-    ;;
-esac
-# --- merge-lane:direct-close:end ---
+# --- merge-push:invoke:end ---
 ```
 
-If `merge_ff_push` returns anything but 0 or 4: STOP. Debug and retry. Do NOT
-write merge metadata, close the bead, or delete the source branch. Status 4 is
-not a failure — the bead is parked awaiting review exactly as a refused gate
-parks it (see 4b); run **2. Cleanup** and let this step complete.
+The script's last output line is always `merge-push: RESULT <status> <summary>`.
+What each status means, and what this step does about it:
+
+| Status | Meaning | This step |
+|---|---|---|
+| 0 | The work bead is closed: landed (direct, or mr after approval), handed off as a pull request (mr, approval off), or closed as already merged. | Continue to patrol-summary. The script already ran its cleanup; do not run another. |
+| 1 | Usage or config error; nothing was touched. | STOP and drain. Read the output above the RESULT line. |
+| 2 | Hard stop; do not mutate bead state. Also returned when a merge landed but recording it on the bead failed: the next patrol's merge-state gate closes it as already merged. | STOP and drain. |
+| 3 | The re-rebase onto the moved target conflicted. | STOP and drain. |
+| 4 | Parked awaiting review: the approval gate refused, or the approved head no longer fast-forwards the target. This is not a failure; the bead stays open and assigned to the refinery. | Continue to patrol-summary. |
+| 5 | The ff-merge was a no-op; nothing landed. | STOP and drain. |
+| 6 | Retries exhausted; the target moved under every attempt. | STOP and drain. |
+| 7 | The remote refused the push while the target stood still. | STOP and drain; see below. |
+| 8 | False completion halted: the bead is blocked and the mayor and witness were nudged. | STOP and drain. |
+| 9 | Invalid `existing_pr` blocked: the bead is blocked and the mayor was mailed. | The block above pours the next wisp, assigns it, burns this one and drains. |
+| 11 | `merge_strategy=local` is unsupported: the mayor was mailed. | STOP. Do NOT close the bead, delete the branch or burn the wisp, until a human decides how to proceed. |
+| anything else | Unknown. | STOP and drain. |
 
 Status 7 is the one that most invites a wrong next move: the remote refused the
 push while `$TARGET` stood still. Re-running the merge immediately just re-runs
@@ -1924,362 +1012,7 @@ the pre-push gate, so if the gate is saturated the retry is what keeps it
 saturated. Read the push output for the refusal reason (a busy push-gate lane,
 a receive hook, permissions), clear that, and let the next patrol iteration pick
 the branch back up. Raise `REFINERY_PUSH_GATE_MAX_WAIT_SECONDS` if the refinery
-is losing slots to a genuinely busy gate rather than to a veto.
-
-Both the `--set-metadata` write and the `gc bd close` are required —
-`merged_sha` and `merged_target` are the only forensic breadcrumbs tying a
-closed bead to its merge commit on `$TARGET`. `--unset-metadata
-rejection_reason` clears any stale rejection field from an earlier
-rejected/reworked attempt before the successful close.
-
-`gastown/tests/test_refinery_merge_push.sh` extracts the block between the
-`merge-ff-push` sentinels out of this file and runs it against real local
-repositories, so the behaviour asserted there is the behaviour the refinery
-runs. Keep the block self-contained and keep the sentinels intact.
-
-**2. Cleanup:**
-```bash
-# --- merge-lane:direct-cleanup:begin ---
-git checkout --detach "origin/$TARGET" >/dev/null 2>&1 || true
-git branch -d temp || git branch -D temp || true
-# --- merge-lane:direct-cleanup:end ---
-```
-If delete_merged_branches = "true": `git push origin --delete $BRANCH`
-
-**If MERGE_STRATEGY = "mr":**
-
-Refinery does NOT land the branch directly. Instead it publishes a pull
-request and treats PR creation as the terminal handoff for this work bead.
-
-**0. Refuse a 0-diff branch (false-completion guard):**
-
-The same predicate covers the empty-PR / 0-commit concern: do not publish a
-pull request for a branch that introduces no change vs its merge-base. The
-PR handoff closes the bead, so an empty PR is the same false completion as
-an empty direct merge. A tool error (status 2) is not an empty branch — stop
-without mutating bead state rather than halt-escalating a healthy branch.
-```bash
-# --- merge-lane:mr-zero-diff:begin ---
-branch_has_real_change "origin/$TARGET" temp
-BHRC_STATUS=$?
-case "$BHRC_STATUS" in
-  0) : ;;  # verified real change -> continue to publish the PR
-  1) halt_false_completion "$BRANCH" "$(git merge-base "origin/$TARGET" temp 2>/dev/null || printf '%s' "origin/$TARGET")" ;;
-  *)
-    echo "branch_has_real_change could not evaluate temp vs origin/$TARGET (tool error, status $BHRC_STATUS). STOP. Do not mutate bead state."
-    gc runtime drain-ack
-    exit 1
-    ;;
-esac
-# --- merge-lane:mr-zero-diff:end ---
-```
-
-**1. Push the rebased branch back to origin:**
-```bash
-# --- merge-lane:mr-push:begin ---
-git checkout temp
-git push origin HEAD:$BRANCH --force-with-lease
-# --- merge-lane:mr-push:end ---
-```
-If `--force-with-lease` fails, the existing PR branch moved after your
-fetch. STOP, fetch the latest branch, rebase your temp branch again, and
-retry with `--force-with-lease`. Do not use plain `--force`.
-
-**2. Reuse, create, or discover the pull request:**
-
-Read the bead's description and notes once and stage them into a PR body
-file (using `--body-file` avoids quoting/encoding hazards with multi-line
-markdown). The body always carries the bead's full description (the
-"why"), and includes the polecat's implementation notes (the "what")
-when present.
-
-```bash
-# --- merge-lane:mr-pr:begin ---
-WORK_JSON=$(gc bd show $WORK --json)
-EXISTING_PR=$(printf '%s' "$WORK_JSON" | jq -r '.[0].metadata.existing_pr // empty')
-ISSUE_TITLE=$(printf '%s' "$WORK_JSON" | jq -r '.[0].title')
-ISSUE_DESC=$(printf '%s' "$WORK_JSON" | jq -r '.[0].description // empty')
-ISSUE_NOTES=$(printf '%s' "$WORK_JSON" | jq -r '.[0].notes // empty')
-ISSUE_TYPE=$(printf '%s' "$WORK_JSON" | jq -r '.[0].issue_type // "task"')
-ISSUE_PRIORITY=$(printf '%s' "$WORK_JSON" | jq -r '.[0].priority // empty')
-
-PR_BODY_FILE=$(mktemp)
-{
-  echo "## Summary"
-  echo
-  if [ -n "$ISSUE_DESC" ]; then
-    printf '%s\n' "$ISSUE_DESC"
-  else
-    printf 'Refinery handoff for `%s` (no bead description recorded).\n' "$WORK"
-  fi
-  if [ -n "$ISSUE_NOTES" ]; then
-    echo
-    echo "## Implementation notes"
-    echo
-    printf '%s\n' "$ISSUE_NOTES"
-  fi
-  echo
-  echo "## Refinery handoff"
-  echo
-  printf -- '- Issue: `%s` (%s%s)\n' "$WORK" "$ISSUE_TYPE" "${ISSUE_PRIORITY:+, P$ISSUE_PRIORITY}"
-  printf -- '- Source branch: `%s`\n' "$BRANCH"
-  printf -- '- Target: `%s`\n' "$TARGET"
-  printf -- '- Rebased on `%s` via Gastown Refinery.\n' "$TARGET"
-} > "$PR_BODY_FILE"
-
-if [ -n "$EXISTING_PR" ]; then
-  PR_REF="$EXISTING_PR"
-else
-  if command -v gh >/dev/null 2>&1; then
-    PR_URL=$(gh pr create \
-      --repo "$ORIGIN_REPO" \
-      --base "$TARGET" \
-      --head "$BRANCH" \
-      --title "$ISSUE_TITLE ($WORK)" \
-      --body-file "$PR_BODY_FILE" 2>/dev/null || true)
-
-    if [ -z "$PR_URL" ]; then
-      PR_URL=$(gh pr view "$BRANCH" --repo "$ORIGIN_REPO" --json url -q '.url')
-    fi
-  else
-    PR_ERR=$(mktemp)
-    if ! init_github_rest 2>"$PR_ERR"; then
-      cat "$PR_ERR"
-      rm -f "$PR_ERR"
-      gc runtime drain-ack
-      exit 1
-    fi
-    EXISTING=$(curl_gh_api "$PR_ERR" \
-      --get "$API/pulls" \
-      --data-urlencode "state=open" \
-      --data-urlencode "head=$OWNER:$BRANCH" \
-      --data-urlencode "base=$TARGET")
-    PR_STATUS=$?
-    PR_ERROR=$(cat "$PR_ERR")
-    if [ "$PR_STATUS" -ne 0 ]; then
-      echo "GitHub API request failed while checking for an existing PR for $BRANCH."
-      [ -n "$PR_ERROR" ] && echo "$PR_ERROR"
-      rm -f "$PR_ERR"
-      gc runtime drain-ack
-      exit 1
-    fi
-    PR_NUMBER=$(printf '%s\n' "$EXISTING" | jq -r '.[0].number // empty')
-    if [ -z "$PR_NUMBER" ]; then
-      CREATE_PAYLOAD=$(jq -n \
-        --arg title "$ISSUE_TITLE ($WORK)" \
-        --arg head "$BRANCH" \
-        --arg base "$TARGET" \
-        --rawfile body "$PR_BODY_FILE" \
-        '{title:$title, head:$head, base:$base, body:$body}')
-      CREATED=$(curl_gh_api "$PR_ERR" \
-        -X POST "$API/pulls" \
-        -d "$CREATE_PAYLOAD")
-      PR_STATUS=$?
-      PR_ERROR=$(cat "$PR_ERR")
-      if [ "$PR_STATUS" -ne 0 ]; then
-        echo "GitHub API request failed while creating a PR for $BRANCH."
-        [ -n "$PR_ERROR" ] && echo "$PR_ERROR"
-        rm -f "$PR_ERR"
-        gc runtime drain-ack
-        exit 1
-      fi
-      PR_NUMBER=$(printf '%s\n' "$CREATED" | jq -r '.number // empty')
-      if [ -z "$PR_NUMBER" ]; then
-        echo "GitHub API response did not include a pull request number."
-        rm -f "$PR_ERR"
-        gc runtime drain-ack
-        exit 1
-      fi
-    fi
-    PR_RAW=$(curl_gh_api "$PR_ERR" "$API/pulls/$PR_NUMBER")
-    PR_STATUS=$?
-    PR_ERROR=$(cat "$PR_ERR")
-    rm -f "$PR_ERR"
-    if [ "$PR_STATUS" -ne 0 ]; then
-      echo "GitHub API request failed while reading PR $PR_NUMBER."
-      [ -n "$PR_ERROR" ] && echo "$PR_ERROR"
-      gc runtime drain-ack
-      exit 1
-    fi
-    PR_URL=$(printf '%s\n' "$PR_RAW" | jq -r '.html_url // empty')
-  fi
-  PR_REF="$BRANCH"
-fi
-
-rm -f "$PR_BODY_FILE"
-# --- merge-lane:mr-pr:end ---
-```
-
-**3. Verify the pull request exists:**
-```bash
-# --- merge-lane:mr-verify:begin ---
-PR_ERR=$(mktemp)
-PR_INFO=$(lookup_pr_info "$PR_REF" "$PR_ERR")
-PR_STATUS=$?
-PR_ERROR=$(cat "$PR_ERR")
-rm -f "$PR_ERR"
-if [ "$PR_STATUS" -ne 0 ] || [ -z "$PR_INFO" ]; then
-  if [ -n "$EXISTING_PR" ] && pr_lookup_missing "$PR_ERROR"; then
-    block_existing_pr "Existing PR $EXISTING_PR was not found or is not accessible."
-  fi
-  echo "Pull request $PR_REF was not found."
-  [ -n "$PR_ERROR" ] && echo "$PR_ERROR"
-  gc runtime drain-ack
-  exit 1
-fi
-PR_URL=$(printf '%s\n' "$PR_INFO" | jq -r '.url')
-PR_NUMBER=$(printf '%s\n' "$PR_INFO" | jq -r '.number')
-PR_STATE=$(printf '%s\n' "$PR_INFO" | jq -r '.state')
-PR_HEAD=$(printf '%s\n' "$PR_INFO" | jq -r '.headRefName')
-PR_BASE=$(printf '%s\n' "$PR_INFO" | jq -r '.baseRefName')
-PR_REPO=$(printf '%s\n' "$PR_URL" | sed -E 's#^https://github.com/([^/]+/[^/]+)/pull/[0-9]+$#\\1#')
-PR_HEAD_REPO=$(printf '%s\n' "$PR_INFO" | jq -r '.headRepositoryOwner.login + "/" + .headRepository.name')
-echo "$PR_URL $PR_NUMBER $PR_STATE $PR_HEAD $PR_BASE $PR_REPO $PR_HEAD_REPO"
-if [ "$PR_STATE" != "OPEN" ]; then
-  if [ -n "$EXISTING_PR" ]; then
-    block_existing_pr "Existing PR $EXISTING_PR is $PR_STATE, want OPEN."
-  fi
-  echo "Pull request $PR_REF is $PR_STATE, want OPEN."
-  gc runtime drain-ack
-  exit 1
-fi
-if [ "$PR_HEAD" != "$BRANCH" ]; then
-  if [ -n "$EXISTING_PR" ]; then
-    block_existing_pr "Existing PR $EXISTING_PR targets branch $PR_HEAD, want $BRANCH."
-  fi
-  echo "Pull request $PR_REF targets branch $PR_HEAD, want $BRANCH."
-  gc runtime drain-ack
-  exit 1
-fi
-if [ "$PR_BASE" != "$TARGET" ]; then
-  if [ -n "$EXISTING_PR" ]; then
-    block_existing_pr "Existing PR $EXISTING_PR targets base $PR_BASE, want $TARGET."
-  fi
-  echo "Pull request $PR_REF targets base $PR_BASE, want $TARGET."
-  gc runtime drain-ack
-  exit 1
-fi
-if [ "$PR_REPO" != "$ORIGIN_REPO" ]; then
-  if [ -n "$EXISTING_PR" ]; then
-    block_existing_pr "Existing PR $EXISTING_PR belongs to repo $PR_REPO, want $ORIGIN_REPO."
-  fi
-  echo "Pull request $PR_REF belongs to repo $PR_REPO, want $ORIGIN_REPO."
-  gc runtime drain-ack
-  exit 1
-fi
-if [ "$PR_HEAD_REPO" != "$ORIGIN_REPO" ]; then
-  if [ -n "$EXISTING_PR" ]; then
-    block_existing_pr "Existing PR $EXISTING_PR head repo $PR_HEAD_REPO, want $ORIGIN_REPO."
-  fi
-  echo "Pull request $PR_REF head repo $PR_HEAD_REPO, want $ORIGIN_REPO."
-  gc runtime drain-ack
-  exit 1
-fi
-# --- merge-lane:mr-verify:end ---
-```
-If this command fails or prints empty output: STOP. Debug and retry. Do NOT continue.
-
-**4. Record PR metadata, then hand off or gate the merge:**
-
-Record the PR breadcrumbs first, in one update. `pr_url` and `pr_number` are
-the only forensic breadcrumbs tying this bead to its pull request, and the
-approval gate reads `pr_number` back to check that the reviewer approved THIS
-PR — so the write must land before the gate runs, not alongside a close.
-`--unset-metadata rejection_reason` clears any stale rejection field from an
-earlier rejected/reworked attempt.
-
-```bash
-# --- merge-lane:mr-record:begin ---
-gc bd update $WORK \
-  --set-metadata pr_url="$PR_URL" \
-  --set-metadata pr_number="$PR_NUMBER" \
-  --set-metadata merged_target="$TARGET" \
-  --unset-metadata rejection_reason
-# --- merge-lane:mr-record:end ---
-```
-
-**4a. Approval gate off (`APPROVAL_REQUIRED` = 0) — PR publication is the
-terminal handoff, unchanged:**
-
-```bash
-# --- merge-lane:mr-handoff:begin ---
-gc bd update $WORK --set-metadata merge_result=pull_request && \
-gc bd close $WORK --reason "Pull request ready: $PR_URL"
-# --- merge-lane:mr-handoff:end ---
-```
-
-**4b. Approval gate on (`APPROVAL_REQUIRED` = 1) — the PR is the start of
-review, not the handoff:**
-
-```bash
-# --- merge-lane:mr-gate:begin ---
-APPROVAL_GATE_OUTPUT=$(run_approval_gate "$(git rev-parse temp)" 2>&1)
-APPROVAL_GATE_STATUS=$?
-echo "$APPROVAL_GATE_OUTPUT"
-if [ "$APPROVAL_GATE_STATUS" -ne 0 ]; then
-  park_awaiting_review "$APPROVAL_GATE_OUTPUT"
-fi
-# --- merge-lane:mr-gate:end ---
-```
-
-If `APPROVAL_GATE_STATUS` is non-zero the bead is parked awaiting review: do
-NOT close it, do NOT merge, do NOT drain-ack, do NOT escalate. Run **5.
-Cleanup** and let this step complete so patrol-summary and next-iteration pour
-the next wisp — the bead stays open and assigned to the refinery, and the next
-iteration re-checks the gate. Waiting for a reviewer is the normal state of
-this lane, not an incident.
-
-If `APPROVAL_GATE_STATUS` is 0 the live PR head is the exact commit a reviewer
-approved. Land it:
-
-```bash
-# --- merge-lane:mr-approved:begin ---
-gc bd update "$WORK" \
-  --set-metadata merge_approval_state=approved \
-  --unset-metadata merge_approval_gate_reason
-# --- merge-lane:mr-approved:end ---
-```
-
-Then run the direct path's **1. Merge, push, verify, and close work bead**
-script verbatim. It merges `temp` ff-only into `$TARGET`, verifies against a
-freshly fetched tip that the target advanced and that it advanced by this
-branch, records `merged_sha`/`merged_target`, and closes the bead as merged.
-GitHub marks the pull request merged once its head commits are reachable from
-the base, so no separate PR-close call is needed.
-
-`APPROVAL_REQUIRED` is still 1 here, so `merge_ff_push` will NOT re-rebase on a
-lost race: an approval authorizes one commit, and re-rebasing would land
-something no reviewer read. It returns the park status instead and the script's
-`case` parks the bead — the same awaiting-review state a refused gate produces,
-re-checked next iteration after the branch is re-rebased, re-tested, and
-re-approved at its new head. Any other non-zero status: STOP, do not mutate
-bead state, and do not retry the gate — a later patrol iteration re-runs the
-whole path.
-
-**5. Cleanup:**
-```bash
-# --- merge-lane:mr-cleanup:begin ---
-git checkout "$TARGET"
-git branch -d temp
-# --- merge-lane:mr-cleanup:end ---
-```
-Do NOT delete `$BRANCH` in mr mode — GitHub pull requests need the source branch.
-
-**If MERGE_STRATEGY = "local":**
-
-STOP. Local-only merge handoff is not implemented in the Gastown example pack.
-Leave the work bead assigned to refinery and escalate to mayor for manual handling:
-```bash
-# --- merge-lane:local:begin ---
-gc mail send mayor/ -s "ESCALATION: unsupported merge_strategy=local" -m "Work bead: $WORK
-Branch: $BRANCH
-Target: $TARGET
-The Gastown example refinery supports direct and mr/pr merge strategies only."
-# --- merge-lane:local:end ---
-```
-Do NOT close the bead, delete the branch, or burn the wisp until a human decides how to proceed.
-
-**GATE**: direct mode requires verified target push. mr mode requires verified PR URL. Bead closure only happens after the selected handoff is confirmed. When `require_merge_approval` is on, every merge additionally requires an approval signal matching the live PR head SHA; anything else — including a gate that cannot reach a verdict — parks the bead instead of landing it."""
+is losing slots to a genuinely busy gate rather than to a veto."""
 
 [[steps]]
 id = "patrol-summary"

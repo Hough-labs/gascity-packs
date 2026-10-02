@@ -276,12 +276,12 @@ A new polecat picks up the bead, sees `metadata.branch` and
 "closed merged" status and a stale `rejection_reason` is internally
 contradictory — downstream tooling that reads `metadata.rejection_reason`
 to surface "this bead failed" can't tell the rejection has been
-resolved. The formula's `merge-push` step chains `--unset-metadata
-rejection_reason` into each terminal `gc bd update` before `gc bd
-close`; do not split the chain, and do not skip the unset because the
-bead's previous rejection looks like ancient history. The cost of the
-unset is one CLI flag; the cost of leaving it set is a permanent
-contradictory record on the bead.
+resolved. `merge-push.sh`, which the formula's `merge-push` step runs,
+chains `--unset-metadata rejection_reason` into each terminal `gc bd
+update` before `gc bd close`; do not split the chain, and do not skip
+the unset because the bead's previous rejection looks like ancient
+history. The cost of the unset is one CLI flag; the cost of leaving it
+set is a permanent contradictory record on the bead.
 
 ## Merge Strategy
 
