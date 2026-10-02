@@ -14,11 +14,11 @@
 # what the patrol's `rebase` step leaves behind. Only gc is stubbed. The stub is
 # modeled on test_refinery_merge_lanes.sh's, but holds a fixture DIRECTORY with
 # one JSON file per bead, so a batch of beads can be read, listed and written:
-#   bd list           every fixture bead, unsorted, so select's own sort is what
+#   gc bd list        every fixture bead, unsorted, so select's own sort is what
 #                     the cases test; the stub insists on the query's flags
-#   bd show <id>      that bead's file; fails for the ids in GC_STUB_FAIL_SHOW
-#   bd update <id>    --set-metadata, --unset-metadata, --assignee, --status
-#   bd close <id>     status closed and the close reason
+#   gc bd show <id>   that bead's file; fails for the ids in GC_STUB_FAIL_SHOW
+#   gc bd update <id> --set-metadata, --unset-metadata, --assignee, --status
+#   gc bd close <id>  status closed and the close reason
 # Every call is journalled to $T/gc.log. A call the model does not know fails
 # loudly (exit 64) and fails the case.
 #
@@ -97,7 +97,7 @@ bd)
         { [ "$#" -eq 4 ] && [ "$4" = --json ]; } || unexpected
         case " ${GC_STUB_FAIL_SHOW:-} " in
         *" $3 "*)
-            echo "stub gc: bd show $3 failed on request" >&2
+            echo "stub gc: gc bd show $3 failed on request" >&2
             exit 1
             ;;
         esac
@@ -281,7 +281,7 @@ finish_rig() {
     [ -n "$ENTRY_SHA" ] || fail "harness bug: finish_rig left no temp branch"
 }
 
-# write_bead <id> <priority> <created_at> [key=value ...] — a bead as `bd show`
+# write_bead <id> <priority> <created_at> [key=value ...] — a bead as `gc bd show`
 # returns it, assigned to the refinery, with the polecat's branch metadata.
 write_bead() {
     local id="$1" prio="$2" created="$3" kv tmp
@@ -671,8 +671,8 @@ case_invariants() {
     count=$(grep -c '{{' "$SCRIPT")
     assert_eq "the script carries no template placeholder" 0 "$count"
     grep -q 'drain-ack' "$SCRIPT" && fail "the script contains drain-ack: patrol-loop control is the step's, not the script's"
-    grep -q 'bd mol wisp' "$SCRIPT" && fail "the script pours a wisp: patrol-loop control is the step's"
-    grep -q 'bd mol burn' "$SCRIPT" && fail "the script burns a wisp: patrol-loop control is the step's"
+    grep -Eq 'bd +mol +wisp' "$SCRIPT" && fail "the script pours a wisp: patrol-loop control is the step's"
+    grep -Eq 'bd +mol +burn' "$SCRIPT" && fail "the script burns a wisp: patrol-loop control is the step's"
 
     run_batch
     assert_eq "no subcommand exits 1" 1 "$(last_rc)"
