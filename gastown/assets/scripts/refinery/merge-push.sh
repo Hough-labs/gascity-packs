@@ -864,6 +864,39 @@ git checkout "$TARGET"
 git branch -d temp
 }
 
+# resolve_origin_repo — set ORIGIN_REPO to the repository this clone pushes to,
+# or leave it empty with ORIGIN_REPO_ERROR saying why.
+resolve_origin_repo() {
+# The repository that matters here is the one this worktree PUSHES to: origin.
+# `gh repo view` answers with gh's own base-repo heuristic, which on a fork that
+# also carries an `upstream` remote resolves to the PARENT — so a fork-based rig
+# would create and look up its pull requests in a repo its branches were never
+# pushed to (gastownhall/gascity-packs#... — the mr lane could not see PR #1 on
+# the fork). Parse origin directly; gh is a fallback only for remotes this
+# parser cannot read (GitHub Enterprise hosts, ssh config aliases).
+ORIGIN_REPO=""
+ORIGIN_REPO_ERROR=""
+ORIGIN_URL=$(git remote get-url origin 2>/dev/null || true)
+case "$ORIGIN_URL" in
+  git@github.com:*|https://github.com/*|ssh://git@github.com/*)
+    ORIGIN_REPO=$(printf '%s
+' "$ORIGIN_URL" | sed -E 's#^ssh://git@github.com/##; s#^git@github.com:##; s#^https://github.com/##; s#\.git$##')
+    ;;
+esac
+if [ -z "$ORIGIN_REPO" ]; then
+  if command -v "$GH" >/dev/null 2>&1; then
+    if ! ORIGIN_REPO=$("$GH" repo view --json nameWithOwner -q '.nameWithOwner' 2>&1); then
+      ORIGIN_REPO_ERROR="gh repo view failed while resolving origin repository: $ORIGIN_REPO"
+      ORIGIN_REPO=""
+    fi
+  elif [ -z "$ORIGIN_URL" ]; then
+    ORIGIN_REPO_ERROR="Could not read the origin remote (git remote get-url origin failed); cannot resolve the repository for pull-request handoff."
+  else
+    ORIGIN_REPO_ERROR="GitHub REST fallback supports only github.com origin remotes; install gh for $ORIGIN_URL."
+  fi
+fi
+}
+
 # MERGE_STRATEGY = direct: "0. Merge-state gate", then the merge, then cleanup.
 lane_direct() {
 FORK_SHA=$(gc bd show "$WORK" --json | jq -r '.[0].metadata.fork_sha // empty')
@@ -1188,34 +1221,7 @@ if [ -z "$TARGET" ] || [ "$TARGET" = null ]; then
   return 1
 fi
 
-# The repository that matters here is the one this worktree PUSHES to: origin.
-# `gh repo view` answers with gh's own base-repo heuristic, which on a fork that
-# also carries an `upstream` remote resolves to the PARENT — so a fork-based rig
-# would create and look up its pull requests in a repo its branches were never
-# pushed to (gastownhall/gascity-packs#... — the mr lane could not see PR #1 on
-# the fork). Parse origin directly; gh is a fallback only for remotes this
-# parser cannot read (GitHub Enterprise hosts, ssh config aliases).
-ORIGIN_REPO=""
-ORIGIN_REPO_ERROR=""
-ORIGIN_URL=$(git remote get-url origin 2>/dev/null || true)
-case "$ORIGIN_URL" in
-  git@github.com:*|https://github.com/*|ssh://git@github.com/*)
-    ORIGIN_REPO=$(printf '%s
-' "$ORIGIN_URL" | sed -E 's#^ssh://git@github.com/##; s#^git@github.com:##; s#^https://github.com/##; s#\.git$##')
-    ;;
-esac
-if [ -z "$ORIGIN_REPO" ]; then
-  if command -v "$GH" >/dev/null 2>&1; then
-    if ! ORIGIN_REPO=$("$GH" repo view --json nameWithOwner -q '.nameWithOwner' 2>&1); then
-      ORIGIN_REPO_ERROR="gh repo view failed while resolving origin repository: $ORIGIN_REPO"
-      ORIGIN_REPO=""
-    fi
-  elif [ -z "$ORIGIN_URL" ]; then
-    ORIGIN_REPO_ERROR="Could not read the origin remote (git remote get-url origin failed); cannot resolve the repository for pull-request handoff."
-  else
-    ORIGIN_REPO_ERROR="GitHub REST fallback supports only github.com origin remotes; install gh for $ORIGIN_URL."
-  fi
-fi
+resolve_origin_repo
 if [ "$MERGE_STRATEGY" = "pr" ]; then
   MERGE_STRATEGY="mr"
 fi
