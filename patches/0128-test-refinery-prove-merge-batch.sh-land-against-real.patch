@@ -1,0 +1,453 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 2 Oct 2026 17:51:29 -0400
+Subject: [PATCH 128/128] test(refinery): prove merge-batch.sh land against
+ real repos (gcp-l8td.9)
+
+Seven new cases on gcp-l8td.8's harness (9 -> 16): green landing with
+per-member commits at offsets 2..0 and the batch tip withheld from member 1,
+a target that moved once (shas recomputed from the landed stack), retries
+exhausted (6) and a refused push (7) with no bead written, a close that fails
+for one member (left open, then closed as already merged by merge-push.sh
+--work through the rebase step's shape), a commit dropped by the re-rebase (all
+members refused, none given a wrong sha) and the seven guards.
+
+The stub grows only GC_STUB_FAIL_CLOSE, beside GC_STUB_FAIL_SHOW; run_push is
+run_batch's sibling for merge-push.sh. Mutation check: removing the patch-id
+verification fails case_land_dropped_commit.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ gastown/tests/test_refinery_merge_batch.sh | 352 ++++++++++++++++++++-
+ 1 file changed, 344 insertions(+), 8 deletions(-)
+
+diff --git a/gastown/tests/test_refinery_merge_batch.sh b/gastown/tests/test_refinery_merge_batch.sh
+index 2442eba0..07bfa658 100755
+--- a/gastown/tests/test_refinery_merge_batch.sh
++++ b/gastown/tests/test_refinery_merge_batch.sh
+@@ -1,12 +1,12 @@
+ #!/usr/bin/env bash
+-# Black-box proof of merge-batch.sh `select` and `stack` against real git
+-# repositories (gcp-l8td.8, D1.1).
++# Black-box proof of merge-batch.sh `select`, `stack` and `land` against real git
++# repositories (gcp-l8td.8, D1.1; gcp-l8td.9, D1.2).
+ #
+ # merge-batch.sh chooses and stacks a batch of beads for the refinery's direct
+ # lane. It is inert until the formula calls it (gcp-l8td.10), so these cases are
+ # its whole proof: each one asserts what the script DID, which is the member ids
+-# it printed, the manifest it wrote, the commits `temp` ended on, and the bead
+-# writes it made or declined to make. None asserts how the script is written,
++# it printed, the manifest it wrote, the commits `temp` ended on, the commits it
++# landed on the target, and the bead writes it made or declined to make. None asserts how the script is written,
+ # except the invariant case, whose subject is the script's text.
+ #
+ # The rig is real git: a bare origin, a polecat clone that pushed one branch per
+@@ -18,7 +18,8 @@
+ #                     the cases test; the stub insists on the query's flags
+ #   gc bd show <id>   that bead's file; fails for the ids in GC_STUB_FAIL_SHOW
+ #   gc bd update <id> --set-metadata, --unset-metadata, --assignee, --status
+-#   gc bd close <id>  status closed and the close reason
++#   gc bd close <id>  status closed and the close reason; fails for the ids in
++#                     GC_STUB_FAIL_CLOSE
+ # Every call is journalled to $T/gc.log. A call the model does not know fails
+ # loudly (exit 64) and fails the case.
+ #
+@@ -26,14 +27,14 @@
+ # in. SCRIPT may point at another copy of merge-batch.sh; it finds merge-push.sh
+ # beside itself, so stage a copy as a pack tree.
+ #
+-# The suite fails unless all 9 cases ran.
++# The suite fails unless all 16 cases ran.
+ set -uo pipefail
+ 
+ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+ PACK_DIR="$ROOT/gastown"
+ SCRIPT="${SCRIPT:-$PACK_DIR/assets/scripts/refinery/merge-batch.sh}"
+ PUSH_SCRIPT="$(dirname "$SCRIPT")/merge-push.sh"
+-EXPECTED_CASES=9
++EXPECTED_CASES=16
+ 
+ AGENT=testrig/gastown.refinery
+ TARGET_NAME=integration
+@@ -130,6 +131,12 @@ bd)
+         done
+         ;;
+     close)
++        case " ${GC_STUB_FAIL_CLOSE:-} " in
++        *" ${3:-} "*)
++            echo "stub gc: gc bd close ${3:-} failed on request" >&2
++            exit 1
++            ;;
++        esac
+         file="$GC_STUB_BEADS/${3:-}.json"
+         { [ "$#" -eq 5 ] && [ "$4" = --reason ] && [ -f "$file" ]; } || unexpected
+         edit_bead "$file" --arg r "$5" '.[0].status = "closed" | .[0].close_reason = $r'
+@@ -182,6 +189,7 @@ CFG
+     : >"$T/out"
+     : >"$T/err"
+     FAIL_SHOW=""
++    FAIL_CLOSE=""
+     EXTRA_ENV=()
+     CONFIG_JSON="$T/config.json"
+     write_config
+@@ -328,7 +336,8 @@ run_batch() {
+             GIT_COMMITTER_NAME=refinery GIT_COMMITTER_EMAIL=refinery@example.invalid \
+             GC_RIG=testrig GC_AGENT="$AGENT" MERGE_PUSH_CONFIG_JSON="$CONFIG_JSON" \
+             GC_STUB_LOG="$T/gc.log" GC_STUB_BEADS="$BEADS" GC_STUB_AGENT="$AGENT" \
+-            GC_STUB_FAIL_SHOW="$FAIL_SHOW" STUB_UNEXPECTED="$T/unexpected" \
++            GC_STUB_FAIL_SHOW="$FAIL_SHOW" GC_STUB_FAIL_CLOSE="$FAIL_CLOSE" \
++            STUB_UNEXPECTED="$T/unexpected" \
+             ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"} \
+             "$BASH" "$SCRIPT" "$@"
+     ) >"$T/out" 2>"$T/err"
+@@ -337,6 +346,27 @@ run_batch() {
+     echo "$RC" >"$T/rc"
+ }
+ 
++# run_push <args...> — run merge-push.sh, the single-bead lane, in the refinery
++# clone under run_batch's env: the recovery a left-open member relies on. --gh
++# names a binary that does not exist, so the lane never reaches for a real gh.
++run_push() {
++    (
++        cd "$REFINERY" || exit 90
++        env -i \
++            PATH="$T/bin:$PATH" HOME="$T/home" TMPDIR="$T/tmp" \
++            GIT_CONFIG_GLOBAL="$T/home/.gitconfig" GIT_CONFIG_NOSYSTEM=1 \
++            GIT_AUTHOR_NAME=refinery GIT_AUTHOR_EMAIL=refinery@example.invalid \
++            GIT_COMMITTER_NAME=refinery GIT_COMMITTER_EMAIL=refinery@example.invalid \
++            GC_RIG=testrig GC_AGENT="$AGENT" MERGE_PUSH_CONFIG_JSON="$CONFIG_JSON" \
++            GC_STUB_LOG="$T/gc.log" GC_STUB_BEADS="$BEADS" GC_STUB_AGENT="$AGENT" \
++            GC_STUB_FAIL_SHOW="$FAIL_SHOW" GC_STUB_FAIL_CLOSE="$FAIL_CLOSE" \
++            STUB_UNEXPECTED="$T/unexpected" \
++            "$BASH" "$PUSH_SCRIPT" --gh "$T/bin/no-gh" "$@"
++    ) >"$T/out" 2>"$T/err"
++    RC=$?
++    echo "$RC" >"$T/rc"
++}
++
+ last_rc() { cat "$T/rc"; }
+ 
+ # selected <args...> — run `select` and print the ids it chose on stdout,
+@@ -705,6 +735,305 @@ case_invariants() {
+     end_case
+ }
+ 
++# --- land ---------------------------------------------------------------------
++
++# stack_three [commits-of-member-2] — the batch every land case starts from:
++# three beads on disjoint files (gcp-h1 the head, gcp-h2, gcp-h3), `temp` rebased
++# onto the target, and the batch stacked by the suite's own `stack`. Leaves the
++# manifest saved at $T/manifest.before, since land removes the real one.
++stack_three() {
++    init_rig
++    add_branch gcp-h1 f1.txt "head"
++    add_branch gcp-h2 f2.txt "member two" "${1:-1}"
++    add_branch gcp-h3 f3.txt "member three"
++    finish_rig gcp-h1
++    write_bead gcp-h1 1 2026-10-02T01:00:00Z
++    write_bead gcp-h2 1 2026-10-02T02:00:00Z
++    write_bead gcp-h3 1 2026-10-02T03:00:00Z
++    run_batch stack --head gcp-h1 --members gcp-h1,gcp-h2,gcp-h3
++    [ "$(last_rc)" = 0 ] && [ "$(mf '.members | length')" = 3 ] ||
++        fail "harness bug: stack did not build a batch of three"
++    cp -f "$(manifest_path)" "$T/manifest.before"
++}
++
++# saved <jq filter> — read the manifest as stack wrote it, before land.
++saved() { jq -r "$1" "$T/manifest.before"; }
++
++origin_tip() { git --git-dir="$ORIGIN" rev-parse refs/heads/integration; }
++last_line() { tail -n 1 "$T/out"; }
++branch_on_origin() { git --git-dir="$ORIGIN" rev-parse --verify -q "refs/heads/polecat/$1" 2>/dev/null; }
++
++# snapshot_beads — the three beads' bytes, to prove a land run wrote none.
++snapshot_beads() { echo "$(bead_sum gcp-h1)|$(bead_sum gcp-h2)|$(bead_sum gcp-h3)"; }
++
++# assert_landed_member <index 0-2> <offset> — member <index+1> closed on its own
++# commit, <offset> commits behind the landed tip.
++assert_landed_member() {
++    local idx="$1" off="$2" id sha want_short
++    id="gcp-h$((idx + 1))"
++    sha=$(bead_meta "$id" merged_sha)
++    assert_eq "$id is closed" closed "$(bead_field "$id" status)"
++    assert_eq "$id's merged_sha is its own commit, $off behind the landed tip" \
++        "$(git -C "$REFINERY" rev-parse "origin/integration~$off")" "$sha"
++    assert_eq "$id's merged_sha carries the patch stack recorded for it" \
++        "$(saved ".members[$idx].patch_id")" "$(patch_id_of "$sha")"
++    assert_eq "$id records the target" integration "$(bead_meta "$id" merged_target)"
++    assert_eq "$id records merge_result" merged "$(bead_meta "$id" merge_result)"
++    assert_eq "$id records its position" "$((idx + 1))" "$(bead_meta "$id" merge_batch_pos)"
++    assert_eq "$id records the batch size" 3 "$(bead_meta "$id" merge_batch_size)"
++    assert_eq "$id records the batch" \
++        "gcp-h1@$(git -C "$REFINERY" rev-parse --short "$(saved '.members[2].tip')")" "$(bead_meta "$id" merge_batch)"
++    want_short=$(git -C "$REFINERY" rev-parse --short "$sha")
++    case "$(bead_field "$id" close_reason)" in
++    "Merged to integration at $want_short"*) ;;
++    *) fail "$id: unexpected close reason: $(bead_field "$id" close_reason)" ;;
++    esac
++}
++
++case_land_green() {
++    new_case land-green
++    stack_three 2
++    set_meta gcp-h3 rejection_reason "an earlier attempt was rejected"
++    local tip i
++    tip=$(saved '.members[2].tip')
++
++    run_batch land --head gcp-h1
++    assert_eq "land exits 0" 0 "$(last_rc)"
++    assert_eq "origin/integration is the manifest's last tip" "$tip" "$(origin_tip)"
++    assert_landed_member 0 3
++    assert_landed_member 1 1
++    assert_landed_member 2 0
++    assert_eq "the three merged_sha values are distinct" 3 \
++        "$(for i in 1 2 3; do bead_meta "gcp-h$i" merged_sha; done | sort -u | wc -l | tr -d ' ')"
++    [ "$(bead_meta gcp-h1 merged_sha)" != "$tip" ] || fail "member 1 was given the batch tip as its merged_sha"
++    assert_eq "member 3's rejection_reason is unset" "<unset>" "$(bead_meta gcp-h3 rejection_reason)"
++    for i in 1 2 3; do
++        [ -z "$(branch_on_origin "gcp-h$i")" ] || fail "origin/polecat/gcp-h$i was not deleted"
++    done
++    git -C "$REFINERY" rev-parse --verify -q refs/heads/temp >/dev/null 2>&1 && fail "the temp branch was left behind"
++    [ ! -f "$(manifest_path)" ] || fail "the manifest was left behind"
++    assert_eq "the last stdout line is the RESULT line" \
++        "merge-batch: RESULT 0 landed=gcp-h1,gcp-h2,gcp-h3 left-open=" "$(last_line)"
++    end_case
++}
++
++case_land_target_moved_once() {
++    new_case land-target-moved-once
++    stack_three
++    move_target elsewhere.txt
++    local i sha
++    run_batch land --head gcp-h1
++    assert_eq "land exits 0 after one re-rebase" 0 "$(last_rc)"
++    for i in 0 1 2; do
++        sha=$(bead_meta "gcp-h$((i + 1))" merged_sha)
++        assert_eq "member $((i + 1))'s merged_sha has its stacked patch-id" \
++            "$(saved ".members[$i].patch_id")" "$(patch_id_of "$sha")"
++        [ "$sha" != "$(saved ".members[$i].tip")" ] ||
++            fail "member $((i + 1))'s merged_sha is its pre-move tip: the landed stack was not re-read"
++        git -C "$REFINERY" merge-base --is-ancestor "$sha" origin/integration ||
++            fail "member $((i + 1))'s merged_sha is not on origin/integration"
++        assert_eq "member $((i + 1)) is closed" closed "$(bead_field "gcp-h$((i + 1))" status)"
++    done
++    git -C "$REFINERY" cat-file -e "origin/integration:elsewhere.txt" 2>/dev/null ||
++        fail "origin/integration lost the commit that moved in"
++    end_case
++}
++
++case_land_retries_exhausted() {
++    new_case land-retries-exhausted
++    stack_three
++    # One racing commit per push attempt, built BEFORE the hook is armed, each a
++    # fast-forward of the last. The hook moves integration to the next one and
++    # refuses the push (test_refinery_merge_push.sh's racing-target shape).
++    local racer="$T/racer" n
++    git_q clone "$ORIGIN" "$racer"
++    : >"$T/chain"
++    for n in 1 2 3; do
++        echo "bump $n" >>"$racer/overlay.txt"
++        git_q -C "$racer" add overlay.txt
++        git_q -C "$racer" commit -m "chore: racing bump $n"
++        git -C "$racer" rev-parse HEAD >>"$T/chain"
++    done
++    git_q -C "$racer" push origin HEAD:refs/heads/racing
++    cat >"$ORIGIN/hooks/pre-receive" <<HOOK
++#!/bin/sh
++unset GIT_QUARANTINE_PATH GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
++n=\$(wc -l <"$T/push-attempts" 2>/dev/null || echo 0)
++n=\$((n + 1))
++echo x >>"$T/push-attempts"
++racing=\$(sed -n "\${n}p" "$T/chain")
++if [ -n "\$racing" ]; then
++  git --git-dir="$ORIGIN" update-ref refs/heads/integration "\$racing"
++fi
++echo "push refused by the test (race \$n)" >&2
++exit 1
++HOOK
++    chmod +x "$ORIGIN/hooks/pre-receive"
++    local before writes
++    before=$(snapshot_beads)
++    writes=$(db_writes)
++
++    run_batch land --head gcp-h1
++    assert_eq "land exits 6 when the target moved under every attempt" 6 "$(last_rc)"
++    assert_eq "the last stdout line is the RESULT line" "merge-batch: RESULT 6 landed= left-open=" "$(last_line)"
++    assert_eq "no member bead was written" "$before" "$(snapshot_beads)"
++    assert_eq "no bead call was made" "$writes" "$(db_writes)"
++    [ "$(wc -l <"$T/push-attempts" | tr -d ' ')" -gt 1 ] ||
++        fail "harness bug: the hook saw fewer than two pushes, so nothing raced"
++    end_case
++}
++
++case_land_refused() {
++    new_case land-refused
++    stack_three
++    cat >"$ORIGIN/hooks/pre-receive" <<'HOOK'
++#!/bin/sh
++echo "push refused by the test" >&2
++exit 1
++HOOK
++    chmod +x "$ORIGIN/hooks/pre-receive"
++    local before writes tip
++    before=$(snapshot_beads)
++    writes=$(db_writes)
++    tip=$(origin_tip)
++
++    run_batch land --head gcp-h1
++    assert_eq "land exits 7 when the remote refuses and the target stood still" 7 "$(last_rc)"
++    assert_eq "the last stdout line is the RESULT line" "merge-batch: RESULT 7 landed= left-open=" "$(last_line)"
++    assert_eq "origin/integration is unchanged" "$tip" "$(origin_tip)"
++    assert_eq "no member bead was written" "$before" "$(snapshot_beads)"
++    assert_eq "no bead call was made" "$writes" "$(db_writes)"
++    end_case
++}
++
++case_land_left_open_recovery() {
++    new_case land-left-open-recovery
++    stack_three
++    FAIL_CLOSE=gcp-h2
++    local tip m2_assignee
++    tip=$(saved '.members[2].tip')
++    m2_assignee=$(bead_field gcp-h2 assignee)
++
++    run_batch land --head gcp-h1
++    assert_eq "land exits 2 with a member left open" 2 "$(last_rc)"
++    assert_eq "origin/integration is the manifest's last tip" "$tip" "$(origin_tip)"
++    assert_landed_member 0 2
++    assert_landed_member 2 0
++    assert_eq "member 2 is not closed: it keeps the in-flight status" in_progress "$(bead_field gcp-h2 status)"
++    assert_eq "member 2's assignee is unchanged" "$m2_assignee" "$(bead_field gcp-h2 assignee)"
++    [ -n "$(branch_on_origin gcp-h2)" ] || fail "origin/polecat/gcp-h2 was deleted though member 2 is open"
++    assert_eq "the last stdout line is the RESULT line" \
++        "merge-batch: RESULT 2 landed=gcp-h1,gcp-h3 left-open=gcp-h2" "$(last_line)"
++
++    # The recovery the single-bead lane gives it: the rebase step rebuilds temp
++    # from the branch (every commit is already upstream, so it collapses to
++    # nothing), and the merge-state gate closes the bead as already merged.
++    FAIL_CLOSE=""
++    git_q -C "$REFINERY" fetch origin "+refs/heads/polecat/gcp-h2:refs/remotes/origin/polecat/gcp-h2"
++    git_q -C "$REFINERY" checkout -B temp origin/polecat/gcp-h2
++    git_q -C "$REFINERY" rebase origin/integration ||
++        git_q -C "$REFINERY" rebase --abort
++    run_push --work gcp-h2
++    assert_eq "merge-push.sh --work exits 0 on the left-open member" 0 "$(last_rc)"
++    assert_eq "member 2 is closed" closed "$(bead_field gcp-h2 status)"
++    assert_eq "member 2 is already_merged" already_merged "$(bead_meta gcp-h2 merge_result)"
++    assert_eq "it records how that was established" rebase_patch_id "$(bead_meta gcp-h2 already_merged_via)"
++    assert_eq "its merged_sha carries member 2's stacked patch" \
++        "$(saved '.members[1].patch_id')" "$(patch_id_of "$(bead_meta gcp-h2 merged_sha)")"
++    end_case
++}
++
++case_land_dropped_commit() {
++    new_case land-dropped-commit
++    stack_three
++    # Member 3's patch reaches the target by another route, so land's re-rebase
++    # drops member 3's commit and every offset behind the landed tip shifts.
++    land_by_patch_id gcp-h3
++    local before_h1 before_h2 before_h3 tip i sha
++    before_h1=$(bead_sum gcp-h1)
++    before_h2=$(bead_sum gcp-h2)
++    before_h3=$(bead_sum gcp-h3)
++    tip=$(origin_tip)
++
++    run_batch land --head gcp-h1
++    assert_eq "land exits 2 when the mapping refuses a member" 2 "$(last_rc)"
++    [ "$(origin_tip)" != "$tip" ] || fail "origin/integration did not advance"
++    for i in 0 1 2; do
++        sha=$(bead_meta "gcp-h$((i + 1))" merged_sha)
++        [ "$sha" = "<unset>" ] && continue
++        assert_eq "gcp-h$((i + 1))'s merged_sha has its own stacked patch-id" \
++            "$(saved ".members[$i].patch_id")" "$(patch_id_of "$sha")"
++    done
++    assert_eq "member 1 stays untouched" "$before_h1" "$(bead_sum gcp-h1)"
++    assert_eq "member 2 stays untouched" "$before_h2" "$(bead_sum gcp-h2)"
++    assert_eq "member 3 stays untouched" "$before_h3" "$(bead_sum gcp-h3)"
++    assert_eq "the last stdout line names every refused member" \
++        "merge-batch: RESULT 2 landed= left-open=gcp-h1,gcp-h2,gcp-h3" "$(last_line)"
++    for i in 1 2 3; do
++        [ -n "$(branch_on_origin "gcp-h$i")" ] || fail "origin/polecat/gcp-h$i was deleted though the member is open"
++    done
++    end_case
++}
++
++case_land_guards() {
++    new_case land-guards
++    stack_three
++    local before tip writes
++    before=$(snapshot_beads)
++    tip=$(origin_tip)
++    writes=$(db_writes)
++
++    # guard_holds <what> <want-status> — the guard that just ran touched nothing.
++    guard_holds() {
++        assert_eq "$1: exit status" "$2" "$(last_rc)"
++        assert_eq "$1: the last stdout line is the RESULT line" \
++            "merge-batch: RESULT $2 landed= left-open=" "$(last_line)"
++        assert_eq "$1: origin/integration is unchanged" "$tip" "$(origin_tip)"
++        assert_eq "$1: no bead changed" "$before" "$(snapshot_beads)"
++        assert_eq "$1: no bead call was made" "$writes" "$(db_writes)"
++    }
++
++    run_batch land
++    guard_holds "land with no --head" 1
++    grep -q '^usage: merge-batch.sh' "$T/err" || fail "land with no --head printed no usage line"
++
++    run_batch land --head gcp-h1 --frobnicate
++    guard_holds "land with an unknown flag" 1
++    grep -q '^usage: merge-batch.sh' "$T/err" || fail "land with an unknown flag printed no usage line"
++
++    run_batch land --head gcp-other
++    guard_holds "a manifest for another head" 1
++
++    jq '.members |= .[:1]' "$T/manifest.before" >"$(manifest_path)"
++    run_batch land --head gcp-h1
++    guard_holds "a 1-member manifest" 1
++
++    printf 'not json' >"$(manifest_path)"
++    run_batch land --head gcp-h1
++    guard_holds "an unparseable manifest" 1
++
++    cp -f "$T/manifest.before" "$(manifest_path)"
++    write_config require_merge_approval=true
++    run_batch land --head gcp-h1
++    guard_holds "approval required" 2
++
++    write_config
++    EXTRA_ENV=(MERGE_PUSH_CONFIG_JSON="$T/missing-config.json")
++    run_batch land --head gcp-h1
++    guard_holds "an unreadable config" 2
++    EXTRA_ENV=()
++
++    git_q -C "$REFINERY" reset --hard HEAD~1
++    run_batch land --head gcp-h1
++    guard_holds "temp one commit behind the manifest's last tip" 2
++    git_q -C "$REFINERY" reset --hard "$(saved '.members[2].tip')"
++
++    rm -f "$(manifest_path)"
++    run_batch land --head gcp-h1
++    guard_holds "no manifest" 1
++    end_case
++}
++
+ # The two functions the batch's eligibility is built on live in merge-push.sh, and
+ # main calls them, so the lane and the batch cannot decide differently.
+ case_extraction() {
+@@ -736,6 +1065,13 @@ case_stack_already_landed
+ case_stack_degrade
+ case_invariants
+ case_extraction
++case_land_green
++case_land_target_moved_once
++case_land_retries_exhausted
++case_land_refused
++case_land_left_open_recovery
++case_land_dropped_commit
++case_land_guards
+ 
+ if [ "$PASS_CASES" -ne "$EXPECTED_CASES" ]; then
+     echo "FAIL: $PASS_CASES of $EXPECTED_CASES cases ran" >&2
+-- 
+2.54.0 (Apple Git-157)
+
