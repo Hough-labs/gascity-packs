@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 2 Oct 2026 17:03:01 -0400
+Subject: [PATCH 125/125] fix(refinery): iterate merge-batch's member ids with
+ for, not a stdin read loop (gcp-l8td.8)
+
+select and stack looped over the member ids with a `while read` fed by a
+here-document. Every git and gc call inside the loop inherits that stdin, so a
+command that reads it (a rebase prompt, a gc subcommand) would silently eat the
+ids still to come and shorten the batch with no error. Bead ids carry no
+whitespace, so a for loop over the word-split list has the same input and no
+shared stdin. Found in self-review; no test hit it because git rebase -q and the
+stub gc never read stdin. The suite passes unchanged.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ gastown/assets/scripts/refinery/merge-batch.sh | 18 ++++++++----------
+ 1 file changed, 8 insertions(+), 10 deletions(-)
+
+diff --git a/gastown/assets/scripts/refinery/merge-batch.sh b/gastown/assets/scripts/refinery/merge-batch.sh
+index 0aa9cb18..6ccf7d1c 100755
+--- a/gastown/assets/scripts/refinery/merge-batch.sh
++++ b/gastown/assets/scripts/refinery/merge-batch.sh
+@@ -239,8 +239,10 @@ cmd_select() {
+   fi
+ 
+   sel_count=1
+-  while IFS= read -r sel_id; do
+-    [ -n "$sel_id" ] || continue
++  # A for loop, not a read loop: the git and gc calls inside would otherwise
++  # inherit the loop's stdin and could swallow the ids still to come. Bead ids
++  # carry no whitespace.
++  for sel_id in $sel_ids; do
+     [ "$sel_id" != "$sel_head" ] || continue
+     [ "$sel_count" -lt "$sel_max" ] || break
+     if ! mb_check_member "$sel_id" "$sel_head_target"; then
+@@ -249,9 +251,7 @@ cmd_select() {
+     fi
+     printf '%s\n' "$sel_id"
+     sel_count=$((sel_count + 1))
+-  done <<EOF
+-$sel_ids
+-EOF
++  done
+   return 0
+ }
+ 
+@@ -488,8 +488,8 @@ cmd_stack() {
+     stk_batchable=0
+   fi
+   if [ "$stk_batchable" -eq 1 ]; then
+-    while IFS= read -r stk_id; do
+-      [ -n "$stk_id" ] || continue
++    # A for loop, not a read loop, for the reason select gives.
++    for stk_id in $stk_ids; do
+       [ "$stk_id" != "$SB_HEAD" ] || continue
+       SB_WHY=""
+       sb_stack_member "$stk_id"
+@@ -506,9 +506,7 @@ cmd_stack() {
+           return 0
+           ;;
+       esac
+-    done <<EOF
+-$stk_ids
+-EOF
++    done
+   fi
+ 
+   git checkout -q temp >/dev/null 2>&1 || {
+-- 
+2.54.0 (Apple Git-157)
+

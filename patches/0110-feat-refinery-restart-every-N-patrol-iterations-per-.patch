@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 27 Sep 2026 18:35:03 -0400
-Subject: [PATCH 110/124] feat(refinery): restart every N patrol iterations per
+Subject: [PATCH 110/125] feat(refinery): restart every N patrol iterations per
  conversation (gcp-l8td.2)
 
 The refinery's only restart trigger was "context feels heavy". Under
