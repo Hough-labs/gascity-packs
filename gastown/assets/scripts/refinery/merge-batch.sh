@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# merge-batch.sh — choose and stack a batch of beads for the refinery's direct
-# lane (gcp-l8td D1; this is D1.1, the first half of the mechanics).
+# merge-batch.sh — choose, stack and land a batch of beads for the refinery's
+# direct lane (gcp-l8td D1; D1.1 added select and stack, D1.2 adds land).
 #
 # One patrol iteration may land several assigned beads behind a single gate run.
 # The AGENT decides how long the batch is and what a red means; this checked-in
@@ -17,6 +17,7 @@
 # Usage:
 #   merge-batch.sh select --head <id> [--max <K>] [config flags]
 #   merge-batch.sh stack  --head <id> [--members <id,id,...>] [config flags]
+#   merge-batch.sh land   --head <id> [config flags]
 # Config flags are merge-push.sh's (--rig, --target-default, --binding-prefix,
 # --require-approval, --review-agent, --delete-merged-branches, --gh), and the
 # config resolves the way merge-push.sh resolves it, including the fail-closed
@@ -55,6 +56,32 @@
 #         Needs `temp` rebased onto origin/<target>, as the patrol's rebase step
 #         leaves it. Exit 1 only for a usage or config error, or no `temp`.
 #
+# land    Land the stacked batch with ONE fast-forward push and close each member
+#         against ITS OWN landed commit. It reads the manifest stack wrote and
+#         runs merge-push.sh's merge_ff_push on `temp`, so the retry loop and the
+#         statuses are the lane's: 0 landed, 2 hard stop, 3 the re-rebase
+#         conflicted, 5 no-op, 6 retries exhausted, 7 the remote refused. Any of
+#         2/3/5/6/7 from the push writes no bead, and leaves temp and the manifest
+#         where they are. Status 4 cannot arise: land stops with 2 when the
+#         approval gate is on, because a batch of more than one never rode it.
+#         After a landing, member i's commit is found in the LANDED stack, not in
+#         the manifest, because a retry re-rebases temp and so rewrites every
+#         sha: with L the landed tip and offset_i the commit count of the members
+#         behind member i, member i's tip is L~offset_i, and it is trusted only
+#         when its patch-id equals the one stack recorded. A member that fails
+#         that check, or whose bead write or close fails, is LEFT OPEN with its
+#         branch kept, never given the batch tip or another member's commit, and
+#         never rolled back: the merge-state gate closes it as already merged on
+#         a later patrol. Status 0 when every member closed, 2 when one is left
+#         open. The manifest is removed after a landing, and temp is cleaned up
+#         only on 0.
+#         Every land exit, guards included, ends its stdout with
+#           merge-batch: RESULT <status> landed=<ids> left-open=<ids>
+#         (comma-separated ids, empty when none). Exit 1 is a usage, config or
+#         manifest error: no --head, an unknown flag, a missing or unparseable
+#         manifest, one for another head, or one with fewer than two members (a
+#         batch of one is merge-push.sh --work's).
+#
 # Warnings go to stderr. select's stdout is the member ids and nothing else.
 #
 # No `set -e`, `set -u` or `set -o pipefail`, for the reason merge-push.sh gives:
@@ -81,6 +108,7 @@ MERGE_BATCH_SCRATCH=batch-member
 batch_usage() {
   echo "usage: merge-batch.sh select --head <id> [--max <K>] [config flags]"
   echo "       merge-batch.sh stack  --head <id> [--members <id,id,...>] [config flags]"
+  echo "       merge-batch.sh land   --head <id> [config flags]"
 }
 
 mb_warn() {
@@ -523,10 +551,201 @@ cmd_stack() {
   return 0
 }
 
+# --- land -------------------------------------------------------------------
+
+# lb_member <index> <field> — one field of the manifest's member at <index>.
+lb_member() {
+  printf '%s' "$LB_JSON" | jq -r --argjson i "$1" --arg f "$2" '.members[$i][$f] | tostring'
+}
+
+# lb_append_landed / lb_append_left_open <id> — the lists the RESULT line prints.
+lb_append_landed() {
+  LB_LANDED="${LB_LANDED:+$LB_LANDED,}$1"
+}
+
+lb_append_left_open() {
+  LB_LEFT_OPEN="${LB_LEFT_OPEN:+$LB_LEFT_OPEN,}$1"
+}
+
+# lb_record <id> <sha> <pos> — write one landed member's result and close it.
+# Returns 1 when either call fails; the caller leaves the member open.
+lb_record() {
+  lr_id="$1"
+  lr_sha="$2"
+  lr_pos="$3"
+  lr_short=$(git rev-parse --short "$lr_sha" 2>/dev/null) || return 1
+  if gc bd update "$lr_id" \
+    --set-metadata merge_result=merged \
+    --set-metadata merged_sha="$lr_sha" \
+    --set-metadata merged_target="$LB_TARGET" \
+    --set-metadata merge_batch="$LB_HEAD@$LB_LANDED_SHORT" \
+    --set-metadata merge_batch_size="$LB_SIZE" \
+    --set-metadata merge_batch_pos="$lr_pos" \
+    --unset-metadata rejection_reason &&
+    gc bd close "$lr_id" --reason "Merged to $LB_TARGET at $lr_short (batch $lr_pos/$LB_SIZE, $LB_HEAD@$LB_LANDED_SHORT)"; then
+    return 0
+  fi
+  return 1
+}
+
+# lb_land_members — after a verified landing, map each member to its own commit
+# in the landed stack and record it. Sets LB_LANDED and LB_LEFT_OPEN. Returns 0
+# when every member closed and 2 when one was left open.
+lb_land_members() {
+  lm_landed_sha="$MERGED_SHA"
+  LB_LANDED_SHORT=$(git rev-parse --short "$lm_landed_sha" 2>/dev/null) || LB_LANDED_SHORT="$lm_landed_sha"
+  # A for loop, not a read loop, for the reason select gives.
+  for lm_idx in $(seq 0 $((LB_SIZE - 1))); do
+    lm_id=$(lb_member "$lm_idx" id)
+    lm_branch=$(lb_member "$lm_idx" branch)
+    lm_pos=$((lm_idx + 1))
+    lm_offset=$(printf '%s' "$LB_JSON" | jq -r --argjson i "$lm_idx" '[.members[$i + 1:][].commits] | add // 0')
+    # The member's own commit in the landed stack. Never L itself, the
+    # manifest's tip or another member's commit (M1).
+    if ! lm_sha=$(git rev-parse --verify -q "$lm_landed_sha~$lm_offset^{commit}" 2>/dev/null); then
+      mb_warn "$lm_id: no commit $lm_offset behind the landed tip $LB_LANDED_SHORT; leaving it open."
+      lb_append_left_open "$lm_id"
+      continue
+    fi
+    lm_patch=$(sb_patch_id "$lm_sha")
+    if [ -z "$lm_patch" ] || [ "$lm_patch" != "$(lb_member "$lm_idx" patch_id)" ]; then
+      mb_warn "$lm_id: the commit $lm_offset behind the landed tip is not its patch (the patch-id differs from the stacked one); leaving it open."
+      lb_append_left_open "$lm_id"
+      continue
+    fi
+    if ! lb_record "$lm_id" "$lm_sha" "$lm_pos"; then
+      mb_warn "$lm_id landed at $lm_sha but recording it failed; leaving it open for the merge-state gate."
+      lb_append_left_open "$lm_id"
+      continue
+    fi
+    lb_append_landed "$lm_id"
+    if [ "$CFG_DELETE_MERGED_BRANCHES" = "true" ]; then
+      git push -q origin --delete "$lm_branch" >/dev/null 2>&1 ||
+        mb_warn "could not delete the merged branch $lm_branch on origin."
+    fi
+  done
+  [ -z "$LB_LEFT_OPEN" ] && return 0
+  return 2
+}
+
+# lb_land <args...> — the body of land. Returns the status; cmd_land prints it.
+lb_land() {
+  lnd_head=""
+  lnd_pass=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --head)
+        [ "$#" -ge 2 ] || { echo "merge-batch: --head needs a value." >&2; batch_usage >&2; return 1; }
+        lnd_head="$2"
+        shift 2
+        ;;
+      *)
+        lnd_pass+=("$1")
+        shift
+        ;;
+    esac
+  done
+  if [ -z "$lnd_head" ]; then
+    echo "merge-batch: land needs --head <id>." >&2
+    batch_usage >&2
+    return 1
+  fi
+  if ! resolve_config --work "$lnd_head" ${lnd_pass[@]+"${lnd_pass[@]}"} >&2; then
+    batch_usage >&2
+    return 1
+  fi
+  resolve_approval_required
+
+  if ! lnd_git_dir=$(git rev-parse --git-dir 2>/dev/null); then
+    echo "merge-batch: not inside a git repository." >&2
+    return 1
+  fi
+  lnd_manifest="$lnd_git_dir/refinery-batch.json"
+  if [ ! -f "$lnd_manifest" ]; then
+    echo "merge-batch: there is no manifest at $lnd_manifest; run stack first." >&2
+    return 1
+  fi
+  if ! LB_JSON=$(jq -c . "$lnd_manifest" 2>/dev/null) || [ -z "$LB_JSON" ]; then
+    echo "merge-batch: the manifest $lnd_manifest is not parseable." >&2
+    return 1
+  fi
+  if [ "$(printf '%s' "$LB_JSON" | jq -r '.head // empty' 2>/dev/null)" != "$lnd_head" ]; then
+    echo "merge-batch: the manifest is not for head $lnd_head." >&2
+    return 1
+  fi
+  LB_SIZE=$(printf '%s' "$LB_JSON" | jq -r '.members | if type == "array" then length else 0 end' 2>/dev/null)
+  case "$LB_SIZE" in
+    '' | *[!0-9]*) LB_SIZE=0 ;;
+  esac
+  if [ "$LB_SIZE" -lt 2 ]; then
+    echo "merge-batch: the manifest holds $LB_SIZE member(s); a batch of one is merge-push.sh --work's." >&2
+    return 1
+  fi
+  if ! printf '%s' "$LB_JSON" | jq -e '
+    (.target | type == "string" and length > 0) and
+    all(.members[];
+      (.id | type == "string" and length > 0) and
+      (.branch | type == "string" and length > 0) and
+      (.tip | type == "string" and length > 0) and
+      (.patch_id | type == "string" and length > 0) and
+      (.commits | type == "number" and . >= 0 and . == floor))' >/dev/null 2>&1; then
+    echo "merge-batch: the manifest is missing a target or a member field." >&2
+    return 1
+  fi
+
+  # From here a guard is a hard stop (2): the manifest is well-formed, so what
+  # fails is the state around it. Nothing is pushed or written.
+  if [ "$APPROVAL_REQUIRED" -eq 1 ]; then
+    echo "merge-batch: the approval gate is on (or unreadable); a batch of more than one never rode it. Nothing landed." >&2
+    return 2
+  fi
+  LB_HEAD="$lnd_head"
+  LB_TARGET=$(printf '%s' "$LB_JSON" | jq -r '.target')
+  lnd_last_tip=$(lb_member $((LB_SIZE - 1)) tip)
+  lnd_temp=$(git rev-parse --verify -q refs/heads/temp 2>/dev/null)
+  if [ "$lnd_temp" != "$lnd_last_tip" ]; then
+    echo "merge-batch: temp is at '${lnd_temp:-<none>}', not the manifest's last tip $lnd_last_tip; the manifest is stale. Nothing landed." >&2
+    return 2
+  fi
+
+  # merge_ff_push reads TARGET, BRANCH (messages only) and APPROVAL_REQUIRED, and
+  # is not copied here: the batch lands exactly as the single-bead lane does.
+  TARGET="$LB_TARGET"
+  BRANCH=$(lb_member 0 branch)
+  APPROVAL_REQUIRED=0
+  merge_ff_push
+  lnd_push=$?
+  if [ "$lnd_push" -ne 0 ]; then
+    echo "merge-batch: merge_ff_push did not land the batch on $TARGET (status $lnd_push). No member was written; temp and the manifest are left in place."
+    return "$lnd_push"
+  fi
+
+  lb_land_members
+  lnd_rc=$?
+  # The manifest describes a stack that now exists only on the target.
+  rm -f "$lnd_manifest"
+  if [ "$lnd_rc" -eq 0 ]; then
+    cleanup_temp
+  else
+    echo "merge-batch: the batch landed on $TARGET at $MERGED_SHORT, but left open: $LB_LEFT_OPEN. The next patrol's merge-state gate closes each as already merged."
+  fi
+  return "$lnd_rc"
+}
+
+cmd_land() {
+  LB_LANDED=""
+  LB_LEFT_OPEN=""
+  lb_land "$@"
+  cl_rc=$?
+  echo "merge-batch: RESULT $cl_rc landed=$LB_LANDED left-open=$LB_LEFT_OPEN"
+  return "$cl_rc"
+}
+
 main_batch() {
   case "${1:-}" in
     select) shift; cmd_select "$@" ;;
     stack) shift; cmd_stack "$@" ;;
+    land) shift; cmd_land "$@" ;;
     *)
       batch_usage >&2
       return 1
