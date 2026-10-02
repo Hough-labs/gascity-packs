@@ -1211,13 +1211,44 @@ The Gastown example refinery supports direct and mr/pr merge strategies only."
 return 11
 }
 
+# resolve_merge_strategy <bead-id> — print the strategy the lane would run for
+# the bead before the approval gate is considered: its metadata.merge_strategy
+# (default direct), with pr read as mr, and an existing_pr forcing mr. The
+# forcing notice goes to stderr so stdout is the strategy alone. merge-batch.sh
+# calls this for each batch candidate, so a member is eligible by the lane's own
+# rule and the two cannot drift (gcp-l8td.8).
+resolve_merge_strategy() {
+  rms_json=$(gc bd show "$1" --json) || return 1
+  rms_strategy=$(printf '%s' "$rms_json" | jq -r '.[0].metadata.merge_strategy // "direct"')
+  rms_existing_pr=$(printf '%s' "$rms_json" | jq -r '.[0].metadata.existing_pr // empty')
+  if [ "$rms_strategy" = "pr" ]; then
+    rms_strategy="mr"
+  fi
+  if [ -n "$rms_existing_pr" ] && [ "$rms_strategy" = "direct" ]; then
+    echo "metadata.existing_pr requires pull-request handoff; using merge_strategy=mr." >&2
+    rms_strategy="mr"
+  fi
+  printf '%s\n' "$rms_strategy"
+}
+
+# resolve_approval_required — set APPROVAL_REQUIRED (0 or 1) from
+# CFG_REQUIRE_MERGE_APPROVAL. Approval gate opt-in: only the recognized off
+# values disable it; anything unrecognized (a typo in the rig's formula_vars)
+# turns it ON, because the failure mode of a mis-read switch must be "review
+# required", never "review silently skipped".
+resolve_approval_required() {
+  case "$(printf '%s' "$CFG_REQUIRE_MERGE_APPROVAL" | tr '[:upper:]' '[:lower:]')" in
+    ''|false|0|no|off) APPROVAL_REQUIRED=0 ;;
+    *) APPROVAL_REQUIRED=1 ;;
+  esac
+}
+
 main() {
 resolve_config "$@" || return 1
 WORK="$CFG_WORK"
 
 BRANCH=$(gc bd show $WORK --json | jq -r '.[0].metadata.branch')
 TARGET=$(gc bd show $WORK --json | jq -r --arg target_default "$CFG_TARGET_DEFAULT" '.[0].metadata.target // $target_default')
-MERGE_STRATEGY=$(gc bd show $WORK --json | jq -r '.[0].metadata.merge_strategy // "direct"')
 EXISTING_PR=$(gc bd show $WORK --json | jq -r '.[0].metadata.existing_pr // empty')
 if [ -z "$TARGET" ] || [ "$TARGET" = null ]; then
   echo "merge-push: $WORK has no metadata.target and no target default resolved (--target-default, the rig's target_branch, or its DefaultBranch)."
@@ -1225,22 +1256,8 @@ if [ -z "$TARGET" ] || [ "$TARGET" = null ]; then
 fi
 
 resolve_origin_repo
-if [ "$MERGE_STRATEGY" = "pr" ]; then
-  MERGE_STRATEGY="mr"
-fi
-if [ -n "$EXISTING_PR" ] && [ "$MERGE_STRATEGY" = "direct" ]; then
-  echo "metadata.existing_pr requires pull-request handoff; using merge_strategy=mr."
-  MERGE_STRATEGY="mr"
-fi
-
-# Approval gate opt-in. Only the recognized off values disable it; anything
-# unrecognized (a typo in the rig's formula_vars) turns it ON, because the
-# failure mode of a mis-read switch must be "review required", never "review
-# silently skipped".
-case "$(printf '%s' "$CFG_REQUIRE_MERGE_APPROVAL" | tr '[:upper:]' '[:lower:]')" in
-  ''|false|0|no|off) APPROVAL_REQUIRED=0 ;;
-  *) APPROVAL_REQUIRED=1 ;;
-esac
+MERGE_STRATEGY=$(resolve_merge_strategy "$WORK")
+resolve_approval_required
 if [ "$APPROVAL_REQUIRED" -eq 1 ] && [ "$MERGE_STRATEGY" = "direct" ]; then
   # A reviewed merge needs something to review. Without this promotion the
   # gate would refuse every direct-mode bead forever (fail-closed, but
