@@ -627,6 +627,10 @@ expect_existing_pr_blocked() {
     wisp=$(first_line_of gc "gc bd mol wisp mol-refinery-patrol --root-only")
     update=$(first_line_of gc "gc bd update $NEXT_WISP_ID --assignee=$REFINERY_AGENT")
     burn=$(first_line_of gc "gc bd mol burn $WISP_ID --force")
+    # The pour carries the values the script resolved, read back from its config
+    # line: the step's block has no template to render them from.
+    logged gc "gc bd mol wisp mol-refinery-patrol --root-only --var target_branch=$TARGET_NAME --var rig_name=testrig --var binding_prefix=gastown. --json" ||
+        fail "the next wisp was not poured with the resolved target_branch, rig_name and binding_prefix; gc calls: $(grep -F 'mol wisp' "$T/gc.log" | tr '\n' ';')"
     if [ -z "$wisp" ] || [ -z "$update" ] || [ -z "$burn" ]; then
         fail "want the next wisp poured, assigned and this one burned; got wisp@${wisp:-none} update@${update:-none} burn@${burn:-none}"
     elif [ "$wisp" -ge "$update" ] || [ "$update" -ge "$burn" ]; then
