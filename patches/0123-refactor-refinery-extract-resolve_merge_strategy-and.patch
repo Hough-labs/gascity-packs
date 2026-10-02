@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 2 Oct 2026 16:45:36 -0400
-Subject: [PATCH 123/125] refactor(refinery): extract resolve_merge_strategy
+Subject: [PATCH 123/126] refactor(refinery): extract resolve_merge_strategy
  and resolve_approval_required from merge-push main (gcp-l8td.8)
 
 merge-batch.sh (D1.1) must decide batch eligibility by the same rules the
