@@ -1005,16 +1005,20 @@ test_lane_mr_cleanup_with_target_in_second_worktree() {
     write_bead merge_strategy=mr
     run_lane
     expect_lane mr
+    expect_status 0
     expect "status" "$(bead status)" closed
-    # TODAY'S FAILURE, pinned on purpose. "5. Cleanup" runs a plain
-    # `git checkout "$TARGET"`, which git refuses while the target is checked
-    # out in another worktree, and `temp` then cannot be deleted either.
-    # gcp-l8td.6 (B1.2b) is the fix; it flips these assertions.
-    output_has "already (checked out|used by worktree)" ||
-        fail "git checkout of the target did not fail with 'already checked out' / 'already used by worktree'"
-    expect "the refinery clone's branch" "$(git -C "$REFINERY" symbolic-ref -q HEAD)" refs/heads/temp
-    git -C "$REFINERY" rev-parse --verify -q refs/heads/temp >/dev/null ||
-        fail "temp is gone; the mr cleanup no longer fails here, so flip this case (gcp-l8td.6)"
+    # The mr cleanup detaches onto the target, as the direct lane's does, so the
+    # target being checked out in another worktree no longer stops it (gcp-l8td.6).
+    ! output_has "already (checked out|used by worktree)" ||
+        fail "the mr cleanup still tried to check the target out while another worktree has it"
+    git -C "$REFINERY" symbolic-ref -q HEAD >/dev/null &&
+        fail "the refinery clone's HEAD is $(git -C "$REFINERY" symbolic-ref HEAD), want detached"
+    expect "the refinery clone's HEAD" "$(git -C "$REFINERY" rev-parse HEAD)" "$(origin_tip)"
+    git -C "$REFINERY" rev-parse --verify -q refs/heads/temp >/dev/null &&
+        fail "temp still exists after cleanup"
+    expect "the second worktree's branch" "$(git -C "$T/second" symbolic-ref -q HEAD)" refs/heads/integration
+    # The pull request needs its source branch: mr mode never deletes it.
+    origin_ref "$BRANCH_NAME" >/dev/null || fail "origin lost $BRANCH_NAME; mr mode must keep it"
     end_case
 }
 

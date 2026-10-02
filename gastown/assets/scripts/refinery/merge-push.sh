@@ -836,11 +836,21 @@ case "$MERGE_LAND_STATUS" in
 esac
 }
 
-# The direct lane's "2. Cleanup", including the branch delete the step gives in
-# prose: If delete_merged_branches = "true": `git push origin --delete $BRANCH`
-direct_cleanup() {
+# Both lanes' cleanup of `temp`: step off it onto the target's tip and delete it.
+# The checkout DETACHES onto origin/$TARGET rather than checking out $TARGET,
+# because git refuses to check a branch out while another worktree has it, and
+# the target is routinely checked out in the rig's main worktree. The mr lane
+# used a plain `git checkout "$TARGET"` until gcp-l8td.6, and failed exactly
+# there: HEAD stayed on `temp`, which then could not be deleted either.
+cleanup_temp() {
 git checkout --detach "origin/$TARGET" >/dev/null 2>&1 || true
 git branch -d temp || git branch -D temp || true
+}
+
+# The direct lane's "2. Cleanup", including the branch delete the step gave in
+# prose: If delete_merged_branches = "true": `git push origin --delete $BRANCH`
+direct_cleanup() {
+cleanup_temp
 if [ "$CFG_DELETE_MERGED_BRANCHES" = "true" ]; then
   git push origin --delete "$BRANCH"
 fi
@@ -855,13 +865,6 @@ after_already_merged_close() {
     direct_cleanup
   fi
   return "$1"
-}
-
-# The mr lane's "5. Cleanup". A plain `git checkout "$TARGET"` fails while the
-# target is checked out in another worktree; gcp-l8td.6 (B1.2b) fixes it.
-mr_cleanup() {
-git checkout "$TARGET"
-git branch -d temp
 }
 
 # resolve_origin_repo — set ORIGIN_REPO to the repository this clone pushes to,
@@ -1176,7 +1179,7 @@ else
   echo "Could not record the pull request handoff on $WORK; the bead is still open. STOP. Debug and retry."
   return 2
 fi
-  mr_cleanup
+  cleanup_temp
   return 0
 fi
 
@@ -1187,14 +1190,14 @@ APPROVAL_GATE_STATUS=$?
 echo "$APPROVAL_GATE_OUTPUT"
 if [ "$APPROVAL_GATE_STATUS" -ne 0 ]; then
   park_awaiting_review "$APPROVAL_GATE_OUTPUT"
-  mr_cleanup
+  cleanup_temp
   return 4
 fi
 gc bd update "$WORK" --set-metadata merge_approval_state=approved --unset-metadata merge_approval_gate_reason
 direct_close
 LAND_STATUS=$?
 case "$LAND_STATUS" in
-  0|4) mr_cleanup ;;
+  0|4) cleanup_temp ;;
 esac
 return "$LAND_STATUS"
 }
