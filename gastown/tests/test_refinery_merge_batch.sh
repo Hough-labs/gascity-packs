@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Black-box proof of merge-batch.sh `select`, `stack` and `land` against real git
-# repositories (gcp-l8td.8, D1.1; gcp-l8td.9, D1.2).
+# Black-box proof of merge-batch.sh `select`, `stack`, `land` and `serial` against
+# real git repositories (gcp-l8td.8, D1.1; gcp-l8td.9, D1.2; gcp-l8td.11, D1.2b).
 #
 # merge-batch.sh chooses and stacks a batch of beads for the refinery's direct
 # lane. It is inert until the formula calls it (gcp-l8td.10), so these cases are
@@ -17,7 +17,9 @@
 #   gc bd list        every fixture bead, unsorted, so select's own sort is what
 #                     the cases test; the stub insists on the query's flags
 #   gc bd show <id>   that bead's file; fails for the ids in GC_STUB_FAIL_SHOW
-#   gc bd update <id> --set-metadata, --unset-metadata, --assignee, --status
+#   gc bd update <id> --set-metadata, --unset-metadata, --assignee, --status;
+#                     fails for the ids in GC_STUB_FAIL_UPDATE
+#   gc bd note <id> --stdin   appends stdin to $GC_STUB_BEADS/<id>.notes
 #   gc bd close <id>  status closed and the close reason; fails for the ids in
 #                     GC_STUB_FAIL_CLOSE
 # Every call is journalled to $T/gc.log. A call the model does not know fails
@@ -27,14 +29,14 @@
 # in. SCRIPT may point at another copy of merge-batch.sh; it finds merge-push.sh
 # beside itself, so stage a copy as a pack tree.
 #
-# The suite fails unless all 16 cases ran.
+# The suite fails unless all 20 cases ran.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 PACK_DIR="$ROOT/gastown"
 SCRIPT="${SCRIPT:-$PACK_DIR/assets/scripts/refinery/merge-batch.sh}"
 PUSH_SCRIPT="$(dirname "$SCRIPT")/merge-push.sh"
-EXPECTED_CASES=16
+EXPECTED_CASES=20
 
 AGENT=testrig/gastown.refinery
 TARGET_NAME=integration
@@ -112,6 +114,12 @@ bd)
         id="${3:-}"
         file="$GC_STUB_BEADS/$id.json"
         [ -f "$file" ] || unexpected
+        case " ${GC_STUB_FAIL_UPDATE:-} " in
+        *" $id "*)
+            echo "stub gc: gc bd update $id failed on request" >&2
+            exit 1
+            ;;
+        esac
         shift 3
         while [ "$#" -gt 0 ]; do
             case "$1" in
@@ -129,6 +137,11 @@ bd)
             esac
             shift
         done
+        ;;
+    note)
+        # gc bd note <id> --stdin: the note text is appended to <id>.notes.
+        { [ "$#" -eq 4 ] && [ "$4" = --stdin ] && [ -f "$GC_STUB_BEADS/${3:-}.json" ]; } || unexpected
+        cat >>"$GC_STUB_BEADS/$3.notes"
         ;;
     close)
         case " ${GC_STUB_FAIL_CLOSE:-} " in
@@ -190,6 +203,7 @@ CFG
     : >"$T/err"
     FAIL_SHOW=""
     FAIL_CLOSE=""
+    FAIL_UPDATE=""
     EXTRA_ENV=()
     CONFIG_JSON="$T/config.json"
     write_config
@@ -337,6 +351,7 @@ run_batch() {
             GC_RIG=testrig GC_AGENT="$AGENT" MERGE_PUSH_CONFIG_JSON="$CONFIG_JSON" \
             GC_STUB_LOG="$T/gc.log" GC_STUB_BEADS="$BEADS" GC_STUB_AGENT="$AGENT" \
             GC_STUB_FAIL_SHOW="$FAIL_SHOW" GC_STUB_FAIL_CLOSE="$FAIL_CLOSE" \
+            GC_STUB_FAIL_UPDATE="$FAIL_UPDATE" \
             STUB_UNEXPECTED="$T/unexpected" \
             ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"} \
             "$BASH" "$SCRIPT" "$@"
@@ -360,6 +375,7 @@ run_push() {
             GC_RIG=testrig GC_AGENT="$AGENT" MERGE_PUSH_CONFIG_JSON="$CONFIG_JSON" \
             GC_STUB_LOG="$T/gc.log" GC_STUB_BEADS="$BEADS" GC_STUB_AGENT="$AGENT" \
             GC_STUB_FAIL_SHOW="$FAIL_SHOW" GC_STUB_FAIL_CLOSE="$FAIL_CLOSE" \
+            GC_STUB_FAIL_UPDATE="$FAIL_UPDATE" \
             STUB_UNEXPECTED="$T/unexpected" \
             "$BASH" "$PUSH_SCRIPT" --gh "$T/bin/no-gh" "$@"
     ) >"$T/out" 2>"$T/err"
@@ -663,6 +679,44 @@ case_stack_already_landed() {
     # the single-bead lane's.
     grep -q 'Skip the merge script' "$T/out" && fail "stack leaked the lane's 'skip the merge script' advice"
     assert_tidy
+    end_case
+}
+
+# A head whose rebase collapsed has no commit of its own. Batched, land would map
+# it to another member's commit and close it merged on that sha (M1), so stack
+# leaves a batch of 1 and the single-bead lane's merge-state gate decides it.
+case_stack_collapsed_head() {
+    new_case stack-collapsed-head
+    init_rig
+    add_branch gcp-h1 f1.txt "head"
+    add_branch gcp-h2 f2.txt "member two"
+    add_branch gcp-h3 f3.txt "member three"
+    move_target elsewhere.txt
+    land_by_patch_id gcp-h1
+    finish_rig gcp-h1
+    write_bead gcp-h1 1 2026-10-02T01:00:00Z
+    write_bead gcp-h2 1 2026-10-02T02:00:00Z
+    write_bead gcp-h3 1 2026-10-02T03:00:00Z
+    local before_temp writes
+    before_temp=$(temp_sha)
+    assert_eq "harness: the head's rebase collapsed onto the target" \
+        "$(git -C "$REFINERY" rev-parse origin/integration)" "$before_temp"
+    writes=$(db_writes)
+
+    run_batch stack --head gcp-h1 --members gcp-h1,gcp-h2,gcp-h3
+    assert_eq "stack exits 0" 0 "$(last_rc)"
+    assert_eq "the manifest holds the head alone" gcp-h1 "$(mf '[.members[].id] | join(",")')"
+    assert_eq "temp is where it was" "$before_temp" "$(temp_sha)"
+    assert_eq "stack wrote no bead" "$writes" "$(db_writes)"
+    grep -q "the head's rebase is empty" "$T/out" || fail "stack did not say the head's rebase is empty"
+    assert_tidy
+
+    # The single-bead lane's merge-state gate now decides the head.
+    run_push --work gcp-h1
+    assert_eq "merge-push.sh --work exits 0" 0 "$(last_rc)"
+    assert_eq "the head is closed" closed "$(bead_field gcp-h1 status)"
+    assert_eq "its merge_result is already_merged" already_merged "$(bead_meta gcp-h1 merge_result)"
+    assert_eq "it records how that was established" rebase_patch_id "$(bead_meta gcp-h1 already_merged_via)"
     end_case
 }
 
@@ -1012,6 +1066,10 @@ case_land_guards() {
     run_batch land --head gcp-h1
     guard_holds "an unparseable manifest" 1
 
+    jq '.members[0].commits = 0' "$T/manifest.before" >"$(manifest_path)"
+    run_batch land --head gcp-h1
+    guard_holds "a member with no commits" 1
+
     cp -f "$T/manifest.before" "$(manifest_path)"
     write_config require_merge_approval=true
     run_batch land --head gcp-h1
@@ -1031,6 +1089,109 @@ case_land_guards() {
     rm -f "$(manifest_path)"
     run_batch land --head gcp-h1
     guard_holds "no manifest" 1
+    end_case
+}
+
+# serial_stamp_of <id> — what origin holds for the member's branch.
+serial_stamp_of() { git --git-dir="$ORIGIN" rev-parse "refs/heads/polecat/$1"; }
+
+# assert_serial_stamped <id> — the member carries the stamp and nothing else of
+# serial's: no rejection_reason, and one note naming the batch's last tip.
+assert_serial_stamped() {
+    assert_eq "$1 carries merge_batch_serial" "$(serial_stamp_of "$1")" "$(bead_meta "$1" merge_batch_serial)"
+    assert_eq "$1 has no rejection_reason" "<unset>" "$(bead_meta "$1" rejection_reason)"
+    [ -f "$BEADS/$1.notes" ] || { fail "$1 has no note"; return; }
+    assert_eq "$1 holds exactly one note" 1 "$(grep -c . "$BEADS/$1.notes")"
+    grep -q "batch red at $(git -C "$REFINERY" rev-parse --short "$(saved '.members[2].tip')")" "$BEADS/$1.notes" ||
+        fail "$1's note does not name the batch's last tip"
+}
+
+case_serial_stamps() {
+    new_case serial-stamps
+    stack_three
+    local i writes status_before assignee_before
+    writes=$(db_writes)
+    status_before=$(bead_field gcp-h1 status)$(bead_field gcp-h2 status)$(bead_field gcp-h3 status)
+    assignee_before=$(bead_field gcp-h1 assignee)$(bead_field gcp-h2 assignee)$(bead_field gcp-h3 assignee)
+
+    run_batch serial --head gcp-h1
+    assert_eq "serial exits 0" 0 "$(last_rc)"
+    for i in 1 2 3; do assert_serial_stamped "gcp-h$i"; done
+    assert_eq "status is unchanged" "$status_before" \
+        "$(bead_field gcp-h1 status)$(bead_field gcp-h2 status)$(bead_field gcp-h3 status)"
+    assert_eq "assignee is unchanged" "$assignee_before" \
+        "$(bead_field gcp-h1 assignee)$(bead_field gcp-h2 assignee)$(bead_field gcp-h3 assignee)"
+    assert_eq "serial made exactly three bead writes" $((writes + 3)) "$(db_writes)"
+    grep -q '^gc bd close ' "$T/gc.log" && fail "serial closed a bead"
+    [ -z "$(temp_sha)" ] || fail "temp was left behind"
+    [ ! -e "$(manifest_path)" ] || fail "the manifest was left behind"
+    assert_eq "the last stdout line is the RESULT line" \
+        "merge-batch: RESULT 0 serial=gcp-h1,gcp-h2,gcp-h3 failed=" "$(last_line)"
+
+    # The stamps suppress batching end to end.
+    assert_eq "select now keeps the head alone" gcp-h1 "$(selected --head gcp-h1 --max 3)"
+    end_case
+}
+
+case_serial_stamp_failure() {
+    new_case serial-stamp-failure
+    stack_three
+    local before_h2
+    before_h2=$(bead_sum gcp-h2)
+    FAIL_UPDATE=gcp-h2
+
+    run_batch serial --head gcp-h1
+    assert_eq "serial exits 2" 2 "$(last_rc)"
+    assert_serial_stamped gcp-h1
+    assert_serial_stamped gcp-h3
+    assert_eq "the failed member is untouched" "$before_h2" "$(bead_sum gcp-h2)"
+    [ -z "$(temp_sha)" ] || fail "temp was left behind"
+    [ ! -e "$(manifest_path)" ] || fail "the manifest was left behind"
+    assert_eq "the last stdout line names the failed member" \
+        "merge-batch: RESULT 2 serial=gcp-h1,gcp-h3 failed=gcp-h2" "$(last_line)"
+    end_case
+}
+
+case_serial_guards() {
+    new_case serial-guards
+    stack_three
+    local before tip writes
+    before=$(snapshot_beads)
+    tip=$(saved '.members[2].tip')
+    writes=$(db_writes)
+
+    # guard_holds <what> — the guard that just ran touched nothing.
+    guard_holds() {
+        assert_eq "$1: exit status" 1 "$(last_rc)"
+        assert_eq "$1: the last stdout line is the RESULT line" \
+            "merge-batch: RESULT 1 serial= failed=" "$(last_line)"
+        assert_eq "$1: no bead changed" "$before" "$(snapshot_beads)"
+        assert_eq "$1: no bead call was made" "$writes" "$(db_writes)"
+        assert_eq "$1: no note was written" 0 "$(find "$BEADS" -name '*.notes' | wc -l | tr -d ' ')"
+        assert_eq "$1: temp is where stack left it" "$tip" "$(temp_sha)"
+    }
+
+    run_batch serial
+    guard_holds "serial with no --head"
+    grep -q '^usage: merge-batch.sh' "$T/err" || fail "serial with no --head printed no usage line"
+
+    run_batch serial --head gcp-h1 --frobnicate
+    guard_holds "serial with an unknown flag"
+
+    run_batch serial --head gcp-other
+    guard_holds "a manifest for another head"
+
+    jq '.members |= .[:1]' "$T/manifest.before" >"$(manifest_path)"
+    run_batch serial --head gcp-h1
+    guard_holds "a 1-member manifest"
+
+    printf 'not json' >"$(manifest_path)"
+    run_batch serial --head gcp-h1
+    guard_holds "an unparseable manifest"
+
+    rm -f "$(manifest_path)"
+    run_batch serial --head gcp-h1
+    guard_holds "no manifest"
     end_case
 }
 
@@ -1062,6 +1223,7 @@ case_select_approval
 case_stack_clean
 case_stack_conflict
 case_stack_already_landed
+case_stack_collapsed_head
 case_stack_degrade
 case_invariants
 case_extraction
@@ -1072,6 +1234,9 @@ case_land_refused
 case_land_left_open_recovery
 case_land_dropped_commit
 case_land_guards
+case_serial_stamps
+case_serial_stamp_failure
+case_serial_guards
 
 if [ "$PASS_CASES" -ne "$EXPECTED_CASES" ]; then
     echo "FAIL: $PASS_CASES of $EXPECTED_CASES cases ran" >&2
