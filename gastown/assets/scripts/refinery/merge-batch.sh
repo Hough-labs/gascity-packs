@@ -239,8 +239,10 @@ cmd_select() {
   fi
 
   sel_count=1
-  while IFS= read -r sel_id; do
-    [ -n "$sel_id" ] || continue
+  # A for loop, not a read loop: the git and gc calls inside would otherwise
+  # inherit the loop's stdin and could swallow the ids still to come. Bead ids
+  # carry no whitespace.
+  for sel_id in $sel_ids; do
     [ "$sel_id" != "$sel_head" ] || continue
     [ "$sel_count" -lt "$sel_max" ] || break
     if ! mb_check_member "$sel_id" "$sel_head_target"; then
@@ -249,9 +251,7 @@ cmd_select() {
     fi
     printf '%s\n' "$sel_id"
     sel_count=$((sel_count + 1))
-  done <<EOF
-$sel_ids
-EOF
+  done
   return 0
 }
 
@@ -488,8 +488,8 @@ cmd_stack() {
     stk_batchable=0
   fi
   if [ "$stk_batchable" -eq 1 ]; then
-    while IFS= read -r stk_id; do
-      [ -n "$stk_id" ] || continue
+    # A for loop, not a read loop, for the reason select gives.
+    for stk_id in $stk_ids; do
       [ "$stk_id" != "$SB_HEAD" ] || continue
       SB_WHY=""
       sb_stack_member "$stk_id"
@@ -506,9 +506,7 @@ cmd_stack() {
           return 0
           ;;
       esac
-    done <<EOF
-$stk_ids
-EOF
+    done
   fi
 
   git checkout -q temp >/dev/null 2>&1 || {
