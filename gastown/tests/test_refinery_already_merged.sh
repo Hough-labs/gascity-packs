@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Contract tests for mol-refinery-patrol's merge-state gate (gcp-a4e7).
+# Contract tests for the refinery merge lane's merge-state gate (gcp-a4e7).
 #
 # The gate has to separate three states that all present as "the rebase of this
 # branch onto the target is empty":
@@ -25,58 +25,24 @@
 # short-circuit), and states 2 and 3 pin the halts the content arm must not
 # swallow.
 #
-# Nothing here asserts the fix by grepping. Both shipped blocks -- the helper
-# group and the gate that calls it -- are extracted from the formula between
-# their sentinels and EXECUTED against real git repositories, with a `gc` stub
-# recording what the gate did to the bead. A regression shows up as "a merged
-# bead was marked refused_false_completion" or "an empty branch was closed as
-# merged", not as an absent string.
+# Nothing here asserts the fix by grepping. The shipped merge-push.sh is
+# sourced (MERGE_PUSH_SOURCE_ONLY=1) and its direct lane's gate is EXECUTED
+# against real git repositories, with a `gc` stub recording what the gate did to
+# the bead. The gate was a pair of formula blocks until gcp-l8td.6 moved the
+# lane into the script; it is now the front half of lane_direct, so run_gate
+# replaces direct_close with a marker to stop where the merge would begin. A
+# regression shows up as "a merged bead was marked refused_false_completion" or
+# "an empty branch was closed as merged", not as an absent string.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-FORMULA="$ROOT/gastown/formulas/mol-refinery-patrol.toml"
+MERGE_PUSH="$ROOT/gastown/assets/scripts/refinery/merge-push.sh"
 
 FAILURES=0
 
 fail() {
     echo "FAIL: $*" >&2
     FAILURES=$((FAILURES + 1))
-}
-
-# Extract one sentinel-delimited block of shipped formula text, substituting the
-# formula's own [vars] defaults. Any `{{...}}` left over is a hard error rather
-# than a block that executes a literal placeholder and passes vacuously.
-extract_block() {
-    python3 - "$FORMULA" "$1" "$2" <<'PY'
-import re
-import sys
-import tomllib
-
-formula, name, out = sys.argv[1:4]
-begin = f"# --- {name}:begin ---"
-end = f"# --- {name}:end ---"
-
-with open(formula, "rb") as handle:
-    doc = tomllib.load(handle)
-
-blocks = [
-    text.split(begin, 1)[1].split(end, 1)[0]
-    for text in (step.get("description", "") for step in doc["steps"])
-    if begin in text and end in text
-]
-if len(blocks) != 1:
-    sys.exit(f"expected exactly one {name} block in {formula}, found {len(blocks)}")
-
-block = blocks[0]
-values = {n: spec.get("default", "") for n, spec in (doc.get("vars") or {}).items()}
-block = re.sub(r"\{\{\s*(\w+)\s*\}\}", lambda m: values.get(m.group(1), m.group(0)), block)
-leftover = re.findall(r"\{\{[^}]*\}\}", block)
-if leftover:
-    sys.exit(f"unsubstituted placeholders in {name}: {sorted(set(leftover))}")
-
-with open(out, "w") as handle:
-    handle.write(block)
-PY
 }
 
 git_quiet() {
@@ -88,7 +54,7 @@ git_quiet() {
         "$@"
 }
 
-# A `gc` that answers exactly what the shipped blocks call. The `gc bd show
+# A `gc` that answers exactly what the shipped script calls. The `gc bd show
 # --json` call serves the work bead's metadata (the gate reads `fork_sha` from
 # it); every other call is recorded so a test can read back what the gate
 # decided.
@@ -197,25 +163,37 @@ build_rig() {
         git_quiet -C "$REFINERY" rebase --abort >/dev/null 2>&1
 }
 
-# Execute the shipped helper group + gate against the refinery clone. Echoes the
-# gate's exit status; the gc stub log holds what it did to the bead.
+# Execute the shipped direct lane's gate against the refinery clone. Its status
+# is the lane's: 0 when the gate closed the bead as already merged or fell
+# through to the merge, non-zero when it halted. The gc stub log holds what it
+# did to the bead.
 run_gate() {
     local branch="$1" fork="$2"
     (
         cd "$REFINERY" || exit 90
         export PATH="$STUBDIR:$PATH"
         export GC_STUB_LOG GC_STUB_FORK_SHA="$fork"
-        # No `set -e`: the blocks must abort on their own explicit checks.
+        # No `set -e`: the lane must abort on its own explicit checks.
         # shellcheck disable=SC2034
         WORK=test-bead
         # shellcheck disable=SC2034
         BRANCH="$branch"
         # shellcheck disable=SC2034
         TARGET=integration
+        # The script is written for, and characterized under, a plain shell
+        # (see its header): it reads variables it has not set.
+        set +u
+        # What resolve_config would have left behind for this rig.
+        # shellcheck disable=SC2034
+        CFG_DELETE_MERGED_BRANCHES=false
+        # shellcheck disable=SC2034
+        CFG_BINDING_PREFIX=gastown.
         # shellcheck disable=SC1090
-        . "$HELPERS"
-        # shellcheck disable=SC1090
-        . "$GATE"
+        MERGE_PUSH_SOURCE_ONLY=1 . "$MERGE_PUSH"
+        # The merge itself is out of scope here; reaching it means the gate fell
+        # through to "a normal merge candidate".
+        direct_close() { return 0; }
+        lane_direct
     ) >/dev/null 2>&1
 }
 
@@ -311,7 +289,7 @@ test_rebased_zero_change_branch_is_not_already_landed() {
     status=$(
         cd "$REFINERY" || exit 90
         # shellcheck disable=SC1090
-        . "$HELPERS"
+        MERGE_PUSH_SOURCE_ONLY=1 . "$MERGE_PUSH"
         branch_already_landed origin/integration origin/polecat/test "$FORK_SHA"
         printf '%s' "$?"
     )
@@ -357,11 +335,7 @@ test_unmerged_branch_falls_through_to_the_merge() {
 
 HARNESS=$(mktemp -d)
 trap 'rm -rf "$HARNESS"' EXIT
-HELPERS="$HARNESS/helpers.sh"
-GATE="$HARNESS/gate.sh"
 STUBDIR="$HARNESS/bin"
-extract_block merge-state-helpers "$HELPERS"
-extract_block merge-state-gate "$GATE"
 make_gc_stub "$STUBDIR"
 
 test_crash_after_a_rebasing_merge_closes_as_already_merged

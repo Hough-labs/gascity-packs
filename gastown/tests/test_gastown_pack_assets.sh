@@ -652,14 +652,16 @@ test_boot_deacon_observation_query_sees_wisps_tier() {
 }
 
 test_refinery_direct_merge_is_worktree_safe_and_fail_closed() {
-    local formula direct_block
-    formula="$GASTOWN/formulas/mol-refinery-patrol.toml"
+    local script direct_block
+    # The direct lane is merge-push.sh's (the formula's merge-push step runs it
+    # since gcp-l8td.6): from the merge's worktree cleanup through lane_direct.
+    script="$GASTOWN/assets/scripts/refinery/merge-push.sh"
 
-    direct_block=$(python3 - "$formula" <<'PY'
+    direct_block=$(python3 - "$script" <<'PY'
 import sys
 text = open(sys.argv[1], encoding="utf-8").read()
-start = text.index('**If MERGE_STRATEGY = "direct"')
-end = text.index('**If MERGE_STRATEGY = "mr"')
+start = text.index('merge_ff_push_cleanup_wt() {')
+end = text.index('# MERGE_STRATEGY = mr:')
 print(text[start:end])
 PY
 )
@@ -701,11 +703,11 @@ PY
     ! printf '%s\n' "$direct_block" | grep -E '^[[:space:]]*git checkout \$TARGET([[:space:]]|$)' >/dev/null ||
         fail "direct refinery merge must not checkout target branch in the active worktree"
 
-    python3 - "$formula" <<'PY' || fail "direct refinery merge must verify origin before setting merged metadata"
+    python3 - "$script" <<'PY' || fail "direct refinery merge must verify origin before setting merged metadata"
 import sys
 text = open(sys.argv[1], encoding="utf-8").read()
-start = text.index('**If MERGE_STRATEGY = "direct"')
-end = text.index('**If MERGE_STRATEGY = "mr"')
+start = text.index('merge_ff_push_cleanup_wt() {')
+end = text.index('# MERGE_STRATEGY = mr:')
 block = text[start:end]
 verify = block.index('git merge-base --is-ancestor "$TEMP_SHA" "$AFTER_SHA"')
 metadata = block.index('--set-metadata merge_result=merged')

@@ -41,7 +41,7 @@
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-FORMULA="$ROOT/gastown/formulas/mol-refinery-patrol.toml"
+MERGE_PUSH="$ROOT/gastown/assets/scripts/refinery/merge-push.sh"
 
 FAILURES=0
 
@@ -50,32 +50,11 @@ fail() {
     FAILURES=$((FAILURES + 1))
 }
 
-# The block under test is the shipped formula text, extracted between its
-# sentinels — not a transcription that could drift from what the refinery runs.
-extract_block() {
-    python3 - "$FORMULA" "$1" <<'PY'
-import sys
-import tomllib
-
-formula, out = sys.argv[1], sys.argv[2]
-begin = "# --- merge-ff-push:begin ---"
-end = "# --- merge-ff-push:end ---"
-
-with open(formula, "rb") as handle:
-    doc = tomllib.load(handle)
-
-blocks = [
-    text.split(begin, 1)[1].split(end, 1)[0]
-    for text in (step.get("description", "") for step in doc["steps"])
-    if begin in text and end in text
-]
-if len(blocks) != 1:
-    sys.exit(f"expected exactly one merge-ff-push block, found {len(blocks)}")
-
-with open(out, "w") as handle:
-    handle.write(blocks[0])
-PY
-}
+# The code under test is the shipped merge-push.sh, sourced with
+# MERGE_PUSH_SOURCE_ONLY=1 so it defines its functions and returns before main.
+# Nothing is transcribed, so it cannot drift from what the refinery runs. The
+# lane lived in the formula's merge-push step until gcp-l8td.6 moved the call
+# to this script; these cases assert the same behaviour at its new home.
 
 git_q() { git "$@" >/dev/null 2>&1; }
 
@@ -140,7 +119,7 @@ run_merge() {
         MERGED_SHA=""
         TEMP_SHA=""
         # shellcheck disable=SC1090
-        . "$BLOCK"
+        MERGE_PUSH_SOURCE_ONLY=1 . "$BLOCK"
         merge_ff_push >&2
         printf '%s|%s|%s\n' "$?" "$MERGED_SHA" "$TEMP_SHA"
     )
@@ -457,7 +436,7 @@ run_cleanup() {
     (
         cd "$WORK" || exit 90
         # shellcheck disable=SC1090
-        . "$BLOCK"
+        MERGE_PUSH_SOURCE_ONLY=1 . "$BLOCK"
         # Consumed by merge_ff_push_cleanup_wt, not by this shell.
         # shellcheck disable=SC2034
         mfp_parent="$parent"
@@ -523,9 +502,7 @@ test_block_does_not_rely_on_set_e() {
     return 0
 }
 
-BLOCK=$(mktemp)
-trap 'rm -f "$BLOCK"' EXIT
-extract_block "$BLOCK"
+BLOCK="$MERGE_PUSH"
 export BLOCK
 
 test_block_does_not_rely_on_set_e

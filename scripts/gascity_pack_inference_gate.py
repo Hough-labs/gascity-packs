@@ -147,28 +147,12 @@ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
         "{{lint_command}}",
         "{{build_command}}",
         "{{test_command}}",
-        "branch_has_real_change",
-        # The rebase-aware arm of the already-merged gate. Without it the
-        # ancestor check is the only arm, and on a lane that lands work by
-        # rebasing that check can essentially never fire — so a crash between
-        # push and close halts a genuinely merged bead as a false completion
-        # (gcp-a4e7, live case winnow-zgr2y.6).
-        "branch_already_landed",
-        "--set-metadata already_merged_via=",
-        'git worktree add --detach "$mfp_wt" "$BEFORE_SHA"',
-        'git -C "$mfp_wt" merge --ff-only "$TEMP_SHA"',
-        # The merge must be proven, not asserted: the target has to have
-        # ADVANCED, and to have advanced BY THIS BRANCH, both read back after
-        # the push. Comparing the pre-push snapshot to itself passed on the one
-        # path that mattered and reported a merge that never happened (gcp-p87).
-        'git merge-base --is-ancestor "$TEMP_SHA" "$AFTER_SHA"',
-        "--set-metadata merge_result=merged",
-        '--set-metadata merged_sha="$MERGED_SHA"',
-        'gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT"',
-        "gh pr create",
-        "gc gastown pr-merge-reconcile record",
-        '"$WORK" "$PR_URL" "$PR_NUMBER" "$TARGET" "$PR_HEAD_SHA"',
-        "closure happens only in",
+        # The merge-push lane itself (the false-completion guard, the
+        # already-merged gate, the ff-merge, the pull-request handoff) is
+        # merge-push.sh's: GASTOWN_SCRIPT_CONTRACTS holds those fragments. The
+        # step keeps only the call.
+        "merge-push.sh",
+        '--work "$WORK"',
     ),
     "mol-witness-patrol": (
         "LIVENESS_MAP=$(jq -n",
@@ -326,6 +310,35 @@ POLECAT_BASE_REF_ALLOWED_ASSIGNMENTS = frozenset(
     {'BASE_REF="$BASE_REMOTE"', 'BASE_REF="$BASE_LOCAL"'}
 )
 POLECAT_BASE_REF_STOP_MESSAGE = "STOP: base branch {{base_branch}} exists neither on origin nor locally."
+# Pack-relative script files whose text carries contract fragments, validated
+# alongside the formulas. The refinery's merge lane moved out of
+# mol-refinery-patrol's merge-push step into merge-push.sh (gcp-l8td.6), and
+# these are the fragments that moved with it.
+GASTOWN_SCRIPT_CONTRACTS = {
+    "assets/scripts/refinery/merge-push.sh": (
+        "branch_has_real_change",
+        # The rebase-aware arm of the already-merged gate. Without it the
+        # ancestor check is the only arm, and on a lane that lands work by
+        # rebasing that check can essentially never fire — so a crash between
+        # push and close halts a genuinely merged bead as a false completion
+        # (gcp-a4e7, live case winnow-zgr2y.6).
+        "branch_already_landed",
+        "--set-metadata already_merged_via=",
+        'git worktree add --detach "$mfp_wt" "$BEFORE_SHA"',
+        'git -C "$mfp_wt" merge --ff-only "$TEMP_SHA"',
+        # The merge must be proven, not asserted: the target has to have
+        # ADVANCED, and to have advanced BY THIS BRANCH, both read back after
+        # the push. Comparing the pre-push snapshot to itself passed on the one
+        # path that mattered and reported a merge that never happened (gcp-p87).
+        'git merge-base --is-ancestor "$TEMP_SHA" "$AFTER_SHA"',
+        "--set-metadata merge_result=merged",
+        '--set-metadata merged_sha="$MERGED_SHA"',
+        'gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT"',
+        '"$GH" pr create',
+        "--set-metadata pr_url=\"$PR_URL\"",
+        "gc bd close $WORK --reason \"Pull request ready: $PR_URL\"",
+    ),
+}
 METHODOLOGY_FLOW_CONTRACTS = {
     "superpowers": {
         "review_expansion": "superpowers-code-review",
@@ -3111,6 +3124,15 @@ def validate_gastown_orchestration_contract(pack_source: Path) -> None:
         for fragment in required_fragments:
             if fragment not in text:
                 missing.append(f"{formula_name}: missing contract fragment {fragment!r}")
+    for relative_path, required_fragments in GASTOWN_SCRIPT_CONTRACTS.items():
+        path = pack_source / relative_path
+        if not path.is_file():
+            missing.append(f"{relative_path}: missing script file {path}")
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for fragment in required_fragments:
+            if fragment not in text:
+                missing.append(f"{relative_path}: missing contract fragment {fragment!r}")
     if missing:
         raise GateError("Gastown orchestration contract drifted:\n" + "\n".join(f"- {item}" for item in missing))
     validate_polecat_branch_content_gate(pack_source)

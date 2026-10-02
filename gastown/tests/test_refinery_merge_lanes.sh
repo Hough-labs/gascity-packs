@@ -1,49 +1,39 @@
 #!/usr/bin/env bash
-# Black-box characterization of mol-refinery-patrol's merge-push step: every
-# merge lane (direct, mr, local), run end to end (gcp-l8td.4, B1.1).
+# Black-box characterization of the refinery's merge-push step: every merge lane
+# (direct, mr, local), run end to end (gcp-l8td.4 B1.1, gcp-l8td.5 B1.2a,
+# gcp-l8td.6 B1.2b).
 #
-# This suite pins TODAY's behaviour so that B1.2a (gcp-l8td.5) can move the
-# lane out of the formula into a script and prove it runs the same way. The mr
-# lane, the post-merge close and both cleanups had no executed test, and the mr
-# lane is dormant (every rig lands direct), so a refactor could break them
-# silently. Each case asserts what a lane DID: the work bead it left behind
-# (metadata, status, close reason), the gc/gh/curl calls it made, and the refs
-# it moved on a real bare origin. It never asserts how the lane is written.
+# The lane used to be 14 fenced blocks of mol-refinery-patrol's merge-push step,
+# hand-rendered by the agent on every patrol. It is now gastown/assets/scripts/
+# refinery/merge-push.sh, and the step is one invoke block that locates the
+# script, runs it, and acts on its exit status. The mr lane is dormant (every rig
+# lands direct) and the post-merge close and both cleanups had no executed test
+# before B1.1, so each case asserts what a lane DID: the work bead it left behind
+# (metadata, status, close reason), the gc/gh/curl calls it made, and the refs it
+# moved on a real bare origin. It never asserts how the lane is written.
 #
-# Every block is EXTRACTED from the shipped formula, never transcribed. The
-# merge-push step carries `# --- merge-lane:<name>:begin/end ---` sentinels
-# around each block no earlier suite already pinned, and this adapter stitches
-# them in lane order together with the blocks the other suites already
-# sentinel. The one exception is the prose-only branch delete in "2. Cleanup",
-# which is not in a code fence; emit_direct_cleanup transcribes it and cites the
-# line. {{...}} is rendered from the formula's [vars] defaults plus per-case
-# overrides, and anything left unrendered is a hard error. A missing or
-# duplicated sentinel aborts the whole suite, so this file cannot pass against
-# a formula it is not really executing. Point FORMULA at another copy to check
-# that.
+# Every case runs the step's own invoke block, EXTRACTED from the shipped formula
+# through tomllib (the renderer's un-escape) and never transcribed: the block
+# between `# --- merge-push:invoke:begin ---` and `:end ---`. That block locates
+# merge-push.sh, runs it, and applies the step's status table, so the journal and
+# the exit status each case sees are the real step's, not a stand-in. Point
+# FORMULA at another copy of the formula to check that. A missing or duplicated
+# sentinel, or a `{{` left in the block, aborts the whole suite. Point SCRIPT at
+# another copy of the script to check that the suite can fail; that copy is
+# staged as a pack tree, because the block finds the script, and the script finds
+# the approval gate, by position.
 #
-# Every case runs twice, once per ADAPTER (gcp-l8td.5, B1.2a). The formula
-# adapter stitches the blocks as described here. The script adapter runs
-# gastown/assets/scripts/refinery/merge-push.sh, the same lane as one process,
-# then applies the merge-push step's status table through the same gc stub, so
-# both adapters meet identical assertions. The suite fails unless each adapter
-# ran all 23 cases. Point SCRIPT at another copy to check that equivalence can
-# fail. A handful of script-only cases (config resolution, invariants) run once,
-# after both passes.
-#
-# The stitching glue is the adapter's transcription of the step's prose, and
-# each branch cites the line it follows. The lane is chosen by running the
-# shared prefix and reading MERGE_STRATEGY, never by the test naming it, so the
-# approval promotion (direct -> mr) and the existing_pr promotion are real. The
-# direct lane runs as TWO processes because the merge-state gate `exit`s the
-# shell: it exits 0 after closing an already-merged bead and 1 after a halt.
+# The suite fails unless the 23 lane cases and the 2 locator cases ran. A handful
+# of script-only cases (config resolution, invariants) run once, after them.
 #
 # The rig is real git: a bare origin, a polecat clone that pushed the branch,
 # and the refinery's clone with `temp` rebased onto the target, which is what
 # the `rebase` step leaves behind. Everything else is stubbed and journalled:
 #   gc    beads against a JSON fixture of the work bead, plus mail, nudges,
 #         drain-ack, the next-wisp pour/burn, and `formula list`. That last one
-#         answers with the real pack, so 4b runs the REAL merge-approval-gate.sh.
+#         answers with no formulas, so the block falls back to GC_PACK_DIR, which
+#         points at the real pack: the lane runs the REAL merge-push.sh and, when
+#         approval is on, the REAL merge-approval-gate.sh beside it.
 #   gh    pull requests from a JSON fixture; the live head sha is read off the
 #         bare origin, as GitHub would report it.
 #   curl  the GitHub REST fallback, used when gh is absent.
@@ -58,14 +48,10 @@ set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 FORMULA="${FORMULA:-$ROOT/gastown/formulas/mol-refinery-patrol.toml}"
-# The approval gate is resolved from the pack the formula ships in, via
-# `gc formula list`. That is always the real pack, even when FORMULA points at
-# a scratch copy.
-PACK_FORMULA="$ROOT/gastown/formulas/mol-refinery-patrol.toml"
-SCRIPT="${SCRIPT:-$ROOT/gastown/assets/scripts/refinery/merge-push.sh}"
-# formula | script: which adapter run_lane drives. The runner sets it per pass.
-ADAPTER=formula
-# Cases finished in the current pass.
+PACK_DIR="$ROOT/gastown"
+SCRIPT="${SCRIPT:-$PACK_DIR/assets/scripts/refinery/merge-push.sh}"
+ADAPTER=script
+# Cases finished so far.
 PASS_CASES=0
 
 WORK_ID=gcp-work
@@ -80,9 +66,6 @@ PR_URL="https://github.com/$ORIGIN_REPO/pull/7"
 API_URL="https://api.github.com/repos/$ORIGIN_REPO"
 ISSUE_TITLE="Teach the widget to count"
 
-# The shared prefix every lane runs first, in formula file order.
-PREFIX_BLOCKS="read-metadata origin-repo-resolution strategy merge-approval-gate-wiring block-existing-pr merge-state-helpers github-helpers"
-
 FAILURES=0
 CASE=""
 
@@ -91,69 +74,31 @@ fail() {
     FAILURES=$((FAILURES + 1))
 }
 
-# extract_blocks <outdir> [var=value ...] — write every block the lanes run to
-# <outdir>/<name>.sh, rendered with the [vars] defaults plus the overrides.
-# Exits non-zero, naming each problem, when any block is missing, duplicated or
-# left with a placeholder, or when the transcribed prose line has moved.
-extract_blocks() {
-    python3 - "$FORMULA" "$@" <<'PY'
-import os
-import re
+# extract_invoke <file> — write the merge-push step's invoke block to <file>.
+# Exits non-zero, naming each problem, when the step is missing or duplicated,
+# the sentinel pair is not exactly one, or a placeholder is left in the block:
+# nothing is rendered, because every config value resolves inside the script.
+extract_invoke() {
+    python3 - "$FORMULA" "$1" <<'PY'
 import sys
 import tomllib
 
-formula, outdir, *overrides = sys.argv[1:]
-LANE = [
-    "read-metadata", "strategy", "block-existing-pr", "github-helpers",
-    "direct-close", "direct-cleanup", "mr-zero-diff", "mr-push", "mr-pr",
-    "mr-verify", "mr-record", "mr-handoff", "mr-gate", "mr-approved",
-    "mr-cleanup", "local",
-]
-SHARED = ["origin-repo-resolution", "merge-state-helpers", "merge-state-gate", "merge-ff-push"]
-# The one command this suite transcribes (see emit_direct_cleanup). Requiring
-# the prose verbatim keeps the transcription from drifting silently.
-DELETE_PROSE = 'If delete_merged_branches = "true": `git push origin --delete $BRANCH`'
-
+formula, out = sys.argv[1:3]
+begin, end = "# --- merge-push:invoke:begin ---", "# --- merge-push:invoke:end ---"
 with open(formula, "rb") as handle:
     doc = tomllib.load(handle)
 steps = [s for s in doc.get("steps", []) if s.get("id") == "merge-push"]
 if len(steps) != 1:
-    sys.exit(f"expected exactly one merge-push step in {formula}, found {len(steps)}")
+    sys.exit(f"extract: expected exactly one merge-push step in {formula}, found {len(steps)}")
 text = steps[0].get("description", "")
-
-markers = {n: (f"# --- merge-lane:{n}:begin ---", f"# --- merge-lane:{n}:end ---") for n in LANE}
-markers.update({n: (f"# --- {n}:begin ---", f"# --- {n}:end ---") for n in SHARED})
-markers["merge-approval-gate-wiring"] = (
-    "# >>> merge-approval-gate-wiring >>>",
-    "# <<< merge-approval-gate-wiring <<<",
-)
-
-values = {n: str(spec.get("default", "")) for n, spec in (doc.get("vars") or {}).items()}
-values.update(kv.split("=", 1) for kv in overrides)
-
-os.makedirs(outdir, exist_ok=True)
-problems = []
-for name, (begin, end) in markers.items():
-    if text.count(begin) != 1 or text.count(end) != 1:
-        problems.append(f"{name}: want exactly one begin and one end sentinel in merge-push, "
-                        f"found {text.count(begin)} and {text.count(end)}")
-        continue
-    block = text.split(begin, 1)[1].split(end, 1)[0]
-    block = re.sub(r"\{\{\s*(\w+)\s*\}\}", lambda m: values.get(m.group(1), m.group(0)), block)
-    leftover = sorted(set(re.findall(r"\{\{[^}]*\}\}", block)))
-    if leftover:
-        problems.append(f"{name}: unrendered placeholders {leftover}")
-        continue
-    with open(os.path.join(outdir, f"{name}.sh"), "w") as handle:
-        handle.write(block)
-if text.count(DELETE_PROSE) != 1:
-    problems.append(f"the prose line this suite transcribes is gone or duplicated: {DELETE_PROSE}")
-with open(os.path.join(outdir, "delete_merged_branches.var"), "w") as handle:
-    handle.write(values.get("delete_merged_branches", ""))
-
-for problem in problems:
-    print(f"extract: {problem}", file=sys.stderr)
-sys.exit(1 if problems else 0)
+if text.count(begin) != 1 or text.count(end) != 1:
+    sys.exit(f"extract: want exactly one begin and one end sentinel in merge-push, "
+             f"found {text.count(begin)} and {text.count(end)}")
+block = text.split(begin, 1)[1].split(end, 1)[0]
+if "{{" in block:
+    sys.exit("extract: the invoke block carries a template placeholder")
+with open(out, "w") as handle:
+    handle.write(block)
 PY
 }
 
@@ -224,7 +169,11 @@ bd)
     ;;
 formula)
     [ "${2:-}" = list ] || unexpected
-    printf '{"formulas":[{"name":"mol-refinery-patrol","source":"%s"}]}\n' "$GC_STUB_FORMULA_SOURCE"
+    if [ -n "${GC_STUB_FORMULA_SOURCE:-}" ]; then
+        printf '{"formulas":[{"name":"mol-refinery-patrol","source":"%s"}]}\n' "$GC_STUB_FORMULA_SOURCE"
+    else
+        printf '{"formulas":[]}\n'
+    fi
     ;;
 runtime) [ "${2:-}" = drain-ack ] || unexpected ;;
 mail) [ "${2:-}" = send ] || unexpected ;;
@@ -525,95 +474,15 @@ edit_pr() {
     jq "$@" "$T/pr.json" >"$tmp" && mv -f "$tmp" "$T/pr.json"
 }
 
-# --- the adapter ------------------------------------------------------------
+# --- running the step ---------------------------------------------------------
 
-emit_block() {
-    cat "$T/blocks/$1.sh"
-    printf '\n'
-}
-
-emit_prefix() {
-    local block
-    # WORK is set by the patrol's earlier steps.
-    printf 'WORK=%s\n' "$WORK_ID"
-    for block in $PREFIX_BLOCKS; do
-        emit_block "$block"
-    done
-}
-
-# "2. Cleanup" of the direct lane, mol-refinery-patrol.toml:1940-1947.
-emit_direct_cleanup() {
-    emit_block direct-cleanup
-    if [ "$(cat "$T/blocks/delete_merged_branches.var")" = "true" ]; then
-        # TRANSCRIBED, not extracted: mol-refinery-patrol.toml:1947 (the design's
-        # :1935) is prose, not a fence:
-        #   If delete_merged_branches = "true": `git push origin --delete $BRANCH`
-        # extract_blocks fails if that line changes or moves out of merge-push.
-        # shellcheck disable=SC2016 # the lane's $BRANCH, expanded in the lane
-        printf '%s\n' 'git push origin --delete $BRANCH'
-    fi
-}
-
-# The first (for mr and local, the only) process: the prefix, then the lane
-# MERGE_STRATEGY names. The glue is single-quoted on purpose: it expands in the
-# lane, not here.
-# shellcheck disable=SC2016
-compose_first() {
-    {
-        emit_prefix
-        # The adapter records which lane the prefix chose.
-        printf '%s\n' 'printf "%s\n" "$MERGE_STRATEGY" >"$LANE_STRATEGY_FILE"'
-        printf '%s\n' 'case "$MERGE_STRATEGY" in' 'direct)'
-        # "0. Merge-state gate". Its exits end this process; the second process
-        # (compose_second) carries the rest of the lane.
-        emit_block merge-state-gate
-        printf '%s\n' ';;' 'mr)'
-        emit_block mr-zero-diff
-        emit_block mr-push
-        emit_block mr-pr
-        emit_block mr-verify
-        emit_block mr-record
-        # :2203 "4a. Approval gate off (APPROVAL_REQUIRED = 0)" / :2213 "4b".
-        printf '%s\n' 'if [ "$APPROVAL_REQUIRED" -eq 0 ]; then'
-        emit_block mr-handoff
-        printf '%s\n' 'else'
-        emit_block mr-gate
-        # :2225-2230 non-zero: parked, do not merge, run 5. Cleanup.
-        # :2232-2257 zero: mr-approved, then the direct path's merge script
-        # (merge-ff-push + direct-close) verbatim.
-        printf '%s\n' 'if [ "$APPROVAL_GATE_STATUS" -eq 0 ]; then'
-        emit_block mr-approved
-        emit_block merge-ff-push
-        emit_block direct-close
-        printf '%s\n' 'fi' 'fi'
-        # :2259 "5. Cleanup".
-        emit_block mr-cleanup
-        printf '%s\n' ';;' 'local)'
-        emit_block local
-        printf '%s\n' ';;' 'esac'
-    } >"$T/lane1.sh"
-}
-
-# The direct lane's second process. :1622-1627: if the gate closed the bead as
-# already merged, SKIP the merge script and go straight to 2. Cleanup;
-# otherwise continue to the merge. :1916-1919: status 0 or 4 goes on to
-# 2. Cleanup, and any other status STOPs (direct-close exits).
-compose_second() {
-    {
-        emit_prefix
-        if [ "$1" = merge ]; then
-            emit_block merge-ff-push
-            emit_block direct-close
-        fi
-        emit_direct_cleanup
-    } >"$T/lane2.sh"
-}
-
-# run_process <script> [arg ...] — runs one lane script inside the refinery
-# clone, as the patrol does. The cd fails closed: a lane run anywhere else would
-# fetch and push the origin of whatever checkout the suite was started from.
-# SCRIPT_ENV (the script adapter's) and then LANE_ENV_EXTRA (the case's) add
-# to the environment; a case's entry wins over the adapter's.
+# run_process <script> [arg ...] — runs one script inside the refinery clone, as
+# the patrol does. The cd fails closed: a lane run anywhere else would fetch and
+# push the origin of whatever checkout the suite was started from. SCRIPT_ENV (the
+# run's) and then LANE_ENV_EXTRA (the case's) add to the environment; a case's
+# entry wins over the run's. GC_PACK_DIR names the pack the invoke
+# block falls back to when `gc formula list` names no formula, and WORK is what
+# the patrol's earlier steps leave for the block.
 run_process() {
     (
         cd "$REFINERY" || exit 90
@@ -623,56 +492,19 @@ run_process() {
             GIT_AUTHOR_NAME=refinery GIT_AUTHOR_EMAIL=refinery@example.invalid \
             GIT_COMMITTER_NAME=refinery GIT_COMMITTER_EMAIL=refinery@example.invalid \
             GC_BEAD_ID="$WISP_ID" GC_AGENT="$REFINERY_AGENT" GC_RIG=testrig \
+            GC_PACK_DIR="$PACK_DIR" WORK="$WORK_ID" \
             GC_STUB_LOG="$T/gc.log" GC_STUB_BEAD="$BEAD" GC_STUB_WORK="$WORK_ID" \
-            GC_STUB_NEXT_WISP="$NEXT_WISP_ID" GC_STUB_FORMULA_SOURCE="$PACK_FORMULA" \
+            GC_STUB_NEXT_WISP="$NEXT_WISP_ID" GC_STUB_FORMULA_SOURCE= \
             GH_STUB_LOG="$T/gh.log" STUB_PR="$T/pr.json" STUB_ORIGIN_DIR="$ORIGIN" \
             STUB_BODY_CAPTURE="$T/pr-body.md" STUB_GH_MISSING="$STUB_GH_MISSING" \
             CURL_STUB_LOG="$T/curl.log" STUB_API="$API_URL" STUB_REST_PR="$T/rest-pr.json" \
             STUB_REST_CREATED="$T/rest-created" \
             STUB_ORIGIN_URL="$ORIGIN_URL_GITHUB" STUB_UNEXPECTED="$T/unexpected" \
-            LANE_STRATEGY_FILE="$T/lane" \
             ${SCRIPT_ENV[@]+"${SCRIPT_ENV[@]}"} \
             ${LANE_ENV_EXTRA[@]+"${LANE_ENV_EXTRA[@]}"} \
             "$BASH" "$@"
     ) >>"$T/lane.out" 2>&1
 }
-
-# run_lane [var=value ...] — run merge-push against the rig and bead through
-# the current ADAPTER. Sets LANE_STATUS (the exit status of the last process
-# run, or for the script the status the merge-push step's table leaves) and LANE
-# (the strategy the lane chose, empty if it stopped before choosing).
-#
-# The formula adapter renders binding_prefix=gastown., the value the patrol
-# really pours with for testrig/gastown.refinery; the script derives the same
-# value from GC_AGENT.
-run_lane() {
-    LANE_STATUS=""
-    LANE=""
-    if [ "$ADAPTER" = script ]; then
-        run_script_lane "$@"
-        return
-    fi
-    if ! extract_blocks "$T/blocks" rig_name=testrig binding_prefix=gastown. "$@" 2>>"$T/lane.out"; then
-        fail "could not extract the merge-push blocks from $FORMULA"
-        LANE_STATUS=70
-        return
-    fi
-    compose_first
-    run_process "$T/lane1.sh"
-    LANE_STATUS=$?
-    LANE=$(cat "$T/lane" 2>/dev/null || true)
-    if [ "$LANE" = direct ] && [ "$LANE_STATUS" -eq 0 ]; then
-        if [ "$(bead status)" = closed ]; then
-            compose_second cleanup
-        else
-            compose_second merge
-        fi
-        run_process "$T/lane2.sh"
-        LANE_STATUS=$?
-    fi
-}
-
-# --- the script adapter -----------------------------------------------------
 
 # write_config_json <file> [var=value ...] — the city config the script reads
 # through MERGE_PUSH_CONFIG_JSON, with run_lane's overrides as testrig's
@@ -687,7 +519,7 @@ write_config_json() {
             vars=$(jq -c --arg k "${kv%%=*}" --arg v "${kv#*=}" '. + {($k): $v}' <<<"$vars")
             ;;
         *)
-            fail "the script adapter has no FormulaVars mapping for ${kv%%=*}"
+            fail "run_lane has no FormulaVars mapping for ${kv%%=*}"
             return 1
             ;;
         esac
@@ -696,56 +528,28 @@ write_config_json() {
         '{config: {Rigs: [{Name: "testrig", DefaultBranch: "integration", FormulaVars: $vars}]}}' >"$file"
 }
 
-# The merge-push step's status table (gcp-l8td.3 DESIGN § Exit status
-# contract). STAND-IN for B1.2b's step table (gcp-l8td.6), which has not been
-# written yet: it runs through the same gc stub, so the journal and LANE_STATUS
-# assertions every case makes hold unchanged.
-#   0, 4, 11            continue: LANE_STATUS 0
-#   1, 2, 3, 5, 6, 7, 8 drain-ack, stop: LANE_STATUS 1
-#   9                   next-iteration's pour/assign/burn, drain-ack: 1
-# shellcheck disable=SC2016 # the step script's $GC_AGENT etc. expand in the step
-step_table() {
-    case "$1" in
-    0 | 4 | 11)
-        LANE_STATUS=0
-        return
-        ;;
-    1 | 2 | 3 | 5 | 6 | 7 | 8)
-        printf '%s\n' 'gc runtime drain-ack' >"$T/step.sh"
-        ;;
-    9)
-        printf '%s\n' \
-            'NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch=integration --var rig_name=testrig --var binding_prefix=gastown. --json | jq -r ".new_epic_id // empty")' \
-            'gc bd update "$NEXT" --assignee="$GC_AGENT"' \
-            'gc bd mol burn "$GC_BEAD_ID" --force' \
-            'gc runtime drain-ack' >"$T/step.sh"
-        ;;
-    *)
-        fail "the script exited $1, a status the merge-push step's table does not have"
-        LANE_STATUS=$1
-        return
-        ;;
-    esac
-    run_process "$T/step.sh" || fail "the step table's gc calls failed"
-    LANE_STATUS=1
-}
-
-# Runs merge-push.sh once, under run_process's exact environment plus the
-# config fixture. Sets SCRIPT_STATUS (the script's own exit status), LANE (from
-# its `merge-push: LANE` line) and LANE_STATUS (via step_table).
-run_script_lane() {
+# run_lane [var=value ...] — run the merge-push step's invoke block against the
+# rig and bead. Sets LANE_STATUS (the block's own exit status: 0 for the statuses
+# the step continues on, 1 where it drains), SCRIPT_STATUS (the script's, from its
+# RESULT line, empty if it never ran) and LANE (the strategy the lane chose, from
+# its `merge-push: LANE` line, empty if it stopped before choosing).
+run_lane() {
     local SCRIPT_ENV=(MERGE_PUSH_CONFIG_JSON="$T/config.json")
+    LANE_STATUS=""
+    LANE=""
     SCRIPT_STATUS=""
     if ! write_config_json "$T/config.json" "$@"; then
         LANE_STATUS=70
         return
     fi
-    run_process "$SCRIPT" --work "$WORK_ID"
-    SCRIPT_STATUS=$?
+    cp -f "$HARNESS/invoke.sh" "$T/invoke.sh"
+    run_process "$T/invoke.sh"
+    LANE_STATUS=$?
     LANE=$(sed -n 's/^merge-push: LANE //p' "$T/lane.out" | tail -n 1)
-    tail -n 1 "$T/lane.out" | grep -qE '^merge-push: RESULT [0-9]+ ' ||
-        fail "the script's last line is not its RESULT line: $(tail -n 1 "$T/lane.out")"
-    step_table "$SCRIPT_STATUS"
+    SCRIPT_STATUS=$(sed -n 's/^merge-push: RESULT \([0-9]*\) .*/\1/p' "$T/lane.out" | tail -n 1)
+    if grep -q '^merge-push: config ' "$T/lane.out" && [ -z "$SCRIPT_STATUS" ]; then
+        fail "merge-push.sh ran but printed no RESULT line"
+    fi
 }
 
 # --- assertions -------------------------------------------------------------
@@ -794,7 +598,7 @@ expect_no_merge_metadata() {
     expect "merged_target" "$(meta merged_target)" "<unset>"
 }
 
-# halt_false_completion's effects (formula :1258-1279).
+# halt_false_completion's effects (merge-push.sh).
 expect_false_completion_halt() {
     expect "status" "$(bead status)" blocked
     expect "assignee" "$(bead assignee)" ""
@@ -810,7 +614,8 @@ expect_false_completion_halt() {
     expect_target_unchanged
 }
 
-# block_existing_pr's effects (formula :1082-1152) for one exact reason.
+# block_existing_pr's effects, and the step's status-9 pour/assign/burn, for one
+# exact reason.
 expect_existing_pr_blocked() {
     local reason="$1" wisp update burn
     expect "assignee" "$(bead assignee)" ""
@@ -1229,6 +1034,58 @@ test_lane_local_mails_mayor() {
     ! logged gc "gc bd close" || fail "the local lane closed the bead"
     ! logged gc "gc bd mol burn" || fail "the local lane burned the wisp"
     [ ! -s "$T/gh.log" ] || fail "the local lane called gh"
+    expect "the script's exit status" "$SCRIPT_STATUS" 11
+    expect_status 0
+    expect_not_drained
+    expect_target_unchanged
+    end_case
+}
+
+# --- cases: locating the script ---------------------------------------------
+
+test_locator_uses_formula_source() {
+    local pack before
+    new_case locator_uses_formula_source
+    build_rig unmerged
+    write_bead
+    before=$(cat "$BEAD")
+    # A pack tree of its own, whose merge-push.sh only records that it ran. GC_PACK_DIR
+    # keeps pointing at the real pack, so only the formula's own source can have won.
+    pack="$T/pack"
+    mkdir -p "$pack/formulas" "$pack/assets/scripts/refinery"
+    : >"$pack/formulas/mol-refinery-patrol.toml"
+    cat >"$pack/assets/scripts/refinery/merge-push.sh" <<'MARK'
+#!/usr/bin/env bash
+printf 'ran: %s\n' "$*" >>"$MARKER_FILE"
+echo "merge-push: RESULT 0 marker"
+exit 0
+MARK
+    chmod +x "$pack/assets/scripts/refinery/merge-push.sh"
+    LANE_ENV_EXTRA=(GC_STUB_FORMULA_SOURCE="$pack/formulas/mol-refinery-patrol.toml" MARKER_FILE="$T/marker")
+    run_lane
+    expect_status 0
+    expect "the formula's pack script's calls" "$(cat "$T/marker" 2>/dev/null)" "ran: --work $WORK_ID"
+    ! output_has '^merge-push: config ' || fail "the real merge-push.sh ran, so GC_PACK_DIR won over the formula's source"
+    [ "$(cat "$BEAD")" = "$before" ] || fail "the bead changed"
+    end_case
+}
+
+test_locator_fails_closed() {
+    local before
+    new_case locator_fails_closed
+    build_rig unmerged
+    write_bead
+    before=$(cat "$BEAD")
+    # gc names no formula and GC_PACK_DIR is empty: nothing resolves.
+    LANE_ENV_EXTRA=(GC_PACK_DIR=)
+    run_lane
+    expect_status 1
+    expect_drained
+    output_has 'merge-push.sh not runnable' || fail "no 'merge-push.sh not runnable' line in the output"
+    ! output_has '^merge-push: (config|LANE|RESULT) ' || fail "merge-push.sh ran although nothing resolved it"
+    [ "$(cat "$BEAD")" = "$before" ] || fail "the bead changed"
+    expect_not_closed
+    ! logged gc "gc bd update" || fail "the step wrote to a bead: $(grep -F 'gc bd update' "$T/gc.log" | tr '\n' ';')"
     expect_target_unchanged
     end_case
 }
@@ -1352,7 +1209,6 @@ test_config_binding_prefix_derivation() {
 }
 
 test_config_unreadable_turns_gate_on() {
-    local ADAPTER=script
     new_case config_unreadable_turns_gate_on
     build_rig unmerged
     write_bead
@@ -1390,7 +1246,6 @@ PY
 }
 
 test_script_honors_refinery_gh() {
-    local ADAPTER=script
     new_case script_honors_refinery_gh
     build_rig unmerged
     write_bead merge_strategy=mr
@@ -1417,10 +1272,21 @@ make_bin "$HARNESS/bin-refinery-gh"
 write_gh_stub "$HARNESS"
 mv -f "$HARNESS/gh" "$HARNESS/bin-refinery-gh/refinery-gh"
 
-# Fail fast and loudly if the formula no longer carries every block.
-if ! extract_blocks "$HARNESS/probe" rig_name=testrig; then
-    echo "FAIL: cannot extract the merge-push lane blocks from $FORMULA" >&2
+# Fail fast and loudly if the formula no longer carries the invoke block.
+if ! extract_invoke "$HARNESS/invoke.sh"; then
+    echo "FAIL: cannot extract the merge-push:invoke block from $FORMULA" >&2
     exit 1
+fi
+
+# The block finds merge-push.sh, and the script finds the approval gate, by
+# position in a pack tree. A SCRIPT override is staged as one, beside the real
+# gate, so the same block runs it.
+if [ "$SCRIPT" != "$PACK_DIR/assets/scripts/refinery/merge-push.sh" ]; then
+    mkdir -p "$HARNESS/pack/assets/scripts/refinery"
+    cp -R "$PACK_DIR/assets/scripts/checks" "$HARNESS/pack/assets/scripts/checks"
+    cp -f "$SCRIPT" "$HARNESS/pack/assets/scripts/refinery/merge-push.sh"
+    chmod +x "$HARNESS/pack/assets/scripts/refinery/merge-push.sh"
+    PACK_DIR="$HARNESS/pack"
 fi
 
 run_all_cases() {
@@ -1448,17 +1314,14 @@ run_all_cases() {
     test_lane_local_mails_mayor
     test_lane_direct_cleanup_with_target_in_second_worktree
     test_lane_mr_cleanup_with_target_in_second_worktree
+    test_locator_uses_formula_source
+    test_locator_fails_closed
     echo "$ADAPTER: $PASS_CASES cases"
 }
 
-ADAPTER=formula
 run_all_cases
-FORMULA_CASES=$PASS_CASES
-ADAPTER=script
-run_all_cases
-SCRIPT_CASES=$PASS_CASES
-if [ "$FORMULA_CASES" -ne 23 ] || [ "$SCRIPT_CASES" -ne 23 ]; then
-    echo "FAIL: want 23 cases through each adapter; formula ran $FORMULA_CASES, script ran $SCRIPT_CASES" >&2
+if [ "$PASS_CASES" -ne 25 ]; then
+    echo "FAIL: want 25 cases (23 lane, 2 locator); ran $PASS_CASES" >&2
     FAILURES=$((FAILURES + 1))
 fi
 

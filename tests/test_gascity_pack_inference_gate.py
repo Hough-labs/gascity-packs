@@ -1377,30 +1377,82 @@ def test_validate_gastown_orchestration_contract_accepts_current_pack() -> None:
     )
 
 
-def test_validate_gastown_orchestration_contract_rejects_missing_build_handoff(tmp_path) -> None:
-    formulas = tmp_path / "gastown" / "formulas"
+def write_gastown_contract_pack(root, *, formula_edit=None, script_edit=None):
+    """Write a pack holding exactly the fragments the Gastown contract needs.
+
+    Formula text is the contract fragments joined by newlines; the script is the
+    real merge-push.sh. The edits receive (name, text) and return the text to write.
+    """
+    formulas = root / "gastown" / "formulas"
     formulas.mkdir(parents=True)
     for formula_name, fragments in gascity_pack_inference_gate.all_gastown_formula_contracts().items():
-        text = "\n".join(fragments)
         if formula_name == "mol-polecat-work":
-            text = text.replace("--assignee=\"$REFINERY_TARGET\"", "")
+            # validate_polecat_branch_content_gate parses this formula's real
+            # submit-and-exit step (upstream #290), so the fixture ships the file.
+            text = (
+                gascity_pack_inference_gate.PACK_SPECS["gastown"].source / "formulas" / f"{formula_name}.toml"
+            ).read_text(encoding="utf-8")
+        else:
+            text = "\n".join(fragments)
+        if formula_edit is not None:
+            text = formula_edit(formula_name, text)
         (formulas / f"{formula_name}.toml").write_text(text, encoding="utf-8")
+    for relative_path in gascity_pack_inference_gate.GASTOWN_SCRIPT_CONTRACTS:
+        text = (gascity_pack_inference_gate.PACK_SPECS["gastown"].source / relative_path).read_text(encoding="utf-8")
+        if script_edit is not None:
+            text = script_edit(relative_path, text)
+        script = root / "gastown" / relative_path
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text(text, encoding="utf-8")
+    return root / "gastown"
+
+
+def test_validate_gastown_orchestration_contract_accepts_the_fixture_pack(tmp_path) -> None:
+    gascity_pack_inference_gate.validate_gastown_orchestration_contract(write_gastown_contract_pack(tmp_path))
+
+
+def test_validate_gastown_orchestration_contract_rejects_missing_build_handoff(tmp_path) -> None:
+    pack = write_gastown_contract_pack(
+        tmp_path,
+        formula_edit=lambda name, text: (
+            text.replace("--assignee=\"$REFINERY_TARGET\"", "") if name == "mol-polecat-work" else text
+        ),
+    )
 
     with pytest.raises(gascity_pack_inference_gate.GateError, match="mol-polecat-work"):
-        gascity_pack_inference_gate.validate_gastown_orchestration_contract(tmp_path / "gastown")
+        gascity_pack_inference_gate.validate_gastown_orchestration_contract(pack)
+
+
+def test_validate_gastown_orchestration_contract_rejects_a_refinery_step_that_stops_calling_the_script(tmp_path) -> None:
+    pack = write_gastown_contract_pack(
+        tmp_path,
+        formula_edit=lambda name, text: (
+            text.replace("merge-push.sh", "").replace('--work "$WORK"', "") if name == "mol-refinery-patrol" else text
+        ),
+    )
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="mol-refinery-patrol"):
+        gascity_pack_inference_gate.validate_gastown_orchestration_contract(pack)
 
 
 def test_validate_gastown_orchestration_contract_rejects_missing_refinery_false_completion_guard(tmp_path) -> None:
-    formulas = tmp_path / "gastown" / "formulas"
-    formulas.mkdir(parents=True)
-    for formula_name, fragments in gascity_pack_inference_gate.all_gastown_formula_contracts().items():
-        text = "\n".join(fragments)
-        if formula_name == "mol-refinery-patrol":
-            text = text.replace("branch_has_real_change", "")
-        (formulas / f"{formula_name}.toml").write_text(text, encoding="utf-8")
+    # The false-completion guard moved out of the formula with the rest of the
+    # merge lane, so it is the SCRIPT that must carry it.
+    pack = write_gastown_contract_pack(
+        tmp_path,
+        script_edit=lambda path, text: text.replace("branch_has_real_change", ""),
+    )
 
-    with pytest.raises(gascity_pack_inference_gate.GateError, match="mol-refinery-patrol"):
-        gascity_pack_inference_gate.validate_gastown_orchestration_contract(tmp_path / "gastown")
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="merge-push.sh"):
+        gascity_pack_inference_gate.validate_gastown_orchestration_contract(pack)
+
+
+def test_validate_gastown_orchestration_contract_rejects_a_pack_without_the_merge_push_script(tmp_path) -> None:
+    pack = write_gastown_contract_pack(tmp_path)
+    (pack / "assets" / "scripts" / "refinery" / "merge-push.sh").unlink()
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="missing script file"):
+        gascity_pack_inference_gate.validate_gastown_orchestration_contract(pack)
 
 
 def gastown_formulas_copy(tmp_path: Path) -> Path:
@@ -1861,11 +1913,16 @@ def test_gastown_build_workflow_contract_covers_orchestration_roles() -> None:
     )
     assert "''|*[!0-9]*) HALT_REASON=content_gate_error ;;" in contracts["mol-polecat-work"]
     assert "0) HALT_REASON=no_commits ;;" in contracts["mol-polecat-work"]
-    assert 'git worktree add --detach "$mfp_wt" "$BEFORE_SHA"' in contracts["mol-refinery-patrol"]
-    assert 'git merge-base --is-ancestor "$TEMP_SHA" "$AFTER_SHA"' in contracts["mol-refinery-patrol"]
-    assert 'gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT"' in contracts["mol-refinery-patrol"]
-    assert "gc gastown pr-merge-reconcile record" in contracts["mol-refinery-patrol"]
-    assert "closure happens only in" in contracts["mol-refinery-patrol"]
+    assert "merge-push.sh" in contracts["mol-refinery-patrol"]
+    assert '--work "$WORK"' in contracts["mol-refinery-patrol"]
+    # The lane's own contract moved with it, into the script.
+    script_contracts = gascity_pack_inference_gate.GASTOWN_SCRIPT_CONTRACTS["assets/scripts/refinery/merge-push.sh"]
+    assert 'git worktree add --detach "$mfp_wt" "$BEFORE_SHA"' in script_contracts
+    assert 'git merge-base --is-ancestor "$TEMP_SHA" "$AFTER_SHA"' in script_contracts
+    assert 'gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT"' in script_contracts
+    assert "gc bd close $WORK --reason \"Pull request ready: $PR_URL\"" in script_contracts
+    assert '"$GH" pr create' in script_contracts
+    assert not {"branch_has_real_change", "branch_already_landed"} & set(contracts["mol-refinery-patrol"])
     assert "FAIL-SAFE: empty liveness map" in contracts["mol-witness-patrol"]
     assert "gc bd create --type=task --labels=warrant" in contracts["mol-deacon-patrol"]
     assert "gc bd dep add" in contracts["mol-idea-to-plan"]

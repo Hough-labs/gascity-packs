@@ -11,38 +11,17 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 FORMULA="$ROOT/gastown/formulas/mol-refinery-patrol.toml"
+MERGE_PUSH="$ROOT/gastown/assets/scripts/refinery/merge-push.sh"
 
 fail() {
     echo "FAIL: $*" >&2
     exit 1
 }
 
-# The block under test is the shipped formula text, extracted between its
-# sentinels — not a transcription that could drift from what the refinery runs.
-extract_resolution() {
-    python3 - "$FORMULA" "$1" <<'PY'
-import sys
-import tomllib
-
-formula, out = sys.argv[1], sys.argv[2]
-begin = "# --- origin-repo-resolution:begin ---"
-end = "# --- origin-repo-resolution:end ---"
-
-with open(formula, "rb") as handle:
-    doc = tomllib.load(handle)
-
-blocks = [
-    text.split(begin, 1)[1].split(end, 1)[0]
-    for text in (step.get("description", "") for step in doc["steps"])
-    if begin in text and end in text
-]
-if len(blocks) != 1:
-    sys.exit(f"expected exactly one origin-repo-resolution block, found {len(blocks)}")
-
-with open(out, "w") as handle:
-    handle.write(blocks[0])
-PY
-}
+# The code under test is the shipped merge-push.sh, sourced with
+# MERGE_PUSH_SOURCE_ONLY=1 so it defines resolve_origin_repo and returns before
+# main — not a transcription that could drift from what the refinery runs. The
+# resolution lived in the formula's merge-push step until gcp-l8td.6.
 
 # A hermetic PATH. The "no gh installed" cases are only meaningful if the real
 # gh on the developer's machine cannot leak in, so the resolution runs against
@@ -51,7 +30,7 @@ make_bin() {
     local bin="$1" gh_repo="${2-}"
     mkdir -p "$bin"
     local tool
-    for tool in git sed; do
+    for tool in git sed dirname; do
         ln -sf "$(command -v "$tool")" "$bin/$tool"
     done
     if [ -n "$gh_repo" ]; then
@@ -83,7 +62,8 @@ make_repo() {
     done
 }
 
-# Echoes "<ORIGIN_REPO>|<ORIGIN_REPO_ERROR>" after running the extracted block.
+# Echoes "<ORIGIN_REPO>|<ORIGIN_REPO_ERROR>" after running the script's
+# origin-repository resolution.
 resolve() {
     local repo="$1" bin="$2"
     (
@@ -94,9 +74,10 @@ resolve() {
         # the inner shell, after the block runs, not in this one.
         # shellcheck disable=SC2016
         PATH="$bin" HOME="$repo" "$BASH" -c '
-            . "$1"
+            MERGE_PUSH_SOURCE_ONLY=1 . "$1"
+            resolve_origin_repo
             printf "%s|%s\n" "$ORIGIN_REPO" "$ORIGIN_REPO_ERROR"
-        ' _ "$BLOCK"
+        ' _ "$MERGE_PUSH"
     )
 }
 
@@ -236,12 +217,24 @@ for step_id, line in unscoped:
     print(f"unscoped gh pr call in step {step_id}: {line}")
 sys.exit(1 if unscoped else 0)
 PY
-}
+    # The pull-request calls now live in merge-push.sh, which reaches gh as
+    # "$GH" (REFINERY_GH or gh). Hold them to the same rule.
+    python3 - "$MERGE_PUSH" <<'PY' || fail "merge-push.sh has an unscoped gh pr call"
+import sys
 
-BLOCK=$(mktemp)
-trap 'rm -f "$BLOCK"' EXIT
-extract_resolution "$BLOCK"
-export BLOCK
+unscoped = []
+with open(sys.argv[1]) as handle:
+    for number, line in enumerate(handle, 1):
+        if line.lstrip().startswith("#"):
+            continue
+        if '"$GH" pr ' in line and '--repo "$ORIGIN_REPO"' not in line:
+            unscoped.append((number, line.strip()))
+
+for number, line in unscoped:
+    print(f"unscoped gh pr call at merge-push.sh:{number}: {line}")
+sys.exit(1 if unscoped else 0)
+PY
+}
 
 test_fork_with_upstream_resolves_origin_not_parent
 test_single_remote_rig_is_unchanged

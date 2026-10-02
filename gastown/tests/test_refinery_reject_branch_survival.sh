@@ -33,6 +33,7 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 REFINERY_FORMULA="$ROOT/gastown/formulas/mol-refinery-patrol.toml"
 POLECAT_FORMULA="$ROOT/gastown/formulas/mol-polecat-work.toml"
+MERGE_PUSH="$ROOT/gastown/assets/scripts/refinery/merge-push.sh"
 
 FAILURES=0
 
@@ -260,39 +261,45 @@ test_resolution_still_halts_on_a_missing_branch() {
 
 # ---------------------------------------------------------------------------
 # 3. Structural: no branch deletion anywhere on the rejection route, and the
-#    merged path's deletion is untouched. Test 1 only executes the sentinelled
-#    block; a `git push origin --delete` re-added elsewhere in handle-failures
-#    would sail past it.
+#    merged path's deletion (merge-push.sh's) is still gated. Test 1 only
+#    executes the sentinelled block; a `git push origin --delete` re-added
+#    elsewhere in handle-failures would sail past it.
 # ---------------------------------------------------------------------------
 test_branch_deletion_lives_only_on_the_merged_path() {
-    python3 - "$REFINERY_FORMULA" <<'PY'
+    python3 - "$REFINERY_FORMULA" "$MERGE_PUSH" <<'PY'
 import sys
 import tomllib
 
-formula = sys.argv[1]
+formula, script = sys.argv[1:3]
 with open(formula, "rb") as handle:
     doc = tomllib.load(handle)
 
 problems = []
 steps = {step["id"]: step.get("description", "") for step in doc["steps"]}
 
-for step_id in ("handle-failures", "rebase-branch"):
-    text = steps.get(step_id)
-    if text is None:
-        continue
+# No step of the formula deletes a branch on the rejection route; the merged
+# path's deletion left the formula with the merge lane (gcp-l8td.6).
+for step_id, text in steps.items():
     if "push origin --delete" in text:
         problems.append(
             f"{step_id} deletes a branch: the rejection route returns the bead to the "
             "pool with metadata.branch still set, and mol-polecat-work resumes from it"
         )
 
-# Upstream's task-artifact lifecycle (#245) retains the source branch after a
-# verified merge as the durable recovery copy, so no step may be REQUIRED to
-# delete one; any step that still does must gate on delete_merged_branches.
-merged = [sid for sid, text in steps.items() if "push origin --delete" in text]
-for sid in merged:
-    if "delete_merged_branches" not in steps[sid]:
-        problems.append(f"{sid} deletes a branch without gating on delete_merged_branches")
+# The merged path is merge-push.sh's. Upstream's task-artifact lifecycle (#245)
+# retains the source branch after a verified merge as the durable recovery copy,
+# so no deletion is REQUIRED; any that remains must gate on
+# delete_merged_branches.
+lines = open(script, encoding="utf-8").read().splitlines()
+deletes = [
+    i for i, line in enumerate(lines)
+    if "push origin --delete" in line and not line.lstrip().startswith("#")
+]
+for i in deletes:
+    if 'CFG_DELETE_MERGED_BRANCHES" = "true"' not in lines[i - 1]:
+        problems.append(
+            f"merge-push.sh:{i + 1} deletes a branch without gating on delete_merged_branches"
+        )
 
 if problems:
     for problem in problems:
