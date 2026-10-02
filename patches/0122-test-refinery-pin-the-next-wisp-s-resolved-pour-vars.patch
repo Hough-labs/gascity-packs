@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 2 Oct 2026 15:52:10 -0400
+Subject: [PATCH 122/122] test(refinery): pin the next wisp's resolved pour
+ vars in the existing_pr-blocked case (gcp-l8td.6)
+
+The merge-push step's status-9 branch pours the next patrol wisp from the values merge-push.sh logged on its config line, since the step has no template to render them from. The existing_pr-blocked case asserted the pour, assign and burn order but not the vars, so a regression to an empty or unrendered pour would have passed. It now asserts target_branch, rig_name and binding_prefix on the pour.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ gastown/tests/test_refinery_merge_lanes.sh | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/gastown/tests/test_refinery_merge_lanes.sh b/gastown/tests/test_refinery_merge_lanes.sh
+index fa00764e..be75e840 100644
+--- a/gastown/tests/test_refinery_merge_lanes.sh
++++ b/gastown/tests/test_refinery_merge_lanes.sh
+@@ -627,6 +627,10 @@ expect_existing_pr_blocked() {
+     wisp=$(first_line_of gc "gc bd mol wisp mol-refinery-patrol --root-only")
+     update=$(first_line_of gc "gc bd update $NEXT_WISP_ID --assignee=$REFINERY_AGENT")
+     burn=$(first_line_of gc "gc bd mol burn $WISP_ID --force")
++    # The pour carries the values the script resolved, read back from its config
++    # line: the step's block has no template to render them from.
++    logged gc "gc bd mol wisp mol-refinery-patrol --root-only --var target_branch=$TARGET_NAME --var rig_name=testrig --var binding_prefix=gastown. --json" ||
++        fail "the next wisp was not poured with the resolved target_branch, rig_name and binding_prefix; gc calls: $(grep -F 'mol wisp' "$T/gc.log" | tr '\n' ';')"
+     if [ -z "$wisp" ] || [ -z "$update" ] || [ -z "$burn" ]; then
+         fail "want the next wisp poured, assigned and this one burned; got wisp@${wisp:-none} update@${update:-none} burn@${burn:-none}"
+     elif [ "$wisp" -ge "$update" ] || [ "$update" -ge "$burn" ]; then
+-- 
+2.54.0 (Apple Git-157)
+

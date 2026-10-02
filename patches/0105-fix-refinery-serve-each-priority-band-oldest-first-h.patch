@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 27 Sep 2026 17:07:27 -0400
-Subject: [PATCH 105/121] fix(refinery): serve each priority band
+Subject: [PATCH 105/122] fix(refinery): serve each priority band
  oldest-first-handoff, not newest-created (gcp-et7g.1)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

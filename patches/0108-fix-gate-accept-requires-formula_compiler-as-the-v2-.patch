@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 27 Sep 2026 18:09:29 -0400
-Subject: [PATCH 108/121] fix(gate): accept [requires] formula_compiler as the
+Subject: [PATCH 108/122] fix(gate): accept [requires] formula_compiler as the
  v2 declaration (gcp-hc5z.1)
 
 load_methodology_formula rejected any methodology formula whose top-level

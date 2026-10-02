@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 27 Sep 2026 21:25:01 -0400
-Subject: [PATCH 115/121] feat(refinery): run gates and classify reds through
+Subject: [PATCH 115/122] feat(refinery): run gates and classify reds through
  known-red (gcp-jb9f)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
