@@ -1,0 +1,141 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 2 Oct 2026 15:43:43 -0400
+Subject: [PATCH 121/121] fix(refinery): detach onto the target in both lanes'
+ temp cleanup (gcp-l8td.6)
+
+The mr lane's "5. Cleanup" ran a plain `git checkout "$TARGET"`. Git refuses
+that while another worktree has the target checked out, which is the normal
+shape of a rig whose main worktree sits on the target. The checkout failed, HEAD
+stayed on `temp`, and `git branch -d temp` then failed too, leaving the
+refinery clone on a stale branch every mr handoff. The direct lane already
+avoided this by detaching onto origin/$TARGET; that fix never reached mr.
+
+One cleanup_temp now serves both lanes: `git checkout --detach "origin/$TARGET"`
+then delete `temp`. direct_cleanup calls it and keeps its branch-delete tail;
+mr_cleanup is gone. Deleting `temp` falls back to -D as the direct lane
+already did, which is safe here because mr has pushed it to origin/$BRANCH, and
+mr still never deletes $BRANCH itself, since the pull request needs it.
+
+The characterization case that pinned the old failure
+(mr_cleanup_with_target_in_second_worktree) is flipped to assert success: the
+bead closes, the clone's HEAD is detached at the target tip, `temp` is gone,
+the second worktree keeps the target, and origin keeps the source branch.
+
+Validation: the flipped case is red against the previous merge-push.sh (4
+assertions: still tried the checkout, HEAD on temp, HEAD not at the target
+tip, temp still exists) and green against this one; every gastown/tests/*.sh
+exits 0.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ gastown/assets/scripts/refinery/merge-push.sh | 29 ++++++++++---------
+ gastown/tests/test_refinery_merge_lanes.sh    | 22 ++++++++------
+ 2 files changed, 29 insertions(+), 22 deletions(-)
+
+diff --git a/gastown/assets/scripts/refinery/merge-push.sh b/gastown/assets/scripts/refinery/merge-push.sh
+index a5ea463c..e247454b 100755
+--- a/gastown/assets/scripts/refinery/merge-push.sh
++++ b/gastown/assets/scripts/refinery/merge-push.sh
+@@ -836,11 +836,21 @@ case "$MERGE_LAND_STATUS" in
+ esac
+ }
+ 
+-# The direct lane's "2. Cleanup", including the branch delete the step gives in
+-# prose: If delete_merged_branches = "true": `git push origin --delete $BRANCH`
+-direct_cleanup() {
++# Both lanes' cleanup of `temp`: step off it onto the target's tip and delete it.
++# The checkout DETACHES onto origin/$TARGET rather than checking out $TARGET,
++# because git refuses to check a branch out while another worktree has it, and
++# the target is routinely checked out in the rig's main worktree. The mr lane
++# used a plain `git checkout "$TARGET"` until gcp-l8td.6, and failed exactly
++# there: HEAD stayed on `temp`, which then could not be deleted either.
++cleanup_temp() {
+ git checkout --detach "origin/$TARGET" >/dev/null 2>&1 || true
+ git branch -d temp || git branch -D temp || true
++}
++
++# The direct lane's "2. Cleanup", including the branch delete the step gave in
++# prose: If delete_merged_branches = "true": `git push origin --delete $BRANCH`
++direct_cleanup() {
++cleanup_temp
+ if [ "$CFG_DELETE_MERGED_BRANCHES" = "true" ]; then
+   git push origin --delete "$BRANCH"
+ fi
+@@ -857,13 +867,6 @@ after_already_merged_close() {
+   return "$1"
+ }
+ 
+-# The mr lane's "5. Cleanup". A plain `git checkout "$TARGET"` fails while the
+-# target is checked out in another worktree; gcp-l8td.6 (B1.2b) fixes it.
+-mr_cleanup() {
+-git checkout "$TARGET"
+-git branch -d temp
+-}
+-
+ # resolve_origin_repo — set ORIGIN_REPO to the repository this clone pushes to,
+ # or leave it empty with ORIGIN_REPO_ERROR saying why.
+ resolve_origin_repo() {
+@@ -1176,7 +1179,7 @@ else
+   echo "Could not record the pull request handoff on $WORK; the bead is still open. STOP. Debug and retry."
+   return 2
+ fi
+-  mr_cleanup
++  cleanup_temp
+   return 0
+ fi
+ 
+@@ -1187,14 +1190,14 @@ APPROVAL_GATE_STATUS=$?
+ echo "$APPROVAL_GATE_OUTPUT"
+ if [ "$APPROVAL_GATE_STATUS" -ne 0 ]; then
+   park_awaiting_review "$APPROVAL_GATE_OUTPUT"
+-  mr_cleanup
++  cleanup_temp
+   return 4
+ fi
+ gc bd update "$WORK" --set-metadata merge_approval_state=approved --unset-metadata merge_approval_gate_reason
+ direct_close
+ LAND_STATUS=$?
+ case "$LAND_STATUS" in
+-  0|4) mr_cleanup ;;
++  0|4) cleanup_temp ;;
+ esac
+ return "$LAND_STATUS"
+ }
+diff --git a/gastown/tests/test_refinery_merge_lanes.sh b/gastown/tests/test_refinery_merge_lanes.sh
+index 0e8eec8b..fa00764e 100644
+--- a/gastown/tests/test_refinery_merge_lanes.sh
++++ b/gastown/tests/test_refinery_merge_lanes.sh
+@@ -1005,16 +1005,20 @@ test_lane_mr_cleanup_with_target_in_second_worktree() {
+     write_bead merge_strategy=mr
+     run_lane
+     expect_lane mr
++    expect_status 0
+     expect "status" "$(bead status)" closed
+-    # TODAY'S FAILURE, pinned on purpose. "5. Cleanup" runs a plain
+-    # `git checkout "$TARGET"`, which git refuses while the target is checked
+-    # out in another worktree, and `temp` then cannot be deleted either.
+-    # gcp-l8td.6 (B1.2b) is the fix; it flips these assertions.
+-    output_has "already (checked out|used by worktree)" ||
+-        fail "git checkout of the target did not fail with 'already checked out' / 'already used by worktree'"
+-    expect "the refinery clone's branch" "$(git -C "$REFINERY" symbolic-ref -q HEAD)" refs/heads/temp
+-    git -C "$REFINERY" rev-parse --verify -q refs/heads/temp >/dev/null ||
+-        fail "temp is gone; the mr cleanup no longer fails here, so flip this case (gcp-l8td.6)"
++    # The mr cleanup detaches onto the target, as the direct lane's does, so the
++    # target being checked out in another worktree no longer stops it (gcp-l8td.6).
++    ! output_has "already (checked out|used by worktree)" ||
++        fail "the mr cleanup still tried to check the target out while another worktree has it"
++    git -C "$REFINERY" symbolic-ref -q HEAD >/dev/null &&
++        fail "the refinery clone's HEAD is $(git -C "$REFINERY" symbolic-ref HEAD), want detached"
++    expect "the refinery clone's HEAD" "$(git -C "$REFINERY" rev-parse HEAD)" "$(origin_tip)"
++    git -C "$REFINERY" rev-parse --verify -q refs/heads/temp >/dev/null &&
++        fail "temp still exists after cleanup"
++    expect "the second worktree's branch" "$(git -C "$T/second" symbolic-ref -q HEAD)" refs/heads/integration
++    # The pull request needs its source branch: mr mode never deletes it.
++    origin_ref "$BRANCH_NAME" >/dev/null || fail "origin lost $BRANCH_NAME; mr mode must keep it"
+     end_case
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+
