@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # merge-batch.sh — choose, stack and land a batch of beads for the refinery's
-# direct lane (gcp-l8td D1; D1.1 added select and stack, D1.2 adds land).
+# direct lane (gcp-l8td D1; D1.1 added select and stack, D1.2 land, D1.2b serial).
 #
 # One patrol iteration may land several assigned beads behind a single gate run.
 # The AGENT decides how long the batch is and what a red means; this checked-in
@@ -18,6 +18,7 @@
 #   merge-batch.sh select --head <id> [--max <K>] [config flags]
 #   merge-batch.sh stack  --head <id> [--members <id,id,...>] [config flags]
 #   merge-batch.sh land   --head <id> [config flags]
+#   merge-batch.sh serial --head <id> [config flags]
 # Config flags are merge-push.sh's (--rig, --target-default, --binding-prefix,
 # --require-approval, --review-agent, --delete-merged-branches, --gh), and the
 # config resolves the way merge-push.sh resolves it, including the fail-closed
@@ -39,7 +40,10 @@
 # stack   Extend `temp`, the already-rebased head, with members 2..k in order.
 #         Each member's commits are rebased onto the current `temp`. The member
 #         ids come from --members, else from the manifest's members (written by
-#         the agent after select), else the head alone. The first member that
+#         the agent after select), else the head alone. A head whose rebase
+#         collapsed (no real change against the target) stays a batch of 1:
+#         merge-push.sh --work's merge-state gate decides it, and land never maps
+#         it to another member's commit. The first member that
 #         conflicts, is ineligible, or collapses to no change ends the batch
 #         there: it and every later member are dropped, keep no new metadata and
 #         stay assigned. One exception: a member that collapses AND passes
@@ -79,8 +83,22 @@
 #           merge-batch: RESULT <status> landed=<ids> left-open=<ids>
 #         (comma-separated ids, empty when none). Exit 1 is a usage, config or
 #         manifest error: no --head, an unknown flag, a missing or unparseable
-#         manifest, one for another head, or one with fewer than two members (a
-#         batch of one is merge-push.sh --work's).
+#         manifest, one for another head, one with fewer than two members (a
+#         batch of one is merge-push.sh --work's), or a member with no commits.
+#
+# serial  Stamp a red batch so its members go serial. For each member, in batch
+#         order, it fetches origin/<branch>, records that sha as
+#         merge_batch_serial (which select reads, so the member is not batched
+#         again until its branch moves) and writes one note. A fetch, rev-parse or
+#         stamp failure leaves the member in failed=; a note failure is a WARN.
+#         It never writes rejection_reason, assignee or status and never closes a
+#         bead, and it does not consult the approval gate. Then, whatever
+#         happened per member, it removes the manifest and cleans up `temp`.
+#         Takes the manifest checks land does. Status 0 when every member is
+#         stamped, 2 when any failed. Every serial exit, guards included, ends its
+#         stdout with
+#           merge-batch: RESULT <status> serial=<ids> failed=<ids>
+#         and exit 1 is a usage, config or manifest error.
 #
 # Warnings go to stderr. select's stdout is the member ids and nothing else.
 #
@@ -109,6 +127,7 @@ batch_usage() {
   echo "usage: merge-batch.sh select --head <id> [--max <K>] [config flags]"
   echo "       merge-batch.sh stack  --head <id> [--members <id,id,...>] [config flags]"
   echo "       merge-batch.sh land   --head <id> [config flags]"
+  echo "       merge-batch.sh serial --head <id> [config flags]"
 }
 
 mb_warn() {
@@ -516,6 +535,25 @@ cmd_stack() {
     stk_batchable=0
   fi
   if [ "$stk_batchable" -eq 1 ]; then
+    # A head whose rebase collapsed (its work already landed, or it produced
+    # nothing) has no commit of its own. Batched, land would map it to another
+    # member's commit and close it merged on that sha (M1), so it stays a batch
+    # of 1 and merge-push.sh --work's merge-state gate decides it.
+    branch_has_real_change "origin/$SB_TARGET" "$SB_ENTRY"
+    stk_real=$?
+    case "$stk_real" in
+      0) ;;
+      1)
+        echo "merge-batch: the head's rebase is empty; merge-push.sh --work's merge-state gate decides it; a batch of 1."
+        stk_batchable=0
+        ;;
+      *)
+        sb_degrade "could not tell whether the head carries a change"
+        return 0
+        ;;
+    esac
+  fi
+  if [ "$stk_batchable" -eq 1 ]; then
     # A for loop, not a read loop, for the reason select gives.
     for stk_id in $stk_ids; do
       [ "$stk_id" != "$SB_HEAD" ] || continue
@@ -628,6 +666,54 @@ lb_land_members() {
   return 2
 }
 
+# lb_read_manifest <head> <cmd> — read and check the manifest stack wrote, for
+# land and serial alike. Sets LB_MANIFEST, LB_JSON and LB_SIZE. Returns 1, with
+# the reason on stderr, when it is missing, unparseable, for another head, holds
+# fewer than two members, or has a bad field. A member with no commits is a bad
+# field: it has no commit of its own to record, and stack never writes one into a
+# batch of more than one.
+lb_read_manifest() {
+  rm_head="$1"
+  rm_cmd="$2"
+  if ! rm_git_dir=$(git rev-parse --git-dir 2>/dev/null); then
+    echo "merge-batch: not inside a git repository." >&2
+    return 1
+  fi
+  LB_MANIFEST="$rm_git_dir/refinery-batch.json"
+  if [ ! -f "$LB_MANIFEST" ]; then
+    echo "merge-batch: there is no manifest at $LB_MANIFEST; run stack first." >&2
+    return 1
+  fi
+  if ! LB_JSON=$(jq -c . "$LB_MANIFEST" 2>/dev/null) || [ -z "$LB_JSON" ]; then
+    echo "merge-batch: the manifest $LB_MANIFEST is not parseable." >&2
+    return 1
+  fi
+  if [ "$(printf '%s' "$LB_JSON" | jq -r '.head // empty' 2>/dev/null)" != "$rm_head" ]; then
+    echo "merge-batch: the manifest is not for head $rm_head." >&2
+    return 1
+  fi
+  LB_SIZE=$(printf '%s' "$LB_JSON" | jq -r '.members | if type == "array" then length else 0 end' 2>/dev/null)
+  case "$LB_SIZE" in
+    '' | *[!0-9]*) LB_SIZE=0 ;;
+  esac
+  if [ "$LB_SIZE" -lt 2 ]; then
+    echo "merge-batch: the manifest holds $LB_SIZE member(s); a batch of one is merge-push.sh --work's ($rm_cmd)." >&2
+    return 1
+  fi
+  if ! printf '%s' "$LB_JSON" | jq -e '
+    (.target | type == "string" and length > 0) and
+    all(.members[];
+      (.id | type == "string" and length > 0) and
+      (.branch | type == "string" and length > 0) and
+      (.tip | type == "string" and length > 0) and
+      (.patch_id | type == "string" and length > 0) and
+      (.commits | type == "number" and . >= 1 and . == floor))' >/dev/null 2>&1; then
+    echo "merge-batch: the manifest is missing a target or a member field, or a member has no commits." >&2
+    return 1
+  fi
+  return 0
+}
+
 # lb_land <args...> — the body of land. Returns the status; cmd_land prints it.
 lb_land() {
   lnd_head=""
@@ -656,42 +742,7 @@ lb_land() {
   fi
   resolve_approval_required
 
-  if ! lnd_git_dir=$(git rev-parse --git-dir 2>/dev/null); then
-    echo "merge-batch: not inside a git repository." >&2
-    return 1
-  fi
-  lnd_manifest="$lnd_git_dir/refinery-batch.json"
-  if [ ! -f "$lnd_manifest" ]; then
-    echo "merge-batch: there is no manifest at $lnd_manifest; run stack first." >&2
-    return 1
-  fi
-  if ! LB_JSON=$(jq -c . "$lnd_manifest" 2>/dev/null) || [ -z "$LB_JSON" ]; then
-    echo "merge-batch: the manifest $lnd_manifest is not parseable." >&2
-    return 1
-  fi
-  if [ "$(printf '%s' "$LB_JSON" | jq -r '.head // empty' 2>/dev/null)" != "$lnd_head" ]; then
-    echo "merge-batch: the manifest is not for head $lnd_head." >&2
-    return 1
-  fi
-  LB_SIZE=$(printf '%s' "$LB_JSON" | jq -r '.members | if type == "array" then length else 0 end' 2>/dev/null)
-  case "$LB_SIZE" in
-    '' | *[!0-9]*) LB_SIZE=0 ;;
-  esac
-  if [ "$LB_SIZE" -lt 2 ]; then
-    echo "merge-batch: the manifest holds $LB_SIZE member(s); a batch of one is merge-push.sh --work's." >&2
-    return 1
-  fi
-  if ! printf '%s' "$LB_JSON" | jq -e '
-    (.target | type == "string" and length > 0) and
-    all(.members[];
-      (.id | type == "string" and length > 0) and
-      (.branch | type == "string" and length > 0) and
-      (.tip | type == "string" and length > 0) and
-      (.patch_id | type == "string" and length > 0) and
-      (.commits | type == "number" and . >= 0 and . == floor))' >/dev/null 2>&1; then
-    echo "merge-batch: the manifest is missing a target or a member field." >&2
-    return 1
-  fi
+  lb_read_manifest "$lnd_head" land || return 1
 
   # From here a guard is a hard stop (2): the manifest is well-formed, so what
   # fails is the state around it. Nothing is pushed or written.
@@ -723,7 +774,7 @@ lb_land() {
   lb_land_members
   lnd_rc=$?
   # The manifest describes a stack that now exists only on the target.
-  rm -f "$lnd_manifest"
+  rm -f "$LB_MANIFEST"
   if [ "$lnd_rc" -eq 0 ]; then
     cleanup_temp
   else
@@ -741,11 +792,111 @@ cmd_land() {
   return "$cl_rc"
 }
 
+# --- serial -----------------------------------------------------------------
+
+# sr_append_serial / sr_append_failed <id> — the lists the RESULT line prints.
+sr_append_serial() {
+  SR_SERIAL="${SR_SERIAL:+$SR_SERIAL,}$1"
+}
+
+sr_append_failed() {
+  SR_FAILED="${SR_FAILED:+$SR_FAILED,}$1"
+}
+
+# sr_stamp <id> <branch> <short> — stamp one member of a red batch: record the
+# origin/<branch> sha mb_check_member compares, then leave a note. Returns 1 when
+# the fetch, the rev-parse or the stamp fails. A note that fails is a WARN: the
+# stamp is the mechanism and the note is forensics.
+sr_stamp() {
+  ss_id="$1"
+  ss_branch="$2"
+  ss_short="$3"
+  if ! git fetch -q origin "+refs/heads/${ss_branch}:refs/remotes/origin/${ss_branch}" >/dev/null 2>&1; then
+    mb_warn "$ss_id: branch $ss_branch could not be fetched from origin; not stamped."
+    return 1
+  fi
+  if ! ss_sha=$(git rev-parse --verify -q "origin/$ss_branch" 2>/dev/null) || [ -z "$ss_sha" ]; then
+    mb_warn "$ss_id: origin/$ss_branch could not be resolved; not stamped."
+    return 1
+  fi
+  if ! gc bd update "$ss_id" --set-metadata merge_batch_serial="$ss_sha"; then
+    mb_warn "$ss_id: recording merge_batch_serial failed; not stamped."
+    return 1
+  fi
+  if ! printf 'merge-batch: batch red at %s; the members go serial. %s carries merge_batch_serial=%s, so select leaves it out of a batch until its branch moves.\n' \
+    "$ss_short" "$ss_id" "$ss_sha" | gc bd note "$ss_id" --stdin >/dev/null; then
+    mb_warn "$ss_id: stamped, but the note could not be written."
+  fi
+  return 0
+}
+
+# sr_serial <args...> — the body of serial. Returns the status; cmd_serial prints it.
+sr_serial() {
+  ser_head=""
+  ser_pass=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --head)
+        [ "$#" -ge 2 ] || { echo "merge-batch: --head needs a value." >&2; batch_usage >&2; return 1; }
+        ser_head="$2"
+        shift 2
+        ;;
+      *)
+        ser_pass+=("$1")
+        shift
+        ;;
+    esac
+  done
+  if [ -z "$ser_head" ]; then
+    echo "merge-batch: serial needs --head <id>." >&2
+    batch_usage >&2
+    return 1
+  fi
+  if ! resolve_config --work "$ser_head" ${ser_pass[@]+"${ser_pass[@]}"} >&2; then
+    batch_usage >&2
+    return 1
+  fi
+  lb_read_manifest "$ser_head" serial || return 1
+
+  ser_target=$(printf '%s' "$LB_JSON" | jq -r '.target')
+  ser_last_tip=$(lb_member $((LB_SIZE - 1)) tip)
+  ser_short=$(git rev-parse --short "$ser_last_tip" 2>/dev/null) || ser_short="$ser_last_tip"
+  # A for loop, not a read loop, for the reason select gives.
+  for ser_idx in $(seq 0 $((LB_SIZE - 1))); do
+    ser_id=$(lb_member "$ser_idx" id)
+    if sr_stamp "$ser_id" "$(lb_member "$ser_idx" branch)" "$ser_short"; then
+      sr_append_serial "$ser_id"
+    else
+      sr_append_failed "$ser_id"
+    fi
+  done
+
+  # Whatever happened per member, the stack is spent: the members go through the
+  # single-bead lane now, each from its own branch.
+  rm -f "$LB_MANIFEST"
+  # cleanup_temp reads TARGET.
+  # shellcheck disable=SC2034
+  TARGET="$ser_target"
+  cleanup_temp
+  [ -z "$SR_FAILED" ] && return 0
+  return 2
+}
+
+cmd_serial() {
+  SR_SERIAL=""
+  SR_FAILED=""
+  sr_serial "$@"
+  cs_rc=$?
+  echo "merge-batch: RESULT $cs_rc serial=$SR_SERIAL failed=$SR_FAILED"
+  return "$cs_rc"
+}
+
 main_batch() {
   case "${1:-}" in
     select) shift; cmd_select "$@" ;;
     stack) shift; cmd_stack "$@" ;;
     land) shift; cmd_land "$@" ;;
+    serial) shift; cmd_serial "$@" ;;
     *)
       batch_usage >&2
       return 1
