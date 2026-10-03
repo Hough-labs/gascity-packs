@@ -1447,6 +1447,33 @@ def test_validate_gastown_orchestration_contract_rejects_a_pack_without_the_merg
         gascity_pack_inference_gate.validate_gastown_orchestration_contract(pack)
 
 
+def test_validate_gastown_orchestration_contract_accepts_the_fixture_pack_with_merge_batch(tmp_path) -> None:
+    pack = write_gastown_contract_pack(tmp_path)
+
+    assert (pack / "assets" / "scripts" / "refinery" / "merge-batch.sh").is_file()
+    gascity_pack_inference_gate.validate_gastown_orchestration_contract(pack)
+
+
+def test_validate_gastown_orchestration_contract_rejects_a_refinery_step_that_stops_calling_merge_batch(tmp_path) -> None:
+    pack = write_gastown_contract_pack(
+        tmp_path,
+        formula_edit=lambda name, text: (
+            text.replace('land --head "$WORK"', "") if name == "mol-refinery-patrol" else text
+        ),
+    )
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="mol-refinery-patrol"):
+        gascity_pack_inference_gate.validate_gastown_orchestration_contract(pack)
+
+
+def test_validate_gastown_orchestration_contract_rejects_a_pack_without_the_merge_batch_script(tmp_path) -> None:
+    pack = write_gastown_contract_pack(tmp_path)
+    (pack / "assets" / "scripts" / "refinery" / "merge-batch.sh").unlink()
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="missing script file"):
+        gascity_pack_inference_gate.validate_gastown_orchestration_contract(pack)
+
+
 def test_validate_methodology_flow_contracts_accept_current_packs() -> None:
     for pack_name in gascity_pack_inference_gate.METHODOLOGY_PACKS:
         gascity_pack_inference_gate.validate_methodology_flow_contract(
@@ -1549,6 +1576,16 @@ def test_gastown_build_workflow_contract_covers_orchestration_roles() -> None:
     assert 'gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT"' in script_contracts
     assert "gc bd close $WORK --reason \"Pull request ready: $PR_URL\"" in script_contracts
     assert '"$GH" pr create' in script_contracts
+    for fragment in ("merge-batch.sh", 'land --head "$WORK"', 'stack --head "$WORK"', 'serial --head "$WORK"'):
+        assert fragment in contracts["mol-refinery-patrol"]
+    # The batch lane's mechanics are the script's, so its fragments live there.
+    batch_contracts = gascity_pack_inference_gate.GASTOWN_SCRIPT_CONTRACTS["assets/scripts/refinery/merge-batch.sh"]
+    assert set(batch_contracts) == {
+        '--set-metadata merged_sha="$lr_sha"',
+        'gc bd update "$ss_id" --set-metadata merge_batch_serial="$ss_sha"',
+        'branch_has_real_change "origin/$SB_TARGET" "$SB_ENTRY"',
+        '(.commits | type == "number" and . >= 1 and . == floor)',
+    }
     assert not {"branch_has_real_change", "branch_already_landed"} & set(contracts["mol-refinery-patrol"])
     assert "FAIL-SAFE: empty liveness map" in contracts["mol-witness-patrol"]
     assert "gc bd create --type=task --label=warrant" in contracts["mol-deacon-patrol"]
