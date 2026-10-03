@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 27 Sep 2026 18:09:29 -0400
-Subject: [PATCH 109/130] fix(formulas): declare [requires] formula_compiler
+Subject: [PATCH 109/133] fix(formulas): declare [requires] formula_compiler
  instead of contract graph.v2 (gcp-hc5z.1)
 
 gc doctor's formula-requirements check warns on every formula that still

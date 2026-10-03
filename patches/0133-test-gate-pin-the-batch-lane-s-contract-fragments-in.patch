@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 2 Oct 2026 20:05:19 -0400
+Subject: [PATCH 133/133] test(gate): pin the batch lane's contract fragments
+ in the inference gate (gcp-l8td.10)
+
+mol-refinery-patrol's contract gains merge-batch.sh and the land, stack and serial
+invocations, so a step that stops calling the script fails the gate. The script
+gets its own GASTOWN_SCRIPT_CONTRACTS entry holding the four lines that make the
+batch guarantees real: merged_sha recorded per member, the serial stamp at the
+branch tip, stack's collapsed-head check and land's commits >= 1 guard. Each
+fragment occurs exactly once in merge-batch.sh.
+
+The gate tests gain the fixture-pack acceptance, a refinery step that stops
+calling land, and a pack without merge-batch.sh; the contract-coverage test only
+gains asserts. 80 gate tests pass.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ scripts/gascity_pack_inference_gate.py    | 17 +++++++++++
+ tests/test_gascity_pack_inference_gate.py | 37 +++++++++++++++++++++++
+ 2 files changed, 54 insertions(+)
+
+diff --git a/scripts/gascity_pack_inference_gate.py b/scripts/gascity_pack_inference_gate.py
+index 8652ea6a..b9b3c38a 100644
+--- a/scripts/gascity_pack_inference_gate.py
++++ b/scripts/gascity_pack_inference_gate.py
+@@ -129,6 +129,13 @@ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
+         # step keeps only the call.
+         "merge-push.sh",
+         '--work "$WORK"',
++        # The batch lane (gcp-l8td.10): the steps call merge-batch.sh and keep
++        # no batch logic of their own, so a step that stops calling it is a
++        # patrol that silently never batches or never stamps a red batch serial.
++        "merge-batch.sh",
++        'land --head "$WORK"',
++        'stack --head "$WORK"',
++        'serial --head "$WORK"',
+     ),
+     "mol-witness-patrol": (
+         "LIVENESS_MAP=$(jq -n",
+@@ -196,6 +203,16 @@ GASTOWN_SCRIPT_CONTRACTS = {
+         "--set-metadata pr_url=\"$PR_URL\"",
+         "gc bd close $WORK --reason \"Pull request ready: $PR_URL\"",
+     ),
++    # The batch lane's mechanics (gcp-l8td.8-.11). Each fragment is the line that
++    # makes one guarantee real: a member is closed against ITS landed commit, a
++    # red batch is stamped serial at the branch tip, stack keeps a collapsed head
++    # a batch of one, and land refuses a member that adds no commit.
++    "assets/scripts/refinery/merge-batch.sh": (
++        '--set-metadata merged_sha="$lr_sha"',
++        'gc bd update "$ss_id" --set-metadata merge_batch_serial="$ss_sha"',
++        'branch_has_real_change "origin/$SB_TARGET" "$SB_ENTRY"',
++        '(.commits | type == "number" and . >= 1 and . == floor)',
++    ),
+ }
+ METHODOLOGY_FLOW_CONTRACTS = {
+     "superpowers": {
+diff --git a/tests/test_gascity_pack_inference_gate.py b/tests/test_gascity_pack_inference_gate.py
+index 14e1d77a..67302c53 100644
+--- a/tests/test_gascity_pack_inference_gate.py
++++ b/tests/test_gascity_pack_inference_gate.py
+@@ -1447,6 +1447,33 @@ def test_validate_gastown_orchestration_contract_rejects_a_pack_without_the_merg
+         gascity_pack_inference_gate.validate_gastown_orchestration_contract(pack)
+ 
+ 
++def test_validate_gastown_orchestration_contract_accepts_the_fixture_pack_with_merge_batch(tmp_path) -> None:
++    pack = write_gastown_contract_pack(tmp_path)
++
++    assert (pack / "assets" / "scripts" / "refinery" / "merge-batch.sh").is_file()
++    gascity_pack_inference_gate.validate_gastown_orchestration_contract(pack)
++
++
++def test_validate_gastown_orchestration_contract_rejects_a_refinery_step_that_stops_calling_merge_batch(tmp_path) -> None:
++    pack = write_gastown_contract_pack(
++        tmp_path,
++        formula_edit=lambda name, text: (
++            text.replace('land --head "$WORK"', "") if name == "mol-refinery-patrol" else text
++        ),
++    )
++
++    with pytest.raises(gascity_pack_inference_gate.GateError, match="mol-refinery-patrol"):
++        gascity_pack_inference_gate.validate_gastown_orchestration_contract(pack)
++
++
++def test_validate_gastown_orchestration_contract_rejects_a_pack_without_the_merge_batch_script(tmp_path) -> None:
++    pack = write_gastown_contract_pack(tmp_path)
++    (pack / "assets" / "scripts" / "refinery" / "merge-batch.sh").unlink()
++
++    with pytest.raises(gascity_pack_inference_gate.GateError, match="missing script file"):
++        gascity_pack_inference_gate.validate_gastown_orchestration_contract(pack)
++
++
+ def test_validate_methodology_flow_contracts_accept_current_packs() -> None:
+     for pack_name in gascity_pack_inference_gate.METHODOLOGY_PACKS:
+         gascity_pack_inference_gate.validate_methodology_flow_contract(
+@@ -1549,6 +1576,16 @@ def test_gastown_build_workflow_contract_covers_orchestration_roles() -> None:
+     assert 'gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT"' in script_contracts
+     assert "gc bd close $WORK --reason \"Pull request ready: $PR_URL\"" in script_contracts
+     assert '"$GH" pr create' in script_contracts
++    for fragment in ("merge-batch.sh", 'land --head "$WORK"', 'stack --head "$WORK"', 'serial --head "$WORK"'):
++        assert fragment in contracts["mol-refinery-patrol"]
++    # The batch lane's mechanics are the script's, so its fragments live there.
++    batch_contracts = gascity_pack_inference_gate.GASTOWN_SCRIPT_CONTRACTS["assets/scripts/refinery/merge-batch.sh"]
++    assert set(batch_contracts) == {
++        '--set-metadata merged_sha="$lr_sha"',
++        'gc bd update "$ss_id" --set-metadata merge_batch_serial="$ss_sha"',
++        'branch_has_real_change "origin/$SB_TARGET" "$SB_ENTRY"',
++        '(.commits | type == "number" and . >= 1 and . == floor)',
++    }
+     assert not {"branch_has_real_change", "branch_already_landed"} & set(contracts["mol-refinery-patrol"])
+     assert "FAIL-SAFE: empty liveness map" in contracts["mol-witness-patrol"]
+     assert "gc bd create --type=task --label=warrant" in contracts["mol-deacon-patrol"]
+-- 
+2.54.0 (Apple Git-157)
+

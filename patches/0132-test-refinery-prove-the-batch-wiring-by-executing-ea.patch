@@ -1,0 +1,549 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 2 Oct 2026 20:05:19 -0400
+Subject: [PATCH 132/133] test(refinery): prove the batch wiring by executing
+ each shipped block (gcp-l8td.10)
+
+Nine cases, each extracting a sentinel-delimited block of the shipped formula
+through tomllib (any placeholder left over is fatal, except the one case that
+leaves {{merge_batch_max}} unrendered on purpose) and running it in a real git
+repo against a stub gc and stub merge-batch.sh / merge-push.sh in a staged pack
+tree: find-work unrendered, rendered, select-one, routed and truncating; rebase
+stack; batch red (serial then the pour block, with no gc call naming a member and
+no rejection); merge-push lanes; and the formula/script default drift check,
+which is shown to fail when either side of a copy changes.
+
+Red/green: against the base formula every case fails; against one-line mutants
+(no BATCH_MAX case, no truncation, no routed guard, no manifest removal on a
+failed stack, no drain on a failed serial, -gt 0 for -gt 1, land without --head,
+a changed default) exactly the matching case fails. No existing suite is edited.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ gastown/tests/test_refinery_batch_wiring.sh | 514 ++++++++++++++++++++
+ 1 file changed, 514 insertions(+)
+ create mode 100755 gastown/tests/test_refinery_batch_wiring.sh
+
+diff --git a/gastown/tests/test_refinery_batch_wiring.sh b/gastown/tests/test_refinery_batch_wiring.sh
+new file mode 100755
+index 00000000..de548796
+--- /dev/null
++++ b/gastown/tests/test_refinery_batch_wiring.sh
+@@ -0,0 +1,514 @@
++#!/usr/bin/env bash
++# Contract tests for the refinery patrol's batch wiring (gcp-l8td.10, D1.3).
++#
++# merge-batch.sh (gcp-l8td.8-.11) chooses, stacks, lands and serials a batch, and
++# was inert until `mol-refinery-patrol` called it. The formula now does, behind
++# `merge_batch_max` (default "1", so every rig runs the single-bead lane until it
++# opts in). The formula keeps no batch logic of its own beyond the BATCH_MAX case
++# and a read of the manifest's member count: the mechanics are the script's, and
++# test_refinery_merge_batch.sh is their proof.
++#
++# What this suite proves is the WIRING, so each case extracts one sentinel-
++# delimited block of shipped formula text and EXECUTES it, in the shape
++# test_refinery_reject_branch_survival.sh extracts a block: from the formula
++# through tomllib, with the formula's [vars] defaults substituted and any `{{...}}`
++# left over a hard error. A regression shows up as "select ran when it must not
++# have", "no manifest was written" or "merge-push.sh was called on a batch", never
++# as a grep for a command that merely appears in the text. The one placeholder a
++# case leaves literal is `{{merge_batch_max}}`, on purpose: that is what the
++# renderer leaves for a patrol poured root-only without the rig setting the var.
++#
++# Only gc and the two scripts are stubbed. gc answers bd list/show/update,
++# bd mol wisp/burn, runtime drain-ack and formula list. The scripts live in a
++# staged pack tree, found the way the shipped blocks find them (`gc formula list`
++# names the formula's source, and the script is its sibling), and each appends its
++# argv to a log and exits as its env says.
++#
++# The suite fails unless all 9 cases ran.
++set -uo pipefail
++
++ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
++FORMULA="${FORMULA:-$ROOT/gastown/formulas/mol-refinery-patrol.toml}"
++BATCH_SCRIPT="${BATCH_SCRIPT:-$ROOT/gastown/assets/scripts/refinery/merge-batch.sh}"
++EXPECTED_CASES=9
++
++REFINERY_AGENT=testrig/gastown.refinery
++HEAD_ID=wb-head
++SECOND_ID=wb-second
++FAILURES=0
++PASS_CASES=0
++CASE=""
++CASE_START_FAILURES=0
++T=""
++
++fail() {
++    echo "FAIL[$CASE]: $*" >&2
++    FAILURES=$((FAILURES + 1))
++}
++
++assert_eq() {
++    # assert_eq <what> <want> <got>
++    [ "$2" = "$3" ] || fail "$1: want '$2', got '$3'"
++}
++
++# --- extracting the shipped blocks ------------------------------------------------
++
++# extract_block <begin-name> <end-name> <outfile> [leave:VAR | set:VAR=value ...]
++#
++# The text from `# --- <begin-name>:begin ---` to `# --- <end-name>:end ---`, which
++# is one block when the two names are the same and a run of adjacent blocks when
++# they differ (find-work's query and batch share one fence). The begin sentinel
++# must occur in exactly one step. Placeholders come from the formula's [vars]
++# defaults. `set:` overrides one the way a rig's formula_vars would, and `leave:`
++# keeps one literal, which is the only placeholder allowed to survive.
++extract_block() {
++    python3 - "$FORMULA" "$@" <<'PY'
++import re
++import sys
++import tomllib
++
++formula, begin_name, end_name, out, *options = sys.argv[1:]
++leave = [o[len("leave:"):] for o in options if o.startswith("leave:")]
++overrides = dict(o[len("set:"):].split("=", 1) for o in options if o.startswith("set:"))
++begin = f"# --- {begin_name}:begin ---"
++end = f"# --- {end_name}:end ---"
++
++with open(formula, "rb") as handle:
++    doc = tomllib.load(handle)
++
++blocks = []
++for step in doc["steps"]:
++    text = step.get("description", "")
++    if begin in text:
++        rest = text.split(begin, 1)[1]
++        if end not in rest:
++            sys.exit(f"{begin_name}: no {end} after the begin sentinel")
++        blocks.append(rest.split(end, 1)[0])
++if len(blocks) != 1:
++    sys.exit(f"expected exactly one {begin_name} block in {formula}, found {len(blocks)}")
++
++values = {n: spec.get("default", "") for n, spec in (doc.get("vars") or {}).items()}
++for name in leave:
++    if name not in values:
++        sys.exit(f"{name!r} is not a declared var of this formula")
++for name in overrides:
++    # A var supplied at pour time (rig_name) is not declared, but the block must
++    # still reference it, so a typo here cannot pass vacuously.
++    if name not in values and "{{%s}}" % name not in blocks[0]:
++        sys.exit(f"{name!r} is neither a declared var nor used by {begin_name}")
++values.update(overrides)
++for name in leave:
++    values.pop(name)
++block = re.sub(r"\{\{\s*(\w+)\s*\}\}", lambda m: values.get(m.group(1), m.group(0)), blocks[0])
++leftover = sorted(set(re.findall(r"\{\{[^}]*\}\}", block)) - {"{{%s}}" % n for n in leave})
++if leftover:
++    sys.exit(f"unsubstituted placeholders in {begin_name}: {leftover}")
++
++with open(out, "w", encoding="utf-8") as handle:
++    handle.write(block)
++PY
++}
++
++# --- the fixture --------------------------------------------------------------------
++
++write_gc_stub() {
++    cat >"$1/gc" <<'STUB'
++#!/usr/bin/env bash
++printf '%s\n' "$*" >>"${GC_STUB_LOG:?GC_STUB_LOG unset}"
++case "${1:-} ${2:-}" in
++"bd list")
++    # The routed scan is the one that asks for unassigned beads.
++    case " $* " in
++    *" --no-assignee "*) printf '%s' "${GC_STUB_ROUTED:-[]}" ;;
++    *) printf '%s' "${GC_STUB_ASSIGNED:-[]}" ;;
++    esac
++    ;;
++"bd update") ;;
++"bd show") printf '[{"assignee":"%s"}]' "${GC_AGENT:-}" ;;
++"bd mol")
++    case "${3:-}" in
++    wisp) printf '{"new_epic_id":"wisp-next"}' ;;
++    burn) ;;
++    *) printf '%s\n' "$*" >>"${GC_STUB_UNEXPECTED:?}"; exit 64 ;;
++    esac
++    ;;
++"runtime drain-ack") ;;
++"formula list")
++    printf '{"formulas":[{"name":"mol-refinery-patrol","source":"%s"}]}' "${GC_STUB_FORMULA_SOURCE:-}"
++    ;;
++*)
++    printf '%s\n' "$*" >>"${GC_STUB_UNEXPECTED:?}"
++    exit 64
++    ;;
++esac
++STUB
++    chmod +x "$1/gc"
++}
++
++# The stand-in for merge-batch.sh: it logs its argv and exits as its env says.
++write_batch_stub() {
++    cat >"$1" <<'STUB'
++#!/usr/bin/env bash
++printf '%s\n' "$*" >>"${STUB_BATCH_LOG:?STUB_BATCH_LOG unset}"
++case "${1:-}" in
++select)
++    [ -z "${STUB_SELECT_OUT:-}" ] || printf '%b\n' "$STUB_SELECT_OUT"
++    exit "${STUB_SELECT_STATUS:-0}"
++    ;;
++stack) exit "${STUB_STACK_STATUS:-0}" ;;
++land)
++    echo "merge-batch: RESULT ${STUB_LAND_STATUS:-0} landed= left-open="
++    exit "${STUB_LAND_STATUS:-0}"
++    ;;
++serial)
++    echo "merge-batch: RESULT ${STUB_SERIAL_STATUS:-0} serial= failed="
++    exit "${STUB_SERIAL_STATUS:-0}"
++    ;;
++*) exit 64 ;;
++esac
++STUB
++    chmod +x "$1"
++}
++
++# The stand-in for merge-push.sh.
++write_push_stub() {
++    cat >"$1" <<'STUB'
++#!/usr/bin/env bash
++printf '%s\n' "$*" >>"${STUB_PUSH_LOG:?STUB_PUSH_LOG unset}"
++echo "merge-push: RESULT ${STUB_PUSH_STATUS:-0} stub"
++exit "${STUB_PUSH_STATUS:-0}"
++STUB
++    chmod +x "$1"
++}
++
++# new_case <name> — a fresh refinery clone, staged pack tree and logs.
++new_case() {
++    CASE="$1"
++    CASE_START_FAILURES=$FAILURES
++    T=$(mktemp -d)
++    mkdir -p "$T/bin" "$T/home" "$T/pack/formulas" "$T/pack/assets/scripts/refinery"
++    : >"$T/pack/formulas/mol-refinery-patrol.toml"
++    write_gc_stub "$T/bin"
++    BATCH_STUB="$T/pack/assets/scripts/refinery/merge-batch.sh"
++    PUSH_STUB="$T/pack/assets/scripts/refinery/merge-push.sh"
++    write_batch_stub "$BATCH_STUB"
++    write_push_stub "$PUSH_STUB"
++    : >"$T/gc.log"
++    : >"$T/batch.log"
++    : >"$T/push.log"
++    : >"$T/unexpected"
++    git init -q "$T/repo"
++    GIT_DIR_PATH="$T/repo/.git"
++    MANIFEST="$GIT_DIR_PATH/refinery-batch.json"
++    MANIFEST_PATH="$GIT_DIR_PATH/refinery-batch.path"
++    ASSIGNED_TWO=$(jq -cn --arg a "$HEAD_ID" --arg b "$SECOND_ID" \
++        '[{id: $a, priority: 1, created_at: "2026-10-02T00:00:00Z", metadata: {branch: "polecat/a"}},
++          {id: $b, priority: 2, created_at: "2026-10-02T00:01:00Z", metadata: {branch: "polecat/b"}}]')
++}
++
++end_case() {
++    [ ! -s "$T/unexpected" ] || fail "unmodelled stub call(s): $(tr '\n' ';' <"$T/unexpected")"
++    if [ "$FAILURES" -ne "$CASE_START_FAILURES" ]; then
++        {
++            echo "--- $CASE: last run stdout ---"
++            cat "$T/out" 2>/dev/null
++            echo "--- $CASE: last run stderr ---"
++            cat "$T/err" 2>/dev/null
++            echo "--- $CASE: gc calls ---"
++            cat "$T/gc.log"
++        } >&2
++    fi
++    trash "$T" 2>/dev/null || rm -rf "$T"
++    PASS_CASES=$((PASS_CASES + 1))
++}
++
++# run_block <file> [VAR=value ...] — run an extracted block in the refinery clone,
++# as the patrol does, under `env -i` so no agent-session variable leaks in. The
++# block's own status is returned; its stdout and stderr land in $T/out and $T/err.
++run_block() {
++    local file="$1"
++    shift
++    (
++        cd "$T/repo" || exit 90
++        env -i \
++            PATH="$T/bin:$PATH" HOME="$T/home" \
++            GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
++            GC_AGENT="$REFINERY_AGENT" GC_RIG=testrig GC_BEAD_ID=wisp-current \
++            GC_STUB_LOG="$T/gc.log" GC_STUB_UNEXPECTED="$T/unexpected" \
++            GC_STUB_FORMULA_SOURCE="$T/pack/formulas/mol-refinery-patrol.toml" \
++            STUB_BATCH_LOG="$T/batch.log" STUB_PUSH_LOG="$T/push.log" \
++            "$@" \
++            bash "$file"
++    ) >"$T/out" 2>"$T/err"
++}
++
++# write_manifest <member-count> — what find-work writes, plus the path file.
++write_manifest() {
++    local n="$1" ids=("$HEAD_ID" "$SECOND_ID")
++    jq -n --arg head "$HEAD_ID" --argjson ids "$(printf '%s\n' "${ids[@]:0:$n}" | jq -R . | jq -sc .)" \
++        '{head: $head, members: ($ids | map({id: .}))}' >"$MANIFEST"
++    printf '%s\n' "$BATCH_STUB" >"$MANIFEST_PATH"
++}
++
++batch_calls() { cat "$T/batch.log"; }
++push_calls() { cat "$T/push.log"; }
++
++assert_no_manifest() {
++    [ ! -e "$MANIFEST" ] || fail "$1: refinery-batch.json exists"
++    [ ! -e "$MANIFEST_PATH" ] || fail "$1: refinery-batch.path exists"
++}
++
++# --- find-work ------------------------------------------------------------------------
++
++# run_find_work <merge_batch_max-or-LITERAL> [VAR=value ...] — the whole find-work
++# fence, query and batch in ONE shell, as the step says to run it. LITERAL leaves
++# {{merge_batch_max}} unrendered, as a root-only pour without the rig's var does.
++run_find_work() {
++    local max="$1" opt
++    shift
++    if [ "$max" = LITERAL ]; then opt=leave:merge_batch_max; else opt="set:merge_batch_max=$max"; fi
++    extract_block find-work-query find-work-batch "$T/find-work.sh" "$opt" ||
++        { fail "could not extract the find-work fence"; return 1; }
++    run_block "$T/find-work.sh" "$@"
++}
++
++case_find_work_unrendered() {
++    new_case find_work_unrendered
++    run_find_work LITERAL GC_STUB_ASSIGNED="$ASSIGNED_TWO"
++    grep -q '{{merge_batch_max}}' "$T/find-work.sh" ||
++        fail "harness bug: the fence has no {{merge_batch_max}} to leave unrendered"
++    assert_eq "merge-batch.sh argv log" "" "$(batch_calls)"
++    assert_no_manifest "unrendered placeholder"
++    grep -q '^INFO: merge_batch_max=' "$T/out" || fail "stdout has no INFO: merge_batch_max= line"
++    ! grep -q 'WARN' "$T/out" "$T/err" || fail "an unrendered merge_batch_max printed a WARN"
++    end_case
++}
++
++case_find_work_rendered() {
++    new_case find_work_rendered
++    run_find_work 3 GC_STUB_ASSIGNED="$ASSIGNED_TWO" STUB_SELECT_OUT="$HEAD_ID\n$SECOND_ID"
++    assert_eq "merge-batch.sh argv log" "select --head $HEAD_ID --max 3" "$(batch_calls)"
++    assert_eq "manifest .head" "$HEAD_ID" "$(jq -r '.head' "$MANIFEST" 2>/dev/null)"
++    assert_eq "manifest member ids" "[\"$HEAD_ID\",\"$SECOND_ID\"]" "$(jq -c '[.members[].id]' "$MANIFEST" 2>/dev/null)"
++    assert_eq "refinery-batch.path" "$BATCH_STUB" "$(cat "$MANIFEST_PATH" 2>/dev/null)"
++    grep -qx "BATCH: $HEAD_ID $SECOND_ID" "$T/out" || fail "stdout has no 'BATCH: $HEAD_ID $SECOND_ID' line"
++    end_case
++}
++
++case_find_work_select_one() {
++    new_case find_work_select_one
++    run_find_work 3 GC_STUB_ASSIGNED="$ASSIGNED_TWO" STUB_SELECT_OUT="$HEAD_ID"
++    assert_eq "merge-batch.sh argv log" "select --head $HEAD_ID --max 3" "$(batch_calls)"
++    assert_no_manifest "a select that printed only the head"
++    end_case
++}
++
++case_find_work_routed() {
++    new_case find_work_routed
++    local routed
++    routed=$(jq -cn --arg a "$HEAD_ID" \
++        '[{id: $a, priority: 1, created_at: "2026-10-02T00:00:00Z", metadata: {branch: "polecat/a"}}]')
++    run_find_work 3 GC_STUB_ASSIGNED='[]' GC_STUB_ROUTED="$routed" STUB_SELECT_OUT="$HEAD_ID\n$SECOND_ID"
++    assert_eq "merge-batch.sh argv log" "" "$(batch_calls)"
++    assert_no_manifest "a routed claim"
++    grep -q 'came from the routed claim' "$T/out" || fail "stdout does not say the head came from the routed claim"
++    grep -q "^bd update $HEAD_ID " "$T/gc.log" || fail "harness bug: the routed bead was never claimed"
++    end_case
++}
++
++case_find_work_truncates() {
++    new_case find_work_truncates
++    write_manifest 2
++    run_find_work 1 GC_STUB_ASSIGNED="$ASSIGNED_TWO" STUB_SELECT_OUT="$HEAD_ID\n$SECOND_ID"
++    assert_no_manifest "a stale manifest and path"
++    assert_eq "merge-batch.sh argv log" "" "$(batch_calls)"
++    end_case
++}
++
++# --- rebase ---------------------------------------------------------------------------
++
++case_rebase_stack() {
++    new_case rebase_stack
++    extract_block rebase-batch-stack rebase-batch-stack "$T/stack.sh" ||
++        { fail "could not extract the rebase-batch-stack block"; end_case; return; }
++
++    write_manifest 2
++    run_block "$T/stack.sh" WORK="$HEAD_ID"
++    assert_eq "argv log, 2-member manifest" "stack --head $HEAD_ID" "$(batch_calls)"
++    [ -e "$MANIFEST" ] || fail "a successful stack removed the manifest"
++
++    : >"$T/batch.log"
++    write_manifest 1
++    run_block "$T/stack.sh" WORK="$HEAD_ID"
++    assert_eq "argv log, 1-member manifest" "" "$(batch_calls)"
++
++    rm -f "$MANIFEST" "$MANIFEST_PATH"
++    run_block "$T/stack.sh" WORK="$HEAD_ID"
++    assert_eq "argv log, no manifest" "" "$(batch_calls)"
++
++    : >"$T/batch.log"
++    write_manifest 2
++    run_block "$T/stack.sh" WORK="$HEAD_ID" STUB_STACK_STATUS=1
++    assert_eq "argv log, failing stack" "stack --head $HEAD_ID" "$(batch_calls)"
++    [ ! -e "$MANIFEST" ] || fail "a stack that exited 1 left the manifest behind"
++    grep -q 'batch of 1' "$T/out" || fail "a failed stack did not say it is a batch of 1"
++    end_case
++}
++
++# --- handle-failures ------------------------------------------------------------------
++
++case_batch_red() {
++    new_case batch_red
++    if ! extract_block batch-red-serial batch-red-serial "$T/serial.sh" ||
++        ! extract_block handle-failures-pour handle-failures-pour "$T/pour.sh" set:rig_name=testrig; then
++        fail "could not extract the batch-red blocks"
++        end_case
++        return
++    fi
++
++    write_manifest 2
++    run_block "$T/serial.sh" WORK="$HEAD_ID" STUB_SERIAL_STATUS=0
++    assert_eq "batch-red-serial status when serial stamps every member" 0 "$?"
++    assert_eq "argv log" "serial --head $HEAD_ID" "$(batch_calls)"
++    grep -q '^BATCH RED:' "$T/out" || fail "stdout has no BATCH RED line"
++    local serial_gc
++    serial_gc=$(cat "$T/gc.log")
++    run_block "$T/pour.sh" WORK="$HEAD_ID"
++    assert_eq "handle-failures-pour status" 0 "$?"
++    assert_eq "bd mol wisp calls" 1 "$(grep -c '^bd mol wisp' "$T/gc.log")"
++    assert_eq "bd mol burn calls" 1 "$(grep -c '^bd mol burn' "$T/gc.log")"
++    ! grep -qE "$HEAD_ID|$SECOND_ID" "$T/gc.log" || fail "a gc call names a batch member"
++    ! grep -qE 'rejection_reason|workflow delete-source' "$T/gc.log" ||
++        fail "a red batch rejected a bead"
++    assert_eq "gc calls before the pour block" "" "$serial_gc"
++
++    : >"$T/gc.log"
++    : >"$T/batch.log"
++    write_manifest 2
++    run_block "$T/serial.sh" WORK="$HEAD_ID" STUB_SERIAL_STATUS=2
++    assert_eq "batch-red-serial status when serial fails" 1 "$?"
++    grep -q '^runtime drain-ack' "$T/gc.log" || fail "a failed serial did not drain-ack"
++    ! grep -q '^bd mol wisp' "$T/gc.log" || fail "a failed serial still poured a wisp"
++    grep -q '^STOP' "$T/out" || fail "a failed serial printed no STOP line"
++
++    : >"$T/gc.log"
++    : >"$T/batch.log"
++    rm -f "$MANIFEST" "$MANIFEST_PATH"
++    run_block "$T/serial.sh" WORK="$HEAD_ID"
++    assert_eq "batch-red-serial status with no manifest" 0 "$?"
++    assert_eq "argv log with no manifest" "" "$(batch_calls)"
++    grep -q '^NOT A BATCH' "$T/out" || fail "a red with no manifest did not say NOT A BATCH"
++    end_case
++}
++
++# --- merge-push -----------------------------------------------------------------------
++
++case_merge_push_lanes() {
++    new_case merge_push_lanes
++    extract_block merge-push:invoke merge-push:invoke "$T/invoke.sh" ||
++        { fail "could not extract the merge-push:invoke block"; end_case; return; }
++
++    write_manifest 2
++    run_block "$T/invoke.sh" WORK="$HEAD_ID" STUB_LAND_STATUS=0
++    assert_eq "block status, land 0" 0 "$?"
++    assert_eq "merge-batch.sh argv log, land 0" "land --head $HEAD_ID" "$(batch_calls)"
++    assert_eq "merge-push.sh argv log, land 0" "" "$(push_calls)"
++    grep -q 'continue to patrol-summary' "$T/out" || fail "land 0 did not continue to patrol-summary"
++
++    : >"$T/batch.log"
++    : >"$T/gc.log"
++    run_block "$T/invoke.sh" WORK="$HEAD_ID" STUB_LAND_STATUS=2
++    assert_eq "block status, land 2" 1 "$?"
++    assert_eq "merge-batch.sh argv log, land 2" "land --head $HEAD_ID" "$(batch_calls)"
++    assert_eq "merge-push.sh argv log, land 2" "" "$(push_calls)"
++    grep -q '^runtime drain-ack' "$T/gc.log" || fail "land 2 did not drain-ack"
++
++    : >"$T/batch.log"
++    : >"$T/gc.log"
++    chmod -x "$BATCH_STUB"
++    run_block "$T/invoke.sh" WORK="$HEAD_ID"
++    assert_eq "block status, merge-batch.sh not runnable" 1 "$?"
++    assert_eq "merge-push.sh argv log, merge-batch.sh not runnable" "" "$(push_calls)"
++    grep -q '^runtime drain-ack' "$T/gc.log" || fail "an unrunnable merge-batch.sh did not drain-ack"
++    chmod +x "$BATCH_STUB"
++
++    : >"$T/batch.log"
++    write_manifest 1
++    run_block "$T/invoke.sh" WORK="$HEAD_ID"
++    assert_eq "block status, 1-member manifest" 0 "$?"
++    assert_eq "merge-push.sh argv log, 1-member manifest" "--work $HEAD_ID" "$(push_calls)"
++    assert_eq "merge-batch.sh argv log, 1-member manifest" "" "$(batch_calls)"
++
++    : >"$T/push.log"
++    rm -f "$MANIFEST" "$MANIFEST_PATH"
++    run_block "$T/invoke.sh" WORK="$HEAD_ID"
++    assert_eq "block status, no manifest" 0 "$?"
++    assert_eq "merge-push.sh argv log, no manifest" "--work $HEAD_ID" "$(push_calls)"
++    assert_eq "merge-batch.sh argv log, no manifest" "" "$(batch_calls)"
++    end_case
++}
++
++# --- the default -----------------------------------------------------------------------
++
++# formula_default <formula> — [vars.merge_batch_max].default, read through tomllib.
++formula_default() {
++    python3 - "$1" <<'PY'
++import sys
++import tomllib
++
++with open(sys.argv[1], "rb") as handle:
++    print(tomllib.load(handle)["vars"]["merge_batch_max"]["default"])
++PY
++}
++
++# script_default <script> — MERGE_BATCH_DEFAULT_MAX as the script embeds it.
++script_default() {
++    sed -n 's/^MERGE_BATCH_DEFAULT_MAX=\([0-9]*\)$/\1/p' "$1"
++}
++
++# defaults_agree <formula> <script> — the drift check: true when the two defaults
++# are one value, and not empty (a check that read nothing would pass vacuously).
++defaults_agree() {
++    local f s
++    f=$(formula_default "$1") || return 1
++    s=$(script_default "$2")
++    [ -n "$f" ] && [ -n "$s" ] && [ "$f" = "$s" ]
++}
++
++case_default_drift() {
++    new_case default_drift
++    defaults_agree "$FORMULA" "$BATCH_SCRIPT" ||
++        fail "formula default '$(formula_default "$FORMULA")' != script default '$(script_default "$BATCH_SCRIPT")'"
++
++    # The check must be able to FAIL: change only one side of a copy.
++    sed '/^\[vars\.merge_batch_max\]/,/^default = /s/^default = "1"$/default = "2"/' "$FORMULA" >"$T/formula-2.toml"
++    cmp -s "$FORMULA" "$T/formula-2.toml" && fail "harness bug: the formula copy was not changed"
++    ! defaults_agree "$T/formula-2.toml" "$BATCH_SCRIPT" ||
++        fail "the drift check passed with the formula default changed to 2"
++
++    sed 's/^MERGE_BATCH_DEFAULT_MAX=1$/MERGE_BATCH_DEFAULT_MAX=2/' "$BATCH_SCRIPT" >"$T/merge-batch-2.sh"
++    cmp -s "$BATCH_SCRIPT" "$T/merge-batch-2.sh" && fail "harness bug: the script copy was not changed"
++    ! defaults_agree "$FORMULA" "$T/merge-batch-2.sh" ||
++        fail "the drift check passed with the script default changed to 2"
++    end_case
++}
++
++case_find_work_unrendered
++case_find_work_rendered
++case_find_work_select_one
++case_find_work_routed
++case_find_work_truncates
++case_rebase_stack
++case_batch_red
++case_merge_push_lanes
++case_default_drift
++
++if [ "$PASS_CASES" -ne "$EXPECTED_CASES" ]; then
++    echo "FAIL: $PASS_CASES of $EXPECTED_CASES cases ran" >&2
++    exit 1
++fi
++if [ "$FAILURES" -ne 0 ]; then
++    echo "FAIL: $FAILURES assertion(s) failed across $PASS_CASES cases" >&2
++    exit 1
++fi
++echo "OK: $PASS_CASES cases passed"
+-- 
+2.54.0 (Apple Git-157)
+

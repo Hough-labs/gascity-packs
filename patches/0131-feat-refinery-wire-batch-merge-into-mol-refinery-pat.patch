@@ -1,0 +1,308 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 2 Oct 2026 20:05:19 -0400
+Subject: [PATCH 131/133] feat(refinery): wire batch merge into
+ mol-refinery-patrol behind merge_batch_max=1 (gcp-l8td.10)
+
+merge-batch.sh (select, stack, land, serial; gcp-l8td.8-.11) was inert until the
+patrol called it. This wires it in behind a new var, merge_batch_max, default
+"1": with the default every rig runs exactly the single-bead lane it ran before,
+and batching starts only when a rig sets the var in [rigs.formula_vars]. The
+patrol is poured root-only, so the var never rides a pour, and an unrendered
+placeholder, an empty value or a non-integer all mean 1.
+
+- find-work: a find-work-batch block follows find-work-query in the same fence
+  (the query's text is byte-identical). It truncates the manifest first, reads
+  BATCH_MAX with check-inbox's cadence-case shape (INFO, never WARN), and only for
+  a head from the assignee scan runs select, writing the 2+ member manifest and
+  the script path. A routed-claim head is never batched; a select error is a
+  batch of 1.
+- rebase: after a clean head rebase, a rebase-batch-stack block runs stack when
+  the manifest has 2+ members; a failure removes the manifest. The conflict path
+  is unchanged.
+- handle-failures: a branch-caused red on a 2+ member manifest runs
+  batch-red-serial, which hands the stamping to merge-batch.sh serial (no shell
+  logic of its own beyond the member count), rejects nobody and then runs the
+  existing pour fence, now wrapped in handle-failures-pour sentinels and
+  otherwise untouched. KNOWN and pre-existing reds keep their rules and land the
+  batch.
+- merge-push: the call becomes land --head "$WORK" for a 2+ member manifest and
+  the original merge-push.sh --work line otherwise; the status case is
+  unchanged. The prose names the RESULT line's left-open ids and says the next
+  iteration's already-merged arm recovers them.
+
+One batch is one iteration: the four session-iteration-stamp blocks and the
+one-pour-per-step counts are untouched.
+
+Validation: gastown/tests/test_refinery_batch_wiring.sh (next commit) executes
+each block; all 21 gastown suites pass.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ gastown/formulas/mol-refinery-patrol.toml | 187 +++++++++++++++++++++-
+ 1 file changed, 184 insertions(+), 3 deletions(-)
+
+diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
+index 94e73602..8617354c 100644
+--- a/gastown/formulas/mol-refinery-patrol.toml
++++ b/gastown/formulas/mol-refinery-patrol.toml
+@@ -117,6 +117,19 @@ wake_mode = "fresh": the controller already starts a new conversation after
+ every burn, so the count never passes 1."""
+ default = "2"
+ 
++[vars.merge_batch_max]
++description = """
++Most beads one patrol iteration lands behind a single gate run. 1 is the
++single-bead lane, exactly as it runs without batching. The patrol is poured
++root-only, so no pour carries this var: a rig sets it in its
++`[rigs.formula_vars]`, and a placeholder left unrendered, an empty value or a
++non-integer means 1 (find-work prints an INFO line, not a WARN). It batches the
++direct lane only: a bead that came from the routed claim, one that needs the
++approval gate, one with an `existing_pr` and one a red already sent serial are
++never batched. One batch counts as ONE iteration for `restart_after_iterations`.
++2-4 is the recommended range."""
++default = "1"
++
+ [[steps]]
+ id = "validate-identity"
+ title = "Validate canonical agent identity"
+@@ -265,7 +278,9 @@ needs = ["check-inbox"]
+ description = """
+ **Config: event_timeout = {{event_timeout}}**
+ 
+-Search for work beads assigned to you, then for work merely routed to you:
++Search for work beads assigned to you, then for work merely routed to you, then
++decide whether this iteration batches. Run the whole fence in ONE shell: the
++batch block reads `WORK` and `ROUTED` from the query above it.
+ ```bash
+ # --- find-work-query:begin ---
+ REFINERY_SELF="${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery"
+@@ -289,6 +304,77 @@ if [ -z "$WORK" ]; then
+   fi
+ fi
+ # --- find-work-query:end ---
++# --- find-work-batch:begin ---
++# A manifest left by an earlier iteration is never this one's: truncate first,
++# even when no work was found.
++BATCH_DIR=$(git rev-parse --git-dir 2>/dev/null) || BATCH_DIR=""
++if [ -n "$BATCH_DIR" ]; then
++  rm -f "$BATCH_DIR/refinery-batch.json" "$BATCH_DIR/refinery-batch.path"
++fi
++BATCH_MAX="{{merge_batch_max}}"
++case "$BATCH_MAX" in
++  ''|*[!0-9]*)
++    echo "INFO: merge_batch_max='$BATCH_MAX' is not an integer; batching off."
++    BATCH_MAX=1
++    ;;
++esac
++if [ -n "$WORK" ] && [ "$BATCH_MAX" -gt 1 ]; then
++  if [ -z "$BATCH_DIR" ]; then
++    echo "INFO: no git dir to hold the batch manifest; batching off."
++  elif [ "$WORK" = "${ROUTED:-}" ]; then
++    echo "INFO: $WORK came from the routed claim; batching off."
++  else
++    BATCH_CITY="${GC_CITY:-${GC_CITY_PATH:-}}"
++    if [ -n "$BATCH_CITY" ]; then
++      BATCH_FORMULA_JSON=$(gc formula list --city "$BATCH_CITY" --json 2>/dev/null)
++    else
++      BATCH_FORMULA_JSON=$(gc formula list --json 2>/dev/null)
++    fi
++    BATCH_FORMULA_SRC=$(printf '%s' "$BATCH_FORMULA_JSON" \\
++      | jq -r '.formulas[]? | select(.name == "mol-refinery-patrol") | .source // empty' 2>/dev/null \\
++      | head -1)
++    MERGE_BATCH=""
++    if [ -n "$BATCH_FORMULA_SRC" ]; then
++      MERGE_BATCH="$(dirname "$(dirname "$BATCH_FORMULA_SRC")")/assets/scripts/refinery/merge-batch.sh"
++    fi
++    if [ ! -x "$MERGE_BATCH" ] && [ -n "${GC_PACK_DIR:-}" ]; then
++      MERGE_BATCH="$GC_PACK_DIR/assets/scripts/refinery/merge-batch.sh"
++    fi
++    if [ ! -x "$MERGE_BATCH" ]; then
++      echo "INFO: merge-batch.sh not runnable (resolved '$MERGE_BATCH'); batching off."
++    elif ! BATCH_IDS=$("$MERGE_BATCH" select --head "$WORK" --max "$BATCH_MAX") || [ -z "$BATCH_IDS" ]; then
++      echo "INFO: merge-batch.sh select failed or printed nothing; batching off."
++    elif [ "$(printf '%s\\n' "$BATCH_IDS" | grep -c .)" -gt 1 ]; then
++      if printf '%s\\n' "$BATCH_IDS" | jq -Rn --arg head "$WORK" \\
++          '{head: $head, members: [inputs | select(length > 0) | {id: .}]}' \\
++          >"$BATCH_DIR/refinery-batch.json" \\
++        && printf '%s\\n' "$MERGE_BATCH" >"$BATCH_DIR/refinery-batch.path"; then
++        echo "BATCH: $(printf '%s' "$BATCH_IDS" | tr '\\n' ' ' | sed 's/ *$//')"
++      else
++        rm -f "$BATCH_DIR/refinery-batch.json" "$BATCH_DIR/refinery-batch.path"
++        echo "INFO: could not write the batch manifest; batching off."
++      fi
++    fi
++  fi
++fi
++# --- find-work-batch:end ---
++```
++
++**The batch (merge_batch_max = {{merge_batch_max}}).** With the default of 1, or
++a placeholder left unrendered, the block batches nothing and prints at most an
++INFO line: this is the single-bead lane, unchanged. With a larger value, and a
++head that came from the assignee scan, `merge-batch.sh select` prints the head
++first and then the beads that can ride behind it, and the block records them in
++the batch manifest and prints `BATCH: <ids>`. A head that came from the routed
++claim is never batched. A select error is not a blocker and never rejects the
++head: the batch is simply 1.
++
++The printed ids are a PREFIX of the refinery's queue. Never reorder them and
++never extend them. The only shortening on offer is to one: if the mail
++check-inbox handled asked to hold any printed bead, do not batch this iteration
++and run
++```bash
++rm -f "$(git rev-parse --git-dir)/refinery-batch.json"
+ ```
+ 
+ `${GC_RIG:+--rig="$GC_RIG"}` scopes the query to this refinery's rig
+@@ -403,7 +489,34 @@ git checkout -b temp origin/$BRANCH
+ git rebase origin/$TARGET
+ ```
+ 
+-If rebase SUCCEEDED (exit 0): close this step, proceed to run-tests.
++If rebase SUCCEEDED (exit 0): run the batch stack block, then close this step and
++proceed to run-tests.
++
++The block stacks the batch's other members onto the rebased head, and only when
++find-work recorded a manifest of more than one member. With no manifest, an
++unparseable one or a single member it does nothing. A stack error is not a
++blocker: it leaves a batch of 1. Run it in ONE shell with `$WORK` set as above:
++```bash
++# --- rebase-batch-stack:begin ---
++BATCH_DIR=$(git rev-parse --git-dir 2>/dev/null) || BATCH_DIR=""
++BATCH_N=0
++if [ -n "$BATCH_DIR" ] && [ -f "$BATCH_DIR/refinery-batch.json" ]; then
++  BATCH_N=$(jq -r '.members | if type == "array" then length else 0 end' "$BATCH_DIR/refinery-batch.json" 2>/dev/null)
++  case "$BATCH_N" in ''|*[!0-9]*) BATCH_N=0 ;; esac
++fi
++if [ "$BATCH_N" -gt 1 ]; then
++  MERGE_BATCH=$(cat "$BATCH_DIR/refinery-batch.path" 2>/dev/null)
++  if [ -x "$MERGE_BATCH" ] && "$MERGE_BATCH" stack --head "$WORK"; then
++    echo "BATCH STACKED: see the manifest's members for what rides behind the head."
++  else
++    rm -f "$BATCH_DIR/refinery-batch.json"
++    echo "INFO: batch of 1."
++  fi
++fi
++# --- rebase-batch-stack:end ---
++```
++A head conflict is the rejection path below, unchanged: the stack block runs
++only after the head rebased cleanly.
+ 
+ If rebase FAILED (conflicts):
+ 
+@@ -653,6 +766,41 @@ fi
+    on target?
+ 
+ 2. If branch caused it:
++   - A batch comes first. When the batch manifest in the git dir holds 2+
++     members, the red is the BATCH's, not any one member's: reject nobody, skip
++     the rest of this step 2, and run the block below in ONE shell with `$WORK`
++     set. It stamps every member to go serial, so each is merged alone on a later
++     patrol. It prints `NOT A BATCH` when there is no such manifest: carry on with
++     the rest of this step 2 as written. It prints `BATCH RED` when every member
++     is stamped: run the handle-failures-pour block below (the "Pour next patrol
++     iteration before burning" fence, referenced and not copied), then close this
++     step after the current wisp is burned. Anything else stops here. The script
++     removes the manifest and cleans up `temp` itself, so this block does neither.
++     A red that step 0 found entirely KNOWN, or step 3 found pre-existing on
++     `$TARGET`, is not this branch: it keeps those rules and merge-push lands the
++     batch.
++     ```bash
++     # --- batch-red-serial:begin ---
++     BATCH_DIR=$(git rev-parse --git-dir 2>/dev/null) || BATCH_DIR=""
++     BATCH_N=0
++     if [ -n "$BATCH_DIR" ] && [ -f "$BATCH_DIR/refinery-batch.json" ]; then
++       BATCH_N=$(jq -r '.members | if type == "array" then length else 0 end' "$BATCH_DIR/refinery-batch.json" 2>/dev/null)
++       case "$BATCH_N" in ''|*[!0-9]*) BATCH_N=0 ;; esac
++     fi
++     if [ "$BATCH_N" -le 1 ]; then
++       echo "NOT A BATCH: no manifest with 2+ members. Carry on with the rest of step 2."
++     else
++       MERGE_BATCH=$(cat "$BATCH_DIR/refinery-batch.path" 2>/dev/null)
++       if [ -x "$MERGE_BATCH" ] && "$MERGE_BATCH" serial --head "$WORK"; then
++         echo "BATCH RED: every member is stamped to go serial; now run the handle-failures-pour block."
++       else
++         echo "STOP. batch red: serial did not stamp every member, or merge-batch.sh is not runnable (resolved '$MERGE_BATCH'). Nothing was rejected. Do NOT run the pour block."
++         gc runtime drain-ack
++         exit 1
++       fi
++     fi
++     # --- batch-red-serial:end ---
++     ```
+    - Clean up the existing workflow and reopen the source bead:
+      ```bash
+      gc workflow delete-source $WORK --apply && gc workflow reopen-source $WORK
+@@ -685,6 +833,7 @@ fi
+      ```
+    - Pour next patrol iteration before burning:
+      ```bash
++     # --- handle-failures-pour:begin ---
+      CURRENT_WISP=${GC_BEAD_ID:-}
+      if [ -z "$CURRENT_WISP" ]; then
+        CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json | jq -r '.[0].id // empty')
+@@ -736,6 +885,7 @@ fi
+        gc runtime drain-ack
+        exit 1
+      fi
++     # --- handle-failures-pour:end ---
+      ```
+    - Close this step after the current wisp is burned.
+ 
+@@ -905,7 +1055,26 @@ if [ ! -x "$MERGE_PUSH" ]; then
+     exit 1
+ fi
+ MP_LOG=$(mktemp)
+-"$MERGE_PUSH" --work "$WORK" >"$MP_LOG" 2>&1
++# A batch manifest of 2+ members, written by find-work and completed by rebase's
++# stack block, makes this the batch lane. No manifest, an unparseable one or one
++# member is the single-bead lane, exactly as without batching.
++BATCH_DIR=$(git rev-parse --git-dir 2>/dev/null) || BATCH_DIR=""
++BATCH_N=0
++if [ -n "$BATCH_DIR" ] && [ -f "$BATCH_DIR/refinery-batch.json" ]; then
++    BATCH_N=$(jq -r '.members | if type == "array" then length else 0 end' "$BATCH_DIR/refinery-batch.json" 2>/dev/null)
++    case "$BATCH_N" in ''|*[!0-9]*) BATCH_N=0 ;; esac
++fi
++if [ "$BATCH_N" -gt 1 ]; then
++    MERGE_BATCH="$(dirname "$MERGE_PUSH")/merge-batch.sh"
++    if [ ! -x "$MERGE_BATCH" ]; then
++        echo "merge-batch.sh not runnable (resolved '$MERGE_BATCH'). STOP. Do not mutate bead state."
++        gc runtime drain-ack
++        exit 1
++    fi
++    "$MERGE_BATCH" land --head "$WORK" >"$MP_LOG" 2>&1
++else
++    "$MERGE_PUSH" --work "$WORK" >"$MP_LOG" 2>&1
++fi
+ MP_STATUS=$?
+ cat "$MP_LOG"
+ case "$MP_STATUS" in
+@@ -1006,6 +1175,16 @@ What each status means, and what this step does about it:
+ | 11 | `merge_strategy=local` is unsupported: the mayor was mailed. | STOP. Do NOT close the bead, delete the branch or burn the wisp, until a human decides how to proceed. |
+ | anything else | Unknown. | STOP and drain. |
+ 
++With a batch (a manifest of 2+ members) the block ran `merge-batch.sh land`
++instead, and its last output line is `merge-batch: RESULT <status> landed=<ids>
++left-open=<ids>`. Its statuses 0, 1, 2, 3, 5, 6 and 7 mean what the table says and
++this step does what the table says; `land` never returns 4, 9 or 11. Status 0 is
++every member closed. Status 2 after a landing means a member was LANDED but not
++recorded: name each `left-open` id in your patrol-summary, STOP and drain, and
++leave it alone. The next iteration's already-merged arm closes it when it comes
++up as the head. `land` removes the manifest after a landing and cleans up `temp`
++only on 0.
++
+ Status 7 is the one that most invites a wrong next move: the remote refused the
+ push while `$TARGET` stood still. Re-running the merge immediately just re-runs
+ the pre-push gate, so if the gate is saturated the retry is what keeps it
+@@ -1024,6 +1203,8 @@ audit trail — the next refinery session can see what happened.
+ 
+ Include:
+ - Branch merged (name, target)
++- Batch (if any): the landed and left-open ids from the RESULT line, or the
++  members stamped serial on a red
+ - Test results (pass/fail, which checks ran)
+ - Bugs filed (IDs, if any pre-existing failures were tracked)
+ - Rejections (if the branch was rejected back to pool)
+-- 
+2.54.0 (Apple Git-157)
+
