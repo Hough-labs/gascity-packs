@@ -153,6 +153,13 @@ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
         # step keeps only the call.
         "merge-push.sh",
         '--work "$WORK"',
+        # The batch lane (gcp-l8td.10): the steps call merge-batch.sh and keep
+        # no batch logic of their own, so a step that stops calling it is a
+        # patrol that silently never batches or never stamps a red batch serial.
+        "merge-batch.sh",
+        'land --head "$WORK"',
+        'stack --head "$WORK"',
+        'serial --head "$WORK"',
     ),
     "mol-witness-patrol": (
         "LIVENESS_MAP=$(jq -n",
@@ -337,6 +344,16 @@ GASTOWN_SCRIPT_CONTRACTS = {
         '"$GH" pr create',
         "--set-metadata pr_url=\"$PR_URL\"",
         "gc bd close $WORK --reason \"Pull request ready: $PR_URL\"",
+    ),
+    # The batch lane's mechanics (gcp-l8td.8-.11). Each fragment is the line that
+    # makes one guarantee real: a member is closed against ITS landed commit, a
+    # red batch is stamped serial at the branch tip, stack keeps a collapsed head
+    # a batch of one, and land refuses a member that adds no commit.
+    "assets/scripts/refinery/merge-batch.sh": (
+        '--set-metadata merged_sha="$lr_sha"',
+        'gc bd update "$ss_id" --set-metadata merge_batch_serial="$ss_sha"',
+        'branch_has_real_change "origin/$SB_TARGET" "$SB_ENTRY"',
+        '(.commits | type == "number" and . >= 1 and . == floor)',
     ),
 }
 METHODOLOGY_FLOW_CONTRACTS = {
