@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 27 Sep 2026 22:42:07 -0400
-Subject: [PATCH 117/133] test(refinery): fail loudly when the merge-lane rig
+Subject: [PATCH 117/134] test(refinery): fail loudly when the merge-lane rig
  is not built (gcp-l8td.4)
 
 A self-review touch-up. build_rig runs its git setup quietly, so a setup

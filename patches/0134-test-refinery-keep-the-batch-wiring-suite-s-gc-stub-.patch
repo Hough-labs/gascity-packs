@@ -1,0 +1,149 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 2 Oct 2026 20:08:37 -0400
+Subject: [PATCH 134/134] test(refinery): keep the batch wiring suite's gc stub
+ clear of the bare-bd guard (gcp-l8td.10)
+
+The suite's stub journalled gc calls as bare "bd ..." and dispatched on
+"bd list"-style patterns, which tests/test_no_bare_bd_commands.py reads as bare bd
+commands (ten new hits). The stub now journals "gc <args>" and dispatches on its
+first and second argument in nested case statements, and the assertions match the
+"gc bd ..." form. No behaviour change: 9 cases pass, shellcheck is clean, and the
+guard's only remaining hits are the baseline ones in docs/design (gcp-98gh).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ gastown/tests/test_refinery_batch_wiring.sh | 70 ++++++++++++---------
+ 1 file changed, 40 insertions(+), 30 deletions(-)
+
+diff --git a/gastown/tests/test_refinery_batch_wiring.sh b/gastown/tests/test_refinery_batch_wiring.sh
+index de548796..b118b0dc 100755
+--- a/gastown/tests/test_refinery_batch_wiring.sh
++++ b/gastown/tests/test_refinery_batch_wiring.sh
+@@ -18,8 +18,9 @@
+ # case leaves literal is `{{merge_batch_max}}`, on purpose: that is what the
+ # renderer leaves for a patrol poured root-only without the rig setting the var.
+ #
+-# Only gc and the two scripts are stubbed. gc answers bd list/show/update,
+-# bd mol wisp/burn, runtime drain-ack and formula list. The scripts live in a
++# Only gc and the two scripts are stubbed. gc answers its beads list, show and
++# update, its molecule wisp and burn, runtime drain-ack and formula list. The
++# stub journals every call as "gc <args>". The scripts live in a
+ # staged pack tree, found the way the shipped blocks find them (`gc formula list`
+ # names the formula's source, and the script is its sibling), and each appends its
+ # argv to a log and exits as its env says.
+@@ -114,32 +115,41 @@ PY
+ write_gc_stub() {
+     cat >"$1/gc" <<'STUB'
+ #!/usr/bin/env bash
+-printf '%s\n' "$*" >>"${GC_STUB_LOG:?GC_STUB_LOG unset}"
+-case "${1:-} ${2:-}" in
+-"bd list")
+-    # The routed scan is the one that asks for unassigned beads.
+-    case " $* " in
+-    *" --no-assignee "*) printf '%s' "${GC_STUB_ROUTED:-[]}" ;;
+-    *) printf '%s' "${GC_STUB_ASSIGNED:-[]}" ;;
++printf 'gc %s\n' "$*" >>"${GC_STUB_LOG:?GC_STUB_LOG unset}"
++unexpected() {
++    printf '%s\n' "$*" >>"${GC_STUB_UNEXPECTED:?}"
++    exit 64
++}
++case "${1:-}" in
++bd)
++    case "${2:-}" in
++    list)
++        # The routed scan is the one that asks for unassigned beads.
++        case " $* " in
++        *" --no-assignee "*) printf '%s' "${GC_STUB_ROUTED:-[]}" ;;
++        *) printf '%s' "${GC_STUB_ASSIGNED:-[]}" ;;
++        esac
++        ;;
++    update) ;;
++    show) printf '[{"assignee":"%s"}]' "${GC_AGENT:-}" ;;
++    mol)
++        case "${3:-}" in
++        wisp) printf '{"new_epic_id":"wisp-next"}' ;;
++        burn) ;;
++        *) unexpected "$@" ;;
++        esac
++        ;;
++    *) unexpected "$@" ;;
+     esac
+     ;;
+-"bd update") ;;
+-"bd show") printf '[{"assignee":"%s"}]' "${GC_AGENT:-}" ;;
+-"bd mol")
+-    case "${3:-}" in
+-    wisp) printf '{"new_epic_id":"wisp-next"}' ;;
+-    burn) ;;
+-    *) printf '%s\n' "$*" >>"${GC_STUB_UNEXPECTED:?}"; exit 64 ;;
+-    esac
++runtime)
++    [ "${2:-}" = drain-ack ] || unexpected "$@"
+     ;;
+-"runtime drain-ack") ;;
+-"formula list")
++formula)
++    [ "${2:-}" = list ] || unexpected "$@"
+     printf '{"formulas":[{"name":"mol-refinery-patrol","source":"%s"}]}' "${GC_STUB_FORMULA_SOURCE:-}"
+     ;;
+-*)
+-    printf '%s\n' "$*" >>"${GC_STUB_UNEXPECTED:?}"
+-    exit 64
+-    ;;
++*) unexpected "$@" ;;
+ esac
+ STUB
+     chmod +x "$1/gc"
+@@ -312,7 +322,7 @@ case_find_work_routed() {
+     assert_eq "merge-batch.sh argv log" "" "$(batch_calls)"
+     assert_no_manifest "a routed claim"
+     grep -q 'came from the routed claim' "$T/out" || fail "stdout does not say the head came from the routed claim"
+-    grep -q "^bd update $HEAD_ID " "$T/gc.log" || fail "harness bug: the routed bead was never claimed"
++    grep -q "^gc bd update $HEAD_ID " "$T/gc.log" || fail "harness bug: the routed bead was never claimed"
+     end_case
+ }
+ 
+@@ -375,8 +385,8 @@ case_batch_red() {
+     serial_gc=$(cat "$T/gc.log")
+     run_block "$T/pour.sh" WORK="$HEAD_ID"
+     assert_eq "handle-failures-pour status" 0 "$?"
+-    assert_eq "bd mol wisp calls" 1 "$(grep -c '^bd mol wisp' "$T/gc.log")"
+-    assert_eq "bd mol burn calls" 1 "$(grep -c '^bd mol burn' "$T/gc.log")"
++    assert_eq "wisp pours" 1 "$(grep -c '^gc bd mol wisp' "$T/gc.log")"
++    assert_eq "wisp burns" 1 "$(grep -c '^gc bd mol burn' "$T/gc.log")"
+     ! grep -qE "$HEAD_ID|$SECOND_ID" "$T/gc.log" || fail "a gc call names a batch member"
+     ! grep -qE 'rejection_reason|workflow delete-source' "$T/gc.log" ||
+         fail "a red batch rejected a bead"
+@@ -387,8 +397,8 @@ case_batch_red() {
+     write_manifest 2
+     run_block "$T/serial.sh" WORK="$HEAD_ID" STUB_SERIAL_STATUS=2
+     assert_eq "batch-red-serial status when serial fails" 1 "$?"
+-    grep -q '^runtime drain-ack' "$T/gc.log" || fail "a failed serial did not drain-ack"
+-    ! grep -q '^bd mol wisp' "$T/gc.log" || fail "a failed serial still poured a wisp"
++    grep -q '^gc runtime drain-ack' "$T/gc.log" || fail "a failed serial did not drain-ack"
++    ! grep -q '^gc bd mol wisp' "$T/gc.log" || fail "a failed serial still poured a wisp"
+     grep -q '^STOP' "$T/out" || fail "a failed serial printed no STOP line"
+ 
+     : >"$T/gc.log"
+@@ -421,7 +431,7 @@ case_merge_push_lanes() {
+     assert_eq "block status, land 2" 1 "$?"
+     assert_eq "merge-batch.sh argv log, land 2" "land --head $HEAD_ID" "$(batch_calls)"
+     assert_eq "merge-push.sh argv log, land 2" "" "$(push_calls)"
+-    grep -q '^runtime drain-ack' "$T/gc.log" || fail "land 2 did not drain-ack"
++    grep -q '^gc runtime drain-ack' "$T/gc.log" || fail "land 2 did not drain-ack"
+ 
+     : >"$T/batch.log"
+     : >"$T/gc.log"
+@@ -429,7 +439,7 @@ case_merge_push_lanes() {
+     run_block "$T/invoke.sh" WORK="$HEAD_ID"
+     assert_eq "block status, merge-batch.sh not runnable" 1 "$?"
+     assert_eq "merge-push.sh argv log, merge-batch.sh not runnable" "" "$(push_calls)"
+-    grep -q '^runtime drain-ack' "$T/gc.log" || fail "an unrunnable merge-batch.sh did not drain-ack"
++    grep -q '^gc runtime drain-ack' "$T/gc.log" || fail "an unrunnable merge-batch.sh did not drain-ack"
+     chmod +x "$BATCH_STUB"
+ 
+     : >"$T/batch.log"
+-- 
+2.54.0 (Apple Git-157)
+
