@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 2 Oct 2026 20:08:37 -0400
-Subject: [PATCH 134/136] test(refinery): keep the batch wiring suite's gc stub
+Subject: [PATCH 134/138] test(refinery): keep the batch wiring suite's gc stub
  clear of the bare-bd guard (gcp-l8td.10)
 
 The suite's stub journalled gc calls as bare "bd ..." and dispatched on

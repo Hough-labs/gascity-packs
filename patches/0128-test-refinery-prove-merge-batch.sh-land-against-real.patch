@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 2 Oct 2026 17:51:29 -0400
-Subject: [PATCH 128/136] test(refinery): prove merge-batch.sh land against
+Subject: [PATCH 128/138] test(refinery): prove merge-batch.sh land against
  real repos (gcp-l8td.9)
 
 Seven new cases on gcp-l8td.8's harness (9 -> 16): green landing with
