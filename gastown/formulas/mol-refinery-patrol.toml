@@ -373,7 +373,7 @@ fi
 # even when no work was found.
 BATCH_DIR=$(git rev-parse --git-dir 2>/dev/null) || BATCH_DIR=""
 if [ -n "$BATCH_DIR" ]; then
-  rm -f "$BATCH_DIR/refinery-batch.json" "$BATCH_DIR/refinery-batch.path"
+  rm -f "${BATCH_DIR:?}/refinery-batch.json" "${BATCH_DIR:?}/refinery-batch.path"
 fi
 BATCH_MAX="{{merge_batch_max}}"
 case "$BATCH_MAX" in
@@ -415,7 +415,7 @@ if [ -n "$WORK" ] && [ "$BATCH_MAX" -gt 1 ]; then
         && printf '%s\\n' "$MERGE_BATCH" >"$BATCH_DIR/refinery-batch.path"; then
         echo "BATCH: $(printf '%s' "$BATCH_IDS" | tr '\\n' ' ' | sed 's/ *$//')"
       else
-        rm -f "$BATCH_DIR/refinery-batch.json" "$BATCH_DIR/refinery-batch.path"
+        rm -f "${BATCH_DIR:?}/refinery-batch.json" "${BATCH_DIR:?}/refinery-batch.path"
         echo "INFO: could not write the batch manifest; batching off."
       fi
     fi
@@ -438,7 +438,7 @@ never extend them. The only shortening on offer is to one: if the mail
 check-inbox handled asked to hold any printed bead, do not batch this iteration
 and run
 ```bash
-rm -f "$(git rev-parse --git-dir)/refinery-batch.json"
+BATCH_DIR=$(git rev-parse --git-dir) && rm -f "${BATCH_DIR:?}/refinery-batch.json"
 ```
 
 `${GC_RIG:+--rig="$GC_RIG"}` scopes the query to this refinery's rig
@@ -561,7 +561,7 @@ case "$ACK_MODE" in
 esac
 if [ "$ACK_MODE" = warn ]; then
   ACK_DIR="$(git rev-parse --git-dir)/acceptance"
-  mkdir -p "$ACK_DIR" && rm -f "$ACK_DIR"/*.packet "$ACK_DIR"/*.err "$ACK_DIR/script.path"
+  mkdir -p "$ACK_DIR" && rm -f "${ACK_DIR:?}"/*.packet "${ACK_DIR:?}"/*.err "${ACK_DIR:?}/script.path"
   ACK_CITY="${GC_CITY:-${GC_CITY_PATH:-}}"
   if [ -n "$ACK_CITY" ]; then
     ACK_FORMULA_JSON=$(gc formula list --city "$ACK_CITY" --json 2>/dev/null)
@@ -885,7 +885,7 @@ if [ "$BATCH_N" -gt 1 ]; then
   if [ -x "$MERGE_BATCH" ] && "$MERGE_BATCH" stack --head "$WORK"; then
     echo "BATCH STACKED: see the manifest's members for what rides behind the head."
   else
-    rm -f "$BATCH_DIR/refinery-batch.json"
+    rm -f "${BATCH_DIR:?}/refinery-batch.json"
     echo "INFO: batch of 1."
   fi
 fi
@@ -1354,7 +1354,7 @@ fi
      DUP_ERR=$(mktemp)
      DUP_JSON=$(gc bd search "$DUP_KEYWORD" --type=bug --json 2>"$DUP_ERR")
      DUP_CODE=$?
-     DUP_MSG=$(cat "$DUP_ERR"); rm -f "$DUP_ERR"
+     DUP_MSG=$(cat "$DUP_ERR"); if [ -n "$DUP_ERR" ]; then rm -f "${DUP_ERR:?}"; fi
      DUP_COUNT=$(printf '%s' "$DUP_JSON" | jq 'length' 2>/dev/null)
      if [ "$DUP_CODE" -ne 0 ] || [ -z "$DUP_COUNT" ]; then
        # FAIL CLOSED. An errored or unparseable duplicate check is NOT

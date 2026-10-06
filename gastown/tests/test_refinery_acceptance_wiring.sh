@@ -25,12 +25,12 @@
 # and the script is its sibling), and appends its argv, one line per call, to a
 # log, then prints and exits as its env says.
 #
-# The suite fails unless all 13 cases ran.
+# The suite fails unless all 14 cases ran.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 FORMULA="${FORMULA:-$ROOT/gastown/formulas/mol-refinery-patrol.toml}"
-EXPECTED_CASES=13
+EXPECTED_CASES=14
 
 REFINERY_AGENT=testrig/gastown.refinery
 HEAD_ID=wa-head
@@ -397,7 +397,7 @@ case "$ACK_MODE" in
 esac
 if [ "$ACK_MODE" = warn ]; then
   ACK_DIR="$(git rev-parse --git-dir)/acceptance"
-  mkdir -p "$ACK_DIR" && rm -f "$ACK_DIR"/*.packet "$ACK_DIR"/*.err "$ACK_DIR/script.path"
+  mkdir -p "$ACK_DIR" && rm -f "${ACK_DIR:?}"/*.packet "${ACK_DIR:?}"/*.err "${ACK_DIR:?}/script.path"
   ACK_CITY="${GC_CITY:-${GC_CITY_PATH:-}}"
   if [ -n "$ACK_CITY" ]; then
     ACK_FORMULA_JSON=$(gc formula list --city "$ACK_CITY" --json 2>/dev/null)
@@ -673,6 +673,40 @@ case_prose() {
     end_case
 }
 
+# rm_unguarded <formula> — "<line>:<text>" for each rm command whose target starts with
+# `"$` and then a letter, underscore or `(`: an unguarded variable or command
+# substitution. Claude Code's built-in safety check denies such an rm unless a person
+# approves it, and a refinery session has none, so a session hand-edits the fence
+# before it runs (gcp-s7j4.6). `"${NAME:?}"` is the form the check exempts.
+rm_unguarded() {
+    grep -nE '(^|[;&|(]|then|do|else)[[:space:]]*rm[[:space:]][^;&|]*"\$[A-Za-z_(]' "$1"
+}
+
+case_rm_targets_guarded() {
+    new_case rm_targets_guarded
+    local found
+    found=$(rm_unguarded "$FORMULA")
+    if [ -n "$found" ]; then
+        fail "rm commands with an unguarded target; write \"\${NAME:?}\" (line:text):
+$found"
+        end_case
+        return
+    fi
+
+    # The check must be able to FAIL: unguard one target in a copy of the formula.
+    local guarded="\"\${ACK_DIR:?}\"/*.packet" unguarded="\"\$ACK_DIR\"/*.packet" text
+    text=$(<"$FORMULA")
+    case "$text" in
+        *"$guarded"*) ;;
+        *) fail "harness bug: the acceptance-check fence's rm no longer holds $guarded" ;;
+    esac
+    printf '%s\n' "${text//"$guarded"/"$unguarded"}" >"$T/formula-unguarded.toml"
+    cmp -s "$FORMULA" "$T/formula-unguarded.toml" && fail "harness bug: the formula copy was not changed"
+    [ -n "$(rm_unguarded "$T/formula-unguarded.toml")" ] ||
+        fail "the guard check passed with an rm target unguarded"
+    end_case
+}
+
 case_steps_and_needs
 case_var
 case_unrendered
@@ -686,6 +720,7 @@ case_not_runnable
 case_stale_files
 case_rubric_verbatim
 case_prose
+case_rm_targets_guarded
 
 if [ "$PASS_CASES" -ne "$EXPECTED_CASES" ]; then
     echo "FAIL: $PASS_CASES of $EXPECTED_CASES cases ran" >&2
