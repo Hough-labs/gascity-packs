@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Tue, 6 Oct 2026 00:52:19 -0400
+Subject: [PATCH 139/139] test(refinery): compare the LATEST NOTES section byte
+ for byte (gcp-s7j4.5)
+
+case_packet_notes compared two $(...) captures, which strip trailing
+newlines, against a section helper that ends its last line with one, so a
+script printing an extra blank line after the tail still passed. Write the
+section body and the expected tail to files and cmp them; the case now
+fails on an extra newline and on a dropped last byte.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ gastown/tests/test_refinery_acceptance_check.sh | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/gastown/tests/test_refinery_acceptance_check.sh b/gastown/tests/test_refinery_acceptance_check.sh
+index 52a1bff4..06073781 100755
+--- a/gastown/tests/test_refinery_acceptance_check.sh
++++ b/gastown/tests/test_refinery_acceptance_check.sh
+@@ -630,8 +630,17 @@ case_packet_notes() {
+         fail "the early unrelated line is in the departure section"
+     section_grep 'LATEST NOTES' -q 'UNRELATED EARLY LINE' &&
+         fail "the early unrelated line is in the latest-notes section"
+-    assert_eq "the LATEST NOTES body is the last 2000 bytes of the notes" \
+-        "$(printf '%s' "$notes" | tail -c 2000)" "$(section 'LATEST NOTES')"
++    # Byte for byte, through files: $(...) strips trailing newlines and `section`
++    # ends its last line with one, so neither could see an extra or a missing one.
++    # LATEST NOTES is the last section and the script ends it with no newline, so
++    # its body is every byte after the header line.
++    local hdr_line
++    assert_eq "the packet has one LATEST NOTES header" 1 "$(grep -c '^== LATEST NOTES' "$T/out")"
++    hdr_line=$(grep -n '^== LATEST NOTES' "$T/out" | head -n 1 | cut -d: -f1)
++    tail -n +$((hdr_line + 1)) "$T/out" >"$T/latest-notes"
++    printf '%s' "$notes" | tail -c 2000 >"$T/expected-tail"
++    cmp -s "$T/expected-tail" "$T/latest-notes" ||
++        fail "the LATEST NOTES body is not byte-equal to the last 2000 bytes of the notes: $(cmp "$T/expected-tail" "$T/latest-notes" 2>&1)"
+     assert_read_only "packet"
+ 
+     # Forty matching lines of 600 characters: the first 30, each cut to 400.
+-- 
+2.54.0 (Apple Git-157)
+
