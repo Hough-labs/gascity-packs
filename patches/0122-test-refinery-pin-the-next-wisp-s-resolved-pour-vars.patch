@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 2 Oct 2026 15:52:10 -0400
-Subject: [PATCH 122/134] test(refinery): pin the next wisp's resolved pour
+Subject: [PATCH 122/136] test(refinery): pin the next wisp's resolved pour
  vars in the existing_pr-blocked case (gcp-l8td.6)
 
 The merge-push step's status-9 branch pours the next patrol wisp from the values merge-push.sh logged on its config line, since the step has no template to render them from. The existing_pr-blocked case asserted the pour, assign and burn order but not the vars, so a regression to an empty or unrendered pour would have passed. It now asserts target_branch, rig_name and binding_prefix on the pour.

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 2 Oct 2026 20:05:19 -0400
-Subject: [PATCH 133/134] test(gate): pin the batch lane's contract fragments
+Subject: [PATCH 133/136] test(gate): pin the batch lane's contract fragments
  in the inference gate (gcp-l8td.10)
 
 mol-refinery-patrol's contract gains merge-batch.sh and the land, stack and serial
