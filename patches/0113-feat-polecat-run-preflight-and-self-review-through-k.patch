@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 27 Sep 2026 20:27:25 -0400
-Subject: [PATCH 113/139] feat(polecat): run preflight and self-review through
+Subject: [PATCH 113/140] feat(polecat): run preflight and self-review through
  known-red (gcp-oczc)
 
 gc-cgxps finding #4: prose telling a polecat to "file a bead" does not

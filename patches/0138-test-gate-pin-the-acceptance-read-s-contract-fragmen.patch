@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Mon, 5 Oct 2026 23:35:50 -0400
-Subject: [PATCH 138/139] test(gate): pin the acceptance read's contract
+Subject: [PATCH 138/140] test(gate): pin the acceptance read's contract
  fragments (gcp-s7j4.2)
 
 The inference gate validates that mol-refinery-patrol still calls the scripts

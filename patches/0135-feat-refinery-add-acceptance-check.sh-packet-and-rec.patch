@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Mon, 5 Oct 2026 22:08:33 -0400
-Subject: [PATCH 135/139] feat(refinery): add acceptance-check.sh packet and
+Subject: [PATCH 135/140] feat(refinery): add acceptance-check.sh packet and
  record, inert (gcp-s7j4.1)
 
 The refinery merges branches whose tests silently drop or swap a named

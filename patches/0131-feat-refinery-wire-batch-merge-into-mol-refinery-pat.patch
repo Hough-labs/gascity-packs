@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 2 Oct 2026 20:05:19 -0400
-Subject: [PATCH 131/139] feat(refinery): wire batch merge into
+Subject: [PATCH 131/140] feat(refinery): wire batch merge into
  mol-refinery-patrol behind merge_batch_max=1 (gcp-l8td.10)
 
 merge-batch.sh (select, stack, land, serial; gcp-l8td.8-.11) was inert until the

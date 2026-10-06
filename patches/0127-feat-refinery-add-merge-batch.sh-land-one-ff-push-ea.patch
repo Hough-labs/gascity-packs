@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 2 Oct 2026 17:51:29 -0400
-Subject: [PATCH 127/139] feat(refinery): add merge-batch.sh land: one ff push,
+Subject: [PATCH 127/140] feat(refinery): add merge-batch.sh land: one ff push,
  each member closed on its own commit (gcp-l8td.9)
 
 D1.2 of the batch merge. land reads the manifest stack wrote and runs

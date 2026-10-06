@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 2 Oct 2026 18:32:38 -0400
-Subject: [PATCH 129/139] feat(refinery): merge-batch.sh keeps a collapsed head
+Subject: [PATCH 129/140] feat(refinery): merge-batch.sh keeps a collapsed head
  a batch of 1, land refuses 0-commit members, add serial (gcp-l8td.11)
 
 Re-grounding the wiring bead (gcp-l8td.10) found two things merge-batch.sh must
