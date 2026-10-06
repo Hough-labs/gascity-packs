@@ -136,6 +136,13 @@ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
         'land --head "$WORK"',
         'stack --head "$WORK"',
         'serial --head "$WORK"',
+        # The acceptance read (gcp-s7j4.2): the step calls acceptance-check.sh for
+        # a packet per bead and records a SKIP for a bead with nothing to read,
+        # and keeps no acceptance logic of its own. A step that stops calling it
+        # is a rig that sets acceptance_check=warn and silently gets no read.
+        "acceptance-check.sh",
+        'packet --work "$ACK_ID"',
+        'record --work "$ACK_ID" --verdict SKIP',
     ),
     "mol-witness-patrol": (
         "LIVENESS_MAP=$(jq -n",
@@ -212,6 +219,16 @@ GASTOWN_SCRIPT_CONTRACTS = {
         'gc bd update "$ss_id" --set-metadata merge_batch_serial="$ss_sha"',
         'branch_has_real_change "origin/$SB_TARGET" "$SB_ENTRY"',
         '(.commits | type == "number" and . >= 1 and . == floor)',
+    ),
+    # The acceptance read's mechanics (gcp-s7j4.1). Each fragment is the line that
+    # makes one guarantee real: the packet diffs the polecat's own work, not the
+    # drift the target gained since the fork; a record carries the tip it judged,
+    # so a later read can tell a judged branch from a moved one; and the label is
+    # what makes a hit queryable.
+    "assets/scripts/refinery/acceptance-check.sh": (
+        'pk_base=$(ac_git merge-base "$pk_target_tip" "$pk_tip" 2>/dev/null)',
+        '--set-metadata "acceptance_check_tip=$rec_tip" \\',
+        'if ! gc bd update "$rec_work" --add-label "$rec_label" >/dev/null; then',
     ),
 }
 METHODOLOGY_FLOW_CONTRACTS = {

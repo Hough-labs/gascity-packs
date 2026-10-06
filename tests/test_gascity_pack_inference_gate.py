@@ -1474,6 +1474,33 @@ def test_validate_gastown_orchestration_contract_rejects_a_pack_without_the_merg
         gascity_pack_inference_gate.validate_gastown_orchestration_contract(pack)
 
 
+def test_validate_gastown_orchestration_contract_accepts_the_fixture_pack_with_acceptance_check(tmp_path) -> None:
+    pack = write_gastown_contract_pack(tmp_path)
+
+    assert (pack / "assets" / "scripts" / "refinery" / "acceptance-check.sh").is_file()
+    gascity_pack_inference_gate.validate_gastown_orchestration_contract(pack)
+
+
+def test_validate_gastown_orchestration_contract_rejects_a_refinery_step_that_stops_calling_acceptance_check(tmp_path) -> None:
+    pack = write_gastown_contract_pack(
+        tmp_path,
+        formula_edit=lambda name, text: (
+            text.replace("acceptance-check.sh", "") if name == "mol-refinery-patrol" else text
+        ),
+    )
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="mol-refinery-patrol"):
+        gascity_pack_inference_gate.validate_gastown_orchestration_contract(pack)
+
+
+def test_validate_gastown_orchestration_contract_rejects_a_pack_without_the_acceptance_check_script(tmp_path) -> None:
+    pack = write_gastown_contract_pack(tmp_path)
+    (pack / "assets" / "scripts" / "refinery" / "acceptance-check.sh").unlink()
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="missing script file"):
+        gascity_pack_inference_gate.validate_gastown_orchestration_contract(pack)
+
+
 def test_validate_methodology_flow_contracts_accept_current_packs() -> None:
     for pack_name in gascity_pack_inference_gate.METHODOLOGY_PACKS:
         gascity_pack_inference_gate.validate_methodology_flow_contract(
@@ -1585,6 +1612,18 @@ def test_gastown_build_workflow_contract_covers_orchestration_roles() -> None:
         'gc bd update "$ss_id" --set-metadata merge_batch_serial="$ss_sha"',
         'branch_has_real_change "origin/$SB_TARGET" "$SB_ENTRY"',
         '(.commits | type == "number" and . >= 1 and . == floor)',
+    }
+    # The acceptance read (gcp-s7j4.2): the step calls the script, the script's
+    # own fragments live there.
+    for fragment in ("acceptance-check.sh", 'packet --work "$ACK_ID"', 'record --work "$ACK_ID" --verdict SKIP'):
+        assert fragment in contracts["mol-refinery-patrol"]
+    acceptance_contracts = gascity_pack_inference_gate.GASTOWN_SCRIPT_CONTRACTS[
+        "assets/scripts/refinery/acceptance-check.sh"
+    ]
+    assert set(acceptance_contracts) == {
+        'pk_base=$(ac_git merge-base "$pk_target_tip" "$pk_tip" 2>/dev/null)',
+        '--set-metadata "acceptance_check_tip=$rec_tip" \\',
+        'if ! gc bd update "$rec_work" --add-label "$rec_label" >/dev/null; then',
     }
     assert not {"branch_has_real_change", "branch_already_landed"} & set(contracts["mol-refinery-patrol"])
     assert "FAIL-SAFE: empty liveness map" in contracts["mol-witness-patrol"]
