@@ -630,8 +630,17 @@ case_packet_notes() {
         fail "the early unrelated line is in the departure section"
     section_grep 'LATEST NOTES' -q 'UNRELATED EARLY LINE' &&
         fail "the early unrelated line is in the latest-notes section"
-    assert_eq "the LATEST NOTES body is the last 2000 bytes of the notes" \
-        "$(printf '%s' "$notes" | tail -c 2000)" "$(section 'LATEST NOTES')"
+    # Byte for byte, through files: $(...) strips trailing newlines and `section`
+    # ends its last line with one, so neither could see an extra or a missing one.
+    # LATEST NOTES is the last section and the script ends it with no newline, so
+    # its body is every byte after the header line.
+    local hdr_line
+    assert_eq "the packet has one LATEST NOTES header" 1 "$(grep -c '^== LATEST NOTES' "$T/out")"
+    hdr_line=$(grep -n '^== LATEST NOTES' "$T/out" | head -n 1 | cut -d: -f1)
+    tail -n +$((hdr_line + 1)) "$T/out" >"$T/latest-notes"
+    printf '%s' "$notes" | tail -c 2000 >"$T/expected-tail"
+    cmp -s "$T/expected-tail" "$T/latest-notes" ||
+        fail "the LATEST NOTES body is not byte-equal to the last 2000 bytes of the notes: $(cmp "$T/expected-tail" "$T/latest-notes" 2>&1)"
     assert_read_only "packet"
 
     # Forty matching lines of 600 characters: the first 30, each cut to 400.
