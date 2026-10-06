@@ -482,7 +482,8 @@ problems = []
 # mol-refinery-patrol's steps at e585cda6, before this wiring.
 want_steps = [
     ("validate-identity", None), ("check-inbox", ["validate-identity"]),
-    ("find-work", ["check-inbox"]), ("rebase", ["find-work"]),
+    ("find-work", ["check-inbox"]), ("acceptance-check", ["find-work"]),
+    ("rebase", ["acceptance-check"]),
     ("run-tests", ["rebase"]), ("handle-failures", ["run-tests"]),
     ("merge-push", ["handle-failures"]), ("patrol-summary", ["merge-push"]),
     ("next-iteration", ["patrol-summary"]),

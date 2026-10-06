@@ -133,6 +133,18 @@ never batched. One batch counts as ONE iteration for `restart_after_iterations`.
 2-4 is the recommended range."""
 default = "1"
 
+[vars.acceptance_check]
+description = """
+off | warn | reject. Whether the refinery reads each bead's acceptance criteria
+against its branch before it merges, and what a miss does. off (the default) runs
+no read. warn reads every bead the iteration is about to merge (the head, and each
+batch member), records the verdict on the bead, and notes, labels and nudges every
+MISS and DECLARED, then merges as before. reject runs as warn until gcp-s7j4.4
+builds it. A placeholder left unrendered, an empty value or an unknown value means
+off. A rig opts in through `[rigs.formula_vars]`. The read costs at most one packet
+(under 30000 characters) per bead."""
+default = "off"
+
 [[steps]]
 id = "validate-identity"
 title = "Validate canonical agent identity"
@@ -519,9 +531,141 @@ When restarted, re-read formula steps — this step stays open until a work bead
 **Do not close this step until you have a work bead with branch metadata.**"""
 
 [[steps]]
+id = "acceptance-check"
+title = "Read each bead's acceptance against its branch"
+needs = ["find-work"]
+description = """
+Read each bead the iteration is about to merge (the head, and every batch member)
+against its branch: does the diff deliver the test work the bead's acceptance
+criteria name, exactly as written? The fence below resolves the pack's
+acceptance-check.sh, builds one packet per bead and says which to read; you apply
+the rubric and record the verdict on the bead. With `acceptance_check` off, the
+default, it prints one line and does nothing else. Warn mode never blocks: it does
+not edit the manifest, reject a branch or hold a merge.
+
+Run the fence in ONE shell, with `$WORK` set to the work bead find-work found.
+```bash
+# --- acceptance-check:begin ---
+ACK_MODE="{{acceptance_check}}"
+case "$ACK_MODE" in
+  off) echo "acceptance check: off" ;;
+  warn) ;;
+  reject)
+    echo "WARN: acceptance_check=reject is not built yet (gcp-s7j4.4); running as warn."
+    ACK_MODE=warn
+    ;;
+  *)
+    echo "INFO: acceptance_check='$ACK_MODE' is not off, warn or reject; check off."
+    ACK_MODE=off
+    ;;
+esac
+if [ "$ACK_MODE" = warn ]; then
+  ACK_DIR="$(git rev-parse --git-dir)/acceptance"
+  mkdir -p "$ACK_DIR" && rm -f "$ACK_DIR"/*.packet "$ACK_DIR"/*.err "$ACK_DIR/script.path"
+  ACK_CITY="${GC_CITY:-${GC_CITY_PATH:-}}"
+  if [ -n "$ACK_CITY" ]; then
+    ACK_FORMULA_JSON=$(gc formula list --city "$ACK_CITY" --json 2>/dev/null)
+  else
+    ACK_FORMULA_JSON=$(gc formula list --json 2>/dev/null)
+  fi
+  ACK_FORMULA_SRC=$(printf '%s' "$ACK_FORMULA_JSON" \\
+    | jq -r '.formulas[]? | select(.name == "mol-refinery-patrol") | .source // empty' 2>/dev/null \\
+    | head -1)
+  ACK=""
+  if [ -n "$ACK_FORMULA_SRC" ]; then
+    ACK="$(dirname "$(dirname "$ACK_FORMULA_SRC")")/assets/scripts/refinery/acceptance-check.sh"
+  fi
+  if [ ! -x "$ACK" ] && [ -n "${GC_PACK_DIR:-}" ]; then
+    ACK="$GC_PACK_DIR/assets/scripts/refinery/acceptance-check.sh"
+  fi
+  if [ ! -x "$ACK" ]; then
+    echo "WARN: acceptance-check.sh not runnable (resolved '$ACK'); acceptance check skipped this iteration."
+  else
+    printf '%s\\n' "$ACK" >"$ACK_DIR/script.path"
+    git fetch --prune origin
+    ACK_IDS="$WORK"
+    ACK_MANIFEST="$(git rev-parse --git-dir)/refinery-batch.json"
+    if [ -f "$ACK_MANIFEST" ]; then
+      ACK_MEMBERS=$(jq -r '.members | if type == "array" then .[].id else empty end' "$ACK_MANIFEST" 2>/dev/null)
+      [ -n "$ACK_MEMBERS" ] && ACK_IDS="$ACK_MEMBERS"
+    fi
+    for ACK_ID in $ACK_IDS; do
+      ACK_OUT=$("$ACK" packet --work "$ACK_ID" 2>"$ACK_DIR/$ACK_ID.err")
+      ACK_RC=$?
+      if [ "$ACK_RC" -eq 0 ]; then
+        printf '%s\\n' "$ACK_OUT" >"$ACK_DIR/$ACK_ID.packet"
+        echo "READ $ACK_DIR/$ACK_ID.packet ($(wc -c <"$ACK_DIR/$ACK_ID.packet" | tr -d ' ') chars)"
+      elif [ "$ACK_RC" -eq 3 ]; then
+        printf '%s\\n' "$ACK_OUT"
+        ACK_CODE=$(printf '%s\\n' "$ACK_OUT" | awk '{print $4}')
+        ACK_TIP=$(printf '%s\\n' "$ACK_OUT" | sed -n 's/.* tip=//p')
+        case "$ACK_CODE" in
+          no-ac | no-change) "$ACK" record --work "$ACK_ID" --verdict SKIP --tip "$ACK_TIP" </dev/null ;;
+          already-judged) ;;
+          *) echo "WARN: acceptance check for $ACK_ID: $ACK_CODE; not checked." ;;
+        esac
+      else
+        echo "WARN: acceptance check for $ACK_ID: packet exit $ACK_RC; not checked (see $ACK_DIR/$ACK_ID.err)."
+      fi
+    done
+  fi
+fi
+# --- acceptance-check:end ---
+```
+
+For each `READ` line, in the order printed: read that packet in full (`cat` it, one packet per command), apply
+the rubric below, then record your verdict with ONE command, the per-item lines as a quoted heredoc:
+```bash
+"$(cat "$(git rev-parse --git-dir)/acceptance/script.path")" record --work <id> --verdict <CONFORMS|DECLARED|MISS> --tip <the tip= value on the packet's PACKET line> <<'ACK_ITEMS'
+<one line per AC item, in the rubric's output format>
+ACK_ITEMS
+```
+Warn mode never blocks. Whatever the verdicts, close this step and proceed to rebase. A `record` that exits 1 or 2
+is a WARN: name it in patrol-summary and proceed. With no `READ` line, close this step.
+
+```
+Acceptance read. For each packet, decide whether the branch delivers every acceptance item
+that names test work, exactly as written.
+
+For each AC item:
+- SKIP an item that is only a command to run (exits 0, typecheck, lint), a red->green
+  citation, a seat's post-merge check, or product code with no test named. The gate covers
+  commands.
+- For an item that names test work, find the added or changed test that does it and compare
+  it LITERALLY with the AC: every named file; the named case; its SETUP (which call is failed
+  or held: first vs second; which input value: 0 vs 47; what order); and its ASSERTION (what
+  is asserted, at which moment).
+
+Per-item verdicts:
+- OK: the diff has it as written.
+- MISSING: a named test, file or case is absent from the diff. A file the AC names only as
+  one that must keep passing or stay unchanged ("existing X still passes") is NOT missing
+  when it is absent. NOT-IN-DIFF in the packet is evidence, not a verdict: read the AC
+  sentence that names the file.
+- SUBSTITUTED: a test exists but its setup or assertion differs from what the AC names, even
+  when it plausibly catches the same bug.
+- DECLARED: MISSING or SUBSTITUTED, but the polecat's notes say so explicitly before handoff:
+  they name the AC item, say what was done instead, and say why. A note that only describes
+  what was done, without saying it departs from the AC, is NOT a declaration. A note claiming
+  "all AC written / literal" is a claim to check, never evidence.
+
+Bead verdict: MISS if any item is MISSING or SUBSTITUTED; else DECLARED if any item is
+DECLARED; else CONFORMS. When unsure whether an item departs, read more of the diff before
+deciding; do not guess MISS.
+
+You may read more of the branch with `git diff <base> <tip> -- <path>` or
+`git show <tip>:<path>`, using the base and tip on the packet's first line. Before you record
+MISS for an item, read the bead's full notes (`gc bd show <id> --json | jq -r '.[0].notes'`)
+for a declaration of that item.
+
+Your per-item lines are record's stdin, one per AC item:
+AC<n> <OK|MISSING|SUBSTITUTED|DECLARED|SKIP> — <the AC phrase> | <evidence: file:line, or "absent">
+```"""
+
+[[steps]]
 id = "rebase"
 title = "Rebase branch on target"
-needs = ["find-work"]
+needs = ["acceptance-check"]
 description = """
 **Config: target_branch = {{target_branch}}**
 
@@ -1449,6 +1593,7 @@ Include:
 - Batch (if any): the landed and left-open ids from the RESULT line, or the
   members stamped serial on a red
 - Test results (pass/fail, which checks ran)
+- Acceptance check: each member's verdict (CONFORMS, DECLARED, MISS or SKIP), and any WARN or record exit 1 or 2
 - Bugs filed (IDs, if any pre-existing failures were tracked)
 - Rejections (if the branch was rejected back to pool)
 - Any escalations sent
