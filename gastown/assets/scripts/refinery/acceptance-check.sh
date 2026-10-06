@@ -1,0 +1,574 @@
+#!/usr/bin/env bash
+# acceptance-check.sh — the mechanics of the refinery's acceptance read
+# (gcp-s7j4.1; the design is gcp-s7j4, section 3).
+#
+# A branch can pass every gate and still drop or swap an acceptance item that
+# names test work, because no gate reads the acceptance criteria. The refinery
+# closes that gap by READING the criteria against the branch's own test hunks.
+# That read is the refinery's judgment. This checked-in script does only the
+# mechanics around it, so the agent never hand-builds a packet or hand-writes a
+# record: `packet` assembles what the reader reads, and `record` writes down the
+# verdict the reader reached. It is a sibling of merge-push.sh and merge-batch.sh
+# and sources merge-push.sh in source-only mode for resolve_config, so the target
+# default, the binding prefix and the rig resolve exactly as the lane resolves
+# them. Nothing of merge-push.sh is copied here.
+#
+# No formula step calls this script yet. It is inert until gcp-s7j4.2.
+#
+# Usage:
+#   acceptance-check.sh packet --work <id> [--cap-chars <N>] [config flags]
+#   acceptance-check.sh record --work <id> --verdict <CONFORMS|DECLARED|MISS|SKIP>
+#                              --tip <sha> [--mode warn] [config flags]
+# Config flags are merge-push.sh's (--rig, --target-default, --binding-prefix,
+# --require-approval, --review-agent, --delete-merged-branches, --gh). Run inside
+# the refinery's clone, after the caller ran `git fetch --prune origin` once: the
+# script reads origin/<branch> and origin/<target> as it finds them and fetches
+# nothing.
+#
+# Every bead read is `gc bd show <id> --json`, the transport merge-push.sh and
+# merge-batch.sh use. The script never calls the beads binary directly.
+#
+# packet  Read-only: it never writes a bead. The diff is the polecat's own, from
+#         the merge-base of origin/<target> and origin/<branch> to the branch tip,
+#         never origin/<target> to the tip, which would count target-only commits.
+#         The target is metadata.target, else the resolved target default.
+#         Exit 3 prints one line and nothing else:
+#           acceptance-check: SKIP <id> <code> tip=<sha|none>
+#         with the first code that holds, checked in this order:
+#           no-branch       metadata.branch is empty, or origin/<branch> or
+#                           origin/<target> does not resolve (tip=none)
+#           no-ac           the acceptance criteria are empty
+#           no-change       the branch adds nothing past the merge-base
+#           already-judged  metadata.acceptance_check_tip equals the tip
+#         Otherwise exit 0 and print, in order: the PACKET line, then the sections
+#         ACCEPTANCE, NAMED TEST FILES, CHANGED FILES, TEST HUNKS, NOTE LINES THAT
+#         MAY DECLARE A DEPARTURE and LATEST NOTES. NAMED TEST FILES is evidence,
+#         never a verdict: a named path matches a changed path when they are equal
+#         or the changed path ends with "/<named>". When a name matches several
+#         changed paths, all of them are listed. One test-path pattern
+#         (ac_is_test_path) picks both the test paths that count as named and the
+#         changed paths whose hunks are shown, so the two cannot drift. TEST HUNKS
+#         is cut at a line boundary at --cap-chars (default 18000) and then lists
+#         every remaining diff --git and @@ line. The departure lines come from ALL
+#         of the notes, not from a tail window. packet prints no verdict.
+#         Exit 1 is a usage, config or read error: nothing is printed on stdout.
+#
+# record  Writes the verdict the reader reached, reading the reader's per-item
+#         lines on stdin (DECLARED and MISS only; CONFORMS and SKIP never read
+#         stdin). It records whatever verdict it is handed. Writes, in this order,
+#         each one only after the one before it succeeded:
+#           1. metadata acceptance_check, acceptance_check_tip and
+#              acceptance_check_mode, in one `gc bd update`
+#           2. DECLARED and MISS: one note through `gc bd note <id> --stdin`
+#           3. DECLARED and MISS: the label acceptance-declared or acceptance-miss
+#           4. DECLARED and MISS: one nudge, at most 200 characters, to the first
+#              target that delivers: metadata.slung_by, then the parent bead's
+#              assignee, then mayor. A target that is empty or equal to $GC_AGENT
+#              is skipped, and a target is never tried twice. The outcome goes to
+#              metadata acceptance_check_nudge ("delivered: <target>" or
+#              "failed: <targets tried>"), which is a fifth write.
+#         It writes nothing else: no status, no assignee, nothing about rework or
+#         pool routing, and it never closes a bead. --mode accepts only warn.
+#         Every record exit prints, last on stdout,
+#           acceptance-check: RESULT <status> <id> <verdict> nudge=<target|none|failed>
+#         and a usage error prints exactly "RESULT 1 - - nudge=none". Exit 0 is
+#         recorded, 1 is a usage or config error with nothing written, and 2 is a
+#         bead write that failed: the writes after it are skipped, and the RESULT
+#         line names what was recorded. A nudge that fails is not a write failure.
+#
+# Warnings go to stderr.
+#
+# This script sets none of bash's exit-on-error, unset-variable or pipeline-status
+# options, for the reason merge-push.sh gives: it was written for, and
+# characterized under, a plain bash shell, and every command that matters is
+# checked on its own exit status.
+
+AC_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+AC_DEFAULT_CAP=18000
+AC_NOTES_TAIL=2000
+AC_DEPARTURE_MAX=30
+AC_DEPARTURE_CUT=400
+AC_DEPARTURE_PATTERN='deviat|depart|did not follow|not follow|instead of|substitut|cannot (be )?(write|written|meet|met)|could not (write|meet)|not met|void per|declare|literal'
+AC_NOTE_MAX_LINES=40
+AC_NOTE_MAX_CHARS=4000
+AC_MESSAGE_MAX=200
+
+# Read by merge-push.sh, not here, and deliberately not exported: a child that
+# ran merge-push.sh would otherwise stop before main.
+# shellcheck disable=SC2034
+MERGE_PUSH_SOURCE_ONLY=1
+# shellcheck source=/dev/null
+. "$AC_DIR/merge-push.sh" || {
+  echo "acceptance-check: cannot source merge-push.sh from $AC_DIR" >&2
+  exit 1
+}
+
+ac_usage() {
+  echo "usage: acceptance-check.sh packet --work <id> [--cap-chars <N>] [config flags]"
+  echo "       acceptance-check.sh record --work <id> --verdict <CONFORMS|DECLARED|MISS|SKIP> --tip <sha> [--mode warn] [config flags]"
+}
+
+ac_warn() {
+  echo "acceptance-check: WARN $*" >&2
+}
+
+# ac_git <args...> — git at the work tree's top, with literal pathspecs. The
+# paths `git diff --name-only` prints are relative to the top, and a changed
+# path with a glob character in it must select only itself.
+ac_git() {
+  git -C "$AC_TOP" --literal-pathspecs "$@"
+}
+
+# ac_is_test_path <path> — the ONE test-path pattern, on the file's own name.
+ac_is_test_path() {
+  case "${1##*/}" in
+    ?*_test.go | ?*.test.js | ?*.test.jsx | ?*.test.ts | ?*.test.tsx) return 0 ;;
+    ?*.spec.js | ?*.spec.jsx | ?*.spec.ts | ?*.spec.tsx) return 0 ;;
+    ?*.bats | ?*_test.py | test_?*.py | ?*_test.sh | test_?*.sh) return 0 ;;
+  esac
+  return 1
+}
+
+# ac_load_bead <id> — read the bead into AC_JSON. Returns 1 when it cannot be read.
+ac_load_bead() {
+  # An id that reads as a flag is not an id: the parent id comes from a bead.
+  case "$1" in
+    '' | -*) return 1 ;;
+  esac
+  AC_JSON=$(gc bd show "$1" --json 2>/dev/null) || return 1
+  printf '%s' "$AC_JSON" | jq -e '.[0].id // empty' >/dev/null 2>&1 || return 1
+  return 0
+}
+
+ac_meta() {
+  printf '%s' "$AC_JSON" | jq -r --arg k "$1" '(.[0].metadata[$k] // "") | tostring'
+}
+
+# ac_target — metadata.target, else the resolved default. An empty target counts
+# as absent.
+ac_target() {
+  printf '%s' "$AC_JSON" | jq -r --arg d "$CFG_TARGET_DEFAULT" \
+    '(.[0].metadata.target // "") | if . == "" then $d else . end'
+}
+
+# ac_named_paths <text> — the distinct test paths a text names, sorted by path.
+# A path is a run of path characters; trailing punctuation that ends a sentence
+# is not part of it.
+ac_named_paths() {
+  printf '%s\n' "$1" | grep -oE '[A-Za-z0-9_./@+-]+' | while IFS= read -r np_tok; do
+    np_tok="${np_tok#./}"
+    while :; do
+      case "$np_tok" in
+        *[./+-]) np_tok="${np_tok%?}" ;;
+        *) break ;;
+      esac
+    done
+    [ -n "$np_tok" ] || continue
+    ac_is_test_path "$np_tok" && printf '%s\n' "$np_tok"
+  done | LC_ALL=C sort -u
+}
+
+# --- packet -----------------------------------------------------------------
+
+# ac_print_hunks <cap> — the diff on stdin, whole lines up to <cap> characters
+# (newlines included), then a cut line and every remaining header. awk counts
+# bytes under LC_ALL=C, so the cap is the same wherever the script runs.
+ac_print_hunks() {
+  LC_ALL=C awk -v cap="$1" '
+    BEGIN { used = 0; cut = 0; printed = 0; rest = 0; headers = 0 }
+    {
+      if (!cut) {
+        len = length($0) + 1
+        if (used + len > cap) {
+          cut = 1
+        } else {
+          used += len
+          printed++
+          print
+          next
+        }
+      }
+      rest++
+      if ($0 ~ /^diff --git / || $0 ~ /^@@/) header[++headers] = $0
+    }
+    END {
+      if (cut) {
+        printf "[cut: %d more lines; headers follow]\n", rest
+        for (i = 1; i <= headers; i++) print header[i]
+      }
+    }'
+}
+
+# ac_departure_lines — up to AC_DEPARTURE_MAX lines of the WHOLE notes field that
+# may declare a departure, each as "<line number>:<line cut to 400 characters>".
+ac_departure_lines() {
+  printf '%s' "$AC_JSON" | jq -j '.[0].notes // ""' |
+    grep -inE "$AC_DEPARTURE_PATTERN" | head -n "$AC_DEPARTURE_MAX" |
+    while IFS= read -r dl_line; do
+      dl_text="${dl_line#*:}"
+      printf '%s:%s\n' "${dl_line%%:*}" "${dl_text:0:$AC_DEPARTURE_CUT}"
+    done
+}
+
+cmd_packet() {
+  pk_work=""
+  pk_cap="$AC_DEFAULT_CAP"
+  pk_pass=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --work | --cap-chars)
+        if [ "$#" -lt 2 ]; then
+          echo "acceptance-check: $1 needs a value." >&2
+          ac_usage >&2
+          return 1
+        fi
+        if [ "$1" = --work ]; then pk_work="$2"; else pk_cap="$2"; fi
+        shift 2
+        ;;
+      *)
+        pk_pass+=("$1")
+        shift
+        ;;
+    esac
+  done
+  if [ -z "$pk_work" ]; then
+    echo "acceptance-check: --work <id> is required." >&2
+    ac_usage >&2
+    return 1
+  fi
+  case "$pk_cap" in
+    '' | *[!0-9]*)
+      echo "acceptance-check: --cap-chars needs a positive integer, got '$pk_cap'." >&2
+      ac_usage >&2
+      return 1
+      ;;
+  esac
+  pk_cap=$((10#$pk_cap))
+  if [ "$pk_cap" -lt 1 ]; then
+    echo "acceptance-check: --cap-chars needs a positive integer, got '$pk_cap'." >&2
+    ac_usage >&2
+    return 1
+  fi
+  # resolve_config reports on stdout; packet's stdout is the packet alone.
+  resolve_config --work "$pk_work" ${pk_pass[@]+"${pk_pass[@]}"} >&2 || return 1
+  if ! AC_TOP=$(git rev-parse --show-toplevel 2>/dev/null); then
+    echo "acceptance-check: not inside a git work tree." >&2
+    return 1
+  fi
+  if ! ac_load_bead "$pk_work"; then
+    ac_warn "cannot read bead $pk_work"
+    return 1
+  fi
+
+  pk_branch=$(ac_meta branch)
+  pk_target=$(ac_target)
+  pk_tip=""
+  pk_base=""
+  if [ -n "$pk_branch" ] && [ -n "$pk_target" ]; then
+    pk_tip=$(ac_git rev-parse --verify -q "refs/remotes/origin/$pk_branch^{commit}" 2>/dev/null)
+    pk_target_tip=$(ac_git rev-parse --verify -q "refs/remotes/origin/$pk_target^{commit}" 2>/dev/null)
+    if [ -n "$pk_tip" ] && [ -n "$pk_target_tip" ]; then
+      pk_base=$(ac_git merge-base "$pk_target_tip" "$pk_tip" 2>/dev/null)
+    fi
+  fi
+  if [ -z "$pk_base" ]; then
+    echo "acceptance-check: SKIP $pk_work no-branch tip=none"
+    return 3
+  fi
+
+  pk_ac=$(printf '%s' "$AC_JSON" | jq -r '.[0].acceptance_criteria // ""')
+  if [ -z "${pk_ac//[[:space:]]/}" ]; then
+    echo "acceptance-check: SKIP $pk_work no-ac tip=$pk_tip"
+    return 3
+  fi
+  ac_git diff --quiet --no-ext-diff "$pk_base" "$pk_tip"
+  pk_diff_rc=$?
+  if [ "$pk_diff_rc" -eq 0 ]; then
+    echo "acceptance-check: SKIP $pk_work no-change tip=$pk_tip"
+    return 3
+  fi
+  if [ "$pk_diff_rc" -ne 1 ]; then
+    ac_warn "git diff $pk_base $pk_tip failed (status $pk_diff_rc)"
+    return 1
+  fi
+  if [ "$(ac_meta acceptance_check_tip)" = "$pk_tip" ]; then
+    echo "acceptance-check: SKIP $pk_work already-judged tip=$pk_tip"
+    return 3
+  fi
+
+  pk_commits=$(ac_git rev-list --count "$pk_base..$pk_tip" 2>/dev/null)
+  pk_changed=()
+  pk_test_paths=()
+  while IFS= read -r -d '' pk_path; do
+    pk_changed+=("$pk_path")
+    ac_is_test_path "$pk_path" && pk_test_paths+=("$pk_path")
+  done < <(ac_git diff --no-renames --no-ext-diff --name-only -z "$pk_base" "$pk_tip")
+
+  echo "acceptance-check: PACKET $pk_work branch=$pk_branch target=$pk_target base=$pk_base tip=$pk_tip commits=${pk_commits:-0}"
+
+  echo "== ACCEPTANCE (verbatim) =="
+  printf '%s\n' "$pk_ac"
+
+  echo "== NAMED TEST FILES (evidence, not a verdict) =="
+  while IFS= read -r pk_named; do
+    [ -n "$pk_named" ] || continue
+    pk_hits=""
+    for pk_path in ${pk_changed[@]+"${pk_changed[@]}"}; do
+      case "$pk_path" in
+        "$pk_named" | */"$pk_named") pk_hits="${pk_hits:+$pk_hits, }$pk_path" ;;
+      esac
+    done
+    if [ -n "$pk_hits" ]; then
+      echo "IN-DIFF $pk_named ($pk_hits)"
+    else
+      echo "NOT-IN-DIFF $pk_named"
+    fi
+  done < <(ac_named_paths "$pk_ac")
+
+  echo "== CHANGED FILES =="
+  ac_git diff --no-renames --no-ext-diff --no-color --stat=120 "$pk_base" "$pk_tip" | tail -n 40
+
+  echo "== TEST HUNKS =="
+  if [ "${#pk_test_paths[@]}" -gt 0 ]; then
+    ac_git diff --no-renames --no-ext-diff --no-color -U3 "$pk_base" "$pk_tip" -- "${pk_test_paths[@]}" |
+      ac_print_hunks "$pk_cap"
+  fi
+
+  echo "== NOTE LINES THAT MAY DECLARE A DEPARTURE (all notes; claims, not evidence) =="
+  ac_departure_lines
+
+  echo "== LATEST NOTES (last $AC_NOTES_TAIL chars; claims, not evidence) =="
+  printf '%s' "$AC_JSON" | jq -j '.[0].notes // ""' | tail -c "$AC_NOTES_TAIL"
+  return 0
+}
+
+# --- record -----------------------------------------------------------------
+
+# ac_nudge_ids <verdict> <items> — the AC ids a nudge names, comma-joined: the
+# first field (AC<n>) of every item line whose second field is MISSING or
+# SUBSTITUTED (MISS) or DECLARED (DECLARED).
+ac_nudge_ids() {
+  ni_ids=""
+  while IFS= read -r ni_line || [ -n "$ni_line" ]; do
+    read -r ni_id ni_state _ <<<"$ni_line"
+    [[ $ni_id =~ ^AC[0-9]+$ ]] || continue
+    case "$1:$ni_state" in
+      MISS:MISSING | MISS:SUBSTITUTED | DECLARED:DECLARED) ni_ids="${ni_ids:+$ni_ids,}$ni_id" ;;
+    esac
+  done <<<"$2"
+  printf '%s' "$ni_ids"
+}
+
+# ac_nudge_message <id> <verdict> <items> — at most AC_MESSAGE_MAX characters.
+# The id list is what gets cut, whole ids at a time; the note pointer stays.
+ac_nudge_message() {
+  nm_head="ACCEPTANCE $2: $1 "
+  nm_tail=" - note on $1 (refinery, warn: merging)"
+  nm_budget=$((AC_MESSAGE_MAX - ${#nm_head} - ${#nm_tail}))
+  nm_list=""
+  IFS=, read -r -a nm_all <<<"$(ac_nudge_ids "$2" "$3")"
+  for nm_id in ${nm_all[@]+"${nm_all[@]}"}; do
+    nm_next="${nm_list:+$nm_list,}$nm_id"
+    [ "${#nm_next}" -le "$nm_budget" ] || break
+    nm_list="$nm_next"
+  done
+  [ -n "$nm_list" ] || nm_list="see note"
+  printf '%s%s%s' "$nm_head" "$nm_list" "$nm_tail"
+}
+
+# ac_try_nudge <target> — send the pending message. Returns 1 when the target is
+# skipped (empty, this agent, already tried, or one that reads as a flag, since
+# slung_by and the parent's assignee are bead data) or the nudge does not deliver.
+ac_try_nudge() {
+  case "$1" in
+    '' | -* | "${GC_AGENT:-}") return 1 ;;
+  esac
+  case " $AC_TRIED " in
+    *" $1 "*) return 1 ;;
+  esac
+  AC_TRIED="${AC_TRIED:+$AC_TRIED }$1"
+  if at_out=$(gc session nudge "$1" "$AC_MESSAGE" 2>&1); then
+    AC_DELIVERED="$1"
+    return 0
+  fi
+  ac_warn "nudge to $1 failed: $at_out"
+  return 1
+}
+
+# ac_notify <id> <verdict> <items> — walk the notify chain. Sets AC_DELIVERED to
+# the target that delivered, or leaves it empty, and AC_TRIED to the targets tried.
+ac_notify() {
+  AC_MESSAGE=$(ac_nudge_message "$1" "$2" "$3")
+  AC_TRIED=""
+  AC_DELIVERED=""
+  nf_slung=""
+  nf_parent=""
+  if ac_load_bead "$1"; then
+    nf_slung=$(ac_meta slung_by)
+    nf_parent=$(printf '%s' "$AC_JSON" |
+      jq -r '(.[0].parent // "") | if type == "object" then (.id // "") else tostring end')
+  else
+    ac_warn "cannot read bead $1 for its notify targets; falling back to mayor"
+  fi
+  ac_try_nudge "$nf_slung" && return 0
+  if [ -n "$nf_parent" ]; then
+    if ac_load_bead "$nf_parent"; then
+      ac_try_nudge "$(printf '%s' "$AC_JSON" | jq -r '.[0].assignee // ""')" && return 0
+    else
+      ac_warn "cannot read parent bead $nf_parent for its assignee"
+    fi
+  fi
+  ac_try_nudge mayor && return 0
+  return 1
+}
+
+# ac_note_text <verdict> <mode> <tip> <items> — the note: a header, the item lines
+# (at most AC_NOTE_MAX_LINES, and the whole note at most AC_NOTE_MAX_CHARS), and
+# for MISS the warn-mode reminder.
+ac_note_text() {
+  nt_header="[acceptance-check $2 $(date -u +%Y-%m-%dT%H:%MZ) ${GC_AGENT:-unknown}] $1 at ${3:0:8}"
+  nt_trailer=""
+  if [ "$1" = MISS ]; then
+    nt_trailer='Merged anyway (warn mode). Seat: confirm with a SONNET-MISS note and a gap bead, or note "acceptance-check FP: <why>".'
+  fi
+  nt_used=$((${#nt_header} + 1))
+  [ -z "$nt_trailer" ] || nt_used=$((nt_used + ${#nt_trailer} + 1))
+  nt_count=0
+  nt_body=""
+  while IFS= read -r nt_line || [ -n "$nt_line" ]; do
+    [ -n "$nt_line" ] || continue
+    [ "$nt_count" -lt "$AC_NOTE_MAX_LINES" ] || break
+    [ $((nt_used + ${#nt_line} + 1)) -le "$AC_NOTE_MAX_CHARS" ] || break
+    nt_body="$nt_body$nt_line"$'\n'
+    nt_used=$((nt_used + ${#nt_line} + 1))
+    nt_count=$((nt_count + 1))
+  done <<<"$4"
+  printf '%s\n%s' "$nt_header" "$nt_body"
+  [ -z "$nt_trailer" ] || printf '%s\n' "$nt_trailer"
+}
+
+rec_run() {
+  rec_work=""
+  rec_verdict=""
+  rec_tip=""
+  rec_mode=warn
+  rec_pass=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --work | --verdict | --tip | --mode)
+        if [ "$#" -lt 2 ]; then
+          echo "acceptance-check: $1 needs a value." >&2
+          ac_usage >&2
+          return 1
+        fi
+        case "$1" in
+          --work) rec_work="$2" ;;
+          --verdict) rec_verdict="$2" ;;
+          --tip) rec_tip="$2" ;;
+          --mode) rec_mode="$2" ;;
+        esac
+        shift 2
+        ;;
+      *)
+        rec_pass+=("$1")
+        shift
+        ;;
+    esac
+  done
+  if [ -z "$rec_work" ]; then
+    echo "acceptance-check: --work <id> is required." >&2
+    ac_usage >&2
+    return 1
+  fi
+  case "$rec_verdict" in
+    CONFORMS | DECLARED | MISS | SKIP) ;;
+    *)
+      echo "acceptance-check: --verdict must be CONFORMS, DECLARED, MISS or SKIP, got '$rec_verdict'." >&2
+      ac_usage >&2
+      return 1
+      ;;
+  esac
+  if [ -z "$rec_tip" ]; then
+    echo "acceptance-check: --tip <sha> is required." >&2
+    ac_usage >&2
+    return 1
+  fi
+  if [ "$rec_mode" != warn ]; then
+    echo "acceptance-check: --mode accepts only warn in this version, got '$rec_mode'." >&2
+    ac_usage >&2
+    return 1
+  fi
+  # resolve_config reports on stdout; the RESULT line must be the last of it.
+  if ! resolve_config --work "$rec_work" ${rec_pass[@]+"${rec_pass[@]}"} >&2; then
+    ac_usage >&2
+    return 1
+  fi
+
+  AC_R_ID="$rec_work"
+  AC_R_VERDICT="$rec_verdict"
+  rec_items=""
+  case "$rec_verdict" in
+    DECLARED | MISS) [ -t 0 ] || rec_items=$(cat) ;;
+  esac
+
+  if ! gc bd update "$rec_work" \
+    --set-metadata "acceptance_check=$rec_verdict" \
+    --set-metadata "acceptance_check_tip=$rec_tip" \
+    --set-metadata "acceptance_check_mode=$rec_mode" >/dev/null; then
+    ac_warn "the metadata write for $rec_work failed; nothing was written"
+    return 2
+  fi
+  case "$rec_verdict" in
+    DECLARED | MISS) ;;
+    *) return 0 ;;
+  esac
+
+  if ! ac_note_text "$rec_verdict" "$rec_mode" "$rec_tip" "$rec_items" |
+    gc bd note "$rec_work" --stdin >/dev/null; then
+    ac_warn "the note write for $rec_work failed; the metadata is written, the label and the nudge are not"
+    return 2
+  fi
+  if [ "$rec_verdict" = MISS ]; then rec_label=acceptance-miss; else rec_label=acceptance-declared; fi
+  if ! gc bd update "$rec_work" --add-label "$rec_label" >/dev/null; then
+    ac_warn "the label write for $rec_work failed; the metadata and the note are written, the nudge is not"
+    return 2
+  fi
+
+  if ac_notify "$rec_work" "$rec_verdict" "$rec_items"; then
+    AC_R_NUDGE="$AC_DELIVERED"
+    rec_outcome="delivered: $AC_DELIVERED"
+  else
+    AC_R_NUDGE=failed
+    rec_outcome="failed: ${AC_TRIED:-none}"
+  fi
+  if ! gc bd update "$rec_work" --set-metadata "acceptance_check_nudge=$rec_outcome" >/dev/null; then
+    ac_warn "the nudge outcome ('$rec_outcome') could not be written to $rec_work"
+    return 2
+  fi
+  return 0
+}
+
+cmd_record() {
+  AC_R_ID=-
+  AC_R_VERDICT=-
+  AC_R_NUDGE=none
+  rec_run "$@"
+  cr_rc=$?
+  echo "acceptance-check: RESULT $cr_rc $AC_R_ID $AC_R_VERDICT nudge=$AC_R_NUDGE"
+  return "$cr_rc"
+}
+
+main_ac() {
+  case "${1:-}" in
+    packet) shift; cmd_packet "$@" ;;
+    record) shift; cmd_record "$@" ;;
+    *)
+      ac_usage >&2
+      return 1
+      ;;
+  esac
+}
+
+main_ac "$@"
+exit $?
