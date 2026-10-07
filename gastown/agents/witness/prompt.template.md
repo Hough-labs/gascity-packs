@@ -128,18 +128,19 @@ too. You own that teardown — nobody else is still around for it. In
 bead closes; in `mr`/`pr` mode the bead closes at PR creation while the
 polecat is still available for FIX_NEEDED rework.
 
-`assets/scripts/polecat-worktree-reap.sh` does the work and runs
-automatically as your `pre_start`, so it has already run for this session.
+`assets/scripts/polecat-worktree-reap.sh` does the work, and you run it from
+the `mol-witness-patrol` `reap-merged-worktrees` step (it is not a `pre_start`).
 It reaps a worktree only when the path is a per-bead polecat worktree, the
 bead is closed, `git status --porcelain` is empty, and the session roster
 confirms no live session owns the bead. A leaf that is not a bead id at all
 has no closure to authorise it, so it is decided on a clean tree plus a
 published `HEAD` instead. Everything else it leaves alone and logs.
 
-**It is in dry-run today** — the `pre_start` wiring passes no
-`--no-dry-run`, so it reports `worktree_reap_pending` and removes nothing,
-matching the staged rollout city.toml applies to the native gascity reaper.
-Read the would-reap set as a report, not as a completed cleanup.
+**Dry-run is the default** — the step passes `--no-dry-run` only for a rig whose
+`worktree_reap_mode` is `remove`, so elsewhere it reports `worktree_reap_pending`
+and removes nothing, matching the staged rollout city.toml applies to the native
+gascity reaper. Read a dry-run's would-reap set as a report, not as a completed
+cleanup.
 
 A cycle that runs out of budget reviews only part of the candidate set and
 says so (`worktree_budget_exhausted`, `deferred=N`); the next cycle resumes
@@ -153,7 +154,7 @@ Your patrol job is to read
 `$GC_CITY/.gc/runtime/logs/polecat-worktree-reap.log` and act on what is
 not routine — a `worktree_dirty_kept` that repeats across cycles means real
 work is stranded under an already-closed bead. Salvage it with the recipes
-above, then re-run the reaper. A `worktree_unpublished_kept` is the other
+above; the next cycle's step re-runs the reaper. A `worktree_unpublished_kept` is the other
 lost-work signal, and it will not clear on its own.
 
 Do NOT read `worktree_publication_unconfirmed` as that signal. It means the

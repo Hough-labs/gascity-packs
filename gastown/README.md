@@ -103,6 +103,35 @@ becomes the start of review instead of the terminal handoff, and a refused
 merge parks the bead (`merge_approval_state=awaiting_review`) for the next
 patrol iteration rather than closing or escalating it.
 
+## Worktree Reap
+
+`mol-witness-patrol`'s `reap-merged-worktrees` step removes the per-bead polecat
+worktree of every closed bead, through `assets/scripts/polecat-worktree-reap.sh`.
+It is a patrol step and not a witness `pre_start`: gascity SIGKILLs a `pre_start`
+at `[session] setup_timeout`, which capped the sweep at 8s and, under load, left
+it one bead read and nothing else. A patrol cycle has no start deadline, so the
+sweep's budget is a policy choice. The agent config wires no reaper, and a test
+fails if it gains one, because two reapers over one worktree set is worse than
+the problem this fixed.
+
+Both knobs are per rig, in `[rigs.formula_vars]`:
+
+```toml
+[rigs.formula_vars]
+worktree_reap_mode = "remove"    # default "dry-run"
+worktree_reap_budget = "120"     # default 120 seconds, capped at 540
+```
+
+`dry-run` logs every would-be reap as `worktree_reap_pending` and removes
+nothing. Only the exact word `remove` passes `--no-dry-run`; an empty, unknown or
+unrendered value means `dry-run`, so arming is always an operator's explicit,
+per-rig decision and never something a pack bump can do. The reap log and its
+events are described in the `reap-merged-worktrees` step.
+
+The step finds the script the way `audit-polecat-homes` finds its sweep, from the
+formula's own source path, with `GC_PACK_DIR` as the fallback only. A script that
+cannot be resolved is a loud `FINDING` and a non-zero exit, never a silent pass.
+
 ## Role prompts point at formulas
 
 `agents/*/prompt.template.md` is injected into an agent's context at spawn and

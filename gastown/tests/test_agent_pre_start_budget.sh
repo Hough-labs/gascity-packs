@@ -51,14 +51,15 @@ fail() {
 #       (GC_WORKTREE_SETUP_BUDGET_SECONDS) and are abandoned, not retried, when
 #       it expires — a worktree one fetch behind is fixed next cycle.
 #   gastown/agents/witness
-#       polecat-worktree-reap.sh. One bulk bead read plus per-worktree git
-#       status, held to 8s (GC_REAP_BUDGET_SECONDS); deferred candidates are
-#       reaped on the next patrol.
+#       None. polecat-worktree-reap.sh used to be here, held to 8s
+#       (GC_REAP_BUDGET_SECONDS), and under load that was one bead read and
+#       nothing else. It is the reap-merged-worktrees step of mol-witness-patrol
+#       now (gcp-d9uj); test_witness_reaps_from_the_patrol_not_a_pre_start below
+#       keeps it there.
 EXPECTED_PRE_STARTS=$(
     cat <<'INVENTORY'
 gastown/agents/polecat/agent.toml	{{.ConfigDir}}/assets/scripts/worktree-setup.sh {{.RigRoot}} {{.WorkDir}} {{.AgentBase}} --sync
 gastown/agents/refinery/agent.toml	{{.ConfigDir}}/assets/scripts/worktree-setup.sh {{.RigRoot}} {{.WorkDir}} {{.AgentBase}} --sync
-gastown/agents/witness/agent.toml	{{.ConfigDir}}/assets/scripts/polecat-worktree-reap.sh {{.RigRoot}} --rig {{.Rig}}
 INVENTORY
 )
 
@@ -156,7 +157,6 @@ assert_bounded() {
 
 test_inventoried_scripts_enforce_their_budget() {
     assert_bounded worktree-setup.sh GC_WORKTREE_SETUP_BUDGET_SECONDS
-    assert_bounded polecat-worktree-reap.sh GC_REAP_BUDGET_SECONDS
 }
 
 # The deacon is the agent gcp-oo0v killed. Naming it directly means a revert of
@@ -169,7 +169,26 @@ test_deacon_carries_no_pre_start() {
         fail "deacon must not wire a pre_start: its push-state sweep measured 18.6s against a ${SETUP_TIMEOUT_SECONDS}s setup_timeout and cost the town its patrols for ~5h (gcp-oo0v). The sweep belongs in mol-deacon-patrol."
 }
 
+# The witness is the agent gcp-ntbf killed, and the reaper's 8s pre_start budget
+# is what gcp-d9uj measured as the reason 63% of cycles never finished a scan.
+# Naming the witness directly means a revert fails with that in the message, and
+# the second assertion keeps the reaper from being wired in BOTH places, which
+# would run two reapers over one worktree set.
+test_witness_reaps_from_the_patrol_not_a_pre_start() {
+    local witness="$ROOT/gastown/agents/witness/agent.toml"
+    local formula="$ROOT/gastown/formulas/mol-witness-patrol.toml"
+
+    [[ -f "$witness" ]] || fail "missing witness agent config"
+    ! grep -E '^[[:space:]]*pre_start[[:space:]]*=' "$witness" >/dev/null ||
+        fail "witness must not wire a pre_start: the worktree reaper belongs in mol-witness-patrol's reap-merged-worktrees step, where it has a patrol-scale budget instead of an 8s SIGKILL cliff (gcp-d9uj, gcp-ntbf)"
+    ! grep -F 'polecat-worktree-reap' "$witness" >/dev/null ||
+        fail "witness agent.toml names the reaper again; exactly one reaper may run per cycle (gcp-d9uj)"
+    grep -F 'assets/scripts/polecat-worktree-reap.sh' "$formula" >/dev/null ||
+        fail "mol-witness-patrol no longer invokes the worktree reaper, and nothing else does (gcp-d9uj)"
+}
+
 test_every_pre_start_is_inventoried
+test_witness_reaps_from_the_patrol_not_a_pre_start
 test_inventoried_scripts_enforce_their_budget
 test_deacon_carries_no_pre_start
 

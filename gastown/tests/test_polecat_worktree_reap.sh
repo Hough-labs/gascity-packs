@@ -565,9 +565,13 @@ JSON
     grep -F '"dry_run":true' "$logdir/polecat-worktree-reap.log" >/dev/null ||
         fail "the default run did not record itself as a dry run"
 
-    # And the wiring the witness actually ships must not carry the opt-in.
-    ! grep -E '^pre_start = .*--no-dry-run' "$ROOT/gastown/agents/witness/agent.toml" >/dev/null ||
-        fail "witness pre_start enables live removal; the rollout must stay staged"
+    # And the wiring the witness actually ships must not carry the opt-in: the
+    # agent config wires no reaper at all (gcp-d9uj), and the patrol's mode var
+    # defaults to dry-run, so arming is a per-rig [rigs.formula_vars] decision.
+    ! grep -v '^[[:space:]]*#' "$ROOT/gastown/agents/witness/agent.toml" | grep -F -e '--no-dry-run' >/dev/null ||
+        fail "witness agent.toml wires live removal; the rollout must stay staged"
+    grep -F 'default = "dry-run"' "$ROOT/gastown/formulas/mol-witness-patrol.toml" >/dev/null ||
+        fail "mol-witness-patrol's worktree_reap_mode must default to dry-run; the rollout must stay staged"
 
     rm -rf "$tmp"
 }
@@ -2131,15 +2135,16 @@ test_a_removal_does_not_start_without_budget_to_finish_it() {
 }
 
 test_the_promotion_criterion_says_what_a_dry_run_cannot_show() {
-    # Ask 4. The staged-rollout criterion at agents/witness/agent.toml:20-25 was
-    # written as sufficient: "review the logged would-reap set across several
+    # Ask 4. The staged-rollout criterion (it lived in agents/witness/agent.toml
+    # until gcp-d9uj moved the reaper into the patrol; it is now the
+    # reap-merged-worktrees step of mol-witness-patrol) was written as sufficient: "review the logged would-reap set across several
     # cycles and confirm no live worktree ever appears in it". winnow's witness
     # satisfied it honestly and still lost 40 worktrees, because the criterion
     # tests WHICH WORKTREES ARE SELECTED and a dry run never calls `git worktree
     # remove` at all — the removal path is outside everything the soak can
     # observe. The next operator must not arm on the same incomplete evidence.
     local toml
-    toml="$ROOT/gastown/agents/witness/agent.toml"
+    toml="$ROOT/gastown/formulas/mol-witness-patrol.toml"
 
     grep -qi 'necessary' "$toml" && grep -qi 'not sufficient' "$toml" ||
         fail "the promotion criterion does not say the soak is necessary and NOT sufficient"
@@ -2148,11 +2153,16 @@ test_the_promotion_criterion_says_what_a_dry_run_cannot_show() {
     grep -q 'gascity-3z7d' "$toml" ||
         fail "the promotion criterion does not name the killed-pre_start precondition (gascity-3z7d)"
 
-    # And the flag itself must still not be wired. Every mention has to be prose.
+    # And the flag itself must still not be wired by default. The agent config
+    # must not carry it outside a comment at all. The patrol's one non-prose
+    # mention is the fence arm a rig's explicit `remove` selects, which
+    # test_gastown_pack_assets.sh pins to exactly one line.
     local wired
-    wired=$(grep -n -- '--no-dry-run' "$toml" | grep -v '^[0-9]*:#' || true)
+    wired=$(grep -n -- '--no-dry-run' "$ROOT/gastown/agents/witness/agent.toml" | grep -v '^[0-9]*:#' || true)
     [[ -z "$wired" ]] ||
         fail "--no-dry-run appears outside the prose: ${wired//$'\n'/ | }"
+    grep -qF 'REAP_ARGS+=(--no-dry-run)' "$toml" ||
+        fail "the patrol no longer has a way to arm the reaper; arming must stay a per-rig decision, not a pack edit"
 }
 
 test_the_pinned_read_serves_both_bead_reads_and_gc_bd_is_not_called() {

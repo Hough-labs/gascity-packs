@@ -342,12 +342,16 @@ test_post_merge_worktree_teardown_has_an_owner() {
     [[ -x "$reaper" ]] || fail "worktree reaper must be executable"
     parse_toml "$witness_cfg" "$patrol" "$polecat"
 
-    # The reaper needs a wiring that actually fires. A formula step cannot name
-    # it (pack assets install into a content-hashed cache), so pre_start with
-    # the config-dir template is the only stable handle.
-    grep -F 'pre_start = ["{{.ConfigDir}}/assets/scripts/polecat-worktree-reap.sh {{.RigRoot}} --rig {{.Rig}}"]' \
-        "$witness_cfg" >/dev/null ||
-        fail "witness must run the worktree reaper from pre_start with rig root and rig name"
+    # The reaper needs a wiring that actually fires, and that is the patrol step
+    # (gcp-d9uj), not a pre_start: pre_start is SIGKILLed at setup_timeout, so it
+    # capped the sweep at 8s. A formula step CAN name a pack asset by resolving it
+    # from the formula's own source path (GC_PACK_DIR is only the fallback; see
+    # gcp-amo). Exactly one reaper may run per cycle, so the agent config must
+    # carry none.
+    ! grep -E '^[[:space:]]*pre_start[[:space:]]*=' "$witness_cfg" >/dev/null ||
+        fail "witness must not wire the worktree reaper (or anything) as a pre_start; it runs from mol-witness-patrol"
+    grep -F 'assets/scripts/polecat-worktree-reap.sh' "$patrol" >/dev/null ||
+        fail "mol-witness-patrol must invoke the worktree reaper from its reap-merged-worktrees step"
 
     # Ownership must be stated where each role reads it, or teardown drifts
     # back to nobody.
@@ -420,6 +424,19 @@ PY
         fail "reaper must make real removal opt-in behind --no-dry-run"
     ! grep -E '^pre_start = .*--no-dry-run' "$witness_cfg" >/dev/null ||
         fail "witness pre_start must not enable live removal while the rollout is staged"
+    python3 - "$patrol" <<'PY' || fail "the patrol must default the reaper to dry-run and pass --no-dry-run only for an explicit worktree_reap_mode=remove"
+import sys
+import tomllib
+
+doc = tomllib.load(open(sys.argv[1], "rb"))
+if doc["vars"]["worktree_reap_mode"]["default"] != "dry-run":
+    raise SystemExit("worktree_reap_mode must default to dry-run")
+step = next(s for s in doc["steps"] if s["id"] == "reap-merged-worktrees")
+fence = step["description"].split("# --- worktree-reap:begin ---", 1)[1].split("# --- worktree-reap:end ---", 1)[0]
+wired = [line.strip() for line in fence.splitlines() if "--no-dry-run" in line]
+if wired != ["remove) REAP_ARGS+=(--no-dry-run) ;;"]:
+    raise SystemExit(f"--no-dry-run must appear exactly once, under the remove arm: {wired}")
+PY
 
     # The reaper cleans up around the canonical checkout; it must never write
     # into it.

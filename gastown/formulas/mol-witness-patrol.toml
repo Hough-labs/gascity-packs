@@ -82,6 +82,28 @@ default = ""
 description = "Seconds to sleep before re-checking. Replaces former event-watch loop which hot-spun on cache-reconcile firehose."
 default = "60"
 
+[vars.worktree_reap_mode]
+description = """
+dry-run | remove. Whether the `reap-merged-worktrees` step actually removes the
+per-bead worktrees of closed beads. dry-run (the default) logs every would-be
+reap as `worktree_reap_pending` and removes nothing; remove passes `--no-dry-run`
+to polecat-worktree-reap.sh. A placeholder left unrendered, an empty value or an
+unknown value means dry-run: nothing but the exact word `remove` arms the reaper.
+A rig opts in through `[rigs.formula_vars]`, so arming stays an operator decision
+made rig by rig."""
+default = "dry-run"
+
+[vars.worktree_reap_budget]
+description = """
+Wall-clock seconds the `reap-merged-worktrees` step lets one sweep spend
+(polecat-worktree-reap.sh --budget). A patrol step has no start deadline, so this
+is a policy choice, not the survival constraint the 8s `pre_start` budget was; 120
+is the size that has produced complete passes on gascity and gauntlet. A
+placeholder left unrendered, an empty value, zero or a non-integer means 120, and
+anything above 540 is held to 540 so the sweep stays inside a shell tool's
+10-minute cap."""
+default = "120"
+
 [[steps]]
 id = "check-inbox"
 title = "Context check, then mail"
@@ -515,7 +537,7 @@ the next wisp and burns this one."""
 
 [[steps]]
 id = "reap-merged-worktrees"
-title = "Review post-merge worktree teardown"
+title = "Reap post-merge worktrees"
 needs = ["recover-orphaned-beads"]
 description = """
 The previous step cleans up worktrees on the CRASH path. This step covers
@@ -536,26 +558,109 @@ per completed bead.
 
 The witness is the one agent that patrols after both have gone.
 
-**You do not run the reaper by hand.** `assets/scripts/polecat-worktree-reap.sh`
-is wired as the witness `pre_start` in `agents/witness/agent.toml`, so it
-has already run for this session:
+**Step 1: Run the sweep.** `assets/scripts/polecat-worktree-reap.sh` is this
+step's job, not a `pre_start`'s (gcp-d9uj). It used to be the witness
+`pre_start`, where gascity bounds it by `[session] setup_timeout` and SIGKILLs an
+overrun, so it had to hold itself to an 8s budget; under load that was one bead
+read and nothing else ("8s budget spent after 1 of 35 candidate(s)"). A patrol
+cycle has no start deadline, so the same sweep runs here with a budget that is a
+policy choice (`worktree_reap_budget`, default 120s) and no cliff behind it.
+`agents/witness/agent.toml` carries no reaper any more. Exactly one reaper runs
+per cycle, and this is it.
 
+Pack assets install into a content-hashed cache directory, so no path to the
+script can be written down here. Resolve it from this formula's OWN resolved
+source path instead, the way `audit-polecat-homes` resolves its sweep: it ships
+beside this formula in the same pack tree, making that the one candidate
+guaranteed present whenever the formula is and version-coherent with it.
+`gc formula list --json` reports that path for every formula gc can see,
+SHA-pinned packs included. (This step used to say the agent config's
+config-dir template was the only handle on the script. A formula step can
+resolve it; three of them already do.)
+
+The sweep runs for up to `worktree_reap_budget` seconds, so give the shell a
+timeout above it (600000 ms covers the 540s cap) rather than the tool default.
+Run the fence in ONE shell:
+
+```bash
+# --- worktree-reap:begin ---
+REAP_MODE="{{worktree_reap_mode}}"
+REAP_BUDGET="{{worktree_reap_budget}}"
+REAP_ARGS=()
+case "$REAP_MODE" in
+  dry-run) ;;
+  remove) REAP_ARGS+=(--no-dry-run) ;;
+  *)
+    echo "INFO: worktree_reap_mode='$REAP_MODE' is not dry-run or remove; dry-run."
+    REAP_MODE=dry-run
+    ;;
+esac
+case "$REAP_BUDGET" in
+  '' | *[!0-9]* | 0)
+    echo "INFO: worktree_reap_budget='$REAP_BUDGET' is not a positive whole number of seconds; 120."
+    REAP_BUDGET=120
+    ;;
+esac
+if [ "$REAP_BUDGET" -gt 540 ]; then
+  echo "INFO: worktree_reap_budget=$REAP_BUDGET is above 540; 540."
+  REAP_BUDGET=540
+fi
+REAP_CITY="${GC_CITY:-${GC_CITY_PATH:-}}"
+if [ -n "$REAP_CITY" ]; then
+  REAP_FORMULA_JSON=$(gc formula list --city "$REAP_CITY" --json 2>/dev/null)
+else
+  REAP_FORMULA_JSON=$(gc formula list --json 2>/dev/null)
+fi
+REAP_FORMULA_SRC=$(printf '%s' "$REAP_FORMULA_JSON" \\
+  | jq -r '.formulas[]? | select(.name == "mol-witness-patrol") | .source // empty' 2>/dev/null \\
+  | head -1)
+REAP=""
+if [ -n "$REAP_FORMULA_SRC" ]; then
+  # <pack>/formulas/mol-witness-patrol.toml -> <pack>/assets/scripts/<sweep>
+  REAP="$(dirname "$(dirname "$REAP_FORMULA_SRC")")/assets/scripts/polecat-worktree-reap.sh"
+fi
+# GC_PACK_DIR is exported only when gc invokes a pack command, so it is a
+# fallback and never the primary: depending on it alone is what made the
+# refinery's approval gate permanently unresolvable (gcp-amo).
+if [ ! -x "$REAP" ] && [ -n "${GC_PACK_DIR:-}" ]; then
+  REAP="$GC_PACK_DIR/assets/scripts/polecat-worktree-reap.sh"
+fi
+REAP_RC=0
+if [ -z "${GC_RIG_ROOT:-}" ] || [ -z "${GC_RIG:-}" ]; then
+  # Sweeping a guessed tree is worse than not sweeping: the script would fall
+  # back to whatever git toplevel this shell happens to be in.
+  echo "FINDING polecat-worktree-reap: GC_RIG_ROOT='${GC_RIG_ROOT:-}' GC_RIG='${GC_RIG:-}' do not name a rig; closed-bead worktrees are UNREAPED this cycle — report it"
+  REAP_RC=2
+elif [ ! -x "$REAP" ]; then
+  # A sweep that cannot be resolved is itself the finding. Nothing else on
+  # this rig removes the worktree of a closed bead, so say it loudly rather
+  # than logging a silent OK: that silence is the failure this step exists to
+  # break.
+  echo "FINDING polecat-worktree-reap: sweep not runnable (resolved '$REAP'); closed-bead worktrees are UNREAPED this cycle — report it"
+  REAP_RC=127
+else
+  echo "polecat-worktree-reap: mode=$REAP_MODE budget=${REAP_BUDGET}s"
+  "$REAP" "$GC_RIG_ROOT" --rig "$GC_RIG" --budget "$REAP_BUDGET" "${REAP_ARGS[@]}"
+  REAP_RC=$?
+  [ "$REAP_RC" -eq 0 ] ||
+    echo "FINDING polecat-worktree-reap: exited $REAP_RC; read the output above — report it"
+fi
+[ "$REAP_RC" -eq 0 ]
+# --- worktree-reap:end ---
 ```
-<pack-config-dir>/assets/scripts/polecat-worktree-reap.sh <rig-root> --rig <rig>
-```
 
-It lives in `pre_start` rather than in a command here because pack assets
-are installed into a content-hashed cache directory that a formula step
-cannot name; the agent config's config-dir template is the only stable
-handle on the script. Your job in this step is to read what it decided and
-act on anything that is not routine. Re-run it by hand only when clearing
-an incident.
+A non-zero exit from the fence is a FINDING, not a reason to stop the patrol:
+mail the mayor with the line it printed, then continue to `audit-polecat-homes`.
 
-**STAGED ROLLOUT — it is in dry-run today.** Real removal is opt-in
-(`--no-dry-run`) and the `pre_start` above does not pass it, so every
-would-be reap logs as `worktree_reap_pending` and nothing is removed. Do
-NOT flip it from a patrol; the flip is an operator decision. Treat the log
-as a report, not as a completed cleanup.
+**STAGED ROLLOUT — dry-run is the default, and arming is per rig.** Real
+removal is opt-in: the fence passes `--no-dry-run` only when
+`worktree_reap_mode` is exactly `remove`, and the pack default is `dry-run`, so
+every would-be reap logs as `worktree_reap_pending` and nothing is removed. A
+rig opts in through `[rigs.formula_vars]` (`worktree_reap_mode = "remove"`).
+Do NOT change that from a patrol; the flip is an operator decision. Where a
+rig is in `dry-run`, treat the log as a report, not as a completed cleanup.
+
+**Step 2: Read what it decided.**
 
 **THE PROMOTION CRITERION — coverage, not a count of clean cycles
 (gcp-schs).** The flip is evidenced by a REVIEWED SET, so it is only sound
@@ -579,7 +684,7 @@ completion is a separate question the log cannot answer.
 So the criterion is stated on coverage AND on the two preconditions the
 soak structurally cannot cover:
 
-> Append `--no-dry-run` to the `pre_start` in `agents/witness/agent.toml`
+> Set `worktree_reap_mode = "remove"` for the rig under `[rigs.formula_vars]`
 > once ALL of the following hold:
 >
 > 1. the log carries at least one **`worktree_scan_complete`** cycle
@@ -589,7 +694,9 @@ soak structurally cannot cover:
 > 2. `gcp-mves` has landed, so a removal interrupted by the SIGKILL leaves
 >    a marked, resumable state instead of an unenumerable orphan;
 > 3. `gascity-3z7d` is resolved, so `pre_start`s are not being killed in
->    the first place.
+>    the first place. (The sweep no longer runs as a `pre_start`, so a kill
+>    cannot land inside it; the precondition is kept because the criterion was
+>    written on it and lifting it is the operator's call, not a patrol's.)
 >
 > Any one of the three alone is the evidence winnow armed on.
 
@@ -727,20 +834,21 @@ jq -r 'select(.reason != "") | [.ts, .event, .reason, .budget_remaining, .bead] 
 | `worktree_residue_no_bead_kept` | A residue directory with NO bead (`reason: residue_no_bead_unverifiable`). Gate 5 carries the no-such-bead path and needs a `git rev-parse HEAD` this directory cannot answer, so no evidence exists either way. Nothing was removed | A real finding that will not resolve on its own — inspect by hand, like `worktree_unpublished_kept`. The content is there; git's view of it is not. Mail the mayor if you cannot tell what it was |
 | `worktree_list_failed` | `git worktree list` ran and did not answer, so no candidate was enumerated. `reason`: `worktree_list_timed_out` or `worktree_list_failed` | Timed out → budget first. Failed → the rig checkout itself is unhealthy; inspect `$RIG_ROOT` by hand |
 | `worktree_bead_query_failed` | The one bulk bead read ran and did not answer. `reason`: `bead_query_timed_out` (slower than the seconds the run had left — the detail names them) or `bead_query_failed` (non-zero exit). The detail also names the TRANSPORT it used: `bd pinned to <rig root>` (the cheap read) or `gc bd --rig <rig>` (the wrapper) | Nothing was examined this cycle. **`bead_query_timed_out` on a small remaining budget is the reaper's clock, not the store** — compare the detail's "Ns left of the Ms budget" before suspecting the endpoint. **A timeout with most of the budget unspent is NOT automatically the endpoint either** — a single wrapped call has been measured at 5.4s on this city, which is most of an 8s budget on its own (gcp-uzq0). Before suspecting the store, time the transport the detail names against the rig's own endpoint: if the pinned read answers fast and only the wrapper is slow, the store is healthy and the cost is gc's. Chasing Dolt on this line has produced two wrong diagnoses already |
-| `worktree_budget_exhausted` | The run hit its own wall-clock budget and stopped at the top of the loop. The detail carries examined/skipped/deferred counts, the window this cycle covered, and where the next resumes | Routine on a rig with many candidates; the rest are deferred to the next cycle. **Not evidence for the `--no-dry-run` flip** — this cycle reviewed a window, not the set. Persistent + a growing candidate count means the store is too slow for the budget — raise `[session] setup_timeout` AND `GC_REAP_BUDGET_SECONDS` together, or investigate the endpoint |
+| `worktree_budget_exhausted` | The run hit its own wall-clock budget and stopped at the top of the loop. The detail carries examined/skipped/deferred counts, the window this cycle covered, and where the next resumes | Routine on a rig with many candidates; the rest are deferred to the next cycle. **Not evidence for the `--no-dry-run` flip** — this cycle reviewed a window, not the set. Persistent + a growing candidate count means the store is too slow for the budget — raise `worktree_reap_budget` in the rig's `[rigs.formula_vars]` (a patrol step has no start deadline, so nothing else moves with it), or investigate the endpoint |
 
 A `worktree_dirty_kept` that repeats across cycles means real work is
 stranded on disk under a bead that is already closed. Mail the mayor —
 that is a lost-work signal, not routine housekeeping.
 
-**Why it may stop early.** The reaper is the witness `pre_start`, so gascity
-bounds it by `[session] setup_timeout` (10s by default) and SIGKILLs an
-overrun — which fails the session start outright and, after six failures in an
-hour, latches the supervisor circuit breaker OPEN so the witness is never
-respawned (`gcp-ntbf`: winnow lost its witness for 26h that way). So the script
-holds itself to a budget inside that limit and exits cleanly when it expires.
-Partial cleanup is by design: the work is idempotent, the next cycle resumes
-it, and a witness that starts is worth more than a rig reaped in one pass.
+**Why it may stop early.** The sweep holds itself to `worktree_reap_budget`
+seconds and exits cleanly when it expires, reporting what it examined. That is
+now a policy limit, not a survival one: as the witness `pre_start` it was
+SIGKILLed at `[session] setup_timeout`, which failed the session start outright
+and, after six failures in an hour, latched the supervisor circuit breaker OPEN
+(`gcp-ntbf`: winnow lost its witness for 26h that way), so it could only ever
+afford 8s. Partial cleanup is still by design: the work is idempotent and the
+next cycle resumes it, and the enumeration rotates so a truncated cycle is a
+moving window rather than a fixed tail.
 
 **Exit criteria:** Reaper log reviewed and any non-routine event acted on.
 Continue to `audit-polecat-homes` — do NOT exit the wisp here. The
@@ -789,8 +897,9 @@ empty and be misread as "nothing owns it".
 by `[session] setup_timeout` (10s) and SIGKILLed on overrun, which fails
 the whole session start; six of those in an hour latch the supervisor
 circuit breaker and the rig loses its witness (gcp-ntbf, and gcp-oo0v on
-the deacon). The witness already spends most of that budget on the reaper.
-A periodic sweep belongs in a patrol cycle. Do not move it.
+the deacon). A periodic sweep belongs in a patrol cycle, which is also where
+the per-bead reaper now runs (`reap-merged-worktrees`, gcp-d9uj). Do not move
+either back.
 
 **Step 1: Run the sweep.**
 

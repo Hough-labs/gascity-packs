@@ -106,9 +106,13 @@
 #   candidates it looks at first and what the log lets a reader conclude.
 #
 # THE INTERRUPTED REMOVAL — why the reap renames before it deletes (gcp-mves):
-#   This script runs as a pre_start, and a pre_start is SIGKILLed at [session]
-#   setup_timeout. That kill cannot be caught, deferred, or bounded from inside
-#   the script: run_bounded bounds the CHILDREN, never the process itself.
+#   This script ran as a pre_start when this was written, and a pre_start is
+#   SIGKILLed at [session] setup_timeout. That kill cannot be caught, deferred, or
+#   bounded from inside the script: run_bounded bounds the CHILDREN, never the
+#   process itself. It now runs from mol-witness-patrol (see WHERE IT RUNS below),
+#   which removes that deadline, but the design stays: the residue earlier kills
+#   left is still on disk, and any caller that kills the run (a shell tool's own
+#   timeout, an operator's ^C) lands in the same window.
 #
 #   `git worktree remove` is not atomic. It drops the worktree's `.git` file and
 #   git's admin entry FIRST, then unlinks the tree. A kill in that window leaves
@@ -196,9 +200,23 @@
 #   not performed, nothing renamed and nothing removed — and held inside the
 #   next cycle's window rather than rotated past.
 #
+# WHERE IT RUNS — the reap-merged-worktrees step of mol-witness-patrol (gcp-d9uj):
+#   The formula step resolves this script from its own source path
+#   (`gc formula list --json`, GC_PACK_DIR as the fallback only), passes
+#   `--rig`, `--budget <worktree_reap_budget>` and, only for a rig that sets
+#   `worktree_reap_mode = "remove"`, `--no-dry-run`. agents/witness/agent.toml
+#   wires no reaper: it was a pre_start, and that placement is what capped the
+#   budget at 8s. A patrol cycle has no start deadline, so the budget is a policy
+#   choice there (default 120s) instead of a survival constraint. Exactly one
+#   reaper may run per cycle; gastown/tests/test_agent_pre_start_budget.sh fails
+#   if the witness gains a pre_start again.
+#
+#   The 8s default below stays for a caller that passes nothing (an operator's
+#   one-off run, a future pre_start): the safe default is the small one.
+#
 # COST MODEL — why this script is shaped the way it is (gcp-ntbf):
-#   It runs as the witness pre_start, which gascity bounds by [session]
-#   setup_timeout (10s by default) and SIGKILLs on overrun. A killed pre_start
+#   As the witness pre_start it was bounded by [session]
+#   setup_timeout (10s by default) and SIGKILLed on overrun. A killed pre_start
 #   fails the whole session start, and after six such failures in an hour the
 #   supervisor's circuit breaker latches OPEN and stops respawning entirely —
 #   winnow's witness was dead for 26h that way, with no health monitor on the
@@ -225,12 +243,12 @@
 #       idempotent and the next cycle resumes it.
 #
 # Staged rollout: REAL REMOVAL IS OPT-IN. The script dry-runs unless it is
-# given --no-dry-run, and the witness pre_start wiring deliberately does not
-# pass it. The city holds the native gascity reaper to the same staged rollout
+# given --no-dry-run, and the patrol step passes it only for a rig that sets
+# worktree_reap_mode = "remove" (default dry-run). The city holds the native gascity reaper to the same staged rollout
 # (city.toml, auto_reap_closed_bead_worktrees_dry_run) until gc-zxxy is
 # answered; a second reaper must not go live while the first is held inert.
-# Flip it by adding --no-dry-run to the pre_start in agents/witness/agent.toml
-# once the log carries a `worktree_scan_complete` cycle (deferred=0 — the
+# Flip it by setting worktree_reap_mode = "remove" in that rig's
+# [rigs.formula_vars] once the log carries a `worktree_scan_complete` cycle (deferred=0 — the
 # reviewed set really was the whole candidate set) and no live worktree appeared
 # in the would-reap set of that cycle or the ones since. A count of clean
 # cycles is NOT the criterion; see THE BIASED CUTOFF below.
@@ -267,8 +285,9 @@
 # Env / args:
 #   $1 | GC_RIG_ROOT   rig repo root (default: `git rev-parse --show-toplevel`)
 #   --rig <name>       rig name — scopes `gc bd`. Defaults to $GC_RIG. Needed
-#                      because pre_start runs before the session environment
-#                      exists, so $GC_RIG cannot be assumed there.
+#                      because a pre_start runs before the session environment
+#                      exists, so $GC_RIG cannot be assumed there. The patrol
+#                      step passes it explicitly too.
 #   LOG_DIR            where to write the log. Defaults to the city runtime log
 #                      directory; NEVER defaults inside the rig repo, which
 #                      would litter the canonical checkout with untracked files.
