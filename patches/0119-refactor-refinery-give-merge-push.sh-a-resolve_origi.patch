@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 2 Oct 2026 15:31:53 -0400
-Subject: [PATCH 119/140] refactor(refinery): give merge-push.sh a
+Subject: [PATCH 119/141] refactor(refinery): give merge-push.sh a
  resolve_origin_repo function (gcp-l8td.6)
 
 The origin-repository resolution was inline in main(), so nothing could call

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 2 Oct 2026 18:32:38 -0400
-Subject: [PATCH 130/140] test(refinery): prove the collapsed head, land's
+Subject: [PATCH 130/141] test(refinery): prove the collapsed head, land's
  0-commit guard and merge-batch.sh serial (gcp-l8td.11)
 
 Adds case_stack_collapsed_head, case_serial_stamps, case_serial_stamp_failure
