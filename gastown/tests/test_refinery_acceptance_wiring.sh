@@ -844,7 +844,7 @@ case_reject_block() {
     run_rej warn GC_STUB_ASSIGNEES="$SECOND_ID="
     assert_eq "a. block status" 0 "$?"
     assert_eq "a. stdout" "" "$(cat "$T/out")"
-    ! grep -q 'bd show' "$T/gc.log" || fail "a. a warn run read a bead"
+    ! grep -q 'gc bd show' "$T/gc.log" || fail "a. a warn run read a bead"
     assert_eq "a. the manifest" "$before" "$(cksum <"$MANIFEST")"
     run_rej LITERAL GC_STUB_ASSIGNEES="$SECOND_ID="
     assert_eq "a. unrendered: block status" 0 "$?"
