@@ -18,7 +18,7 @@
 # Usage:
 #   acceptance-check.sh packet --work <id> [--cap-chars <N>] [config flags]
 #   acceptance-check.sh record --work <id> --verdict <CONFORMS|DECLARED|MISS|SKIP>
-#                              --tip <sha> [--mode warn] [config flags]
+#                              --tip <sha> [--mode <warn|reject>] [config flags]
 # Config flags are merge-push.sh's (--rig, --target-default, --binding-prefix,
 # --require-approval, --review-agent, --delete-merged-branches, --gh). Run inside
 # the refinery's clone, after the caller ran `git fetch --prune origin` once: the
@@ -39,7 +39,13 @@
 #                           origin/<target> does not resolve (tip=none)
 #           no-ac           the acceptance criteria are empty
 #           no-change       the branch adds nothing past the merge-base
-#           already-judged  metadata.acceptance_check_tip equals the tip
+#           already-judged  metadata.acceptance_check_tip equals the tip, unless
+#                           metadata.acceptance_check is MISS and
+#                           metadata.acceptance_check_mode is reject: that bead
+#                           went back to the polecat pool, and a bead that comes
+#                           back at the same tip is read again, so a declaration
+#                           added since is seen and an unchanged branch cannot
+#                           ride through unread
 #         Otherwise exit 0 and print, in order: the PACKET line, then the sections
 #         ACCEPTANCE, NAMED TEST FILES, CHANGED FILES, TEST HUNKS, NOTE LINES THAT
 #         MAY DECLARE A DEPARTURE and LATEST NOTES. NAMED TEST FILES is evidence,
@@ -67,14 +73,29 @@
 #              is skipped, and a target is never tried twice. The outcome goes to
 #              metadata acceptance_check_nudge ("delivered: <target>" or
 #              "failed: <targets tried>"), which is a fifth write.
-#         It writes nothing else: no status, no assignee, nothing about rework or
-#         pool routing, and it never closes a bead. --mode accepts only warn.
+#         In reject mode a MISS goes on to return the bead to the polecat pool, as
+#         the patrol's rebase step does for a conflict, in this order, each one only
+#         after the one before it succeeded:
+#           5. gc workflow delete-source <id> --apply
+#           6. gc workflow reopen-source <id>
+#           7. one `gc bd update`: status open, no assignee, metadata
+#              rejection_reason ("acceptance: <ids> - see note", <ids> being the AC
+#              ids marked MISSING or SUBSTITUTED, or "acceptance: see note" with
+#              none) and gc.routed_to (the rig's polecat pool)
+#         Nothing else routes: DECLARED, CONFORMS and SKIP write what they write in
+#         warn mode, plus acceptance_check_mode=reject, and make no workflow call and
+#         no status or assignee write. record never closes a bead and never touches a
+#         molecule. --mode is warn (the default) or reject; anything else is a usage
+#         error.
 #         Every record exit prints, last on stdout,
 #           acceptance-check: RESULT <status> <id> <verdict> nudge=<target|none|failed>
 #         and a usage error prints exactly "RESULT 1 - - nudge=none". Exit 0 is
 #         recorded, 1 is a usage or config error with nothing written, and 2 is a
 #         bead write that failed: the writes after it are skipped, and the RESULT
 #         line names what was recorded. A nudge that fails is not a write failure.
+#
+# A failure at 5, 6 or 7 is a failed write: the writes after it are skipped, the
+# bead stays assigned to the refinery, and record exits 2.
 #
 # Warnings go to stderr.
 #
@@ -106,7 +127,7 @@ MERGE_PUSH_SOURCE_ONLY=1
 
 ac_usage() {
   echo "usage: acceptance-check.sh packet --work <id> [--cap-chars <N>] [config flags]"
-  echo "       acceptance-check.sh record --work <id> --verdict <CONFORMS|DECLARED|MISS|SKIP> --tip <sha> [--mode warn] [config flags]"
+  echo "       acceptance-check.sh record --work <id> --verdict <CONFORMS|DECLARED|MISS|SKIP> --tip <sha> [--mode <warn|reject>] [config flags]"
 }
 
 ac_warn() {
@@ -292,7 +313,8 @@ cmd_packet() {
     ac_warn "git diff $pk_base $pk_tip failed (status $pk_diff_rc)"
     return 1
   fi
-  if [ "$(ac_meta acceptance_check_tip)" = "$pk_tip" ]; then
+  if [ "$(ac_meta acceptance_check_tip)" = "$pk_tip" ] &&
+    ! { [ "$(ac_meta acceptance_check)" = MISS ] && [ "$(ac_meta acceptance_check_mode)" = reject ]; }; then
     echo "acceptance-check: SKIP $pk_work already-judged tip=$pk_tip"
     return 3
   fi
@@ -360,11 +382,18 @@ ac_nudge_ids() {
   printf '%s' "$ni_ids"
 }
 
-# ac_nudge_message <id> <verdict> <items> — at most AC_MESSAGE_MAX characters.
-# The id list is what gets cut, whole ids at a time; the note pointer stays.
+# ac_nudge_message <id> <verdict> <items> <mode> — at most AC_MESSAGE_MAX
+# characters. The id list is what gets cut, whole ids at a time; the note pointer
+# stays. The pointer says what the refinery does next: merge (warn), send the bead
+# back to the pool (reject + MISS) or merge anyway (reject + DECLARED).
 ac_nudge_message() {
   nm_head="ACCEPTANCE $2: $1 "
-  nm_tail=" - note on $1 (refinery, warn: merging)"
+  case "$4:$2" in
+    reject:MISS) nm_fate="reject: back to pool" ;;
+    reject:*) nm_fate="reject: merging" ;;
+    *) nm_fate="warn: merging" ;;
+  esac
+  nm_tail=" - note on $1 (refinery, $nm_fate)"
   nm_budget=$((AC_MESSAGE_MAX - ${#nm_head} - ${#nm_tail}))
   nm_list=""
   IFS=, read -r -a nm_all <<<"$(ac_nudge_ids "$2" "$3")"
@@ -396,10 +425,10 @@ ac_try_nudge() {
   return 1
 }
 
-# ac_notify <id> <verdict> <items> — walk the notify chain. Sets AC_DELIVERED to
-# the target that delivered, or leaves it empty, and AC_TRIED to the targets tried.
+# ac_notify <id> <verdict> <items> <mode> — walk the notify chain. Sets AC_DELIVERED
+# to the target that delivered, or leaves it empty, and AC_TRIED to the targets tried.
 ac_notify() {
-  AC_MESSAGE=$(ac_nudge_message "$1" "$2" "$3")
+  AC_MESSAGE=$(ac_nudge_message "$1" "$2" "$3" "$4")
   AC_TRIED=""
   AC_DELIVERED=""
   nf_slung=""
@@ -425,12 +454,16 @@ ac_notify() {
 
 # ac_note_text <verdict> <mode> <tip> <items> — the note: a header, the item lines
 # (at most AC_NOTE_MAX_LINES, and the whole note at most AC_NOTE_MAX_CHARS), and
-# for MISS the warn-mode reminder.
+# for MISS the reminder for the mode.
 ac_note_text() {
   nt_header="[acceptance-check $2 $(date -u +%Y-%m-%dT%H:%MZ) ${GC_AGENT:-unknown}] $1 at ${3:0:8}"
   nt_trailer=""
   if [ "$1" = MISS ]; then
-    nt_trailer='Merged anyway (warn mode). Seat: confirm with a SONNET-MISS note and a gap bead, or note "acceptance-check FP: <why>".'
+    if [ "$2" = reject ]; then
+      nt_trailer='Reject mode: the refinery returns this bead to the polecat pool, and sets rejection_reason once it has. Seat: confirm with a SONNET-MISS note, or note "acceptance-check FP: <why>".'
+    else
+      nt_trailer='Merged anyway (warn mode). Seat: confirm with a SONNET-MISS note and a gap bead, or note "acceptance-check FP: <why>".'
+    fi
   fi
   nt_used=$((${#nt_header} + 1))
   [ -z "$nt_trailer" ] || nt_used=$((nt_used + ${#nt_trailer} + 1))
@@ -494,11 +527,14 @@ rec_run() {
     ac_usage >&2
     return 1
   fi
-  if [ "$rec_mode" != warn ]; then
-    echo "acceptance-check: --mode accepts only warn in this version, got '$rec_mode'." >&2
-    ac_usage >&2
-    return 1
-  fi
+  case "$rec_mode" in
+    warn | reject) ;;
+    *)
+      echo "acceptance-check: --mode must be warn or reject, got '$rec_mode'." >&2
+      ac_usage >&2
+      return 1
+      ;;
+  esac
   # resolve_config reports on stdout; the RESULT line must be the last of it.
   if ! resolve_config --work "$rec_work" ${rec_pass[@]+"${rec_pass[@]}"} >&2; then
     ac_usage >&2
@@ -535,7 +571,7 @@ rec_run() {
     return 2
   fi
 
-  if ac_notify "$rec_work" "$rec_verdict" "$rec_items"; then
+  if ac_notify "$rec_work" "$rec_verdict" "$rec_items" "$rec_mode"; then
     AC_R_NUDGE="$AC_DELIVERED"
     rec_outcome="delivered: $AC_DELIVERED"
   else
@@ -545,6 +581,35 @@ rec_run() {
   if ! gc bd update "$rec_work" --set-metadata "acceptance_check_nudge=$rec_outcome" >/dev/null; then
     ac_warn "the nudge outcome ('$rec_outcome') could not be written to $rec_work"
     return 2
+  fi
+  if [ "$rec_mode" = reject ] && [ "$rec_verdict" = MISS ]; then
+    rec_return_to_pool "$rec_work" "$rec_items" || return 2
+  fi
+  return 0
+}
+
+# rec_return_to_pool <id> <items> — a reject-mode MISS goes back to the polecat
+# pool the way the patrol's rebase step sends back a conflict: the workflow is
+# cleaned up and the source reopened, then the bead is put back with its reason and
+# its routing. Each write runs only after the one before it succeeded. CFG_RIG and
+# CFG_BINDING_PREFIX are resolve_config's twins of the rebase step's
+# ${GC_RIG:+$GC_RIG/}<binding prefix>polecat. Returns 1 when a write failed.
+rec_return_to_pool() {
+  rp_ids=$(ac_nudge_ids MISS "$2")
+  rp_reason="acceptance: ${rp_ids:+$rp_ids - }see note"
+  if ! gc workflow delete-source "$1" --apply >/dev/null; then
+    ac_warn "gc workflow delete-source for $1 failed; the bead stays with the refinery"
+    return 1
+  fi
+  if ! gc workflow reopen-source "$1" >/dev/null; then
+    ac_warn "gc workflow reopen-source for $1 failed; the bead stays with the refinery"
+    return 1
+  fi
+  if ! gc bd update "$1" --status=open --assignee= \
+    --set-metadata "rejection_reason=$rp_reason" \
+    --set-metadata "gc.routed_to=${CFG_RIG:+$CFG_RIG/}${CFG_BINDING_PREFIX}polecat" >/dev/null; then
+    ac_warn "the pool return of $1 failed; the bead stays with the refinery"
+    return 1
   fi
   return 0
 }
