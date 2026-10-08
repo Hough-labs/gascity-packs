@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 27 Sep 2026 23:50:22 -0400
-Subject: [PATCH 118/144] feat(refinery): add merge-push.sh and prove it
+Subject: [PATCH 118/145] feat(refinery): add merge-push.sh and prove it
  matches the formula lane (gcp-l8td.5)
 
 B1 phase 3, step 2 (gcp-l8td.3 DESIGN, Sequencing 2). The refinery runs

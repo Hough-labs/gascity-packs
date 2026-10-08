@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Tue, 6 Oct 2026 14:36:14 -0400
-Subject: [PATCH 140/144] fix(refinery): guard patrol rm targets with ${NAME:?}
+Subject: [PATCH 140/145] fix(refinery): guard patrol rm targets with ${NAME:?}
  so fences run verbatim (gcp-s7j4.6)
 
 Claude Code's built-in safety check denies an rm whose target is an

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Mon, 5 Oct 2026 23:35:50 -0400
-Subject: [PATCH 137/144] feat(refinery): wire acceptance-check into the patrol
+Subject: [PATCH 137/145] feat(refinery): wire acceptance-check into the patrol
  behind acceptance_check=off (gcp-s7j4.2)
 
 acceptance-check.sh (gcp-s7j4.1) built a packet per bead and recorded a verdict,

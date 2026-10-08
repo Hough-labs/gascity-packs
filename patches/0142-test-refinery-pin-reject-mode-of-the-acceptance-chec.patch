@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 8 Oct 2026 15:11:56 -0400
-Subject: [PATCH 142/144] test(refinery): pin reject mode of the acceptance
+Subject: [PATCH 142/145] test(refinery): pin reject mode of the acceptance
  check, red against b3b72667 (gcp-s7j4.4)
 
 Reject mode is specified in the bead before it is built, so the suites that

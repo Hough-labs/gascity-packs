@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 8 Oct 2026 15:13:04 -0400
-Subject: [PATCH 143/144] feat(refinery): record --mode reject returns a MISS
+Subject: [PATCH 143/145] feat(refinery): record --mode reject returns a MISS
  to the polecat pool (gcp-s7j4.4)
 
 record gains --mode reject. In reject mode it does everything warn does, in the

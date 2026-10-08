@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 8 Oct 2026 15:15:12 -0400
-Subject: [PATCH 144/144] feat(refinery): reject mode returns a MISS to the
+Subject: [PATCH 144/145] feat(refinery): reject mode returns a MISS to the
  pool before rebase and trims the batch (gcp-s7j4.4)
 
 acceptance_check = reject was wired as warn. It now does what warn does and
