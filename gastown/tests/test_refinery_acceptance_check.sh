@@ -14,15 +14,22 @@
 # stubbed. The stub is modeled on test_refinery_merge_batch.sh's, over a fixture
 # DIRECTORY with one JSON file per bead:
 #   gc bd show <id> --json    that bead's file; fails for the ids in GC_STUB_FAIL_SHOW
-#   gc bd update <id> ...     --set-metadata k=v and --add-label <label>; fails for
-#                             the ids in GC_STUB_FAIL_UPDATE, and, for a call that
-#                             adds a label, for the ids in GC_STUB_FAIL_LABEL
+#   gc bd update <id> ...     --set-metadata k=v, --add-label <label>, --status=<s>
+#                             and --assignee=<a>; fails for the ids in
+#                             GC_STUB_FAIL_UPDATE, for a call that adds a label,
+#                             for the ids in GC_STUB_FAIL_LABEL, and for a call
+#                             that carries --status, for the ids in
+#                             GC_STUB_FAIL_STATUS
 #   gc bd note <id> --stdin   appends the note to $GC_STUB_BEADS/<id>.notelog;
 #                             fails for the ids in GC_STUB_FAIL_NOTE
 #   gc session nudge <target> <message>
 #                             journals "<target><TAB><message>" to $GC_STUB_NUDGES,
 #                             failed attempts too; fails for the targets in
 #                             GC_STUB_FAIL_NUDGE
+#   gc workflow delete-source <id> --apply
+#   gc workflow reopen-source <id>
+#                             journalled; delete-source fails for the ids in
+#                             GC_STUB_FAIL_WORKFLOW
 # Every call is journalled to $T/gc.log. A call the model does not know fails
 # loudly (exit 64) and fails the case.
 #
@@ -36,13 +43,13 @@
 # of 47 where the criteria say 0, a keep-passing file named but unchanged), with
 # invented paths and wording.
 #
-# The suite fails unless all 19 cases ran.
+# The suite fails unless all 22 cases ran.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 PACK_DIR="$ROOT/gastown"
 SCRIPT="${SCRIPT:-$PACK_DIR/assets/scripts/refinery/acceptance-check.sh}"
-EXPECTED_CASES=19
+EXPECTED_CASES=22
 
 AGENT=testrig/gastown.refinery
 TARGET_NAME=integration
@@ -120,9 +127,21 @@ bd)
             esac
             ;;
         esac
+        case " ${ARGS[*]} " in
+        *" --status"*)
+            case " ${GC_STUB_FAIL_STATUS:-} " in
+            *" $id "*)
+                echo "stub gc: gc bd update $id --status failed on request" >&2
+                exit 1
+                ;;
+            esac
+            ;;
+        esac
         shift 3
         while [ "$#" -gt 0 ]; do
             case "$1" in
+            --status=*) edit_bead "$file" --arg v "${1#--status=}" '.[0].status = $v' ;;
+            --assignee=*) edit_bead "$file" --arg v "${1#--assignee=}" '.[0].assignee = $v' ;;
             --set-metadata)
                 edit_bead "$file" --arg k "${2%%=*}" --arg v "${2#*=}" '.[0].metadata[$k] = $v'
                 shift
@@ -146,6 +165,23 @@ bd)
             ;;
         esac
         cat >>"$GC_STUB_BEADS/$3.notelog"
+        ;;
+    *) unexpected ;;
+    esac
+    ;;
+workflow)
+    case "${2:-}" in
+    delete-source)
+        { [ "$#" -eq 4 ] && [ "$4" = --apply ] && [ -f "$GC_STUB_BEADS/${3:-}.json" ]; } || unexpected
+        case " ${GC_STUB_FAIL_WORKFLOW:-} " in
+        *" $3 "*)
+            echo "stub gc: gc workflow delete-source $3 failed on request" >&2
+            exit 1
+            ;;
+        esac
+        ;;
+    reopen-source)
+        { [ "$#" -eq 3 ] && [ -f "$GC_STUB_BEADS/${3:-}.json" ]; } || unexpected
         ;;
     *) unexpected ;;
     esac
@@ -211,6 +247,8 @@ CFG
     FAIL_LABEL=""
     FAIL_NOTE=""
     FAIL_NUDGE=""
+    FAIL_WORKFLOW=""
+    FAIL_STATUS=""
     EXTRA_ENV=()
     CONFIG_DEFAULT_BRANCH="$TARGET_NAME"
     CONFIG_JSON="$T/config.json"
@@ -344,7 +382,8 @@ run_ac() {
             GC_STUB_LOG="$T/gc.log" GC_STUB_BEADS="$BEADS" GC_STUB_NUDGES="$T/nudges" \
             GC_STUB_FAIL_SHOW="$FAIL_SHOW" GC_STUB_FAIL_UPDATE="$FAIL_UPDATE" \
             GC_STUB_FAIL_LABEL="$FAIL_LABEL" GC_STUB_FAIL_NOTE="$FAIL_NOTE" \
-            GC_STUB_FAIL_NUDGE="$FAIL_NUDGE" STUB_UNEXPECTED="$T/unexpected" \
+            GC_STUB_FAIL_NUDGE="$FAIL_NUDGE" GC_STUB_FAIL_WORKFLOW="$FAIL_WORKFLOW" \
+            GC_STUB_FAIL_STATUS="$FAIL_STATUS" STUB_UNEXPECTED="$T/unexpected" \
             ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"} \
             "$BASH" "$SCRIPT" "$@" <"$T/stdin"
     ) >"$T/out" 2>"$T/err"
@@ -720,6 +759,30 @@ case_packet_skips() {
     set_meta gcp-k1 acceptance_check_tip "$x"
     expect_skip "a branch already judged at its tip" gcp-k1 "acceptance-check: SKIP gcp-k1 already-judged tip=$x"
 
+    # A MISS recorded in reject mode went back to the pool: the same tip is read
+    # again. Every other judgment at the tip still skips.
+    reset_beads
+    set_meta gcp-k1 acceptance_check_tip "$x"
+    set_meta gcp-k1 acceptance_check MISS
+    set_meta gcp-k1 acceptance_check_mode reject
+    run_ac packet --work gcp-k1
+    assert_eq "a reject-mode MISS at the tip: exit status" 0 "$RC"
+    assert_match "a reject-mode MISS at the tip: the first line is the PACKET line" \
+        '^acceptance-check: PACKET ' "$(head -n 1 "$T/out")"
+    assert_read_only "a reject-mode MISS at the tip"
+
+    reset_beads
+    set_meta gcp-k1 acceptance_check_tip "$x"
+    set_meta gcp-k1 acceptance_check MISS
+    set_meta gcp-k1 acceptance_check_mode warn
+    expect_skip "a warn-mode MISS at the tip" gcp-k1 "acceptance-check: SKIP gcp-k1 already-judged tip=$x"
+
+    reset_beads
+    set_meta gcp-k1 acceptance_check_tip "$x"
+    set_meta gcp-k1 acceptance_check DECLARED
+    set_meta gcp-k1 acceptance_check_mode reject
+    expect_skip "a reject-mode DECLARED at the tip" gcp-k1 "acceptance-check: SKIP gcp-k1 already-judged tip=$x"
+
     # The order the codes are checked in.
     reset_beads
     set_meta gcp-k1 branch ""
@@ -959,13 +1022,13 @@ case_record_usage() {
         run_ac record "$@"
         assert_eq "$what: exit status" 1 "$RC"
         grep -q '^usage: acceptance-check.sh' "$T/err" || fail "$what: no stderr line starts 'usage: acceptance-check.sh'"
-        assert_eq "$what: no bead or nudge call" 0 "$(calls '^gc (bd (update|note) |session nudge )')"
+        assert_eq "$what: no bead, workflow or nudge call" 0 "$(calls '^gc (bd (update|note) |workflow |session nudge )')"
         assert_eq "$what: the last stdout line" "acceptance-check: RESULT 1 - - nudge=none" "$(last_line)"
     }
     expect_usage "a verdict outside the four" --work gcp-r1 --verdict MAYBE --tip "$X"
     expect_usage "a missing --work" --verdict MISS --tip "$X"
     expect_usage "a missing --tip" --work gcp-r1 --verdict MISS
-    expect_usage "--mode reject" --work gcp-r1 --verdict MISS --tip "$X" --mode reject
+    expect_usage "--mode bogus" --work gcp-r1 --verdict MISS --tip "$X" --mode bogus
     end_case
 }
 
@@ -1011,14 +1074,121 @@ case_record_write_failure() {
     end_case
 }
 
+# --- cases: record, reject mode (gcp-s7j4.4) --------------------------------
+
+# The reject trailer D4 fixes, byte for byte.
+REJECT_TRAILER='Reject mode: the refinery returns this bead to the polecat pool, and sets rejection_reason once it has. Seat: confirm with a SONNET-MISS note, or note "acceptance-check FP: <why>".'
+
+# The gc calls that write, in the order they were made: bead writes, nudges and
+# workflow calls. Reads are left out.
+write_calls() { grep -E '^gc (bd (update|note) |session nudge |workflow )' "$T/gc.log"; }
+
+case_record_reject_miss() {
+    new_case record-reject-miss
+    record_rig
+    printf '%s\n' 'AC1 OK — a | b' 'AC2 MISSING — c | absent' 'AC4 SUBSTITUTED — d | e' >"$T/stdin"
+
+    run_ac record --work gcp-r1 --verdict MISS --tip "$X" --mode reject
+    assert_eq "record exits 0" 0 "$RC"
+    assert_eq "the last stdout line" "acceptance-check: RESULT 0 gcp-r1 MISS nudge=testrig/crew.seat" "$(last_line)"
+    assert_eq "the writes, in order" "gc bd update gcp-r1 --set-metadata acceptance_check=MISS --set-metadata acceptance_check_tip=$X --set-metadata acceptance_check_mode=reject
+gc bd note gcp-r1 --stdin
+gc bd update gcp-r1 --add-label acceptance-miss
+gc session nudge testrig/crew.seat ACCEPTANCE MISS: gcp-r1 AC2,AC4 - note on gcp-r1 (refinery, reject: back to pool)
+gc bd update gcp-r1 --set-metadata acceptance_check_nudge=delivered: testrig/crew.seat
+gc workflow delete-source gcp-r1 --apply
+gc workflow reopen-source gcp-r1
+gc bd update gcp-r1 --status=open --assignee= --set-metadata rejection_reason=acceptance: AC2,AC4 - see note --set-metadata gc.routed_to=testrig/gastown.polecat" \
+        "$(write_calls)"
+    assert_eq "status" open "$(bead_field gcp-r1 status)"
+    assert_eq "assignee" "" "$(bead_field gcp-r1 assignee)"
+    assert_eq "rejection_reason" "acceptance: AC2,AC4 - see note" "$(bead_meta gcp-r1 rejection_reason)"
+    assert_eq "gc.routed_to" testrig/gastown.polecat "$(bead_meta gcp-r1 gc.routed_to)"
+    assert_eq "acceptance_check_mode" reject "$(bead_meta gcp-r1 acceptance_check_mode)"
+    assert_match "the note's first line" "^\[acceptance-check reject " "$(note_first_line gcp-r1)"
+    assert_eq "the note's last line is the reject trailer" "$REJECT_TRAILER" "$(tail -n 1 "$BEADS/gcp-r1.notelog")"
+    case "$(nudge_message 1)" in
+        *" - note on gcp-r1 (refinery, reject: back to pool)") ;;
+        *) fail "the nudge message does not end with the reject tail: $(nudge_message 1)" ;;
+    esac
+
+    # With no item lines there is no id to name.
+    reset_record
+    run_ac record --work gcp-r1 --verdict MISS --tip "$X" --mode reject
+    assert_eq "no items: record exits 0" 0 "$RC"
+    assert_eq "no items: rejection_reason" "acceptance: see note" "$(bead_meta gcp-r1 rejection_reason)"
+    assert_eq "no items: status" open "$(bead_field gcp-r1 status)"
+    end_case
+}
+
+case_record_no_route() {
+    new_case record-no-route
+    record_rig
+    # run_no_route <what> <mode> <verdict> <stdin line> <nudge tail, or - for none>
+    run_no_route() {
+        reset_record
+        if [ -n "$4" ]; then printf '%s\n' "$4" >"$T/stdin"; fi
+        run_ac record --work gcp-r1 --verdict "$3" --tip "$X" --mode "$2"
+        assert_eq "$1: exit status" 0 "$RC"
+        assert_eq "$1: no workflow call" 0 "$(calls '^gc workflow ')"
+        assert_eq "$1: no update carries --status or --assignee" 0 "$(calls '^gc bd update .*--(status|assignee)')"
+        assert_eq "$1: status is untouched" in_progress "$(bead_field gcp-r1 status)"
+        assert_eq "$1: assignee is untouched" "$AGENT" "$(bead_field gcp-r1 assignee)"
+        assert_eq "$1: acceptance_check_mode" "$2" "$(bead_meta gcp-r1 acceptance_check_mode)"
+        if [ "$5" = - ]; then
+            assert_eq "$1: no nudge" 0 "$(nudge_count)"
+        else
+            case "$(nudge_message 1)" in
+                *"$5") ;;
+                *) fail "$1: the nudge message does not end with '$5': $(nudge_message 1)" ;;
+            esac
+        fi
+    }
+    run_no_route "reject DECLARED" reject DECLARED 'AC3 DECLARED — x | y' ' - note on gcp-r1 (refinery, reject: merging)'
+    run_no_route "reject CONFORMS" reject CONFORMS '' -
+    run_no_route "reject SKIP" reject SKIP '' -
+    run_no_route "warn MISS" warn MISS 'AC2 MISSING — c | absent' ' - note on gcp-r1 (refinery, warn: merging)'
+    end_case
+}
+
+case_record_reject_route_failure() {
+    new_case record-reject-route-failure
+    record_rig
+
+    # The workflow cleanup fails: nothing after it is written.
+    printf '%s\n' 'AC2 MISSING — c | absent' >"$T/stdin"
+    FAIL_WORKFLOW=gcp-r1
+    run_ac record --work gcp-r1 --verdict MISS --tip "$X" --mode reject
+    assert_eq "a failed delete-source: exit status" 2 "$RC"
+    assert_eq "a failed delete-source: the last stdout line" \
+        "acceptance-check: RESULT 2 gcp-r1 MISS nudge=testrig/crew.seat" "$(last_line)"
+    assert_eq "a failed delete-source: delete-source was tried" 1 "$(calls '^gc workflow delete-source gcp-r1 --apply$')"
+    assert_eq "a failed delete-source: no reopen-source call" 0 "$(calls '^gc workflow reopen-source ')"
+    assert_eq "a failed delete-source: no update carries --status" 0 "$(calls '^gc bd update .*--status')"
+    assert_eq "a failed delete-source: the assignee is unchanged" "$AGENT" "$(bead_field gcp-r1 assignee)"
+
+    # The pool return fails at the last write: the bead is still the refinery's.
+    reset_record
+    FAIL_WORKFLOW=""
+    FAIL_STATUS=gcp-r1
+    printf '%s\n' 'AC2 MISSING — c | absent' >"$T/stdin"
+    run_ac record --work gcp-r1 --verdict MISS --tip "$X" --mode reject
+    assert_eq "a failed status write: exit status" 2 "$RC"
+    assert_eq "a failed status write: the last stdout line" \
+        "acceptance-check: RESULT 2 gcp-r1 MISS nudge=testrig/crew.seat" "$(last_line)"
+    assert_eq "a failed status write: delete-source ran" 1 "$(calls '^gc workflow delete-source gcp-r1 --apply$')"
+    assert_eq "a failed status write: reopen-source ran" 1 "$(calls '^gc workflow reopen-source gcp-r1$')"
+    assert_eq "a failed status write: the assignee is unchanged" "$AGENT" "$(bead_field gcp-r1 assignee)"
+    end_case
+}
+
 # --- cases: the script's text -----------------------------------------------
 
 # text_invariants_ok <file> — the file contains none of the forbidden fragments.
 # Each is an extended regex, so this suite's own text holds none of them verbatim.
 text_invariants_ok() {
     local pat bad=0
-    for pat in '\{\{' 'drain-ack' 'bd +mol' '--status' '--assignee' 'bd +close' \
-        'rejection_reason' 'gc\.routed_to' 'set +-e' 'set +-u' 'pipefail'; do
+    for pat in '\{\{' 'drain-ack' 'bd +mol' 'bd +close' 'set +-e' 'set +-u' 'pipefail'; do
         if grep -Eq -- "$pat" "$1"; then
             echo "forbidden fragment /$pat/ in $1" >&2
             bad=1
@@ -1030,10 +1200,10 @@ text_invariants_ok() {
 case_text_invariants() {
     new_case text-invariants
     text_invariants_ok "$SCRIPT" || fail "the script carries a forbidden fragment, comments included"
-    cp -f "$SCRIPT" "$T/with-status.sh"
-    printf '%s\n' '# gc bd update x --status=closed' >>"$T/with-status.sh"
-    if text_invariants_ok "$T/with-status.sh" 2>/dev/null; then
-        fail "the invariant check passed a copy with a --status line added"
+    cp -f "$SCRIPT" "$T/with-close.sh"
+    printf '%s\n' '# gc bd close x' >>"$T/with-close.sh"
+    if text_invariants_ok "$T/with-close.sh" 2>/dev/null; then
+        fail "the invariant check passed a copy with a bead-close line added"
     fi
     grep -q 'MERGE_PUSH_SOURCE_ONLY=1' "$SCRIPT" || fail "the script does not source merge-push.sh in source-only mode"
     grep -Eq '^resolve_config\(\)' "$SCRIPT" && fail "the script defines resolve_config instead of sourcing it"
@@ -1063,6 +1233,9 @@ case_record_conforms_and_skip
 case_record_notify_fallback
 case_record_usage
 case_record_write_failure
+case_record_reject_miss
+case_record_no_route
+case_record_reject_route_failure
 case_text_invariants
 
 if [ "$PASS_CASES" -ne "$EXPECTED_CASES" ]; then
