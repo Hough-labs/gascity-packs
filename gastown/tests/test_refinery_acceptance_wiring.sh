@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Contract tests for the refinery patrol's acceptance-check wiring (gcp-s7j4.2).
+# Contract tests for the refinery patrol's acceptance-check wiring (gcp-s7j4.2, and
+# reject mode, gcp-s7j4.4).
 #
 # acceptance-check.sh (gcp-s7j4.1) builds an evidence packet per bead and records a
 # verdict on it, and was inert until `mol-refinery-patrol` called it. The formula
@@ -7,7 +8,9 @@
 # (default "off", so a rig that sets nothing sees one line and no read). The
 # formula keeps no acceptance logic of its own beyond the mode case, the packet
 # loop and the SKIP routing: the mechanics are the script's, and
-# test_refinery_acceptance_check.sh is their proof.
+# test_refinery_acceptance_check.sh is their proof. In reject mode `record` returns
+# each MISS to the polecat pool, and one block after the last record trims the
+# iteration to the beads the refinery still holds (case_reject_block).
 #
 # What this suite proves is the WIRING, so each case that runs the fence extracts
 # the sentinel-delimited block of shipped formula text through tomllib, with the
@@ -25,16 +28,17 @@
 # and the script is its sibling), and appends its argv, one line per call, to a
 # log, then prints and exits as its env says.
 #
-# The suite fails unless all 14 cases ran.
+# The suite fails unless all 16 cases ran.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 FORMULA="${FORMULA:-$ROOT/gastown/formulas/mol-refinery-patrol.toml}"
-EXPECTED_CASES=14
+EXPECTED_CASES=16
 
 REFINERY_AGENT=testrig/gastown.refinery
 HEAD_ID=wa-head
 SECOND_ID=wa-second
+THIRD_ID=wa-third
 FAILURES=0
 PASS_CASES=0
 CASE=""
@@ -124,6 +128,26 @@ formula)
         exit 64
     fi
     printf '{"formulas":[{"name":"mol-refinery-patrol","source":"%s"}]}' "${GC_STUB_FORMULA_SOURCE:-}"
+    ;;
+bd)
+    # gc bd show <id> --json, the read the reject block makes. GC_STUB_ASSIGNEES is
+    # words of "<id>=<assignee>" ("<id>=" is an empty assignee), an id it does not
+    # list is assigned to GC_AGENT, and the ids in GC_STUB_FAIL_SHOW fail the read.
+    if [ "${2:-}" != show ] || [ "${4:-}" != --json ] || [ "$#" -ne 4 ]; then
+        printf '%s\n' "$*" >>"${GC_STUB_UNEXPECTED:?}"
+        exit 64
+    fi
+    case " ${GC_STUB_FAIL_SHOW:-} " in
+    *" $3 "*)
+        echo "stub gc: gc bd show $3 failed on request" >&2
+        exit 1
+        ;;
+    esac
+    assignee="${GC_AGENT:-}"
+    for pair in ${GC_STUB_ASSIGNEES:-}; do
+        [ "${pair%%=*}" = "$3" ] && assignee="${pair#*=}"
+    done
+    jq -n --arg id "$3" --arg a "$assignee" '[{id: $id, assignee: $a}]'
     ;;
 *)
     printf '%s\n' "$*" >>"${GC_STUB_UNEXPECTED:?}"
@@ -243,6 +267,29 @@ write_manifest() {
         '{head: $head, members: [{id: $head}, {id: $second}]}' >"$MANIFEST"
 }
 
+# write_manifest_of <id>... — what find-work and stack write for a batch: the head
+# first, and the fields stack records beside the members.
+write_manifest_of() {
+    local members
+    members=$(printf '%s\n' "$@" |
+        jq -R '{id: ., branch: ("polecat/" + .), tip: "t1", commits: 1, patch_id: "p1"}' | jq -s .)
+    jq -n --arg head "$1" --argjson members "$members" \
+        '{head: $head, target: "main", base: "b0", members: $members}' >"$MANIFEST"
+}
+
+# run_rej <mode-or-LITERAL> [VAR=value ...] — the acceptance-reject block in ONE
+# shell, with WORK set to the head. LITERAL leaves {{acceptance_check}} unrendered.
+# The stub's journal is emptied first, so a case can run the block more than once.
+run_rej() {
+    local mode="$1" opt
+    shift
+    if [ "$mode" = LITERAL ]; then opt=leave:acceptance_check; else opt="set:acceptance_check=$mode"; fi
+    extract_block acceptance-reject acceptance-reject "$T/rej.sh" "$opt" ||
+        { fail "could not extract the acceptance-reject block"; return 1; }
+    : >"$T/gc.log"
+    run_block "$T/rej.sh" WORK="$HEAD_ID" "$@"
+}
+
 # --- reading the formula ------------------------------------------------------------
 
 # formula_steps <formula> — "<id> <needs-json>" per step, in order.
@@ -321,9 +368,50 @@ import tomllib
 with open(sys.argv[1], "rb") as handle:
     steps = {s["id"]: s for s in tomllib.load(handle)["steps"]}
 lines = steps["patrol-summary"]["description"].split("\n")
-want = "- Acceptance check: each member's verdict (CONFORMS, DECLARED, MISS or SKIP), and any WARN or record exit 1 or 2"
+want = "- Acceptance check: each member's verdict (CONFORMS, DECLARED, MISS or SKIP), any WARN or record exit 1 or 2, and in reject mode each LEFT and HEAD LEFT line"
 i = lines.index("- Test results (pass/fail, which checks ran)")
 sys.exit(0 if lines[i + 1] == want else 1)
+PY
+}
+
+# pour_copy_matches <formula> — true when the acceptance-check step's description
+# holds, after the acceptance-reject:end sentinel, a fenced bash block byte for byte
+# equal to the rebase step's conflict-path pour-and-burn block: the one whose first
+# line is CURRENT_WISP=${GC_BEAD_ID:-}, from its ```bash line to its closing fence.
+pour_copy_matches() {
+    python3 - "$1" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as handle:
+    steps = {s["id"]: s for s in tomllib.load(handle)["steps"]}
+opener = "```bash\nCURRENT_WISP=${GC_BEAD_ID:-}\n"
+
+
+def fenced(text, start):
+    at = text.find(opener, start)
+    if at < 0:
+        sys.exit("no pour block found")
+    end = text.find("\n```", at + len(opener))
+    if end < 0:
+        sys.exit("the pour block has no closing fence")
+    return text[at:end + len("\n```")]
+
+
+rebase = steps["rebase"]["description"]
+ack = steps["acceptance-check"]["description"]
+if rebase.count(opener) != 1:
+    sys.exit(f"want exactly one pour block in the rebase step, found {rebase.count(opener)}")
+sentinel = "# --- acceptance-reject:end ---"
+if ack.count(sentinel) != 1:
+    sys.exit("want exactly one acceptance-reject:end sentinel in the acceptance-check step")
+if ack.count(opener) != 1:
+    sys.exit(f"want exactly one pour block in the acceptance-check step, found {ack.count(opener)}")
+at = ack.index(sentinel)
+if ack.index(opener) < at:
+    sys.exit("the pour block sits before the acceptance-reject:end sentinel")
+if fenced(ack, at) != fenced(rebase, 0):
+    sys.exit("the acceptance-check step's pour block differs from the rebase step's")
 PY
 }
 
@@ -385,17 +473,13 @@ write_fence() {
 ACK_MODE="{{acceptance_check}}"
 case "$ACK_MODE" in
   off) echo "acceptance check: off" ;;
-  warn) ;;
-  reject)
-    echo "WARN: acceptance_check=reject is not built yet (gcp-s7j4.4); running as warn."
-    ACK_MODE=warn
-    ;;
+  warn | reject) ;;
   *)
     echo "INFO: acceptance_check='$ACK_MODE' is not off, warn or reject; check off."
     ACK_MODE=off
     ;;
 esac
-if [ "$ACK_MODE" = warn ]; then
+if [ "$ACK_MODE" != off ]; then
   ACK_DIR="$(git rev-parse --git-dir)/acceptance"
   mkdir -p "$ACK_DIR" && rm -f "${ACK_DIR:?}"/*.packet "${ACK_DIR:?}"/*.err "${ACK_DIR:?}/script.path"
   ACK_CITY="${GC_CITY:-${GC_CITY_PATH:-}}"
@@ -436,7 +520,7 @@ if [ "$ACK_MODE" = warn ]; then
         ACK_CODE=$(printf '%s\n' "$ACK_OUT" | awk '{print $4}')
         ACK_TIP=$(printf '%s\n' "$ACK_OUT" | sed -n 's/.* tip=//p')
         case "$ACK_CODE" in
-          no-ac | no-change) "$ACK" record --work "$ACK_ID" --verdict SKIP --tip "$ACK_TIP" </dev/null ;;
+          no-ac | no-change) "$ACK" record --work "$ACK_ID" --verdict SKIP --tip "$ACK_TIP" --mode "$ACK_MODE" </dev/null ;;
           already-judged) ;;
           *) echo "WARN: acceptance check for $ACK_ID: $ACK_CODE; not checked." ;;
         esac
@@ -450,17 +534,41 @@ fi
 EXPECTED_FENCE
 }
 
-write_prose() {
+# The prose after the fence, in the three pieces D11 gives it. The reject block
+# (case_reject_block) and the pour-and-burn (case_head_left_pour) sit between them.
+write_prose_before_block() {
     cat >"$1" <<'EXPECTED_PROSE'
 For each `READ` line, in the order printed: read that packet in full (`cat` it, one packet per command), apply
 the rubric below, then record your verdict with ONE command, the per-item lines as a quoted heredoc:
 ```bash
-"$(cat "$(git rev-parse --git-dir)/acceptance/script.path")" record --work <id> --verdict <CONFORMS|DECLARED|MISS> --tip <the tip= value on the packet's PACKET line> <<'ACK_ITEMS'
+"$(cat "$(git rev-parse --git-dir)/acceptance/script.path")" record --work <id> --verdict <CONFORMS|DECLARED|MISS> --tip <the tip= value on the packet's PACKET line> --mode {{acceptance_check}} <<'ACK_ITEMS'
 <one line per AC item, in the rubric's output format>
 ACK_ITEMS
 ```
-Warn mode never blocks. Whatever the verdicts, close this step and proceed to rebase. A `record` that exits 1 or 2
-is a WARN: name it in patrol-summary and proceed. With no `READ` line, close this step.
+A `record` that exits 1 or 2 is a WARN: name it in patrol-summary and proceed. With no `READ` line, close this
+step and proceed to rebase.
+
+After the last `record`, run this block ONCE, in one shell, with `$WORK` set as above. Outside reject mode it
+prints nothing and changes nothing. In reject mode `record` has already returned each MISS to the polecat pool,
+and this block takes every bead no longer assigned to you out of this iteration:
+```bash
+EXPECTED_PROSE
+}
+
+write_prose_between() {
+    cat >"$1" <<'EXPECTED_PROSE'
+```
+If it printed `HEAD LEFT: <id>`, this iteration has no head. Pour the next iteration and burn this one, exactly as
+a rebase conflict does, then close this step:
+```bash
+EXPECTED_PROSE
+}
+
+write_prose_after_pour() {
+    cat >"$1" <<'EXPECTED_PROSE'
+```
+Otherwise close this step and proceed to rebase, whatever the verdicts. `stack` takes the batch as the block
+left it.
 EXPECTED_PROSE
 }
 
@@ -490,7 +598,7 @@ case_var() {
     local desc word
     assert_eq "[vars.acceptance_check].default" off "$(formula_var "$FORMULA" acceptance_check default)"
     desc=$(formula_var "$FORMULA" acceptance_check description)
-    for word in off warn reject gcp-s7j4.4; do
+    for word in off warn reject; do
         case "$desc" in
         *"$word"*) ;;
         *) fail "[vars.acceptance_check].description does not contain '$word'" ;;
@@ -571,7 +679,7 @@ case_skip_codes() {
         run_ack warn STUB_PACKET_STATUS=3 STUB_PACKET_OUT="$line"
         assert_eq "$code: block status" 0 "$?"
         assert_eq "$code: script argv log" \
-            "$(printf 'packet --work %s\nrecord --work %s --verdict SKIP --tip abc123' "$HEAD_ID" "$HEAD_ID")" "$(ack_calls)"
+            "$(printf 'packet --work %s\nrecord --work %s --verdict SKIP --tip abc123 --mode warn' "$HEAD_ID" "$HEAD_ID")" "$(ack_calls)"
         assert_eq "$code: record stdin" 0 "$(wc -c <"$T/ack-stdin.log" | tr -d ' ')"
         [ ! -e "$ACK_DIR_PATH/$HEAD_ID.packet" ] || fail "$code: a packet file exists for a SKIP"
     done
@@ -605,13 +713,27 @@ case_packet_error() {
     end_case
 }
 
-case_reject_runs_as_warn() {
-    new_case reject_runs_as_warn
+case_reject_mode() {
+    new_case reject_mode
+    write_manifest
+    local before after
+    before=$(cksum <"$MANIFEST")
     run_ack reject
     assert_eq "block status" 0 "$?"
-    assert_eq "stdout's first line" \
-        "WARN: acceptance_check=reject is not built yet (gcp-s7j4.4); running as warn." "$(head -n 1 "$T/out")"
-    assert_eq "script argv log" "packet --work $HEAD_ID" "$(ack_calls)"
+    ! grep -q 'not built yet' "$T/out" || fail "stdout still says reject is not built yet"
+    assert_eq "script argv log" "$(printf 'packet --work %s\npacket --work %s' "$HEAD_ID" "$SECOND_ID")" "$(ack_calls)"
+    assert_eq "READ lines" \
+        "$(printf 'READ .git/acceptance/%s.packet\nREAD .git/acceptance/%s.packet' "$HEAD_ID" "$SECOND_ID")" \
+        "$(grep '^READ ' "$T/out" | sed 's/ ([0-9]* chars)$//')"
+    after=$(cksum <"$MANIFEST")
+    assert_eq "refinery-batch.json checksum" "$before" "$after"
+
+    # A SKIP is recorded with the mode the fence runs in.
+    rm -f "$MANIFEST"
+    run_ack reject STUB_PACKET_STATUS=3 STUB_PACKET_OUT="acceptance-check: SKIP $HEAD_ID no-ac tip=abc123"
+    assert_eq "no-ac: block status" 0 "$?"
+    assert_eq "no-ac: script argv log" \
+        "$(printf 'packet --work %s\nrecord --work %s --verdict SKIP --tip abc123 --mode reject' "$HEAD_ID" "$HEAD_ID")" "$(ack_calls)"
     end_case
 }
 
@@ -660,15 +782,18 @@ case_prose() {
     new_case prose
     write_sentence "$T/sentence.txt"
     write_fence "$T/fence.txt"
-    write_prose "$T/prose.txt"
+    write_prose_before_block "$T/prose-before.txt"
+    write_prose_between "$T/prose-between.txt"
+    write_prose_after_pour "$T/prose-after.txt"
     write_rubric "$T/rubric.txt"
-    step_text_in_order "$FORMULA" "$T/sentence.txt" "$T/fence.txt" "$T/prose.txt" "$T/rubric.txt" ||
+    step_text_in_order "$FORMULA" "$T/sentence.txt" "$T/fence.txt" "$T/prose-before.txt" \
+        "$T/prose-between.txt" "$T/prose-after.txt" "$T/rubric.txt" ||
         fail "the acceptance-check step lacks the sentence, fence, prose and rubric, byte for byte and in that order"
     summary_bullet_follows "$FORMULA" ||
         fail "patrol-summary lacks the acceptance bullet right after its test-results bullet"
 
     # The check must be able to FAIL: swap the order of the files it is given.
-    ! step_text_in_order "$FORMULA" "$T/prose.txt" "$T/fence.txt" 2>/dev/null ||
+    ! step_text_in_order "$FORMULA" "$T/prose-before.txt" "$T/fence.txt" 2>/dev/null ||
         fail "the order check passed with the prose before the fence"
     end_case
 }
@@ -707,6 +832,99 @@ $found"
     end_case
 }
 
+# The acceptance-reject block: after the last record it takes every bead the
+# refinery no longer holds out of the iteration. R is the refinery agent.
+case_reject_block() {
+    new_case reject_block
+    local R="$REFINERY_AGENT" before members other_before
+
+    # a. Not reject: nothing is read, said or changed.
+    write_manifest_of "$HEAD_ID" "$SECOND_ID" "$THIRD_ID"
+    before=$(cksum <"$MANIFEST")
+    run_rej warn GC_STUB_ASSIGNEES="$SECOND_ID="
+    assert_eq "a. block status" 0 "$?"
+    assert_eq "a. stdout" "" "$(cat "$T/out")"
+    ! grep -q 'bd show' "$T/gc.log" || fail "a. a warn run read a bead"
+    assert_eq "a. the manifest" "$before" "$(cksum <"$MANIFEST")"
+    run_rej LITERAL GC_STUB_ASSIGNEES="$SECOND_ID="
+    assert_eq "a. unrendered: block status" 0 "$?"
+    assert_eq "a. unrendered: stdout" "" "$(cat "$T/out")"
+    assert_eq "a. unrendered: no gc call" "" "$(cat "$T/gc.log")"
+    assert_eq "a. unrendered: the manifest" "$before" "$(cksum <"$MANIFEST")"
+
+    # b. Reject, and every bead is still the refinery's.
+    run_rej reject GC_STUB_ASSIGNEES="$HEAD_ID=$R $SECOND_ID=$R $THIRD_ID=$R"
+    assert_eq "b. block status" 0 "$?"
+    assert_eq "b. stdout" "" "$(cat "$T/out")"
+    assert_eq "b. the manifest" "$before" "$(cksum <"$MANIFEST")"
+
+    # c. A member left: it is cut from the manifest and nothing else changes.
+    other_before=$(jq -cS 'del(.members)' "$MANIFEST")
+    members=$(jq -cS --arg gone "$SECOND_ID" '[.members[] | select(.id != $gone)]' "$MANIFEST")
+    run_rej reject GC_STUB_ASSIGNEES="$SECOND_ID="
+    assert_eq "c. block status" 0 "$?"
+    assert_eq "c. stdout" "LEFT: $SECOND_ID (assignee now '')
+BATCH: $HEAD_ID $THIRD_ID" "$(cat "$T/out")"
+    assert_eq "c. .head" "$HEAD_ID" "$(jq -r .head "$MANIFEST")"
+    assert_eq "c. .members[].id" "$HEAD_ID
+$THIRD_ID" "$(jq -r '.members[].id' "$MANIFEST")"
+    assert_eq "c. every other field" "$other_before" "$(jq -cS 'del(.members)' "$MANIFEST")"
+    assert_eq "c. the surviving members, whole" "$members" "$(jq -cS .members "$MANIFEST")"
+
+    # d. Down to the head alone: the manifest goes.
+    write_manifest
+    run_rej reject GC_STUB_ASSIGNEES="$SECOND_ID="
+    assert_eq "d. block status" 0 "$?"
+    [ ! -e "$MANIFEST" ] || fail "d. the manifest survived a batch of 1"
+    assert_eq "d. the last line" "INFO: batch of 1." "$(tail -n 1 "$T/out")"
+
+    # e. The head left: the manifest goes, and HEAD LEFT is the last line.
+    write_manifest_of "$HEAD_ID" "$SECOND_ID" "$THIRD_ID"
+    run_rej reject GC_STUB_ASSIGNEES="$HEAD_ID="
+    assert_eq "e. block status" 0 "$?"
+    [ ! -e "$MANIFEST" ] || fail "e. the manifest survived a head that left"
+    assert_eq "e. the last line" "HEAD LEFT: $HEAD_ID" "$(tail -n 1 "$T/out")"
+    grep -qxF "LEFT: $HEAD_ID (assignee now '')" "$T/out" || fail "e. stdout lacks the LEFT line for the head"
+
+    # f. No manifest: the head is $WORK.
+    run_rej reject GC_STUB_ASSIGNEES="$HEAD_ID="
+    assert_eq "f. block status" 0 "$?"
+    assert_eq "f. the last line" "HEAD LEFT: $HEAD_ID" "$(tail -n 1 "$T/out")"
+    [ ! -e "$MANIFEST" ] || fail "f. a manifest appeared"
+
+    # g. A read that fails keeps the bead in the iteration.
+    write_manifest_of "$HEAD_ID" "$SECOND_ID" "$THIRD_ID"
+    before=$(cksum <"$MANIFEST")
+    run_rej reject GC_STUB_FAIL_SHOW="$SECOND_ID" GC_STUB_ASSIGNEES="$SECOND_ID="
+    assert_eq "g. block status" 0 "$?"
+    assert_eq "g. stdout" "WARN: could not read $SECOND_ID; it stays in this iteration." "$(cat "$T/out")"
+    assert_eq "g. the manifest" "$before" "$(cksum <"$MANIFEST")"
+    end_case
+}
+
+# The pour-and-burn for a head that left is the rebase conflict path's, byte for
+# byte (D10), so the iteration advances the way a rebase conflict advances it.
+case_head_left_pour() {
+    new_case head_left_pour
+    pour_copy_matches "$FORMULA" ||
+        fail "the acceptance-check step lacks a pour-and-burn block equal to the rebase step's, after the acceptance-reject:end sentinel"
+
+    # The check must be able to FAIL: change one character of the copy.
+    python3 - "$FORMULA" "$T/formula-altered.toml" <<'PY' || fail "harness bug: could not alter the copy"
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+at = text.index("# --- acceptance-reject:end ---")
+old = "gc bd mol burn"
+cut = text.index(old, at)
+open(sys.argv[2], "w", encoding="utf-8").write(text[:cut] + "gc bd mol bur_" + text[cut + len(old):])
+PY
+    cmp -s "$FORMULA" "$T/formula-altered.toml" && fail "harness bug: the formula copy was not changed"
+    ! pour_copy_matches "$T/formula-altered.toml" 2>/dev/null ||
+        fail "the pour-copy check passed with one character of the copy changed"
+    end_case
+}
+
 case_steps_and_needs
 case_var
 case_unrendered
@@ -715,12 +933,14 @@ case_warn_single
 case_warn_batch
 case_skip_codes
 case_packet_error
-case_reject_runs_as_warn
+case_reject_mode
 case_not_runnable
 case_stale_files
 case_rubric_verbatim
 case_prose
 case_rm_targets_guarded
+case_reject_block
+case_head_left_pour
 
 if [ "$PASS_CASES" -ne "$EXPECTED_CASES" ]; then
     echo "FAIL: $PASS_CASES of $EXPECTED_CASES cases ran" >&2

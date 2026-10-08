@@ -10,7 +10,7 @@
 # that count with restart_after_iterations before any merge work.
 #
 # Two halves, both EXECUTED from the shipped formula text rather than
-# transcribed: the four session-iteration-stamp blocks (one per pour site that
+# transcribed: the five session-iteration-stamp blocks (one per pour site that
 # continues the conversation) and the one restart-cadence-check block. The stub
 # `gc` really mutates a fixture and journals every update, so an assertion reads
 # what the block's writes left behind, not what its source says. The blocks are
@@ -35,7 +35,7 @@ fail() {
 # The stamp must sit at every pour that continues the conversation, and only
 # there. The check-inbox pour starts a NEW conversation: the epoch bump makes
 # its unstamped wisp read correctly as one, so stamping it would be wrong.
-test_stamp_blocks_sit_at_exactly_the_four_continuing_pours() {
+test_stamp_blocks_sit_at_exactly_the_five_continuing_pours() {
     python3 - "$FORMULA" <<'PY' || fail "the session-iteration-stamp blocks are misplaced or have drifted apart (see above)"
 import sys
 import tomllib
@@ -48,12 +48,12 @@ pour = "gc bd mol wisp mol-refinery-patrol"
 problems = []
 
 holders = sorted(sid for sid, text in steps.items() if begin in text)
-expected = sorted(["rebase", "handle-failures", "merge-push", "next-iteration"])
+expected = sorted(["acceptance-check", "rebase", "handle-failures", "merge-push", "next-iteration"])
 if holders != expected:
     problems.append(f"stamp blocks live in {holders}, want exactly {expected}")
 total = sum(text.count(begin) for text in steps.values())
-if total != 4:
-    problems.append(f"formula carries {total} stamp blocks, want 4")
+if total != 5:
+    problems.append(f"formula carries {total} stamp blocks, want 5")
 
 blocks = {}
 for sid, text in steps.items():
@@ -483,7 +483,7 @@ trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/bin"
 write_gc_stub "$TMP/bin"
 
-test_stamp_blocks_sit_at_exactly_the_four_continuing_pours
+test_stamp_blocks_sit_at_exactly_the_five_continuing_pours
 test_cadence_check_runs_first_in_check_inbox
 
 extract_block session-iteration-stamp "$TMP/stamp.sh" || exit 1
