@@ -77,6 +77,35 @@ and the failure handling get lost.
 The same block appears in the rejection paths of steps `rebase` and
 `handle-failures` — those copies are the formula's own and stay in sync with it.
 
+For crash recovery the block is copied below; the formula is authoritative if
+they ever disagree, and `tests/test_prompt_formula_command_drift.py` holds the
+copy to its invariants (every bail drain-acks):
+
+```bash
+CURRENT_WISP=${GC_BEAD_ID:-}
+if [ -z "$CURRENT_WISP" ]; then
+  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json | jq -r '.[0].id // empty')
+fi
+NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id // empty')
+if [ -z "$NEXT" ]; then
+  echo "Could not pour next refinery wisp; not burning."
+  gc runtime drain-ack
+  exit 1
+fi
+if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+  echo "Could not assign next refinery wisp; not burning."
+  gc runtime drain-ack
+  exit 1
+fi
+if [ -n "$CURRENT_WISP" ]; then
+  gc bd mol burn "$CURRENT_WISP" --force
+else
+  echo "Could not resolve current wisp; not burning."
+  gc runtime drain-ack
+  exit 1
+fi
+```
+
 **This rule applies UNCONDITIONALLY, including when:**
 
 - The merge-queue scan returned zero beads at this wisp's scan time.

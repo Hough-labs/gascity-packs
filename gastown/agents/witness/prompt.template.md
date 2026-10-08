@@ -186,10 +186,9 @@ nothing).
 # Step 1: Reconcile your patrol wisps to exactly one (town ledger, via gc bd).
 # Collect every open/in_progress patrol wisp assigned to you, keep one, and
 # burn the surplus so restarts never accumulate duplicates. Wisp roots are
-# molecules — filter --type=molecule, never --type=wisp. They are also
-# ephemeral, so they live in the wisps tier that gc bd list hides without
-# --include-infra; drop that flag and these queries return [] even when a
-# wisp is assigned, and you pour a duplicate.
+# molecules — filter --type=molecule, never --type=wisp. `--include-infra` is
+# REQUIRED: wisp roots are ephemeral beads in the wisps table, which gc bd list
+# skips unless asked for, so a query without it silently returns nothing.
 WISP_IDS=$(
   gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=0 --json | jq -r '.[].id'
   gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r '.[].id'
@@ -228,18 +227,41 @@ is a bug indicator. Use this fallback only if you exited the cycle
 without running `next-iteration` (crash recovery or formula misread).
 If `next-iteration` already ran, do not pour again; run `gc hook`.
 
-The fallback is the same work `next-iteration` does, so read it from there
-rather than from a copy here:
+This fallback is a copy of `mol-witness-patrol` step `next-iteration`, kept
+here for crash recovery; the formula is authoritative if they ever disagree,
+and `tests/test_prompt_formula_command_drift.py` holds the copy to its
+invariants (every bail drain-acks):
 
 ```bash
-gc bd formula show mol-witness-patrol   # step `next-iteration`, sections 2-3
-```
-
-Sections 2 and 3 reconcile the queued patrol wisps to exactly one — reusing an
-already-queued wisp instead of pouring a duplicate, and burning the surplus —
-then burn the current wisp. Run them, then:
-
-```bash
+CURRENT_WISP=${GC_BEAD_ID:-}
+if [ -z "$CURRENT_WISP" ]; then
+  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json | jq -r '.[0].id // empty')
+fi
+# Reconcile queued patrol wisps to exactly one. Wisps are poured open and
+# nothing transitions them, so both live statuses are queried with one filter
+# (gcp-ah8h), and the wisp being resumed is excluded so this can never burn it.
+SURPLUS_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json \
+  | jq -r --arg cur "$CURRENT_WISP" '.[] | select(.id != $cur) | .id')
+ASSIGNED_WISP=$(printf '%s\n' $SURPLUS_WISPS | sed -n '1p')
+for extra in $(printf '%s\n' $SURPLUS_WISPS | sed '1d'); do
+  gc bd mol burn "$extra" --force
+done
+if [ -z "$ASSIGNED_WISP" ]; then
+  NEXT=$(gc bd mol wisp mol-witness-patrol --root-only --var binding_prefix='{{ .BindingPrefix }}' --json | jq -r '.new_epic_id // empty')
+  if [ -z "$NEXT" ]; then
+    echo "Could not pour next witness wisp; not burning."
+    gc runtime drain-ack
+    exit 1
+  fi
+  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+    echo "Could not assign next witness wisp; not burning."
+    gc runtime drain-ack
+    exit 1
+  fi
+fi
+if [ -n "$CURRENT_WISP" ]; then
+  gc bd mol burn "$CURRENT_WISP" --force
+fi
 gc hook
 ```
 

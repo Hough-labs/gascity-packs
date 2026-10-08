@@ -207,7 +207,7 @@ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
         # becomes a pathspec matching nothing, `git diff --quiet` exits 0, and an
         # unmerged branch reads as merged and is force-closed.
         'done < <(git diff --name-only -z "$MERGE_BASE" "origin/$BRANCH")',
-        'elif git diff --quiet "origin/main" "origin/$BRANCH" -- "${CHANGED[@]}"; then',
+        'elif git diff --quiet "origin/$DEFAULT_BRANCH" "origin/$BRANCH" -- "${CHANGED[@]}"; then',
         # All three destructive sites re-state the verdict. Step 3a is not
         # redundant with Step 3b: it skips to Step 4, so a guard placed only at
         # the pool reset would never cover it.

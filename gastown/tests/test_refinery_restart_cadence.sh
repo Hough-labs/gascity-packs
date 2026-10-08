@@ -35,7 +35,7 @@ fail() {
 # The stamp must sit at every pour that continues the conversation, and only
 # there. The check-inbox pour starts a NEW conversation: the epoch bump makes
 # its unstamped wisp read correctly as one, so stamping it would be wrong.
-test_stamp_blocks_sit_at_exactly_the_five_continuing_pours() {
+test_stamp_blocks_sit_at_exactly_the_six_continuing_pours() {
     python3 - "$FORMULA" <<'PY' || fail "the session-iteration-stamp blocks are misplaced or have drifted apart (see above)"
 import sys
 import tomllib
@@ -51,35 +51,45 @@ holders = sorted(sid for sid, text in steps.items() if begin in text)
 expected = sorted(["acceptance-check", "rebase", "handle-failures", "merge-push", "next-iteration"])
 if holders != expected:
     problems.append(f"stamp blocks live in {holders}, want exactly {expected}")
+# One block per continuing pour. The rebase step carries two: its rejection
+# pour and upstream's target-branch-missing halt (#374), which also continues
+# the conversation and so is stamped too.
 total = sum(text.count(begin) for text in steps.values())
-if total != 5:
-    problems.append(f"formula carries {total} stamp blocks, want 5")
+if total != 6:
+    problems.append(f"formula carries {total} stamp blocks, want 6")
 
 blocks = {}
 for sid, text in steps.items():
     if begin not in text:
         continue
-    if text.count(begin) != 1 or text.count(end) != 1:
-        problems.append(f"{sid}: want exactly one begin and one end sentinel")
+    n = text.count(begin)
+    if text.count(end) != n:
+        problems.append(f"{sid}: want one end sentinel per begin sentinel")
         continue
-    before, rest = text.split(begin, 1)
-    body, after = rest.split(end, 1)
-    blocks[sid] = [line.lstrip() for line in body.strip().split("\n")]
-    # In place: after this step's pour, before its burn, and it is the ONLY
-    # assignment of NEXT in the step, so no unstamped write survives beside it.
-    if pour not in before:
-        problems.append(f"{sid}: the stamp block must follow the successor pour")
-    if "gc bd mol burn" not in after:
-        problems.append(f"{sid}: the stamp block must precede the burn of the current wisp")
-    if text.count('gc bd update "$NEXT"') != 1 or 'gc bd update "$NEXT"' not in body:
-        problems.append(f"{sid}: NEXT must be assigned once, inside the stamp block")
-    if text.count(pour) != 1:
-        problems.append(f"{sid}: want exactly one successor pour, found {text.count(pour)}")
+    if text.count(pour) != n:
+        problems.append(f"{sid}: want one successor pour per stamp block, found {text.count(pour)} pours for {n} blocks")
+    if text.count('gc bd update "$NEXT"') != n:
+        problems.append(f"{sid}: NEXT must be assigned once per stamp block, inside it")
+    rest = text
+    for k in range(n):
+        before, rest = rest.split(begin, 1)
+        body, rest = rest.split(end, 1)
+        # In place: after this pour, before the next one and before its burn,
+        # and holding the only assignment of NEXT for that pour.
+        if pour not in before:
+            problems.append(f"{sid}: stamp block {k + 1} must follow its successor pour")
+        if 'gc bd update "$NEXT"' not in body:
+            problems.append(f"{sid}: stamp block {k + 1} must hold the assignment of NEXT")
+        upto_next_pour = rest.split(pour, 1)[0]
+        if "gc bd mol burn" not in upto_next_pour:
+            problems.append(f"{sid}: stamp block {k + 1} must precede the burn of the current wisp")
+        blocks.setdefault(sid, []).append([line.lstrip() for line in body.strip().split("\n")])
 
-reference = blocks.get("next-iteration")
-for sid, lines in blocks.items():
-    if reference is not None and lines != reference:
-        problems.append(f"{sid}: stamp block differs from next-iteration's after stripping leading whitespace")
+reference = blocks.get("next-iteration", [None])[0]
+for sid, copies in blocks.items():
+    for lines in copies:
+        if reference is not None and lines != reference:
+            problems.append(f"{sid}: stamp block differs from next-iteration's after stripping leading whitespace")
 
 inbox = steps["check-inbox"]
 if begin in inbox:
@@ -483,7 +493,7 @@ trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/bin"
 write_gc_stub "$TMP/bin"
 
-test_stamp_blocks_sit_at_exactly_the_five_continuing_pours
+test_stamp_blocks_sit_at_exactly_the_six_continuing_pours
 test_cadence_check_runs_first_in_check_inbox
 
 extract_block session-iteration-stamp "$TMP/stamp.sh" || exit 1

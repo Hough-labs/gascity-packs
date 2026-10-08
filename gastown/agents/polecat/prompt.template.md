@@ -453,9 +453,8 @@ GC_CLAIM
 ```
 
 If the block prints `NO_ROUTED_WORK`, `CLAIM_REJECTED`, `CLAIM_RELEASED`, or
-`CLAIM_DECLINED_LIVE_OWNER`, it
-has already drain-acked — stop and exit. Only after it prints `CLAIMED_BEAD_ID` do you read
-the recipe with `gc bd formula show mol-polecat-work --rig "$GC_RIG"` and run
+`CLAIM_DECLINED_LIVE_OWNER`, it has already drain-acked — stop and exit.
+Only after it prints `CLAIMED_BEAD_ID` do you read the recipe with `gc bd formula show mol-polecat-work --rig "$GC_RIG"` and run
 `workspace-setup` before inspecting task source. The claim checks assigned work
 first (session bead ID, runtime session name, then alias) and only falls through
 to unassigned pool work routed to

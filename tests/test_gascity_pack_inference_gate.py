@@ -785,7 +785,7 @@ def test_manifold_validation_step_bodies_are_unweakened() -> None:
         'test -n "$ANTHROPIC_DEFAULT_SONNET_MODEL"',
         'test -n "$ANTHROPIC_DEFAULT_OPUS_MODEL"',
         'test -n "$CLAUDE_CODE_SUBAGENT_MODEL"',
-        'test "$GC_INFERENCE_EXPECTED_MODEL" = "kimi-k2.7-code"',
+        'test "$GC_INFERENCE_EXPECTED_MODEL" = "kimi-k3"',
     )
     for relative_path in (
         ".github/workflows/supported-pack-nightly.yml",
@@ -2027,7 +2027,7 @@ WITNESS_ORPHAN_GUARD_PINS = (
     'elif ! [[ "$BEAD_UPDATED_AT" < "$CYCLE_MAP_BUILT_AT" ]]; then',
     # Content test: -z and the quoted array are jointly load-bearing.
     'done < <(git diff --name-only -z "$MERGE_BASE" "origin/$BRANCH")',
-    'elif git diff --quiet "origin/main" "origin/$BRANCH" -- "${CHANGED[@]}"; then',
+    'elif git diff --quiet "origin/$DEFAULT_BRANCH" "origin/$BRANCH" -- "${CHANGED[@]}"; then',
     # All three destructive sites re-state the verdict.  Step 3a skips to Step
     # 4, so a guard placed only at the pool reset would never cover it.
     'if [ "$STILL_ORPHANED" = "true" ] && [ "$ON_MAIN" = "true" ]; then',

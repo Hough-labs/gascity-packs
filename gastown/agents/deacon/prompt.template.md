@@ -98,19 +98,41 @@ is a bug indicator. Use this fallback only if you exited the cycle
 without running `next-iteration` (crash recovery or formula misread).
 If `next-iteration` already ran, do not pour again; run `gc hook`.
 
-The fallback is the same work `next-iteration` does, so read it from there
-rather than from a copy here:
+This fallback is a copy of `mol-deacon-patrol` step `next-iteration`, kept
+here for crash recovery; the formula is authoritative if they ever disagree,
+and `tests/test_prompt_formula_command_drift.py` holds the copy to its
+invariants (every bail drain-acks):
 
 ```bash
-gc bd formula show mol-deacon-patrol   # step `next-iteration`, sections 3-4
-```
-
-Section 3 resolves the current wisp, reconciles your queued patrol wisps to
-exactly one — reusing an already-queued successor instead of pouring a duplicate
-and burning the surplus — and drain-acks before it bails if a pour or an
-assignment fails; section 4 burns the current wisp. Run them, then:
-
-```bash
+CURRENT_WISP=${GC_BEAD_ID:-}
+if [ -z "$CURRENT_WISP" ]; then
+  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json | jq -r '.[0].id // empty')
+fi
+# Reconcile queued patrol wisps to exactly one. Wisps are poured open and
+# nothing transitions them, so both live statuses are queried with one filter
+# (gcp-ah8h), and the wisp being resumed is excluded so this can never burn it.
+SURPLUS_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json \
+  | jq -r --arg cur "$CURRENT_WISP" '.[] | select(.id != $cur) | .id')
+ASSIGNED_WISP=$(printf '%s\n' $SURPLUS_WISPS | sed -n '1p')
+for extra in $(printf '%s\n' $SURPLUS_WISPS | sed '1d'); do
+  gc bd mol burn "$extra" --force
+done
+if [ -z "$ASSIGNED_WISP" ]; then
+  NEXT=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id // empty')
+  if [ -z "$NEXT" ]; then
+    echo "Could not pour next deacon wisp; not burning."
+    gc runtime drain-ack
+    exit 1
+  fi
+  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+    echo "Could not assign next deacon wisp; not burning."
+    gc runtime drain-ack
+    exit 1
+  fi
+fi
+if [ -n "$CURRENT_WISP" ]; then
+  gc bd mol burn "$CURRENT_WISP" --force
+fi
 gc hook
 ```
 

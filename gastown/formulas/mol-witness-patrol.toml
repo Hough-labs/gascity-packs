@@ -508,6 +508,40 @@ if [ -n "$BRANCH" ] && ! git check-ref-format --branch "$BRANCH" >/dev/null 2>&1
 fi
 ```
 
+Resolve the rig's default branch before you go any further. Case C and Step 3
+both compare against it, and neither may assume `main`: rigs run on `master`
+(gauntlet), `dev` (winnow) and `edge-integration` (gascity) too. Against those,
+a hardcoded `origin/main` does not resolve at all — git exits 128 and the
+caller reads a plain negative, which in Step 3 means "not merged" and sends
+finished work back to the pool (gcp-5ddt).
+
+```bash
+# Run from the rig root or the bead's worktree — either is inside the repo.
+DEFAULT_REF=$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null || true)
+DEFAULT_BRANCH=${DEFAULT_REF#refs/remotes/origin/}
+if [ -z "$DEFAULT_BRANCH" ]; then
+  # origin/HEAD is not set in every clone — a worktree cut with --detach never
+  # gets one. Ask the remote instead of guessing a name.
+  DEFAULT_BRANCH=$(git ls-remote --symref origin HEAD 2>/dev/null |
+    awk '$1 == "ref:" { sub("refs/heads/", "", $2); print $2; exit }')
+fi
+if [ -n "$DEFAULT_BRANCH" ]; then
+  git fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1 || true
+fi
+if [ -z "$DEFAULT_BRANCH" ] ||
+   ! git rev-parse --verify --quiet "origin/$DEFAULT_BRANCH" >/dev/null; then
+  # FAIL CLOSED: RECOVERY_BLOCKED makes Step 2a skip this bead. Step 3's
+  # already-merged guard cannot run without this ref, and the cost of guessing
+  # wrong is re-dispatching completed work. Leaving the bead orphaned for one
+  # more cycle is cheap; re-dispatching merged work is not.
+  RECOVERY_BLOCKED=true
+  echo "SKIP <bead>: cannot resolve origin's default branch in $(pwd)"
+  gc mail send mayor/ -s "WITNESS: orphan recovery skipped — unresolvable default branch" \
+    -m "Bead <bead>: could not resolve origin's default branch (origin/HEAD unset and git ls-remote --symref gave nothing). Skipped recovery rather than risk re-dispatching already-merged work. Fix by setting origin/HEAD on this rig: git remote set-head origin --auto"
+  # Continue with the next orphaned bead.
+fi
+```
+
 If `RECOVERY_BLOCKED=true`, escalate and stop processing this bead. Do not run
 Cases A-E, cleanup, or workflow reset for it during this patrol.
 
@@ -601,41 +635,6 @@ per-bead loop — do not salvage, do not close, do not reassign, do not delete
 the worktree. Everything from here to Step 4 assumes `STILL_ORPHANED=true`
 and each destructive site re-states the check, so a step reached out of order
 still fails closed.
-
-Resolve the rig's default branch before you go any further. Case C and Step 3
-both compare against it, and neither may assume `main`: rigs run on `master`
-(gauntlet), `dev` (winnow) and `edge-integration` (gascity) too. Against those,
-a hardcoded `origin/main` does not resolve at all — git exits 128 and the
-caller reads a plain negative, which in Step 3 means "not merged" and sends
-finished work back to the pool (gcp-5ddt).
-
-```bash
-# Run from the rig root or the bead's worktree — either is inside the repo.
-DEFAULT_REF=$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null || true)
-DEFAULT_BRANCH=${DEFAULT_REF#refs/remotes/origin/}
-if [ -z "$DEFAULT_BRANCH" ]; then
-  # origin/HEAD is not set in every clone — a worktree cut with --detach never
-  # gets one. Ask the remote instead of guessing a name.
-  DEFAULT_BRANCH=$(git ls-remote --symref origin HEAD 2>/dev/null |
-    awk '$1 == "ref:" { sub("refs/heads/", "", $2); print $2; exit }')
-fi
-if [ -n "$DEFAULT_BRANCH" ]; then
-  git fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1 || true
-fi
-if [ -z "$DEFAULT_BRANCH" ] ||
-   ! git rev-parse --verify --quiet "origin/$DEFAULT_BRANCH" >/dev/null; then
-  # FAIL CLOSED: skip this bead entirely, do not recover it. Step 3's
-  # already-merged guard cannot run without this ref, and the cost of guessing
-  # wrong is re-dispatching completed work. Leaving the bead orphaned for one
-  # more cycle is cheap; re-dispatching merged work is not.
-  STILL_ORPHANED=false
-  echo "SKIP <bead>: cannot resolve origin's default branch in $(pwd)"
-  gc mail send mayor/ -s "WITNESS: orphan recovery skipped — unresolvable default branch" \
-    -m "Bead <bead>: could not resolve origin's default branch (origin/HEAD unset and git ls-remote --symref gave nothing). Skipped recovery rather than risk re-dispatching already-merged work. Fix by setting origin/HEAD on this rig: git remote set-head origin --auto"
-  # Continue with the next orphaned bead.
-fi
-```
-
 
 Only Cases B-D apply when `WORKTREE` is non-empty after this validation.
 Never `cd` to, scan, or remove the unvalidated candidate. Check the bead and

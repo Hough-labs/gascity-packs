@@ -51,6 +51,14 @@ THIS_FILE = Path(__file__).resolve()
 # still containing the broken form. Skipping it loses no coverage: the shipped
 # post-image of that same content is scanned directly.
 DERIVED_PREFIXES = ("patches/",)
+# Test harnesses quote the flag tokens in grep patterns and fixtures; they are
+# not queries anything runs.
+TEST_PREFIXES = ("tests/", "gastown/tests/")
+# Boot's patrol loop arrived upstream (#261) after the open-wisp facet below was
+# measured (gcp-ah8h), and upstream pins its resolvers in the in_progress form
+# (test_boot_patrol_burn_resolves_current_wisp). The live-status facet is held to
+# the three patrol roles it was measured on; boot keeps the --include-infra rule.
+LIVE_STATUS_EXEMPT = ("gastown/agents/boot/", "gastown/formulas/mol-boot-patrol.toml")
 
 # Match the flag form only (`--type=molecule` / `--type molecule`), never the
 # prose spelling `issue_type=molecule` that documents what a wisp root is.
@@ -101,7 +109,7 @@ def tracked_files() -> list[Path]:
     return [
         REPO_ROOT / path
         for path in result.stdout.decode().split("\0")
-        if path and not path.startswith(DERIVED_PREFIXES)
+        if path and not path.startswith(DERIVED_PREFIXES + TEST_PREFIXES)
     ]
 
 
@@ -247,6 +255,8 @@ def test_shipped_live_wisp_queries_cover_open_and_in_progress() -> None:
     violations = []
     for path in tracked_files():
         if path.resolve() == THIS_FILE:
+            continue
+        if path.relative_to(REPO_ROOT).as_posix().startswith(LIVE_STATUS_EXEMPT):
             continue
         try:
             text = path.read_text(encoding="utf-8")

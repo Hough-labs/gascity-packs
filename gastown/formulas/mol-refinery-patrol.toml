@@ -884,7 +884,7 @@ Target: $TARGET"
   # bead must not end the merge lane.
   CURRENT_WISP=${GC_BEAD_ID:-}
   if [ -z "$CURRENT_WISP" ]; then
-    CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
+    CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json | jq -r '.[0].id // empty')
   fi
   NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
   if [ -z "$NEXT" ]; then
@@ -892,11 +892,34 @@ Target: $TARGET"
     gc runtime drain-ack
     exit 1
   fi
-  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+  # --- session-iteration-stamp:begin ---
+  # Carry the conversation's iteration count onto NEXT in the same write that
+  # assigns it, so check-inbox can restart at restart_after_iterations. The count
+  # continues only while CURRENT was stamped under this GC_CONTINUATION_EPOCH;
+  # any other epoch was an earlier conversation, so NEXT starts again at 1. With
+  # the epoch unset nothing is stamped and the cadence check reads "off".
+  set -- --assignee="$GC_AGENT"
+  if [ -n "${GC_CONTINUATION_EPOCH:-}" ]; then
+    if ! STAMP_JSON=$(gc bd show "$CURRENT_WISP" --json 2>/dev/null); then
+      echo "WARN: could not read $CURRENT_WISP; the next wisp's iteration count restarts at 1."
+      STAMP_JSON=""
+    fi
+    STAMP_EPOCH=$(printf '%s' "$STAMP_JSON" | jq -r '.[0].metadata.session_epoch // empty' 2>/dev/null)
+    STAMP_K=$(printf '%s' "$STAMP_JSON" | jq -r '.[0].metadata.session_iterations // empty' 2>/dev/null)
+    case "$STAMP_K" in ''|*[!0-9]*) STAMP_K=0 ;; esac
+    if [ "$STAMP_EPOCH" = "$GC_CONTINUATION_EPOCH" ]; then
+      STAMP_K=$((STAMP_K + 1))
+    else
+      STAMP_K=1
+    fi
+    set -- "$@" --set-metadata session_epoch="$GC_CONTINUATION_EPOCH" --set-metadata session_iterations="$STAMP_K"
+  fi
+  if ! gc bd update "$NEXT" "$@"; then
     echo "Could not assign next refinery wisp; not burning."
     gc runtime drain-ack
     exit 1
   fi
+  # --- session-iteration-stamp:end ---
   if [ -n "$CURRENT_WISP" ]; then
     gc bd mol burn "$CURRENT_WISP" --force
   else

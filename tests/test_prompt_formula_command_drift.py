@@ -32,6 +32,10 @@ AGENT_PROMPT_GLOB = "gastown/agents/*/prompt.template.md"
 
 FENCE_OPEN = re.compile(r"^\s*```(\w*)\s*$")
 FENCE_CLOSE = re.compile(r"^\s*```\s*$")
+# Warrant creation, by either spelling of the label flag. Upstream renamed the
+# create flag from --label to --labels (#330), so a detector keyed on the old
+# spelling would stop seeing every warrant it exists to check.
+WARRANT_LABEL = re.compile(r"--labels?[= ]warrant\b")
 
 POOL_RETURN_ASSIGNEE = re.compile(r"""--assignee=(?:""|'')""")
 
@@ -172,7 +176,7 @@ def warrant_dedup_violations(path: Path, text: str) -> list[str]:
         for number in range(start, start + body.count("\n") + 1)
     }
     for number, command in logical_commands(text):
-        if "gc bd create" not in command or "--label=warrant" not in command:
+        if "gc bd create" not in command or not WARRANT_LABEL.search(command):
             continue
         if number in guarded:
             continue
@@ -199,7 +203,7 @@ def warrant_workflow_kind_violations(path: Path, text: str) -> list[str]:
     """
     violations = []
     for number, command in logical_commands(text):
-        if "gc bd create" not in command or "--label=warrant" not in command:
+        if "gc bd create" not in command or not WARRANT_LABEL.search(command):
             continue
         if "gc.routed_to" not in command:
             continue
@@ -584,6 +588,14 @@ def test_detectors_catch_the_drift_they_are_named_for() -> None:
         ]
     )
     assert warrant_dedup_violations(fixture, unguarded_warrant)
+    unguarded_plural = "\n".join(
+        [
+            "```bash",
+            "gc bd create --type=task --labels=warrant --metadata '{\"target\":\"x\"}'",
+            "```",
+        ]
+    )
+    assert warrant_dedup_violations(fixture, unguarded_plural)
     guarded_warrant = "\n".join(
         [
             "```bash",
