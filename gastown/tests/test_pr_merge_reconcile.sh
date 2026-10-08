@@ -1058,8 +1058,12 @@ PY
 }
 
 test_formula_uses_pending_merge_gate() {
-    grep -F 'gc gastown pr-merge-reconcile record' "$FORMULA" >/dev/null ||
-        fail "refinery formula must record PR handoffs through the reconciler"
+    # This fork runs the merge-push lane from merge-push.sh (gcp-l8td.6), not
+    # from fenced blocks of the formula, so the publication-path contract is
+    # read where the lane lives; the find-work ordering stays in the formula.
+    local merge_push="$ROOT/gastown/assets/scripts/refinery/merge-push.sh"
+    grep -F 'gc gastown pr-merge-reconcile record' "$merge_push" >/dev/null ||
+        fail "the merge-push lane must record PR handoffs through the reconciler"
     grep -F 'Every time this open step is entered or re-entered after an idle wake' "$FORMULA" >/dev/null ||
         fail "open refinery work scan must repeat pending-merge reconciliation after idle wakes"
     [ "$(grep -c '^id = "find-work"$' "$FORMULA")" -eq 1 ] ||
@@ -1070,10 +1074,10 @@ test_formula_uses_pending_merge_gate() {
     search_line=$(grep -nF 'Search for work beads assigned to you' "$FORMULA" | head -n1 | cut -d: -f1)
     [[ "$reconcile_line" -lt "$cleanup_line" && "$cleanup_line" -lt "$search_line" ]] ||
         fail "find-work must order reconciliation, bounded cleanup, then normal work search"
-    grep -F 'Do not invoke task-artifact cleanup on this publication path.' "$FORMULA" >/dev/null ||
+    grep -F 'No task-artifact cleanup here: reconciliation runs it after the verified' "$merge_push" >/dev/null ||
         fail "MR publication path must defer cleanup until verified close"
-    ! grep -F 'gc bd close $WORK --reason "Pull request ready:' "$FORMULA" >/dev/null ||
-        fail "refinery formula must not close source beads at PR publication"
+    ! grep -F 'gc bd close $WORK --reason "Pull request ready:' "$FORMULA" "$merge_push" >/dev/null ||
+        fail "neither the formula nor the merge-push lane may close source beads at PR publication"
 }
 
 test_record_blocks_without_closing

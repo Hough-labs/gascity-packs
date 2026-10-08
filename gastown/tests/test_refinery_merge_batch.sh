@@ -157,6 +157,12 @@ bd)
     *) unexpected ;;
     esac
     ;;
+gastown)
+    # gc gastown task-artifact-cleanup <id>: the pack command a lane runs after
+    # a verified close (upstream's task-artifact lifecycle). Journalled only;
+    # its own suite owns its behaviour.
+    { [ "${2:-}" = task-artifact-cleanup ] && [ "$#" -eq 3 ]; } || unexpected
+    ;;
 *) unexpected ;;
 esac
 exit 0

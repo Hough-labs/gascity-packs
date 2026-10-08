@@ -29,6 +29,9 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 FORMULA="${REBASE_GUARD_FORMULA:-$ROOT/gastown/formulas/mol-refinery-patrol.toml}"
+# The mr lane, and so its lease-failure recovery, lives in merge-push.sh in this
+# fork (gcp-l8td.6); legs 9 and 10 read it there.
+MERGE_PUSH="${REBASE_GUARD_MERGE_PUSH:-$ROOT/gastown/assets/scripts/refinery/merge-push.sh}"
 
 # The halt leg pipes the wisp-pour answer through real `jq`, so jq is a hard
 # test dependency.  Declare it rather than shadowing jq in the stub PATH: the
@@ -686,75 +689,36 @@ leg8() {
 # so pin it the way leg 7 pins the fence: the two halves drifted apart once
 # already.  This leg is the executable counterpart of that contract.
 leg9() {
-    local mr="$tmp/mr-section.md" off_clear off_probe off_rematerialize
+    # This fork runs the merge-push lane from merge-push.sh (gcp-l8td.6), so the
+    # `mr` lease-failure recovery is pinned where it lives: the script's lane_mr.
+    # The contract is upstream's (#374): never rebase temp in place, never claim
+    # a rebase in the PR body, and re-enter the rebase step's ancestry decision.
+    local mr="$tmp/mr-lane.sh" lease="$tmp/mr-lease-arm.sh" cleanup="$tmp/cleanup-temp.sh"
+    awk '/^lane_mr\(\) \{/ { on = 1 } on { print } on && /^}/ { exit }' "$MERGE_PUSH" >"$mr"
+    [ -s "$mr" ] || fail "leg 9: could not slice lane_mr out of $MERGE_PUSH"
+    awk '/^if ! git push origin HEAD:\$BRANCH --force-with-lease; then/ { on = 1 } on { print } on && /^fi$/ { exit }' "$mr" >"$lease"
+    [ -s "$lease" ] || fail "leg 9: could not slice the lease-failure arm out of lane_mr"
 
-    # Prefix marker, matching the slice in gastown/tests/test_gastown_pack_assets.sh:
-    # the heading closes its bold run after the colon, so anchoring on `"mr"**`
-    # would match nothing.
-    awk 'index($0, "**If MERGE_STRATEGY = \"mr\"") { on = 1 } on' "$FORMULA" >"$mr"
-    [ -s "$mr" ] || fail "leg 9: could not slice the mr strategy section out of $FORMULA"
-
-    # The retired instruction must be gone, not merely supplemented: left in
-    # place it is still the literal thing an agent follows on lease failure.
     ! grep -Fq -- 'rebase your temp branch again' "$mr" ||
-        fail "leg 9: the mr lease-failure recovery still instructs an in-place rebase of temp; on the skip path that flattens the source branch and force-pushes the result"
-
-    # The heading is part of the contract: on the skip path `temp` was never
-    # rebased, so a heading promising a rebased branch is false.
-    grep -Fq -- '**1. Push the branch back to origin:**' "$mr" ||
-        fail "leg 9: the mr push heading must not claim the branch is rebased -- the skip path pushes an unrebased temp"
-
-    # The recovery has to route back through the ancestry decision rather than
-    # describe a push-level fixup.
-    grep -Fq -- 're-enter the `rebase` step' "$mr" ||
-        fail "leg 9: the mr lease-failure recovery must re-enter the rebase step's ancestry decision"
-    grep -Fq -- 'git merge-base --is-ancestor "origin/$TARGET" "origin/$BRANCH"' "$mr" ||
-        fail "leg 9: the mr lease-failure recovery must re-probe ancestry, direction-locked like the decision itself"
-    # Single-line literals throughout: `grep -F` treats an embedded newline as a
-    # pattern separator, so a two-line pattern would quietly become an OR.
-    grep -Fq -- 'rc=0 re-materializes `temp` at the freshly fetched `origin/$BRANCH`, unrebased' "$mr" ||
-        fail "leg 9: the mr recovery must keep an already-based temp unrebased (probe rc=0)"
-    grep -Fq -- 'any other status STOPs without mutating bead state' "$mr" ||
-        fail "leg 9: the mr recovery must fail closed on a probe error, like the decision's third arm"
-
-    # "Re-materialize" is a verb, not a command.  Bind it: the recovery names the
-    # exact pair an agent runs, and leg 10 executes that pair out of the formula.
-    grep -Fq -- 'git checkout --detach "origin/$TARGET" && git branch -D temp' "$mr" ||
-        fail "leg 9: the mr lease-failure recovery must name the concrete command that clears temp, not an unbound \"re-materialize\""
-    grep -Fq -- 'git checkout -B temp' "$mr" ||
-        fail "leg 9: the mr recovery must warn off re-materializing in place with git checkout -B temp, which keeps the branch alive across the probe"
-
-    # The provenance line is published to human reviewers.  On the skip path temp
-    # was never rebased, so it may not claim it was; both paths do leave
-    # origin/$TARGET an ancestor of temp, which is what "Based on" asserts.
+        fail "leg 9: the mr lease-failure recovery still instructs an in-place rebase of temp"
+    ! grep -Eq -- '(^|[^-])git rebase' "$lease" ||
+        fail "leg 9: the lease-failure arm rebases temp in place; on the skip path that flattens the source branch"
+    grep -Fq -- 'cleanup_temp' "$lease" ||
+        fail "leg 9: the lease-failure arm must drop the stale temp before the step is re-entered"
+    grep -Fq -- "re-runs the rebase step's ancestry decision" "$lease" ||
+        fail "leg 9: the lease-failure arm must route back through the rebase step's ancestry decision"
     grep -Fq -- "printf -- '- Based on \`%s\` via Gastown Refinery." "$mr" ||
         fail "leg 9: the mr PR body must not advertise a rebase that the skip path never ran"
     ! grep -Fq -- "printf -- '- Rebased on \`%s\` via Gastown Refinery." "$mr" ||
         fail "leg 9: the mr PR body still publishes '- Rebased on ...' provenance, false on the skip path"
-    grep -Fq -- 'a step re-entry' "$mr" ||
-        fail "leg 9: the mr recovery re-materializes temp, so it must say the retry re-enters the step and re-runs run-tests rather than reading as a push-level fixup"
-    grep -Fq -- 'run-tests` runs again' "$mr" ||
-        fail "leg 9: the mr recovery must state that run-tests re-runs on the re-materialized temp"
 
-    # Ordering is the load-bearing half, and it is the DECISION's order that wins:
-    # the rebase step probes before any branch exists ("so every STOP leaves the
-    # worktree clean"), and legs 4/6 assert it.  An earlier revision of this
-    # recovery mandated the inverse -- re-materialize, then probe -- which left a
-    # mutated temp behind a probe error and put the two halves of one contract in
-    # contradiction.  So: clear temp FIRST, then the probe, and only then the
-    # re-materialization the arms perform.  Byte offsets, so a reflow of the
-    # paragraph cannot break the check.
-    off_clear=$(grep -Fob -m1 -- 'git checkout --detach "origin/$TARGET" && git branch -D temp' "$mr" | cut -d: -f1) || true
-    [ -n "$off_clear" ] ||
-        fail "leg 9: the mr recovery must clear temp with a concrete command before re-entering the step"
-    off_probe=$(grep -Fob -m1 -- 'git merge-base --is-ancestor "origin/$TARGET" "origin/$BRANCH"' "$mr" | cut -d: -f1) || true
-    [ -n "$off_probe" ] || fail "leg 9: the re-probe literal vanished between checks"
-    off_rematerialize=$(grep -Fob -m1 -- 'rc=0 re-materializes `temp` at the freshly fetched `origin/$BRANCH`, unrebased' "$mr" | cut -d: -f1) || true
-    [ -n "$off_rematerialize" ] || fail "leg 9: the rc=0 re-materialization literal vanished between checks"
-    [ "$off_clear" -lt "$off_probe" ] ||
-        fail "leg 9: the mr recovery must clear temp before re-probing (clear at byte $off_clear, probe at byte $off_probe)"
-    [ "$off_probe" -lt "$off_rematerialize" ] ||
-        fail "leg 9: the mr recovery must probe before re-materializing temp, matching the rebase step's probe-first rationale (probe at byte $off_probe, re-materialize at byte $off_rematerialize)"
+    # The clear is concrete and detaches: leg 10 executes exactly this body.
+    awk '/^cleanup_temp\(\) \{/ { on = 1; next } on && /^}/ { exit } on { print }' "$MERGE_PUSH" >"$cleanup"
+    grep -Fq -- 'git checkout --detach "origin/$TARGET"' "$cleanup" ||
+        fail "leg 9: cleanup_temp must detach onto origin/\$TARGET before deleting temp"
+    grep -Fq -- 'git branch -D temp' "$cleanup" ||
+        fail "leg 9: cleanup_temp must delete temp"
+    return 0
 }
 
 # Leg 10 -- the `mr` lease-failure recovery, EXECUTED rather than pinned.
@@ -774,7 +738,11 @@ leg9() {
 leg10() {
     local ex d recovery first_temp moved
     recovery="$tmp/mr-recovery.sh"
-    lift_block 'git checkout --detach "origin/$TARGET" && git branch -D temp' "$recovery"
+    # The recovery merge-push.sh's lane_mr runs on a lease failure: its own
+    # cleanup_temp body, lifted from the script rather than transcribed.
+    awk '/^cleanup_temp\(\) \{/ { on = 1; next } on && /^}/ { exit } on { print }' "$MERGE_PUSH" >"$recovery"
+    [ -s "$recovery" ] || fail "leg 10: could not lift cleanup_temp out of $MERGE_PUSH"
+    bash -n "$recovery" || fail "leg 10: the lifted cleanup_temp body does not parse"
 
     for ex in ex1 ex3a; do
         d="$tmp/leg10-$ex"

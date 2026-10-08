@@ -30,7 +30,9 @@
 # embedded default.
 #   require_merge_approval  --require-approval        default false
 #   review_agent            --review-agent            default ""
-#   delete_merged_branches  --delete-merged-branches  default true
+#   delete_merged_branches  --delete-merged-branches  default true; deprecated,
+#                           deletes nothing: a verified merge keeps its source
+#                           branch as the task artifact's recovery copy
 #   target_branch           --target-default          derived: the rig's
 #                           DefaultBranch. Used only when the bead has no
 #                           metadata.target.
@@ -51,11 +53,15 @@
 #
 # Exit status. The merge-push step owns patrol-loop control for every status;
 # this script never ends the agent's session and never pours or burns a wisp.
-#    0  the work bead is closed: landed (direct, or mr after approval), handed
-#       off as a pull request (mr, approval off), or closed as already merged
+#    0  handed off: the work bead is closed and its task artifact cleaned
+#       (landed direct, or mr after approval, or closed as already merged), or,
+#       for mr with approval off, the pull request is recorded pending and the
+#       bead is BLOCKED until `gc gastown pr-merge-reconcile` verifies the merge
 #    1  usage or config error; nothing touched
 #    2  hard stop; do not mutate bead state. Also returned when a merge landed
-#       but recording it on the bead failed: the next patrol's merge-state gate
+#       but its task-artifact cleanup did not converge (retryable: find-work's
+#       sweep picks it up), or when a merge landed but recording it on the bead
+#       failed: the next patrol's merge-state gate
 #       closes it as already merged.
 #    3  the re-rebase onto the moved target conflicted
 #    4  parked awaiting review (the gate refused, or the approved head no longer
@@ -590,7 +596,7 @@ lookup_pr_info() {
     return 1
   fi
   if command -v "$GH" >/dev/null 2>&1; then
-    "$GH" pr view --repo "$ORIGIN_REPO" --json url,number,state,headRefName,baseRefName,headRepositoryOwner,headRepository -- "$ref" 2>"$err_file"
+    "$GH" pr view --repo "$ORIGIN_REPO" --json url,number,state,headRefName,headRefOid,baseRefName,headRepositoryOwner,headRepository -- "$ref" 2>"$err_file"
     return $?
   fi
   if ! init_github_rest 2>"$err_file"; then
@@ -615,7 +621,7 @@ lookup_pr_info() {
   fi
   PR_RAW=$(curl_gh_api "$err_file" "$API/pulls/$PR_NUMBER") || return 1
   printf '%s
-' "$PR_RAW" | jq '{url:.html_url, number, state:(.state | ascii_upcase), headRefName:.head.ref, baseRefName:.base.ref, headRepositoryOwner:{login:.head.repo.owner.login}, headRepository:{name:.head.repo.name}}'
+' "$PR_RAW" | jq '{url:.html_url, number, state:(.state | ascii_upcase), headRefName:.head.ref, headRefOid:.head.sha, baseRefName:.base.ref, headRepositoryOwner:{login:.head.repo.owner.login}, headRepository:{name:.head.repo.name}}'
 }
 
 # --- merge_ff_push ----------------------------------------------------------
@@ -847,13 +853,18 @@ git checkout --detach "origin/$TARGET" >/dev/null 2>&1 || true
 git branch -d temp || git branch -D temp || true
 }
 
-# The direct lane's "2. Cleanup", including the branch delete the step gave in
-# prose: If delete_merged_branches = "true": `git push origin --delete $BRANCH`
+# The direct lane's "2. Cleanup" after a verified close (upstream #245 and the
+# task-artifact lifecycle): drop temp, then run the successful task-artifact
+# cleanup. origin/$BRANCH is deliberately kept: it is the durable recovery copy,
+# and the cleanup proves a worktree safe to remove against it. delete_merged_branches
+# is retained only for formula compatibility and deletes nothing.
 direct_cleanup() {
 cleanup_temp
-if [ "$CFG_DELETE_MERGED_BRANCHES" = "true" ]; then
-  git push origin --delete "$BRANCH"
+if ! gc gastown task-artifact-cleanup "$WORK"; then
+  echo "Task artifact cleanup did not converge. STOP; its durable pending/blocked state remains retryable."
+  return 2
 fi
+return 0
 }
 
 # The already-merged close is a real completion: skip the merge and run
@@ -862,7 +873,7 @@ fi
 after_already_merged_close() {
   if [ "$1" -eq 0 ]; then
     MP_SUMMARY="closed as already merged to $TARGET"
-    direct_cleanup
+    direct_cleanup || return $?
   fi
   return "$1"
 }
@@ -968,7 +979,8 @@ esac
 direct_close
 LAND_STATUS=$?
 case "$LAND_STATUS" in
-  0|4) direct_cleanup ;;
+  0) direct_cleanup || return $? ;;
+  4) cleanup_temp ;;
 esac
 return "$LAND_STATUS"
 }
@@ -991,7 +1003,12 @@ case "$BHRC_STATUS" in
 esac
 git checkout temp
 if ! git push origin HEAD:$BRANCH --force-with-lease; then
-  echo "git push --force-with-lease of $BRANCH failed: the existing PR branch moved after your fetch. STOP, fetch the latest branch, rebase your temp branch again, and retry with --force-with-lease. Do not use plain --force."
+  # Upstream #374/#245: temp is stale, and on the rebase step's skip path it is
+  # origin/$BRANCH with its merge topology intact, so rebasing it here would
+  # flatten exactly what the ancestry decision preserved. Drop temp and let the
+  # next patrol re-run the rebase step's decision on the moved branch.
+  cleanup_temp
+  echo "git push --force-with-lease of $BRANCH failed: the existing PR branch moved after your fetch and temp is stale. Dropped temp; the next patrol re-runs the rebase step's ancestry decision on the moved branch. Do NOT rebase temp in place, and do not use plain --force."
   return 2
 fi
 WORK_JSON=$(gc bd show $WORK --json)
@@ -1029,7 +1046,9 @@ PR_BODY_FILE=$(mktemp)
 ' "$BRANCH"
   printf -- '- Target: `%s`
 ' "$TARGET"
-  printf -- '- Rebased on `%s` via Gastown Refinery.
+  # "Based on", not "Rebased on": on the rebase step's skip path temp was never
+  # rebased; both paths end with origin/$TARGET an ancestor of temp.
+  printf -- '- Based on `%s` via Gastown Refinery.
 ' "$TARGET"
 } > "$PR_BODY_FILE"
 
@@ -1123,6 +1142,8 @@ PR_REPO=$(printf '%s
 ' "$PR_URL" | sed -E 's#^https://github.com/([^/]+/[^/]+)/pull/[0-9]+$#\1#')
 PR_HEAD_REPO=$(printf '%s
 ' "$PR_INFO" | jq -r '.headRepositoryOwner.login + "/" + .headRepository.name')
+PR_HEAD_SHA=$(printf '%s
+' "$PR_INFO" | jq -r '.headRefOid')
 echo "$PR_URL $PR_NUMBER $PR_STATE $PR_HEAD $PR_BASE $PR_REPO $PR_HEAD_REPO"
 if [ "$PR_STATE" != "OPEN" ]; then
   if [ -n "$EXISTING_PR" ]; then
@@ -1164,24 +1185,42 @@ if [ "$PR_HEAD_REPO" != "$ORIGIN_REPO" ]; then
   echo "Pull request $PR_REF head repo $PR_HEAD_REPO, want $ORIGIN_REPO."
   return 2
 fi
+# Upstream #245: the pending-merge record binds completion to the exact head
+# that passed this refinery's validation, so the PR must point at it now.
+EXPECTED_PR_HEAD=$(git rev-parse temp)
+if [ "$PR_HEAD_SHA" != "$EXPECTED_PR_HEAD" ]; then
+  echo "Pull request $PR_REF head is $PR_HEAD_SHA, want validated branch head $EXPECTED_PR_HEAD."
+  return 2
+fi
 # The step's "If this command fails or prints empty output: STOP."
 if [ -z "$PR_URL" ] || [ "$PR_URL" = null ] || [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = null ]; then
   echo "Pull request $PR_REF verified without a URL or number. STOP. Debug and retry. Do NOT continue."
   return 2
 fi
 
-gc bd update $WORK --set-metadata pr_url="$PR_URL" --set-metadata pr_number="$PR_NUMBER" --set-metadata merged_target="$TARGET" --unset-metadata rejection_reason
 if [ "$APPROVAL_REQUIRED" -eq 0 ]; then
-  # 4a. Approval gate off: PR publication is the terminal handoff.
-if gc bd update $WORK --set-metadata merge_result=pull_request && gc bd close $WORK --reason "Pull request ready: $PR_URL"; then
-  MP_SUMMARY="pull request ready: $PR_URL"
-else
-  echo "Could not record the pull request handoff on $WORK; the bead is still open. STOP. Debug and retry."
-  return 2
-fi
+  # 4a. Approval gate off: record the pending PR WITHOUT closing the work bead
+  # (upstream #245). The bead moves to blocked, so its dependents stay blocked,
+  # until `gc gastown pr-merge-reconcile` verifies the merge on a later patrol.
+  # No task-artifact cleanup here: reconciliation runs it after the verified
+  # close.
+  if ! gc gastown pr-merge-reconcile record "$WORK" "$PR_URL" "$PR_NUMBER" "$TARGET" "$PR_HEAD_SHA"; then
+    echo "Failed to record pending PR state. STOP. Do not close $WORK."
+    return 2
+  fi
+  if ! gc mail send mayor/ -s "PR ready for review: $WORK" -m "Work bead: $WORK
+Pull request: $PR_URL
+ The bead and its dependents remain blocked until a refinery patrol verifies the merge."; then
+    echo "Pending PR state is safe, but mayor notification failed; report the delivery failure."
+  fi
+  MP_SUMMARY="pull request pending merge: $PR_URL"
   cleanup_temp
   return 0
 fi
+
+# 4b. Breadcrumbs first: the approval gate reads pr_number back to check the
+# reviewer approved THIS pull request.
+gc bd update $WORK --set-metadata pr_url="$PR_URL" --set-metadata pr_number="$PR_NUMBER" --set-metadata merged_target="$TARGET" --unset-metadata rejection_reason
 
 # 4b. Approval gate on: refused parks the bead; approved lands it with the
 # direct path's merge.
@@ -1197,7 +1236,8 @@ gc bd update "$WORK" --set-metadata merge_approval_state=approved --unset-metada
 direct_close
 LAND_STATUS=$?
 case "$LAND_STATUS" in
-  0|4) cleanup_temp ;;
+  0) direct_cleanup || return $? ;;
+  4) cleanup_temp ;;
 esac
 return "$LAND_STATUS"
 }

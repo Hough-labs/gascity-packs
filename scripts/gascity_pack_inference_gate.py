@@ -349,8 +349,14 @@ GASTOWN_SCRIPT_CONTRACTS = {
         '--set-metadata merged_sha="$MERGED_SHA"',
         'gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT"',
         '"$GH" pr create',
-        "--set-metadata pr_url=\"$PR_URL\"",
-        "gc bd close $WORK --reason \"Pull request ready: $PR_URL\"",
+        # Upstream #245: approval off, a PR is a PENDING handoff recorded with
+        # the validated head; the bead is blocked, never closed at publication.
+        "gc gastown pr-merge-reconcile record",
+        '"$WORK" "$PR_URL" "$PR_NUMBER" "$TARGET" "$PR_HEAD_SHA"',
+        'if [ "$PR_HEAD_SHA" != "$EXPECTED_PR_HEAD" ]; then',
+        # A verified close runs the task-artifact cleanup and keeps the source
+        # branch as its recovery copy.
+        'gc gastown task-artifact-cleanup "$WORK"',
     ),
     # The batch lane's mechanics (gcp-l8td.8-.11). Each fragment is the line that
     # makes one guarantee real: a member is closed against ITS landed commit, a

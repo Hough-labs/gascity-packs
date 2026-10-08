@@ -1974,7 +1974,8 @@ def test_gastown_build_workflow_contract_covers_orchestration_roles() -> None:
     assert 'git worktree add --detach "$mfp_wt" "$BEFORE_SHA"' in script_contracts
     assert 'git merge-base --is-ancestor "$TEMP_SHA" "$AFTER_SHA"' in script_contracts
     assert 'gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT"' in script_contracts
-    assert "gc bd close $WORK --reason \"Pull request ready: $PR_URL\"" in script_contracts
+    assert "gc gastown pr-merge-reconcile record" in script_contracts
+    assert 'gc gastown task-artifact-cleanup "$WORK"' in script_contracts
     assert '"$GH" pr create' in script_contracts
     for fragment in ("merge-batch.sh", 'land --head "$WORK"', 'stack --head "$WORK"', 'serial --head "$WORK"'):
         assert fragment in contracts["mol-refinery-patrol"]

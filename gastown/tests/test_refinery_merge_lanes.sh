@@ -175,6 +175,28 @@ formula)
         printf '{"formulas":[]}\n'
     fi
     ;;
+gastown)
+    case "${2:-}" in
+    task-artifact-cleanup)
+        # Run after a verified close (upstream's task-artifact lifecycle).
+        # Journalled only; its own suite owns its behaviour.
+        { [ "$#" -eq 3 ] && [ "$3" = "$GC_STUB_WORK" ]; } || unexpected
+        ;;
+    pr-merge-reconcile)
+        # `record <work> <url> <number> <target> <head>`: upstream #245's
+        # pending-merge handoff. Modelled on the bead it leaves: the PR
+        # identity and validated head recorded, merge_result=pull_request_pending,
+        # stale rejection cleared, and the bead BLOCKED, never closed.
+        { [ "${3:-}" = record ] && [ "$#" -eq 8 ] && [ "$4" = "$GC_STUB_WORK" ]; } || unexpected
+        edit_bead --arg url "$5" --arg num "$6" --arg target "$7" --arg head "$8" \
+            '.[0].metadata.pr_url = $url | .[0].metadata.pr_number = $num
+             | .[0].metadata.merged_target = $target | .[0].metadata.pr_head_sha = $head
+             | .[0].metadata.merge_result = "pull_request_pending"
+             | del(.[0].metadata.rejection_reason) | .[0].status = "blocked"'
+        ;;
+    *) unexpected ;;
+    esac
+    ;;
 runtime) [ "${2:-}" = drain-ack ] || unexpected ;;
 mail) [ "${2:-}" = send ] || unexpected ;;
 session) [ "${2:-}" = nudge ] || unexpected ;;
@@ -263,6 +285,12 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 [ -f "${STUB_REST_PR:-}" ] || unexpected
+# The live head sha is read off the bare origin, as GitHub would report it.
+rest_pr() {
+    local oid
+    oid=$(git --git-dir="$STUB_ORIGIN_DIR" rev-parse --verify -q "refs/heads/$(jq -r '.head.ref' "$STUB_REST_PR")" || true)
+    jq --arg oid "$oid" '.head.sha = $oid' "$STUB_REST_PR"
+}
 case "$method $url" in
 "GET $STUB_API/pulls")
     if [ -e "$STUB_REST_CREATED" ]; then
@@ -273,10 +301,10 @@ case "$method $url" in
     ;;
 "POST $STUB_API/pulls")
     : >"$STUB_REST_CREATED"
-    cat "$STUB_REST_PR"
+    rest_pr
     ;;
 "GET $STUB_API/pulls/$(jq -r '.number' "$STUB_REST_PR")")
-    cat "$STUB_REST_PR"
+    rest_pr
     ;;
 *) unexpected ;;
 esac
@@ -658,6 +686,8 @@ test_lane_direct_lands_and_closes() {
     expect "rejection_reason" "$(meta rejection_reason)" "<unset>"
     expect "status" "$(bead status)" closed
     expect "close reason" "$(bead close_reason)" "Merged to $TARGET_NAME at $(short_sha "$TEMP_SHA")"
+    logged gc "gc gastown task-artifact-cleanup $WORK_ID" ||
+        fail "no task-artifact cleanup after the verified close"
     expect_not_drained
     end_case
 }
@@ -808,7 +838,10 @@ test_lane_direct_cleanup_with_target_in_second_worktree() {
     git -C "$REFINERY" rev-parse --verify -q refs/heads/temp >/dev/null &&
         fail "temp still exists after cleanup"
     expect "the second worktree's branch" "$(git -C "$T/second" symbolic-ref -q HEAD)" refs/heads/integration
-    origin_ref "$BRANCH_NAME" >/dev/null && fail "origin still has $BRANCH_NAME after delete_merged_branches=true"
+    # Upstream #245: a verified merge KEEPS its source branch as the task
+    # artifact's recovery copy; delete_merged_branches no longer deletes.
+    origin_ref "$BRANCH_NAME" >/dev/null ||
+        fail "origin lost $BRANCH_NAME; a verified merge keeps its source branch even with delete_merged_branches=true"
     end_case
 }
 
@@ -842,8 +875,10 @@ test_lane_mr_reuses_existing_pr() {
     # (:1420-1472) before any lane runs, and mr-verify reads it again as
     # PR_REF (:2115).
     expect "scoped views of the existing PR" \
-        "$(count_logged gh "gh pr view --repo $ORIGIN_REPO --json url,number,state,headRefName,baseRefName,headRepositoryOwner,headRepository -- $PR_URL")" 2
-    expect "close reason" "$(bead close_reason)" "Pull request ready: $PR_URL"
+        "$(count_logged gh "gh pr view --repo $ORIGIN_REPO --json url,number,state,headRefName,headRefOid,baseRefName,headRepositoryOwner,headRepository -- $PR_URL")" 2
+    expect "status" "$(bead status)" blocked
+    expect "merge_result" "$(meta merge_result)" pull_request_pending
+    expect "close reason" "$(bead close_reason)" "<unset>"
     end_case
 }
 
@@ -864,7 +899,9 @@ test_lane_mr_rest_fallback_without_gh() {
         fail "no create-or-find call to $API_URL/pulls; curl calls: $(tr '\n' ';' <"$T/curl.log")"
     expect "pr_url" "$(meta pr_url)" "https://github.com/acme/widgets/pull/42"
     expect "pr_number" "$(meta pr_number)" 42
-    expect "close reason" "$(bead close_reason)" "Pull request ready: https://github.com/acme/widgets/pull/42"
+    expect "status" "$(bead status)" blocked
+    expect "merge_result" "$(meta merge_result)" pull_request_pending
+    expect "close reason" "$(bead close_reason)" "<unset>"
     end_case
 }
 
@@ -931,18 +968,26 @@ test_lane_mr_existing_pr_wrong_head_repo_blocks() {
     end_case
 }
 
-test_lane_mr_4a_closes_pull_request_ready() {
-    new_case mr_4a_closes_pull_request_ready
+# Upstream #245: approval off, PR publication is a PENDING handoff, never a
+# close. The bead is blocked (so its dependents stay blocked) until
+# `gc gastown pr-merge-reconcile` verifies the merge on a later patrol.
+test_lane_mr_4a_records_pending_pull_request() {
+    new_case mr_4a_records_pending_pull_request
     build_rig unmerged
     write_bead merge_strategy=mr
     run_lane
     expect_lane mr
     expect_status 0
-    expect "merge_result" "$(meta merge_result)" pull_request
+    logged gc "gc gastown pr-merge-reconcile record $WORK_ID $PR_URL 7 $TARGET_NAME $TEMP_SHA" ||
+        fail "no pending-merge record of the validated head; gc calls: $(tr '\n' ';' <"$T/gc.log")"
+    logged gc "gc mail send mayor/ -s PR ready for review: $WORK_ID" || fail "the mayor was not told the PR is ready for review"
+    grep -qF "gc gastown task-artifact-cleanup" "$T/gc.log" && fail "task-artifact cleanup ran at PR publication"
+    expect "merge_result" "$(meta merge_result)" pull_request_pending
     expect "merged_target" "$(meta merged_target)" "$TARGET_NAME"
+    expect "pr_head_sha" "$(meta pr_head_sha)" "$TEMP_SHA"
     expect "rejection_reason" "$(meta rejection_reason)" "<unset>"
-    expect "status" "$(bead status)" closed
-    expect "close reason" "$(bead close_reason)" "Pull request ready: $PR_URL"
+    expect "status" "$(bead status)" blocked
+    expect "close reason" "$(bead close_reason)" "<unset>"
     expect "origin/$BRANCH_NAME" "$(origin_ref "$BRANCH_NAME")" "$TEMP_SHA"
     expect_target_unchanged
     expect_not_drained
@@ -1010,7 +1055,7 @@ test_lane_mr_cleanup_with_target_in_second_worktree() {
     run_lane
     expect_lane mr
     expect_status 0
-    expect "status" "$(bead status)" closed
+    expect "status" "$(bead status)" blocked
     # The mr cleanup detaches onto the target, as the direct lane's does, so the
     # target being checked out in another worktree no longer stops it (gcp-l8td.6).
     ! output_has "already (checked out|used by worktree)" ||
@@ -1265,7 +1310,9 @@ test_script_honors_refinery_gh() {
     grep -qE '^gh pr (create|view) ' "$T/gh.log" ||
         fail "refinery-gh received no pull request call; its calls: $(tr '\n' ';' <"$T/gh.log")"
     expect "pr_url" "$(meta pr_url)" "$PR_URL"
-    expect "close reason" "$(bead close_reason)" "Pull request ready: $PR_URL"
+    expect "status" "$(bead status)" blocked
+    expect "merge_result" "$(meta merge_result)" pull_request_pending
+    expect "close reason" "$(bead close_reason)" "<unset>"
     end_case
 }
 
@@ -1315,7 +1362,7 @@ run_all_cases() {
     test_lane_mr_existing_pr_wrong_base_blocks
     test_lane_mr_existing_pr_wrong_repo_blocks
     test_lane_mr_existing_pr_wrong_head_repo_blocks
-    test_lane_mr_4a_closes_pull_request_ready
+    test_lane_mr_4a_records_pending_pull_request
     test_lane_mr_4b_refused_parks
     test_lane_mr_4b_approved_lands_and_closes
     test_lane_mr_zero_diff_halts

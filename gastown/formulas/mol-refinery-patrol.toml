@@ -1678,7 +1678,7 @@ What each status means, and what this step does about it:
 
 | Status | Meaning | This step |
 |---|---|---|
-| 0 | The work bead is closed: landed (direct, or mr after approval), handed off as a pull request (mr, approval off), or closed as already merged. | Continue to patrol-summary. The script already ran its cleanup; do not run another. |
+| 0 | Handed off: the work bead is closed and its task artifact cleaned (landed direct, or mr after approval, or closed as already merged), or, for mr with approval off, the pull request is recorded pending and the bead is blocked until `gc gastown pr-merge-reconcile` verifies the merge on a later patrol. | Continue to patrol-summary. The script already ran its cleanup; do not run another. |
 | 1 | Usage or config error; nothing was touched. | STOP and drain. Read the output above the RESULT line. |
 | 2 | Hard stop; do not mutate bead state. Also returned when a merge landed but recording it on the bead failed: the next patrol's merge-state gate closes it as already merged. | STOP and drain. |
 | 3 | The re-rebase onto the moved target conflicted. | STOP and drain. |
