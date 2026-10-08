@@ -139,10 +139,12 @@ off | warn | reject. Whether the refinery reads each bead's acceptance criteria
 against its branch before it merges, and what a miss does. off (the default) runs
 no read. warn reads every bead the iteration is about to merge (the head, and each
 batch member), records the verdict on the bead, and notes, labels and nudges every
-MISS and DECLARED, then merges as before. reject runs as warn until gcp-s7j4.4
-builds it. A placeholder left unrendered, an empty value or an unknown value means
-off. A rig opts in through `[rigs.formula_vars]`. The read costs at most one packet
-(under 30000 characters) per bead."""
+MISS and DECLARED, then merges as before. reject does what warn does, then returns
+each MISS to the polecat pool before rebase, as a rebase conflict does: a head that
+misses ends the iteration, and a member that misses leaves the batch. DECLARED and
+SKIP never reject. A placeholder left unrendered, an empty value or an unknown value
+means off. A rig opts in through `[rigs.formula_vars]`. The read costs at most one
+packet (under 30000 characters) per bead."""
 default = "off"
 
 [[steps]]
@@ -541,7 +543,9 @@ criteria name, exactly as written? The fence below resolves the pack's
 acceptance-check.sh, builds one packet per bead and says which to read; you apply
 the rubric and record the verdict on the bead. With `acceptance_check` off, the
 default, it prints one line and does nothing else. Warn mode never blocks: it does
-not edit the manifest, reject a branch or hold a merge.
+not edit the manifest, reject a branch or hold a merge. Reject mode returns each MISS
+to the polecat pool before rebase: a head that misses ends the iteration, and a
+member that misses leaves the batch.
 
 Run the fence in ONE shell, with `$WORK` set to the work bead find-work found.
 ```bash
@@ -549,17 +553,13 @@ Run the fence in ONE shell, with `$WORK` set to the work bead find-work found.
 ACK_MODE="{{acceptance_check}}"
 case "$ACK_MODE" in
   off) echo "acceptance check: off" ;;
-  warn) ;;
-  reject)
-    echo "WARN: acceptance_check=reject is not built yet (gcp-s7j4.4); running as warn."
-    ACK_MODE=warn
-    ;;
+  warn | reject) ;;
   *)
     echo "INFO: acceptance_check='$ACK_MODE' is not off, warn or reject; check off."
     ACK_MODE=off
     ;;
 esac
-if [ "$ACK_MODE" = warn ]; then
+if [ "$ACK_MODE" != off ]; then
   ACK_DIR="$(git rev-parse --git-dir)/acceptance"
   mkdir -p "$ACK_DIR" && rm -f "${ACK_DIR:?}"/*.packet "${ACK_DIR:?}"/*.err "${ACK_DIR:?}/script.path"
   ACK_CITY="${GC_CITY:-${GC_CITY_PATH:-}}"
@@ -600,7 +600,7 @@ if [ "$ACK_MODE" = warn ]; then
         ACK_CODE=$(printf '%s\\n' "$ACK_OUT" | awk '{print $4}')
         ACK_TIP=$(printf '%s\\n' "$ACK_OUT" | sed -n 's/.* tip=//p')
         case "$ACK_CODE" in
-          no-ac | no-change) "$ACK" record --work "$ACK_ID" --verdict SKIP --tip "$ACK_TIP" </dev/null ;;
+          no-ac | no-change) "$ACK" record --work "$ACK_ID" --verdict SKIP --tip "$ACK_TIP" --mode "$ACK_MODE" </dev/null ;;
           already-judged) ;;
           *) echo "WARN: acceptance check for $ACK_ID: $ACK_CODE; not checked." ;;
         esac
@@ -616,12 +616,118 @@ fi
 For each `READ` line, in the order printed: read that packet in full (`cat` it, one packet per command), apply
 the rubric below, then record your verdict with ONE command, the per-item lines as a quoted heredoc:
 ```bash
-"$(cat "$(git rev-parse --git-dir)/acceptance/script.path")" record --work <id> --verdict <CONFORMS|DECLARED|MISS> --tip <the tip= value on the packet's PACKET line> <<'ACK_ITEMS'
+"$(cat "$(git rev-parse --git-dir)/acceptance/script.path")" record --work <id> --verdict <CONFORMS|DECLARED|MISS> --tip <the tip= value on the packet's PACKET line> --mode {{acceptance_check}} <<'ACK_ITEMS'
 <one line per AC item, in the rubric's output format>
 ACK_ITEMS
 ```
-Warn mode never blocks. Whatever the verdicts, close this step and proceed to rebase. A `record` that exits 1 or 2
-is a WARN: name it in patrol-summary and proceed. With no `READ` line, close this step.
+A `record` that exits 1 or 2 is a WARN: name it in patrol-summary and proceed. With no `READ` line, close this
+step and proceed to rebase.
+
+After the last `record`, run this block ONCE, in one shell, with `$WORK` set as above. Outside reject mode it
+prints nothing and changes nothing. In reject mode `record` has already returned each MISS to the polecat pool,
+and this block takes every bead no longer assigned to you out of this iteration:
+```bash
+# --- acceptance-reject:begin ---
+if [ "{{acceptance_check}}" = reject ]; then
+  REJ_MANIFEST="$(git rev-parse --git-dir)/refinery-batch.json"
+  REJ_IDS="$WORK"
+  if [ -f "$REJ_MANIFEST" ]; then
+    REJ_MEMBERS=$(jq -r '.members | if type == "array" then .[].id else empty end' "$REJ_MANIFEST" 2>/dev/null)
+    [ -n "$REJ_MEMBERS" ] && REJ_IDS="$REJ_MEMBERS"
+  fi
+  REJ_GONE=""
+  REJ_HEAD_GONE=""
+  for REJ_ID in $REJ_IDS; do
+    REJ_JSON=$(gc bd show "$REJ_ID" --json 2>/dev/null)
+    if [ $? -ne 0 ] || [ -z "$(printf '%s' "$REJ_JSON" | jq -r '.[0].id // empty' 2>/dev/null)" ]; then
+      echo "WARN: could not read $REJ_ID; it stays in this iteration."
+      continue
+    fi
+    REJ_ASSIGNEE=$(printf '%s' "$REJ_JSON" | jq -r '.[0].assignee // empty' 2>/dev/null)
+    if [ "$REJ_ASSIGNEE" != "$GC_AGENT" ]; then
+      echo "LEFT: $REJ_ID (assignee now '$REJ_ASSIGNEE')"
+      REJ_GONE="${REJ_GONE:+$REJ_GONE }$REJ_ID"
+      [ "$REJ_ID" = "$WORK" ] && REJ_HEAD_GONE=1
+    fi
+  done
+  if [ -n "$REJ_HEAD_GONE" ]; then
+    rm -f "${REJ_MANIFEST:?}"
+    echo "HEAD LEFT: $WORK"
+  elif [ -n "$REJ_GONE" ]; then
+    REJ_KEPT=""
+    REJ_TMP="${REJ_MANIFEST}.tmp"
+    if jq --arg gone "$REJ_GONE" '.members |= map(select(.id as $i | ($gone | split(" ") | index($i)) | not))' "$REJ_MANIFEST" >"$REJ_TMP" 2>/dev/null &&
+       mv -f "$REJ_TMP" "$REJ_MANIFEST"; then
+      REJ_KEPT=$(jq -r '.members[].id' "$REJ_MANIFEST" 2>/dev/null | paste -sd ' ' -)
+    fi
+    rm -f "${REJ_TMP:?}"
+    if [ "$(printf '%s\n' "$REJ_KEPT" | wc -w | tr -d ' ')" -ge 2 ]; then
+      echo "BATCH: $REJ_KEPT"
+    else
+      rm -f "${REJ_MANIFEST:?}"
+      echo "INFO: batch of 1."
+    fi
+  fi
+fi
+# --- acceptance-reject:end ---
+```
+If it printed `HEAD LEFT: <id>`, this iteration has no head. Pour the next iteration and burn this one, exactly as
+a rebase conflict does, then close this step:
+```bash
+CURRENT_WISP=${GC_BEAD_ID:-}
+if [ -z "$CURRENT_WISP" ]; then
+  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json | jq -r '.[0].id // empty')
+fi
+if [ -z "$CURRENT_WISP" ]; then
+  echo "ERROR: could not resolve the current refinery wisp: GC_BEAD_ID is unset and no open/in_progress patrol wisp is assigned to $GC_AGENT."
+  echo "ERROR: refusing to continue. With CURRENT_WISP empty this cycle would pour a successor and never burn the wisp it is running, leaking one wisp every cycle, while every command still exits 0."
+  gc runtime drain-ack
+  exit 1
+fi
+NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
+if [ -z "$NEXT" ]; then
+  echo "Could not pour next refinery wisp; not burning."
+  gc runtime drain-ack
+  exit 1
+fi
+# --- session-iteration-stamp:begin ---
+# Carry the conversation's iteration count onto NEXT in the same write that
+# assigns it, so check-inbox can restart at restart_after_iterations. The count
+# continues only while CURRENT was stamped under this GC_CONTINUATION_EPOCH;
+# any other epoch was an earlier conversation, so NEXT starts again at 1. With
+# the epoch unset nothing is stamped and the cadence check reads "off".
+set -- --assignee="$GC_AGENT"
+if [ -n "${GC_CONTINUATION_EPOCH:-}" ]; then
+  if ! STAMP_JSON=$(gc bd show "$CURRENT_WISP" --json 2>/dev/null); then
+    echo "WARN: could not read $CURRENT_WISP; the next wisp's iteration count restarts at 1."
+    STAMP_JSON=""
+  fi
+  STAMP_EPOCH=$(printf '%s' "$STAMP_JSON" | jq -r '.[0].metadata.session_epoch // empty' 2>/dev/null)
+  STAMP_K=$(printf '%s' "$STAMP_JSON" | jq -r '.[0].metadata.session_iterations // empty' 2>/dev/null)
+  case "$STAMP_K" in ''|*[!0-9]*) STAMP_K=0 ;; esac
+  if [ "$STAMP_EPOCH" = "$GC_CONTINUATION_EPOCH" ]; then
+    STAMP_K=$((STAMP_K + 1))
+  else
+    STAMP_K=1
+  fi
+  set -- "$@" --set-metadata session_epoch="$GC_CONTINUATION_EPOCH" --set-metadata session_iterations="$STAMP_K"
+fi
+if ! gc bd update "$NEXT" "$@"; then
+  echo "Could not assign next refinery wisp; not burning."
+  gc runtime drain-ack
+  exit 1
+fi
+# --- session-iteration-stamp:end ---
+if [ -n "$CURRENT_WISP" ]; then
+  gc bd mol burn "$CURRENT_WISP" --force
+else
+  echo "ERROR: could not resolve the current refinery wisp; not burning. The patrol loop cannot advance — this wisp leaks and no successor runs."
+  gc runtime drain-ack
+  exit 1
+fi
+```
+Otherwise close this step and proceed to rebase, whatever the verdicts. `stack` takes the batch as the block
+left it.
 
 ```
 Acceptance read. For each packet, decide whether the branch delivers every acceptance item
@@ -1593,7 +1699,7 @@ Include:
 - Batch (if any): the landed and left-open ids from the RESULT line, or the
   members stamped serial on a red
 - Test results (pass/fail, which checks ran)
-- Acceptance check: each member's verdict (CONFORMS, DECLARED, MISS or SKIP), and any WARN or record exit 1 or 2
+- Acceptance check: each member's verdict (CONFORMS, DECLARED, MISS or SKIP), any WARN or record exit 1 or 2, and in reject mode each LEFT and HEAD LEFT line
 - Bugs filed (IDs, if any pre-existing failures were tracked)
 - Rejections (if the branch was rejected back to pool)
 - Any escalations sent
