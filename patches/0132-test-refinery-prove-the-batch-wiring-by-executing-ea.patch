@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 2 Oct 2026 20:05:19 -0400
-Subject: [PATCH 132/141] test(refinery): prove the batch wiring by executing
+Subject: [PATCH 132/144] test(refinery): prove the batch wiring by executing
  each shipped block (gcp-l8td.10)
 
 Nine cases, each extracting a sentinel-delimited block of the shipped formula

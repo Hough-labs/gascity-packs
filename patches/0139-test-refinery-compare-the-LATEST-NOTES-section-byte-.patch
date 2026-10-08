@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Tue, 6 Oct 2026 00:52:19 -0400
-Subject: [PATCH 139/141] test(refinery): compare the LATEST NOTES section byte
+Subject: [PATCH 139/144] test(refinery): compare the LATEST NOTES section byte
  for byte (gcp-s7j4.5)
 
 case_packet_notes compared two $(...) captures, which strip trailing

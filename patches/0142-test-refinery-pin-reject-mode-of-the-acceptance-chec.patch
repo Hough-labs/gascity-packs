@@ -1,0 +1,812 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 8 Oct 2026 15:11:56 -0400
+Subject: [PATCH 142/144] test(refinery): pin reject mode of the acceptance
+ check, red against b3b72667 (gcp-s7j4.4)
+
+Reject mode is specified in the bead before it is built, so the suites that
+prove it come first and fail for the reasons the bead names: record rejects
+--mode reject as a usage error, the fence still says reject is not built yet,
+there is no acceptance-reject block, and the formula has four stamp blocks.
+
+test_refinery_acceptance_check.sh: the gc stub learns --status and --assignee
+updates and a workflow arm, with the GC_STUB_FAIL_WORKFLOW and GC_STUB_FAIL_STATUS
+knobs. New cases pin the full write order of a reject-mode MISS, that nothing
+routes except that MISS, and a pool return that fails at delete-source or at the
+status write. packet re-reads a bead that came back at the same tip after a
+reject-mode MISS and still skips every other judged case. The text invariant
+drops the four fragments reject mode now writes and keeps the ones that say
+record never closes a bead or touches a molecule.
+
+test_refinery_acceptance_wiring.sh: the reject-runs-as-warn case becomes a
+reject-mode case, the fence pin carries the three edits to the fence, the prose
+pin comes in three pieces, case_reject_block executes the new block against a
+stub that answers per-id assignees, and case_head_left_pour holds the pour copy
+byte-equal to the rebase step's.
+
+test_refinery_restart_cadence.sh: the acceptance-check step is the fifth pour
+that continues the conversation.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../tests/test_refinery_acceptance_check.sh   | 201 ++++++++++++-
+ .../tests/test_refinery_acceptance_wiring.sh  | 274 ++++++++++++++++--
+ .../tests/test_refinery_restart_cadence.sh    |  12 +-
+ 3 files changed, 440 insertions(+), 47 deletions(-)
+
+diff --git a/gastown/tests/test_refinery_acceptance_check.sh b/gastown/tests/test_refinery_acceptance_check.sh
+index 06073781..40d7623c 100755
+--- a/gastown/tests/test_refinery_acceptance_check.sh
++++ b/gastown/tests/test_refinery_acceptance_check.sh
+@@ -14,15 +14,22 @@
+ # stubbed. The stub is modeled on test_refinery_merge_batch.sh's, over a fixture
+ # DIRECTORY with one JSON file per bead:
+ #   gc bd show <id> --json    that bead's file; fails for the ids in GC_STUB_FAIL_SHOW
+-#   gc bd update <id> ...     --set-metadata k=v and --add-label <label>; fails for
+-#                             the ids in GC_STUB_FAIL_UPDATE, and, for a call that
+-#                             adds a label, for the ids in GC_STUB_FAIL_LABEL
++#   gc bd update <id> ...     --set-metadata k=v, --add-label <label>, --status=<s>
++#                             and --assignee=<a>; fails for the ids in
++#                             GC_STUB_FAIL_UPDATE, for a call that adds a label,
++#                             for the ids in GC_STUB_FAIL_LABEL, and for a call
++#                             that carries --status, for the ids in
++#                             GC_STUB_FAIL_STATUS
+ #   gc bd note <id> --stdin   appends the note to $GC_STUB_BEADS/<id>.notelog;
+ #                             fails for the ids in GC_STUB_FAIL_NOTE
+ #   gc session nudge <target> <message>
+ #                             journals "<target><TAB><message>" to $GC_STUB_NUDGES,
+ #                             failed attempts too; fails for the targets in
+ #                             GC_STUB_FAIL_NUDGE
++#   gc workflow delete-source <id> --apply
++#   gc workflow reopen-source <id>
++#                             journalled; delete-source fails for the ids in
++#                             GC_STUB_FAIL_WORKFLOW
+ # Every call is journalled to $T/gc.log. A call the model does not know fails
+ # loudly (exit 64) and fails the case.
+ #
+@@ -36,13 +43,13 @@
+ # of 47 where the criteria say 0, a keep-passing file named but unchanged), with
+ # invented paths and wording.
+ #
+-# The suite fails unless all 19 cases ran.
++# The suite fails unless all 22 cases ran.
+ set -uo pipefail
+ 
+ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+ PACK_DIR="$ROOT/gastown"
+ SCRIPT="${SCRIPT:-$PACK_DIR/assets/scripts/refinery/acceptance-check.sh}"
+-EXPECTED_CASES=19
++EXPECTED_CASES=22
+ 
+ AGENT=testrig/gastown.refinery
+ TARGET_NAME=integration
+@@ -120,9 +127,21 @@ bd)
+             esac
+             ;;
+         esac
++        case " ${ARGS[*]} " in
++        *" --status"*)
++            case " ${GC_STUB_FAIL_STATUS:-} " in
++            *" $id "*)
++                echo "stub gc: gc bd update $id --status failed on request" >&2
++                exit 1
++                ;;
++            esac
++            ;;
++        esac
+         shift 3
+         while [ "$#" -gt 0 ]; do
+             case "$1" in
++            --status=*) edit_bead "$file" --arg v "${1#--status=}" '.[0].status = $v' ;;
++            --assignee=*) edit_bead "$file" --arg v "${1#--assignee=}" '.[0].assignee = $v' ;;
+             --set-metadata)
+                 edit_bead "$file" --arg k "${2%%=*}" --arg v "${2#*=}" '.[0].metadata[$k] = $v'
+                 shift
+@@ -150,6 +169,23 @@ bd)
+     *) unexpected ;;
+     esac
+     ;;
++workflow)
++    case "${2:-}" in
++    delete-source)
++        { [ "$#" -eq 4 ] && [ "$4" = --apply ] && [ -f "$GC_STUB_BEADS/${3:-}.json" ]; } || unexpected
++        case " ${GC_STUB_FAIL_WORKFLOW:-} " in
++        *" $3 "*)
++            echo "stub gc: gc workflow delete-source $3 failed on request" >&2
++            exit 1
++            ;;
++        esac
++        ;;
++    reopen-source)
++        { [ "$#" -eq 3 ] && [ -f "$GC_STUB_BEADS/${3:-}.json" ]; } || unexpected
++        ;;
++    *) unexpected ;;
++    esac
++    ;;
+ session)
+     { [ "${2:-}" = nudge ] && [ "$#" -eq 4 ]; } || unexpected
+     printf '%s\t%s\n' "$3" "$4" >>"$GC_STUB_NUDGES"
+@@ -211,6 +247,8 @@ CFG
+     FAIL_LABEL=""
+     FAIL_NOTE=""
+     FAIL_NUDGE=""
++    FAIL_WORKFLOW=""
++    FAIL_STATUS=""
+     EXTRA_ENV=()
+     CONFIG_DEFAULT_BRANCH="$TARGET_NAME"
+     CONFIG_JSON="$T/config.json"
+@@ -344,7 +382,8 @@ run_ac() {
+             GC_STUB_LOG="$T/gc.log" GC_STUB_BEADS="$BEADS" GC_STUB_NUDGES="$T/nudges" \
+             GC_STUB_FAIL_SHOW="$FAIL_SHOW" GC_STUB_FAIL_UPDATE="$FAIL_UPDATE" \
+             GC_STUB_FAIL_LABEL="$FAIL_LABEL" GC_STUB_FAIL_NOTE="$FAIL_NOTE" \
+-            GC_STUB_FAIL_NUDGE="$FAIL_NUDGE" STUB_UNEXPECTED="$T/unexpected" \
++            GC_STUB_FAIL_NUDGE="$FAIL_NUDGE" GC_STUB_FAIL_WORKFLOW="$FAIL_WORKFLOW" \
++            GC_STUB_FAIL_STATUS="$FAIL_STATUS" STUB_UNEXPECTED="$T/unexpected" \
+             ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"} \
+             "$BASH" "$SCRIPT" "$@" <"$T/stdin"
+     ) >"$T/out" 2>"$T/err"
+@@ -720,6 +759,30 @@ case_packet_skips() {
+     set_meta gcp-k1 acceptance_check_tip "$x"
+     expect_skip "a branch already judged at its tip" gcp-k1 "acceptance-check: SKIP gcp-k1 already-judged tip=$x"
+ 
++    # A MISS recorded in reject mode went back to the pool: the same tip is read
++    # again. Every other judgment at the tip still skips.
++    reset_beads
++    set_meta gcp-k1 acceptance_check_tip "$x"
++    set_meta gcp-k1 acceptance_check MISS
++    set_meta gcp-k1 acceptance_check_mode reject
++    run_ac packet --work gcp-k1
++    assert_eq "a reject-mode MISS at the tip: exit status" 0 "$RC"
++    assert_match "a reject-mode MISS at the tip: the first line is the PACKET line" \
++        '^acceptance-check: PACKET ' "$(head -n 1 "$T/out")"
++    assert_read_only "a reject-mode MISS at the tip"
++
++    reset_beads
++    set_meta gcp-k1 acceptance_check_tip "$x"
++    set_meta gcp-k1 acceptance_check MISS
++    set_meta gcp-k1 acceptance_check_mode warn
++    expect_skip "a warn-mode MISS at the tip" gcp-k1 "acceptance-check: SKIP gcp-k1 already-judged tip=$x"
++
++    reset_beads
++    set_meta gcp-k1 acceptance_check_tip "$x"
++    set_meta gcp-k1 acceptance_check DECLARED
++    set_meta gcp-k1 acceptance_check_mode reject
++    expect_skip "a reject-mode DECLARED at the tip" gcp-k1 "acceptance-check: SKIP gcp-k1 already-judged tip=$x"
++
+     # The order the codes are checked in.
+     reset_beads
+     set_meta gcp-k1 branch ""
+@@ -959,13 +1022,13 @@ case_record_usage() {
+         run_ac record "$@"
+         assert_eq "$what: exit status" 1 "$RC"
+         grep -q '^usage: acceptance-check.sh' "$T/err" || fail "$what: no stderr line starts 'usage: acceptance-check.sh'"
+-        assert_eq "$what: no bead or nudge call" 0 "$(calls '^gc (bd (update|note) |session nudge )')"
++        assert_eq "$what: no bead, workflow or nudge call" 0 "$(calls '^gc (bd (update|note) |workflow |session nudge )')"
+         assert_eq "$what: the last stdout line" "acceptance-check: RESULT 1 - - nudge=none" "$(last_line)"
+     }
+     expect_usage "a verdict outside the four" --work gcp-r1 --verdict MAYBE --tip "$X"
+     expect_usage "a missing --work" --verdict MISS --tip "$X"
+     expect_usage "a missing --tip" --work gcp-r1 --verdict MISS
+-    expect_usage "--mode reject" --work gcp-r1 --verdict MISS --tip "$X" --mode reject
++    expect_usage "--mode bogus" --work gcp-r1 --verdict MISS --tip "$X" --mode bogus
+     end_case
+ }
+ 
+@@ -1011,14 +1074,121 @@ case_record_write_failure() {
+     end_case
+ }
+ 
++# --- cases: record, reject mode (gcp-s7j4.4) --------------------------------
++
++# The reject trailer D4 fixes, byte for byte.
++REJECT_TRAILER='Reject mode: the refinery returns this bead to the polecat pool, and sets rejection_reason once it has. Seat: confirm with a SONNET-MISS note, or note "acceptance-check FP: <why>".'
++
++# The gc calls that write, in the order they were made: bead writes, nudges and
++# workflow calls. Reads are left out.
++write_calls() { grep -E '^gc (bd (update|note) |session nudge |workflow )' "$T/gc.log"; }
++
++case_record_reject_miss() {
++    new_case record-reject-miss
++    record_rig
++    printf '%s\n' 'AC1 OK — a | b' 'AC2 MISSING — c | absent' 'AC4 SUBSTITUTED — d | e' >"$T/stdin"
++
++    run_ac record --work gcp-r1 --verdict MISS --tip "$X" --mode reject
++    assert_eq "record exits 0" 0 "$RC"
++    assert_eq "the last stdout line" "acceptance-check: RESULT 0 gcp-r1 MISS nudge=testrig/crew.seat" "$(last_line)"
++    assert_eq "the writes, in order" "gc bd update gcp-r1 --set-metadata acceptance_check=MISS --set-metadata acceptance_check_tip=$X --set-metadata acceptance_check_mode=reject
++gc bd note gcp-r1 --stdin
++gc bd update gcp-r1 --add-label acceptance-miss
++gc session nudge testrig/crew.seat ACCEPTANCE MISS: gcp-r1 AC2,AC4 - note on gcp-r1 (refinery, reject: back to pool)
++gc bd update gcp-r1 --set-metadata acceptance_check_nudge=delivered: testrig/crew.seat
++gc workflow delete-source gcp-r1 --apply
++gc workflow reopen-source gcp-r1
++gc bd update gcp-r1 --status=open --assignee= --set-metadata rejection_reason=acceptance: AC2,AC4 - see note --set-metadata gc.routed_to=testrig/gastown.polecat" \
++        "$(write_calls)"
++    assert_eq "status" open "$(bead_field gcp-r1 status)"
++    assert_eq "assignee" "" "$(bead_field gcp-r1 assignee)"
++    assert_eq "rejection_reason" "acceptance: AC2,AC4 - see note" "$(bead_meta gcp-r1 rejection_reason)"
++    assert_eq "gc.routed_to" testrig/gastown.polecat "$(bead_meta gcp-r1 gc.routed_to)"
++    assert_eq "acceptance_check_mode" reject "$(bead_meta gcp-r1 acceptance_check_mode)"
++    assert_match "the note's first line" "^\[acceptance-check reject " "$(note_first_line gcp-r1)"
++    assert_eq "the note's last line is the reject trailer" "$REJECT_TRAILER" "$(tail -n 1 "$BEADS/gcp-r1.notelog")"
++    case "$(nudge_message 1)" in
++        *" - note on gcp-r1 (refinery, reject: back to pool)") ;;
++        *) fail "the nudge message does not end with the reject tail: $(nudge_message 1)" ;;
++    esac
++
++    # With no item lines there is no id to name.
++    reset_record
++    run_ac record --work gcp-r1 --verdict MISS --tip "$X" --mode reject
++    assert_eq "no items: record exits 0" 0 "$RC"
++    assert_eq "no items: rejection_reason" "acceptance: see note" "$(bead_meta gcp-r1 rejection_reason)"
++    assert_eq "no items: status" open "$(bead_field gcp-r1 status)"
++    end_case
++}
++
++case_record_no_route() {
++    new_case record-no-route
++    record_rig
++    # run_no_route <what> <mode> <verdict> <stdin line> <nudge tail, or - for none>
++    run_no_route() {
++        reset_record
++        if [ -n "$4" ]; then printf '%s\n' "$4" >"$T/stdin"; fi
++        run_ac record --work gcp-r1 --verdict "$3" --tip "$X" --mode "$2"
++        assert_eq "$1: exit status" 0 "$RC"
++        assert_eq "$1: no workflow call" 0 "$(calls '^gc workflow ')"
++        assert_eq "$1: no update carries --status or --assignee" 0 "$(calls '^gc bd update .*--(status|assignee)')"
++        assert_eq "$1: status is untouched" in_progress "$(bead_field gcp-r1 status)"
++        assert_eq "$1: assignee is untouched" "$AGENT" "$(bead_field gcp-r1 assignee)"
++        assert_eq "$1: acceptance_check_mode" "$2" "$(bead_meta gcp-r1 acceptance_check_mode)"
++        if [ "$5" = - ]; then
++            assert_eq "$1: no nudge" 0 "$(nudge_count)"
++        else
++            case "$(nudge_message 1)" in
++                *"$5") ;;
++                *) fail "$1: the nudge message does not end with '$5': $(nudge_message 1)" ;;
++            esac
++        fi
++    }
++    run_no_route "reject DECLARED" reject DECLARED 'AC3 DECLARED — x | y' ' - note on gcp-r1 (refinery, reject: merging)'
++    run_no_route "reject CONFORMS" reject CONFORMS '' -
++    run_no_route "reject SKIP" reject SKIP '' -
++    run_no_route "warn MISS" warn MISS 'AC2 MISSING — c | absent' ' - note on gcp-r1 (refinery, warn: merging)'
++    end_case
++}
++
++case_record_reject_route_failure() {
++    new_case record-reject-route-failure
++    record_rig
++
++    # The workflow cleanup fails: nothing after it is written.
++    printf '%s\n' 'AC2 MISSING — c | absent' >"$T/stdin"
++    FAIL_WORKFLOW=gcp-r1
++    run_ac record --work gcp-r1 --verdict MISS --tip "$X" --mode reject
++    assert_eq "a failed delete-source: exit status" 2 "$RC"
++    assert_eq "a failed delete-source: the last stdout line" \
++        "acceptance-check: RESULT 2 gcp-r1 MISS nudge=testrig/crew.seat" "$(last_line)"
++    assert_eq "a failed delete-source: delete-source was tried" 1 "$(calls '^gc workflow delete-source gcp-r1 --apply$')"
++    assert_eq "a failed delete-source: no reopen-source call" 0 "$(calls '^gc workflow reopen-source ')"
++    assert_eq "a failed delete-source: no update carries --status" 0 "$(calls '^gc bd update .*--status')"
++    assert_eq "a failed delete-source: the assignee is unchanged" "$AGENT" "$(bead_field gcp-r1 assignee)"
++
++    # The pool return fails at the last write: the bead is still the refinery's.
++    reset_record
++    FAIL_WORKFLOW=""
++    FAIL_STATUS=gcp-r1
++    printf '%s\n' 'AC2 MISSING — c | absent' >"$T/stdin"
++    run_ac record --work gcp-r1 --verdict MISS --tip "$X" --mode reject
++    assert_eq "a failed status write: exit status" 2 "$RC"
++    assert_eq "a failed status write: the last stdout line" \
++        "acceptance-check: RESULT 2 gcp-r1 MISS nudge=testrig/crew.seat" "$(last_line)"
++    assert_eq "a failed status write: delete-source ran" 1 "$(calls '^gc workflow delete-source gcp-r1 --apply$')"
++    assert_eq "a failed status write: reopen-source ran" 1 "$(calls '^gc workflow reopen-source gcp-r1$')"
++    assert_eq "a failed status write: the assignee is unchanged" "$AGENT" "$(bead_field gcp-r1 assignee)"
++    end_case
++}
++
+ # --- cases: the script's text -----------------------------------------------
+ 
+ # text_invariants_ok <file> — the file contains none of the forbidden fragments.
+ # Each is an extended regex, so this suite's own text holds none of them verbatim.
+ text_invariants_ok() {
+     local pat bad=0
+-    for pat in '\{\{' 'drain-ack' 'bd +mol' '--status' '--assignee' 'bd +close' \
+-        'rejection_reason' 'gc\.routed_to' 'set +-e' 'set +-u' 'pipefail'; do
++    for pat in '\{\{' 'drain-ack' 'bd +mol' 'bd +close' 'set +-e' 'set +-u' 'pipefail'; do
+         if grep -Eq -- "$pat" "$1"; then
+             echo "forbidden fragment /$pat/ in $1" >&2
+             bad=1
+@@ -1030,10 +1200,10 @@ text_invariants_ok() {
+ case_text_invariants() {
+     new_case text-invariants
+     text_invariants_ok "$SCRIPT" || fail "the script carries a forbidden fragment, comments included"
+-    cp -f "$SCRIPT" "$T/with-status.sh"
+-    printf '%s\n' '# gc bd update x --status=closed' >>"$T/with-status.sh"
+-    if text_invariants_ok "$T/with-status.sh" 2>/dev/null; then
+-        fail "the invariant check passed a copy with a --status line added"
++    cp -f "$SCRIPT" "$T/with-close.sh"
++    printf '%s\n' '# gc bd close x' >>"$T/with-close.sh"
++    if text_invariants_ok "$T/with-close.sh" 2>/dev/null; then
++        fail "the invariant check passed a copy with a bead-close line added"
+     fi
+     grep -q 'MERGE_PUSH_SOURCE_ONLY=1' "$SCRIPT" || fail "the script does not source merge-push.sh in source-only mode"
+     grep -Eq '^resolve_config\(\)' "$SCRIPT" && fail "the script defines resolve_config instead of sourcing it"
+@@ -1063,6 +1233,9 @@ case_record_conforms_and_skip
+ case_record_notify_fallback
+ case_record_usage
+ case_record_write_failure
++case_record_reject_miss
++case_record_no_route
++case_record_reject_route_failure
+ case_text_invariants
+ 
+ if [ "$PASS_CASES" -ne "$EXPECTED_CASES" ]; then
+diff --git a/gastown/tests/test_refinery_acceptance_wiring.sh b/gastown/tests/test_refinery_acceptance_wiring.sh
+index 63e9af7b..a8d10eab 100755
+--- a/gastown/tests/test_refinery_acceptance_wiring.sh
++++ b/gastown/tests/test_refinery_acceptance_wiring.sh
+@@ -1,5 +1,6 @@
+ #!/usr/bin/env bash
+-# Contract tests for the refinery patrol's acceptance-check wiring (gcp-s7j4.2).
++# Contract tests for the refinery patrol's acceptance-check wiring (gcp-s7j4.2, and
++# reject mode, gcp-s7j4.4).
+ #
+ # acceptance-check.sh (gcp-s7j4.1) builds an evidence packet per bead and records a
+ # verdict on it, and was inert until `mol-refinery-patrol` called it. The formula
+@@ -7,7 +8,9 @@
+ # (default "off", so a rig that sets nothing sees one line and no read). The
+ # formula keeps no acceptance logic of its own beyond the mode case, the packet
+ # loop and the SKIP routing: the mechanics are the script's, and
+-# test_refinery_acceptance_check.sh is their proof.
++# test_refinery_acceptance_check.sh is their proof. In reject mode `record` returns
++# each MISS to the polecat pool, and one block after the last record trims the
++# iteration to the beads the refinery still holds (case_reject_block).
+ #
+ # What this suite proves is the WIRING, so each case that runs the fence extracts
+ # the sentinel-delimited block of shipped formula text through tomllib, with the
+@@ -25,16 +28,17 @@
+ # and the script is its sibling), and appends its argv, one line per call, to a
+ # log, then prints and exits as its env says.
+ #
+-# The suite fails unless all 14 cases ran.
++# The suite fails unless all 16 cases ran.
+ set -uo pipefail
+ 
+ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+ FORMULA="${FORMULA:-$ROOT/gastown/formulas/mol-refinery-patrol.toml}"
+-EXPECTED_CASES=14
++EXPECTED_CASES=16
+ 
+ REFINERY_AGENT=testrig/gastown.refinery
+ HEAD_ID=wa-head
+ SECOND_ID=wa-second
++THIRD_ID=wa-third
+ FAILURES=0
+ PASS_CASES=0
+ CASE=""
+@@ -125,6 +129,26 @@ formula)
+     fi
+     printf '{"formulas":[{"name":"mol-refinery-patrol","source":"%s"}]}' "${GC_STUB_FORMULA_SOURCE:-}"
+     ;;
++bd)
++    # gc bd show <id> --json, the read the reject block makes. GC_STUB_ASSIGNEES is
++    # words of "<id>=<assignee>" ("<id>=" is an empty assignee), an id it does not
++    # list is assigned to GC_AGENT, and the ids in GC_STUB_FAIL_SHOW fail the read.
++    if [ "${2:-}" != show ] || [ "${4:-}" != --json ] || [ "$#" -ne 4 ]; then
++        printf '%s\n' "$*" >>"${GC_STUB_UNEXPECTED:?}"
++        exit 64
++    fi
++    case " ${GC_STUB_FAIL_SHOW:-} " in
++    *" $3 "*)
++        echo "stub gc: gc bd show $3 failed on request" >&2
++        exit 1
++        ;;
++    esac
++    assignee="${GC_AGENT:-}"
++    for pair in ${GC_STUB_ASSIGNEES:-}; do
++        [ "${pair%%=*}" = "$3" ] && assignee="${pair#*=}"
++    done
++    jq -n --arg id "$3" --arg a "$assignee" '[{id: $id, assignee: $a}]'
++    ;;
+ *)
+     printf '%s\n' "$*" >>"${GC_STUB_UNEXPECTED:?}"
+     exit 64
+@@ -243,6 +267,29 @@ write_manifest() {
+         '{head: $head, members: [{id: $head}, {id: $second}]}' >"$MANIFEST"
+ }
+ 
++# write_manifest_of <id>... — what find-work and stack write for a batch: the head
++# first, and the fields stack records beside the members.
++write_manifest_of() {
++    local members
++    members=$(printf '%s\n' "$@" |
++        jq -R '{id: ., branch: ("polecat/" + .), tip: "t1", commits: 1, patch_id: "p1"}' | jq -s .)
++    jq -n --arg head "$1" --argjson members "$members" \
++        '{head: $head, target: "main", base: "b0", members: $members}' >"$MANIFEST"
++}
++
++# run_rej <mode-or-LITERAL> [VAR=value ...] — the acceptance-reject block in ONE
++# shell, with WORK set to the head. LITERAL leaves {{acceptance_check}} unrendered.
++# The stub's journal is emptied first, so a case can run the block more than once.
++run_rej() {
++    local mode="$1" opt
++    shift
++    if [ "$mode" = LITERAL ]; then opt=leave:acceptance_check; else opt="set:acceptance_check=$mode"; fi
++    extract_block acceptance-reject acceptance-reject "$T/rej.sh" "$opt" ||
++        { fail "could not extract the acceptance-reject block"; return 1; }
++    : >"$T/gc.log"
++    run_block "$T/rej.sh" WORK="$HEAD_ID" "$@"
++}
++
+ # --- reading the formula ------------------------------------------------------------
+ 
+ # formula_steps <formula> — "<id> <needs-json>" per step, in order.
+@@ -321,12 +368,53 @@ import tomllib
+ with open(sys.argv[1], "rb") as handle:
+     steps = {s["id"]: s for s in tomllib.load(handle)["steps"]}
+ lines = steps["patrol-summary"]["description"].split("\n")
+-want = "- Acceptance check: each member's verdict (CONFORMS, DECLARED, MISS or SKIP), and any WARN or record exit 1 or 2"
++want = "- Acceptance check: each member's verdict (CONFORMS, DECLARED, MISS or SKIP), any WARN or record exit 1 or 2, and in reject mode each LEFT and HEAD LEFT line"
+ i = lines.index("- Test results (pass/fail, which checks ran)")
+ sys.exit(0 if lines[i + 1] == want else 1)
+ PY
+ }
+ 
++# pour_copy_matches <formula> — true when the acceptance-check step's description
++# holds, after the acceptance-reject:end sentinel, a fenced bash block byte for byte
++# equal to the rebase step's conflict-path pour-and-burn block: the one whose first
++# line is CURRENT_WISP=${GC_BEAD_ID:-}, from its ```bash line to its closing fence.
++pour_copy_matches() {
++    python3 - "$1" <<'PY'
++import sys
++import tomllib
++
++with open(sys.argv[1], "rb") as handle:
++    steps = {s["id"]: s for s in tomllib.load(handle)["steps"]}
++opener = "```bash\nCURRENT_WISP=${GC_BEAD_ID:-}\n"
++
++
++def fenced(text, start):
++    at = text.find(opener, start)
++    if at < 0:
++        sys.exit("no pour block found")
++    end = text.find("\n```", at + len(opener))
++    if end < 0:
++        sys.exit("the pour block has no closing fence")
++    return text[at:end + len("\n```")]
++
++
++rebase = steps["rebase"]["description"]
++ack = steps["acceptance-check"]["description"]
++if rebase.count(opener) != 1:
++    sys.exit(f"want exactly one pour block in the rebase step, found {rebase.count(opener)}")
++sentinel = "# --- acceptance-reject:end ---"
++if ack.count(sentinel) != 1:
++    sys.exit("want exactly one acceptance-reject:end sentinel in the acceptance-check step")
++if ack.count(opener) != 1:
++    sys.exit(f"want exactly one pour block in the acceptance-check step, found {ack.count(opener)}")
++at = ack.index(sentinel)
++if ack.index(opener) < at:
++    sys.exit("the pour block sits before the acceptance-reject:end sentinel")
++if fenced(ack, at) != fenced(rebase, 0):
++    sys.exit("the acceptance-check step's pour block differs from the rebase step's")
++PY
++}
++
+ # --- the shipped text, to the byte -------------------------------------------------
+ 
+ # The rubric is DESIGN section 5 of gcp-s7j4, measured as written: changing a word
+@@ -385,17 +473,13 @@ write_fence() {
+ ACK_MODE="{{acceptance_check}}"
+ case "$ACK_MODE" in
+   off) echo "acceptance check: off" ;;
+-  warn) ;;
+-  reject)
+-    echo "WARN: acceptance_check=reject is not built yet (gcp-s7j4.4); running as warn."
+-    ACK_MODE=warn
+-    ;;
++  warn | reject) ;;
+   *)
+     echo "INFO: acceptance_check='$ACK_MODE' is not off, warn or reject; check off."
+     ACK_MODE=off
+     ;;
+ esac
+-if [ "$ACK_MODE" = warn ]; then
++if [ "$ACK_MODE" != off ]; then
+   ACK_DIR="$(git rev-parse --git-dir)/acceptance"
+   mkdir -p "$ACK_DIR" && rm -f "${ACK_DIR:?}"/*.packet "${ACK_DIR:?}"/*.err "${ACK_DIR:?}/script.path"
+   ACK_CITY="${GC_CITY:-${GC_CITY_PATH:-}}"
+@@ -436,7 +520,7 @@ if [ "$ACK_MODE" = warn ]; then
+         ACK_CODE=$(printf '%s\n' "$ACK_OUT" | awk '{print $4}')
+         ACK_TIP=$(printf '%s\n' "$ACK_OUT" | sed -n 's/.* tip=//p')
+         case "$ACK_CODE" in
+-          no-ac | no-change) "$ACK" record --work "$ACK_ID" --verdict SKIP --tip "$ACK_TIP" </dev/null ;;
++          no-ac | no-change) "$ACK" record --work "$ACK_ID" --verdict SKIP --tip "$ACK_TIP" --mode "$ACK_MODE" </dev/null ;;
+           already-judged) ;;
+           *) echo "WARN: acceptance check for $ACK_ID: $ACK_CODE; not checked." ;;
+         esac
+@@ -450,17 +534,41 @@ fi
+ EXPECTED_FENCE
+ }
+ 
+-write_prose() {
++# The prose after the fence, in the three pieces D11 gives it. The reject block
++# (case_reject_block) and the pour-and-burn (case_head_left_pour) sit between them.
++write_prose_before_block() {
+     cat >"$1" <<'EXPECTED_PROSE'
+ For each `READ` line, in the order printed: read that packet in full (`cat` it, one packet per command), apply
+ the rubric below, then record your verdict with ONE command, the per-item lines as a quoted heredoc:
+ ```bash
+-"$(cat "$(git rev-parse --git-dir)/acceptance/script.path")" record --work <id> --verdict <CONFORMS|DECLARED|MISS> --tip <the tip= value on the packet's PACKET line> <<'ACK_ITEMS'
++"$(cat "$(git rev-parse --git-dir)/acceptance/script.path")" record --work <id> --verdict <CONFORMS|DECLARED|MISS> --tip <the tip= value on the packet's PACKET line> --mode {{acceptance_check}} <<'ACK_ITEMS'
+ <one line per AC item, in the rubric's output format>
+ ACK_ITEMS
+ ```
+-Warn mode never blocks. Whatever the verdicts, close this step and proceed to rebase. A `record` that exits 1 or 2
+-is a WARN: name it in patrol-summary and proceed. With no `READ` line, close this step.
++A `record` that exits 1 or 2 is a WARN: name it in patrol-summary and proceed. With no `READ` line, close this
++step and proceed to rebase.
++
++After the last `record`, run this block ONCE, in one shell, with `$WORK` set as above. Outside reject mode it
++prints nothing and changes nothing. In reject mode `record` has already returned each MISS to the polecat pool,
++and this block takes every bead no longer assigned to you out of this iteration:
++```bash
++EXPECTED_PROSE
++}
++
++write_prose_between() {
++    cat >"$1" <<'EXPECTED_PROSE'
++```
++If it printed `HEAD LEFT: <id>`, this iteration has no head. Pour the next iteration and burn this one, exactly as
++a rebase conflict does, then close this step:
++```bash
++EXPECTED_PROSE
++}
++
++write_prose_after_pour() {
++    cat >"$1" <<'EXPECTED_PROSE'
++```
++Otherwise close this step and proceed to rebase, whatever the verdicts. `stack` takes the batch as the block
++left it.
+ EXPECTED_PROSE
+ }
+ 
+@@ -490,7 +598,7 @@ case_var() {
+     local desc word
+     assert_eq "[vars.acceptance_check].default" off "$(formula_var "$FORMULA" acceptance_check default)"
+     desc=$(formula_var "$FORMULA" acceptance_check description)
+-    for word in off warn reject gcp-s7j4.4; do
++    for word in off warn reject; do
+         case "$desc" in
+         *"$word"*) ;;
+         *) fail "[vars.acceptance_check].description does not contain '$word'" ;;
+@@ -571,7 +679,7 @@ case_skip_codes() {
+         run_ack warn STUB_PACKET_STATUS=3 STUB_PACKET_OUT="$line"
+         assert_eq "$code: block status" 0 "$?"
+         assert_eq "$code: script argv log" \
+-            "$(printf 'packet --work %s\nrecord --work %s --verdict SKIP --tip abc123' "$HEAD_ID" "$HEAD_ID")" "$(ack_calls)"
++            "$(printf 'packet --work %s\nrecord --work %s --verdict SKIP --tip abc123 --mode warn' "$HEAD_ID" "$HEAD_ID")" "$(ack_calls)"
+         assert_eq "$code: record stdin" 0 "$(wc -c <"$T/ack-stdin.log" | tr -d ' ')"
+         [ ! -e "$ACK_DIR_PATH/$HEAD_ID.packet" ] || fail "$code: a packet file exists for a SKIP"
+     done
+@@ -605,13 +713,27 @@ case_packet_error() {
+     end_case
+ }
+ 
+-case_reject_runs_as_warn() {
+-    new_case reject_runs_as_warn
++case_reject_mode() {
++    new_case reject_mode
++    write_manifest
++    local before after
++    before=$(cksum <"$MANIFEST")
+     run_ack reject
+     assert_eq "block status" 0 "$?"
+-    assert_eq "stdout's first line" \
+-        "WARN: acceptance_check=reject is not built yet (gcp-s7j4.4); running as warn." "$(head -n 1 "$T/out")"
+-    assert_eq "script argv log" "packet --work $HEAD_ID" "$(ack_calls)"
++    ! grep -q 'not built yet' "$T/out" || fail "stdout still says reject is not built yet"
++    assert_eq "script argv log" "$(printf 'packet --work %s\npacket --work %s' "$HEAD_ID" "$SECOND_ID")" "$(ack_calls)"
++    assert_eq "READ lines" \
++        "$(printf 'READ .git/acceptance/%s.packet\nREAD .git/acceptance/%s.packet' "$HEAD_ID" "$SECOND_ID")" \
++        "$(grep '^READ ' "$T/out" | sed 's/ ([0-9]* chars)$//')"
++    after=$(cksum <"$MANIFEST")
++    assert_eq "refinery-batch.json checksum" "$before" "$after"
++
++    # A SKIP is recorded with the mode the fence runs in.
++    rm -f "$MANIFEST"
++    run_ack reject STUB_PACKET_STATUS=3 STUB_PACKET_OUT="acceptance-check: SKIP $HEAD_ID no-ac tip=abc123"
++    assert_eq "no-ac: block status" 0 "$?"
++    assert_eq "no-ac: script argv log" \
++        "$(printf 'packet --work %s\nrecord --work %s --verdict SKIP --tip abc123 --mode reject' "$HEAD_ID" "$HEAD_ID")" "$(ack_calls)"
+     end_case
+ }
+ 
+@@ -660,15 +782,18 @@ case_prose() {
+     new_case prose
+     write_sentence "$T/sentence.txt"
+     write_fence "$T/fence.txt"
+-    write_prose "$T/prose.txt"
++    write_prose_before_block "$T/prose-before.txt"
++    write_prose_between "$T/prose-between.txt"
++    write_prose_after_pour "$T/prose-after.txt"
+     write_rubric "$T/rubric.txt"
+-    step_text_in_order "$FORMULA" "$T/sentence.txt" "$T/fence.txt" "$T/prose.txt" "$T/rubric.txt" ||
++    step_text_in_order "$FORMULA" "$T/sentence.txt" "$T/fence.txt" "$T/prose-before.txt" \
++        "$T/prose-between.txt" "$T/prose-after.txt" "$T/rubric.txt" ||
+         fail "the acceptance-check step lacks the sentence, fence, prose and rubric, byte for byte and in that order"
+     summary_bullet_follows "$FORMULA" ||
+         fail "patrol-summary lacks the acceptance bullet right after its test-results bullet"
+ 
+     # The check must be able to FAIL: swap the order of the files it is given.
+-    ! step_text_in_order "$FORMULA" "$T/prose.txt" "$T/fence.txt" 2>/dev/null ||
++    ! step_text_in_order "$FORMULA" "$T/prose-before.txt" "$T/fence.txt" 2>/dev/null ||
+         fail "the order check passed with the prose before the fence"
+     end_case
+ }
+@@ -707,6 +832,99 @@ $found"
+     end_case
+ }
+ 
++# The acceptance-reject block: after the last record it takes every bead the
++# refinery no longer holds out of the iteration. R is the refinery agent.
++case_reject_block() {
++    new_case reject_block
++    local R="$REFINERY_AGENT" before members other_before
++
++    # a. Not reject: nothing is read, said or changed.
++    write_manifest_of "$HEAD_ID" "$SECOND_ID" "$THIRD_ID"
++    before=$(cksum <"$MANIFEST")
++    run_rej warn GC_STUB_ASSIGNEES="$SECOND_ID="
++    assert_eq "a. block status" 0 "$?"
++    assert_eq "a. stdout" "" "$(cat "$T/out")"
++    ! grep -q 'bd show' "$T/gc.log" || fail "a. a warn run read a bead"
++    assert_eq "a. the manifest" "$before" "$(cksum <"$MANIFEST")"
++    run_rej LITERAL GC_STUB_ASSIGNEES="$SECOND_ID="
++    assert_eq "a. unrendered: block status" 0 "$?"
++    assert_eq "a. unrendered: stdout" "" "$(cat "$T/out")"
++    assert_eq "a. unrendered: no gc call" "" "$(cat "$T/gc.log")"
++    assert_eq "a. unrendered: the manifest" "$before" "$(cksum <"$MANIFEST")"
++
++    # b. Reject, and every bead is still the refinery's.
++    run_rej reject GC_STUB_ASSIGNEES="$HEAD_ID=$R $SECOND_ID=$R $THIRD_ID=$R"
++    assert_eq "b. block status" 0 "$?"
++    assert_eq "b. stdout" "" "$(cat "$T/out")"
++    assert_eq "b. the manifest" "$before" "$(cksum <"$MANIFEST")"
++
++    # c. A member left: it is cut from the manifest and nothing else changes.
++    other_before=$(jq -cS 'del(.members)' "$MANIFEST")
++    members=$(jq -cS --arg gone "$SECOND_ID" '[.members[] | select(.id != $gone)]' "$MANIFEST")
++    run_rej reject GC_STUB_ASSIGNEES="$SECOND_ID="
++    assert_eq "c. block status" 0 "$?"
++    assert_eq "c. stdout" "LEFT: $SECOND_ID (assignee now '')
++BATCH: $HEAD_ID $THIRD_ID" "$(cat "$T/out")"
++    assert_eq "c. .head" "$HEAD_ID" "$(jq -r .head "$MANIFEST")"
++    assert_eq "c. .members[].id" "$HEAD_ID
++$THIRD_ID" "$(jq -r '.members[].id' "$MANIFEST")"
++    assert_eq "c. every other field" "$other_before" "$(jq -cS 'del(.members)' "$MANIFEST")"
++    assert_eq "c. the surviving members, whole" "$members" "$(jq -cS .members "$MANIFEST")"
++
++    # d. Down to the head alone: the manifest goes.
++    write_manifest
++    run_rej reject GC_STUB_ASSIGNEES="$SECOND_ID="
++    assert_eq "d. block status" 0 "$?"
++    [ ! -e "$MANIFEST" ] || fail "d. the manifest survived a batch of 1"
++    assert_eq "d. the last line" "INFO: batch of 1." "$(tail -n 1 "$T/out")"
++
++    # e. The head left: the manifest goes, and HEAD LEFT is the last line.
++    write_manifest_of "$HEAD_ID" "$SECOND_ID" "$THIRD_ID"
++    run_rej reject GC_STUB_ASSIGNEES="$HEAD_ID="
++    assert_eq "e. block status" 0 "$?"
++    [ ! -e "$MANIFEST" ] || fail "e. the manifest survived a head that left"
++    assert_eq "e. the last line" "HEAD LEFT: $HEAD_ID" "$(tail -n 1 "$T/out")"
++    grep -qxF "LEFT: $HEAD_ID (assignee now '')" "$T/out" || fail "e. stdout lacks the LEFT line for the head"
++
++    # f. No manifest: the head is $WORK.
++    run_rej reject GC_STUB_ASSIGNEES="$HEAD_ID="
++    assert_eq "f. block status" 0 "$?"
++    assert_eq "f. the last line" "HEAD LEFT: $HEAD_ID" "$(tail -n 1 "$T/out")"
++    [ ! -e "$MANIFEST" ] || fail "f. a manifest appeared"
++
++    # g. A read that fails keeps the bead in the iteration.
++    write_manifest_of "$HEAD_ID" "$SECOND_ID" "$THIRD_ID"
++    before=$(cksum <"$MANIFEST")
++    run_rej reject GC_STUB_FAIL_SHOW="$SECOND_ID" GC_STUB_ASSIGNEES="$SECOND_ID="
++    assert_eq "g. block status" 0 "$?"
++    assert_eq "g. stdout" "WARN: could not read $SECOND_ID; it stays in this iteration." "$(cat "$T/out")"
++    assert_eq "g. the manifest" "$before" "$(cksum <"$MANIFEST")"
++    end_case
++}
++
++# The pour-and-burn for a head that left is the rebase conflict path's, byte for
++# byte (D10), so the iteration advances the way a rebase conflict advances it.
++case_head_left_pour() {
++    new_case head_left_pour
++    pour_copy_matches "$FORMULA" ||
++        fail "the acceptance-check step lacks a pour-and-burn block equal to the rebase step's, after the acceptance-reject:end sentinel"
++
++    # The check must be able to FAIL: change one character of the copy.
++    python3 - "$FORMULA" "$T/formula-altered.toml" <<'PY' || fail "harness bug: could not alter the copy"
++import sys
++
++text = open(sys.argv[1], encoding="utf-8").read()
++at = text.index("# --- acceptance-reject:end ---")
++old = "gc bd mol burn"
++cut = text.index(old, at)
++open(sys.argv[2], "w", encoding="utf-8").write(text[:cut] + "gc bd mol bur_" + text[cut + len(old):])
++PY
++    cmp -s "$FORMULA" "$T/formula-altered.toml" && fail "harness bug: the formula copy was not changed"
++    ! pour_copy_matches "$T/formula-altered.toml" 2>/dev/null ||
++        fail "the pour-copy check passed with one character of the copy changed"
++    end_case
++}
++
+ case_steps_and_needs
+ case_var
+ case_unrendered
+@@ -715,12 +933,14 @@ case_warn_single
+ case_warn_batch
+ case_skip_codes
+ case_packet_error
+-case_reject_runs_as_warn
++case_reject_mode
+ case_not_runnable
+ case_stale_files
+ case_rubric_verbatim
+ case_prose
+ case_rm_targets_guarded
++case_reject_block
++case_head_left_pour
+ 
+ if [ "$PASS_CASES" -ne "$EXPECTED_CASES" ]; then
+     echo "FAIL: $PASS_CASES of $EXPECTED_CASES cases ran" >&2
+diff --git a/gastown/tests/test_refinery_restart_cadence.sh b/gastown/tests/test_refinery_restart_cadence.sh
+index 08f47704..c4530a72 100755
+--- a/gastown/tests/test_refinery_restart_cadence.sh
++++ b/gastown/tests/test_refinery_restart_cadence.sh
+@@ -10,7 +10,7 @@
+ # that count with restart_after_iterations before any merge work.
+ #
+ # Two halves, both EXECUTED from the shipped formula text rather than
+-# transcribed: the four session-iteration-stamp blocks (one per pour site that
++# transcribed: the five session-iteration-stamp blocks (one per pour site that
+ # continues the conversation) and the one restart-cadence-check block. The stub
+ # `gc` really mutates a fixture and journals every update, so an assertion reads
+ # what the block's writes left behind, not what its source says. The blocks are
+@@ -35,7 +35,7 @@ fail() {
+ # The stamp must sit at every pour that continues the conversation, and only
+ # there. The check-inbox pour starts a NEW conversation: the epoch bump makes
+ # its unstamped wisp read correctly as one, so stamping it would be wrong.
+-test_stamp_blocks_sit_at_exactly_the_four_continuing_pours() {
++test_stamp_blocks_sit_at_exactly_the_five_continuing_pours() {
+     python3 - "$FORMULA" <<'PY' || fail "the session-iteration-stamp blocks are misplaced or have drifted apart (see above)"
+ import sys
+ import tomllib
+@@ -48,12 +48,12 @@ pour = "gc bd mol wisp mol-refinery-patrol"
+ problems = []
+ 
+ holders = sorted(sid for sid, text in steps.items() if begin in text)
+-expected = sorted(["rebase", "handle-failures", "merge-push", "next-iteration"])
++expected = sorted(["acceptance-check", "rebase", "handle-failures", "merge-push", "next-iteration"])
+ if holders != expected:
+     problems.append(f"stamp blocks live in {holders}, want exactly {expected}")
+ total = sum(text.count(begin) for text in steps.values())
+-if total != 4:
+-    problems.append(f"formula carries {total} stamp blocks, want 4")
++if total != 5:
++    problems.append(f"formula carries {total} stamp blocks, want 5")
+ 
+ blocks = {}
+ for sid, text in steps.items():
+@@ -483,7 +483,7 @@ trap 'rm -rf "$TMP"' EXIT
+ mkdir -p "$TMP/bin"
+ write_gc_stub "$TMP/bin"
+ 
+-test_stamp_blocks_sit_at_exactly_the_four_continuing_pours
++test_stamp_blocks_sit_at_exactly_the_five_continuing_pours
+ test_cadence_check_runs_first_in_check_inbox
+ 
+ extract_block session-iteration-stamp "$TMP/stamp.sh" || exit 1
+-- 
+2.54.0 (Apple Git-157)
+

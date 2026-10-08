@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 2 Oct 2026 17:12:09 -0400
-Subject: [PATCH 126/141] test(refinery): route the merge-batch suite's bd
+Subject: [PATCH 126/144] test(refinery): route the merge-batch suite's bd
  prose through gc so the bare-bd guard stays at baseline (gcp-l8td.8)
 
 tests/test_no_bare_bd_commands.py flags any `bd <subcommand>` text in a tracked
