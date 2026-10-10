@@ -425,6 +425,23 @@ def test_installer_falls_back_to_the_release_tag_when_gc_records_no_revision(tmp
     assert "release tag v1.5.0" in completed.stderr
 
 
+def test_installer_refuses_the_rolling_edge_tag_as_a_stand_in(tmp_path):
+    # `edge` is the one tag that cannot vouch for a build: it is rolled forward
+    # in place several times a day, so fetching it later can land on a newer
+    # build than the one installed -- the race reading vcs.revision exists to
+    # rule out. An edge gc with no vcs.revision therefore fails rather than
+    # warning and exporting `edge`, and exports nothing.
+    release = make_release(tmp_path, stamped=False)
+    completed, result = run_installer(tmp_path, release)
+
+    assert completed.returncode == 1
+    assert "records no vcs.revision" in completed.stderr
+    assert "edge is a rolling tag" in completed.stderr
+    assert "using release tag edge" not in completed.stderr
+    assert result["github_env"] == ""
+    assert result["github_path"] == ""
+
+
 def test_installer_names_the_module_commit_a_go_install_build_was_made_from(tmp_path, release):
     # A short SHA has no release archive, so gc comes from `go install`, which
     # builds in module mode and records no vcs.revision. Its build info does

@@ -72,11 +72,13 @@ check out that commit as a shallow git tree and export the checkout as
 `GASCITY_SOURCE_ROOT`. The commit comes from the binary, not from resolving the
 requested ref a second time, because `main` installs the rolling `edge`
 pre-release, which can move between the two. A binary that records no revision
-falls back to its release tag. A ref with no archive (a branch or commit SHA)
-is built with `go install`, which records no revision either; its commit is the
-`.Origin.Hash` the module proxy records for the exact module version that build
-used, as upstream's workflows resolve it. When nothing names the commit, the
-install fails rather than name a source it cannot vouch for.
+falls back to its release tag, except `edge`: that tag can already name a later
+build, so an `edge` gc with no revision fails the install instead. A ref with no
+archive (a branch or commit SHA) is built with `go install`, which records no
+revision either; its commit is the `.Origin.Hash` the module proxy records for
+the exact module version that build used, as upstream's workflows resolve it.
+When nothing names the commit, the install fails rather than name a source it
+cannot vouch for.
 
 The fixture rig gets a local bare `origin` (next to the rig, as
 `<rig>-origin.git`) with `origin/HEAD` set, because build formulas base

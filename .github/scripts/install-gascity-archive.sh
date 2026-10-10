@@ -142,8 +142,9 @@ export_source_ref() {
 # `git fetch` can resolve. A release archive is built from a git checkout, so
 # its gc records the full commit as vcs.revision in its build info. Only when
 # that is absent does something else stand in for it: the release tag for an
-# archive, the module's recorded commit for a go-install build (an empty TAG).
-# When nothing names the source, fail rather than export a guess.
+# archive -- never `edge`, which can already name a later build -- and the
+# module's recorded commit for a go-install build (an empty TAG). When nothing
+# names the source, fail rather than export a guess.
 resolve_source_ref() {
   local binary="$1"
   local tag="$2"
@@ -155,6 +156,11 @@ resolve_source_ref() {
     awk '$1 == "build" && $2 ~ /^vcs\.revision=/ { sub(/^vcs\.revision=/, "", $2); print $2 }' || true)"
   if [[ -n "$revision" ]]; then
     printf '%s' "$revision"
+  elif [[ "$tag" == "edge" ]]; then
+    echo "${binary} records no vcs.revision, and edge is a rolling tag: it is rebuilt in place" >&2
+    echo "several times a day, so fetching it now can name a later build than this gc." >&2
+    echo "Refusing to export it as GASCITY_SOURCE_REF; pass a release tag instead." >&2
+    return 1
   elif [[ -n "$tag" ]]; then
     echo "WARNING: ${binary} records no vcs.revision; using release tag ${tag} as the gascity source ref." >&2
     printf '%s' "$tag"
