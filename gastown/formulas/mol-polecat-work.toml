@@ -21,8 +21,9 @@ and reassigns it to the refinery. The refinery merges and closes.
 status=closed on it. Even if you believe the code is already merged, reassign
 to refinery — only the refinery verifies merges and closes beads. The single
 exception is your own formula step beads: `submit-and-exit` closes its own
-step (resolved with `gc hook current`) before draining, because a step left
-claimed is handed back to the pool and re-run.
+step (resolved with `gc hook current`, or failing that from this session's own
+in-progress submit-and-exit step) before draining, because a step left claimed
+is handed back to the pool and re-run.
 `{{base_branch}}` may come from the work bead's own `metadata.target` or
 be inherited from a parent convoy with `metadata.target` set.
 
@@ -1120,6 +1121,24 @@ needs = ["self-review"]
 description = """
 Hand off your work and self-clean. You cease to exist after this step.
 
+**Closing this step.** Every exit below closes this step before
+`gc runtime drain-ack`, because drain-ack gives back every claim the session
+still holds and a step left claimed is run again. The step is resolved in two
+tiers, and each exit carries both:
+
+1. `gc hook current`, when the claim it names is an in-progress step whose
+   `gc.step_ref` ends `.submit-and-exit` (upstream #490).
+2. Otherwise, the one in-progress step held by `$BEADS_ACTOR` whose
+   `gc.step_ref` ends `.submit-and-exit`. `gc hook current` reports only the
+   bead `gc hook --claim` last served, and at a step boundary that is often the
+   WORK bead workspace-setup holds `in_progress`. The startup claim block then
+   re-points onto this step (`STEP_REPOINTED`) with a plain `--claim` update,
+   which records the claim under `$BEADS_ACTOR` without moving the hook's
+   stamp. gc before 1.5.0 has no `gc hook current` at all.
+
+No match, or more than one, refuses the ack and exits 1: closing a step picked
+by guesswork can finish another molecule's.
+
 **0. Already-submitted guard (idempotent re-entry).**
 
 A re-entered submit-and-exit must not re-write bead state. Step 6 sets the
@@ -1132,7 +1151,6 @@ commit, and the bead held by the refinery itself:
 ```bash
 CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
 WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
-STEP_SESSION="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
 # Resolved with the exact expression step 6 writes, so the mark this guard reads
 # and the handoff it stands for can never disagree.
 REFINERY_TARGET="${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery"
@@ -1149,9 +1167,10 @@ if [ -n "$SUBMITTED_TARGET" ] && [ -n "$SUBMITTED_REMOTE" ] &&
    [ "$SUBMITTED_ASSIGNEE" = "$REFINERY_TARGET" ]; then
     echo "ALREADY_SUBMITTED $WORK_BEAD_ID target=$SUBMITTED_TARGET branch=$SUBMITTED_BRANCH assignee=$SUBMITTED_ASSIGNEE"
     echo "Handoff already completed. Closing this step and draining without re-writing bead state."
-    STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
-    STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
-    printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
+    STEP_BEAD_ID=$(gc hook current --id-only 2>/dev/null) || STEP_BEAD_ID=""  # drain-ack gives back every claim this session still holds, so close this step first
+    [ -n "$STEP_BEAD_ID" ] && gc bd show "$STEP_BEAD_ID" --json 2>/dev/null | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null ||
+        STEP_BEAD_ID=$([ -n "${BEADS_ACTOR:-}" ] && gc bd list --assignee="$BEADS_ACTOR" --status=in_progress --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null | jq -r '[.[] | select(.status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))) | .id] | if length == 1 then .[0] else empty end' 2>/dev/null)  # tier 2: this session's own step (see "Closing this step" above)
+    [ -n "$STEP_BEAD_ID" ] || { echo "submit-and-exit: this session holds no single in-progress submit-and-exit step; not acknowledging drain" >&2; exit 1; }
     gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=pass --status=closed || exit 1
     gc runtime drain-ack
     exit 0
@@ -1164,16 +1183,16 @@ proves nothing — a caller may set it before dispatch to choose the base branch
 salvage push leaves behind (gcp-7bo9), which is not a handoff this step
 performed.
 
-The assignee mark is an IDENTITY test against `$REFINERY_TARGET`, never
-`!= $STEP_SESSION`. "Somebody who is not me" is satisfied by every third party a
-work bead can end up on — an operator parking it on a crew seat, a witness
-re-routing it, a reviewer taking it — and none of those is this step's handoff.
-Read as evidence, they make a resuming polecat announce ALREADY_SUBMITTED and
-drain while the refinery never receives the work and the branch strands on
-origin unmerged (gcp-0pa4; observed live on winnow-zgr2y.8, parked on
-`winnow/specialists.thomas`). The blast radius scales with parked seats holding
-open beads, so the check has to name the one assignee that means "handed off"
-rather than enumerate the ones that do not.
+The assignee mark is an IDENTITY test against `$REFINERY_TARGET`, never a `!=`
+against this session's own identity. "Somebody who is not me" is satisfied by
+every third party a work bead can end up on — an operator parking it on a crew
+seat, a witness re-routing it, a reviewer taking it — and none of those is this
+step's handoff. Read as evidence, they make a resuming polecat announce
+ALREADY_SUBMITTED and drain while the refinery never receives the work and the
+branch strands on origin unmerged (gcp-0pa4; observed live on winnow-zgr2y.8,
+parked on `winnow/specialists.thomas`). The blast radius scales with parked
+seats holding open beads, so the check has to name the one assignee that means
+"handed off" rather than enumerate the ones that do not.
 
 **1. Branch-shape gate (fails closed — non-negotiable).**
 
@@ -1207,9 +1226,10 @@ if [ "$CURRENT_BRANCH" != "$EXPECTED_BRANCH" ]; then
     echo "  - Re-run submit-and-exit"
     echo ""
     echo "Do NOT proceed past this gate."
-    STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
-    STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
-    printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
+    STEP_BEAD_ID=$(gc hook current --id-only 2>/dev/null) || STEP_BEAD_ID=""  # drain-ack gives back every claim this session still holds, so close this step first
+    [ -n "$STEP_BEAD_ID" ] && gc bd show "$STEP_BEAD_ID" --json 2>/dev/null | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null ||
+        STEP_BEAD_ID=$([ -n "${BEADS_ACTOR:-}" ] && gc bd list --assignee="$BEADS_ACTOR" --status=in_progress --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null | jq -r '[.[] | select(.status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))) | .id] | if length == 1 then .[0] else empty end' 2>/dev/null)  # tier 2: this session's own step (see "Closing this step" above)
+    [ -n "$STEP_BEAD_ID" ] || { echo "submit-and-exit: this session holds no single in-progress submit-and-exit step; not acknowledging drain" >&2; exit 1; }
     gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=branch_shape_gate --status=closed || exit 1
     gc runtime drain-ack
     exit 1
@@ -1325,9 +1345,10 @@ BODY
       gc session nudge "$ESCALATE_TARGET" "POLECAT HANDOFF HALT ($HALT_REASON): $WORK_BEAD_ID on $EXPECTED_BRANCH — no handoff stamped; bead returned to the pool open and unassigned. Needs a coordinator decision." \
         || echo "WARNING: could not nudge $ESCALATE_TARGET about $WORK_BEAD_ID; escalate by hand."
     done
-    STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
-    STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
-    printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
+    STEP_BEAD_ID=$(gc hook current --id-only 2>/dev/null) || STEP_BEAD_ID=""  # drain-ack gives back every claim this session still holds, so close this step first
+    [ -n "$STEP_BEAD_ID" ] && gc bd show "$STEP_BEAD_ID" --json 2>/dev/null | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null ||
+        STEP_BEAD_ID=$([ -n "${BEADS_ACTOR:-}" ] && gc bd list --assignee="$BEADS_ACTOR" --status=in_progress --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null | jq -r '[.[] | select(.status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))) | .id] | if length == 1 then .[0] else empty end' 2>/dev/null)  # tier 2: this session's own step (see "Closing this step" above)
+    [ -n "$STEP_BEAD_ID" ] || { echo "submit-and-exit: this session holds no single in-progress submit-and-exit step; not acknowledging drain" >&2; exit 1; }
     gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason="$HALT_REASON" --status=closed || exit 1
     gc runtime drain-ack
     exit 1
@@ -1473,9 +1494,10 @@ Resolve: check the ledger is healthy, then record the decision as metadata —
   gc bd update $WORK_BEAD_ID --set-metadata auto_push=false   # confirm the halt
   gc bd update $WORK_BEAD_ID --set-metadata auto_push=true    # authorise the push
 and re-sling. Use --set-metadata so branch and gc.routed_to survive."
-  STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
-  STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
-  printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
+  STEP_BEAD_ID=$(gc hook current --id-only 2>/dev/null) || STEP_BEAD_ID=""  # drain-ack gives back every claim this session still holds, so close this step first
+  [ -n "$STEP_BEAD_ID" ] && gc bd show "$STEP_BEAD_ID" --json 2>/dev/null | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null ||
+      STEP_BEAD_ID=$([ -n "${BEADS_ACTOR:-}" ] && gc bd list --assignee="$BEADS_ACTOR" --status=in_progress --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null | jq -r '[.[] | select(.status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))) | .id] | if length == 1 then .[0] else empty end' 2>/dev/null)  # tier 2: this session's own step (see "Closing this step" above)
+  [ -n "$STEP_BEAD_ID" ] || { echo "submit-and-exit: this session holds no single in-progress submit-and-exit step; not acknowledging drain" >&2; exit 1; }
   gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=metadata_unreadable --status=closed || exit 1
   gc runtime drain-ack
   exit 0
@@ -1494,9 +1516,10 @@ if [ "$AUTO_PUSH" = "false" ]; then
     --set-metadata halt_reason=auto_push_false \
     --set-metadata gc.routed_to="" \
     --append-notes "Branch ready: auto_push=false (no push, no refinery handoff)"
-  STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
-  STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
-  printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
+  STEP_BEAD_ID=$(gc hook current --id-only 2>/dev/null) || STEP_BEAD_ID=""  # drain-ack gives back every claim this session still holds, so close this step first
+  [ -n "$STEP_BEAD_ID" ] && gc bd show "$STEP_BEAD_ID" --json 2>/dev/null | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null ||
+      STEP_BEAD_ID=$([ -n "${BEADS_ACTOR:-}" ] && gc bd list --assignee="$BEADS_ACTOR" --status=in_progress --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null | jq -r '[.[] | select(.status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))) | .id] | if length == 1 then .[0] else empty end' 2>/dev/null)  # tier 2: this session's own step (see "Closing this step" above)
+  [ -n "$STEP_BEAD_ID" ] || { echo "submit-and-exit: this session holds no single in-progress submit-and-exit step; not acknowledging drain" >&2; exit 1; }
   gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=auto_push_false --status=closed || exit 1
   gc runtime drain-ack
   exit 0
@@ -1601,9 +1624,10 @@ Resolve: read the rail, then record the decision as metadata —
   gc bd update $WORK_BEAD_ID --set-metadata auto_push=false   # confirm the halt
   gc bd update $WORK_BEAD_ID --set-metadata auto_push=true    # authorise the push
 and re-sling. Use --set-metadata so branch and gc.routed_to survive."
-    STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
-    STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
-    printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
+    STEP_BEAD_ID=$(gc hook current --id-only 2>/dev/null) || STEP_BEAD_ID=""  # drain-ack gives back every claim this session still holds, so close this step first
+    [ -n "$STEP_BEAD_ID" ] && gc bd show "$STEP_BEAD_ID" --json 2>/dev/null | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null ||
+        STEP_BEAD_ID=$([ -n "${BEADS_ACTOR:-}" ] && gc bd list --assignee="$BEADS_ACTOR" --status=in_progress --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null | jq -r '[.[] | select(.status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))) | .id] | if length == 1 then .[0] else empty end' 2>/dev/null)  # tier 2: this session's own step (see "Closing this step" above)
+    [ -n "$STEP_BEAD_ID" ] || { echo "submit-and-exit: this session holds no single in-progress submit-and-exit step; not acknowledging drain" >&2; exit 1; }
     gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=no_push_rail_unresolved --status=closed || exit 1
     gc runtime drain-ack
     exit 0
@@ -1631,9 +1655,10 @@ if ! git show-ref --verify --quiet "refs/remotes/origin/{{base_branch}}"; then
     --set-metadata gc.routed_to="" \
     --append-notes "Branch ready: base branch {{base_branch}} does not exist on origin, so the refinery cannot merge it. Push the base branch, then re-run submit-and-exit."
   gc mail send "${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness" -s "polecat halted: base_branch_local_only ($WORK_BEAD_ID)" -m "Work is committed on branch $BRANCH, but base branch {{base_branch}} does not exist on origin, so the refinery cannot merge it. Push the base branch, then re-run submit-and-exit for $WORK_BEAD_ID."
-  STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
-  STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
-  printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
+  STEP_BEAD_ID=$(gc hook current --id-only 2>/dev/null) || STEP_BEAD_ID=""  # drain-ack gives back every claim this session still holds, so close this step first
+  [ -n "$STEP_BEAD_ID" ] && gc bd show "$STEP_BEAD_ID" --json 2>/dev/null | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null ||
+      STEP_BEAD_ID=$([ -n "${BEADS_ACTOR:-}" ] && gc bd list --assignee="$BEADS_ACTOR" --status=in_progress --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null | jq -r '[.[] | select(.status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))) | .id] | if length == 1 then .[0] else empty end' 2>/dev/null)  # tier 2: this session's own step (see "Closing this step" above)
+  [ -n "$STEP_BEAD_ID" ] || { echo "submit-and-exit: this session holds no single in-progress submit-and-exit step; not acknowledging drain" >&2; exit 1; }
   gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=base_branch_local_only --status=closed || exit 1
   gc runtime drain-ack
   exit 0
@@ -1646,9 +1671,10 @@ if [ $PUSH_EXIT -ne 0 ]; then
     echo "Aborting handoff — bead stays with polecat."
     echo ""
     echo "Diagnose the push failure (network, auth, force-needed?) and re-run submit-and-exit."
-    STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
-    STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
-    printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
+    STEP_BEAD_ID=$(gc hook current --id-only 2>/dev/null) || STEP_BEAD_ID=""  # drain-ack gives back every claim this session still holds, so close this step first
+    [ -n "$STEP_BEAD_ID" ] && gc bd show "$STEP_BEAD_ID" --json 2>/dev/null | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null ||
+        STEP_BEAD_ID=$([ -n "${BEADS_ACTOR:-}" ] && gc bd list --assignee="$BEADS_ACTOR" --status=in_progress --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null | jq -r '[.[] | select(.status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))) | .id] | if length == 1 then .[0] else empty end' 2>/dev/null)  # tier 2: this session's own step (see "Closing this step" above)
+    [ -n "$STEP_BEAD_ID" ] || { echo "submit-and-exit: this session holds no single in-progress submit-and-exit step; not acknowledging drain" >&2; exit 1; }
     gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=push_failed --status=closed || exit 1
     gc runtime drain-ack
     exit 1
@@ -1660,9 +1686,10 @@ if [ -z "$REMOTE_REF" ]; then
     echo "PUSH VERIFICATION FAILED"
     echo "  git push exited 0 but 'git ls-remote' returned no ref for '$CURRENT_BRANCH' on origin."
     echo "  Branch is local-only. Aborting handoff."
-    STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
-    STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
-    printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
+    STEP_BEAD_ID=$(gc hook current --id-only 2>/dev/null) || STEP_BEAD_ID=""  # drain-ack gives back every claim this session still holds, so close this step first
+    [ -n "$STEP_BEAD_ID" ] && gc bd show "$STEP_BEAD_ID" --json 2>/dev/null | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null ||
+        STEP_BEAD_ID=$([ -n "${BEADS_ACTOR:-}" ] && gc bd list --assignee="$BEADS_ACTOR" --status=in_progress --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null | jq -r '[.[] | select(.status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))) | .id] | if length == 1 then .[0] else empty end' 2>/dev/null)  # tier 2: this session's own step (see "Closing this step" above)
+    [ -n "$STEP_BEAD_ID" ] || { echo "submit-and-exit: this session holds no single in-progress submit-and-exit step; not acknowledging drain" >&2; exit 1; }
     gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=push_verify_failed --status=closed || exit 1
     gc runtime drain-ack
     exit 1
@@ -1672,9 +1699,10 @@ if [ "$REMOTE_REF" != "$LOCAL_HEAD" ]; then
     echo "  origin/$CURRENT_BRANCH = $REMOTE_REF"
     echo "  local HEAD             = $LOCAL_HEAD"
     echo "  Branch tip on origin does not match local HEAD. Aborting handoff."
-    STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
-    STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
-    printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
+    STEP_BEAD_ID=$(gc hook current --id-only 2>/dev/null) || STEP_BEAD_ID=""  # drain-ack gives back every claim this session still holds, so close this step first
+    [ -n "$STEP_BEAD_ID" ] && gc bd show "$STEP_BEAD_ID" --json 2>/dev/null | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null ||
+        STEP_BEAD_ID=$([ -n "${BEADS_ACTOR:-}" ] && gc bd list --assignee="$BEADS_ACTOR" --status=in_progress --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null | jq -r '[.[] | select(.status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))) | .id] | if length == 1 then .[0] else empty end' 2>/dev/null)  # tier 2: this session's own step (see "Closing this step" above)
+    [ -n "$STEP_BEAD_ID" ] || { echo "submit-and-exit: this session holds no single in-progress submit-and-exit step; not acknowledging drain" >&2; exit 1; }
     gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=push_verify_failed --status=closed || exit 1
     gc runtime drain-ack
     exit 1
@@ -1753,9 +1781,10 @@ Polecat submit-and-exit halted at the refinery handoff: gc.routed_to=human.
 Branch is pushed and metadata.target is recorded. Assignee and routing left as
 the escalation set them; a human decides whether this goes to the refinery.
 HUMAN_HALT
-    STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
-    STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
-    printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
+    STEP_BEAD_ID=$(gc hook current --id-only 2>/dev/null) || STEP_BEAD_ID=""  # drain-ack gives back every claim this session still holds, so close this step first
+    [ -n "$STEP_BEAD_ID" ] && gc bd show "$STEP_BEAD_ID" --json 2>/dev/null | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null ||
+        STEP_BEAD_ID=$([ -n "${BEADS_ACTOR:-}" ] && gc bd list --assignee="$BEADS_ACTOR" --status=in_progress --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null | jq -r '[.[] | select(.status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))) | .id] | if length == 1 then .[0] else empty end' 2>/dev/null)  # tier 2: this session's own step (see "Closing this step" above)
+    [ -n "$STEP_BEAD_ID" ] || { echo "submit-and-exit: this session holds no single in-progress submit-and-exit step; not acknowledging drain" >&2; exit 1; }
     gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=routed_to_human --status=closed || exit 1
     gc runtime drain-ack
     exit 0
@@ -1831,9 +1860,10 @@ the work on its next poll.
 
 **8. Signal reconciler and exit.**
 ```bash
-STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
-STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
-printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
+STEP_BEAD_ID=$(gc hook current --id-only 2>/dev/null) || STEP_BEAD_ID=""  # drain-ack gives back every claim this session still holds, so close this step first
+[ -n "$STEP_BEAD_ID" ] && gc bd show "$STEP_BEAD_ID" --json 2>/dev/null | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null ||
+    STEP_BEAD_ID=$([ -n "${BEADS_ACTOR:-}" ] && gc bd list --assignee="$BEADS_ACTOR" --status=in_progress --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null | jq -r '[.[] | select(.status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))) | .id] | if length == 1 then .[0] else empty end' 2>/dev/null)  # tier 2: this session's own step (see "Closing this step" above)
+[ -n "$STEP_BEAD_ID" ] || { echo "submit-and-exit: this session holds no single in-progress submit-and-exit step; not acknowledging drain" >&2; exit 1; }
 gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=pass --status=closed || exit 1
 gc runtime drain-ack
 exit

@@ -287,7 +287,7 @@ POLECAT_BRANCH_CONTENT_GATE_HALT_PATH = (
     # claim the session still holds, and a step left claimed is run again.
     # Anchored to the escalation loop's `done`, which occurs only in this gate,
     # so the close cannot move ahead of the escalation and skip it.
-    ("halt close after escalation", "    done\n    STEP_BEAD_ID=$(gc hook current --id-only) || exit 1"),
+    ("halt close after escalation", '    done\n    STEP_BEAD_ID=$(gc hook current --id-only 2>/dev/null) || STEP_BEAD_ID=""'),
     # Anchored to this gate's own close, whose `gc.failure_reason="$HALT_REASON"`
     # occurs only here. The checked window runs to the push, so it also spans
     # the auto_push=false halt further down: a bare "gc runtime drain-ack"

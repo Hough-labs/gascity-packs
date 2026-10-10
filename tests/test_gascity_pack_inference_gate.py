@@ -1615,8 +1615,8 @@ def test_validate_polecat_branch_content_gate_rejects_gate_moved_after_the_push(
         # without the close, and a close moved ahead of the loop breaks the
         # same adjacency.
         pytest.param(
-            "    done\n    STEP_BEAD_ID=$(gc hook current --id-only) || exit 1",
-            "    done\n    true\n    STEP_BEAD_ID=$(gc hook current --id-only) || exit 1",
+            '    done\n    STEP_BEAD_ID=$(gc hook current --id-only 2>/dev/null) || STEP_BEAD_ID=""',
+            '    done\n    true\n    STEP_BEAD_ID=$(gc hook current --id-only 2>/dev/null) || STEP_BEAD_ID=""',
             "halt close after escalation",
             id="statement-between-the-escalation-and-the-close",
         ),
