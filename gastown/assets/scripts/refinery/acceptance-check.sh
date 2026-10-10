@@ -593,7 +593,10 @@ rec_run() {
 # cleaned up and the source reopened, then the bead is put back with its reason and
 # its routing. Each write runs only after the one before it succeeded. CFG_RIG and
 # CFG_BINDING_PREFIX are resolve_config's twins of the rebase step's
-# ${GC_RIG:+$GC_RIG/}<binding prefix>polecat. Returns 1 when a write failed.
+# ${GC_RIG:+$GC_RIG/}<binding prefix>polecat. handoff_stage is cleared as on every
+# rejection (upstream #322): the polecat's completed submit no longer stands, and a
+# stale marker would let the witness's Step 3a hand this tip straight back here.
+# Returns 1 when a write failed.
 rec_return_to_pool() {
   rp_ids=$(ac_nudge_ids MISS "$2")
   rp_reason="acceptance: ${rp_ids:+$rp_ids - }see note"
@@ -605,7 +608,7 @@ rec_return_to_pool() {
     ac_warn "gc workflow reopen-source for $1 failed; the bead stays with the refinery"
     return 1
   fi
-  if ! gc bd update "$1" --status=open --assignee= \
+  if ! gc bd update "$1" --status=open --assignee= --unset-metadata handoff_stage \
     --set-metadata "rejection_reason=$rp_reason" \
     --set-metadata "gc.routed_to=${CFG_RIG:+$CFG_RIG/}${CFG_BINDING_PREFIX}polecat" >/dev/null; then
     ac_warn "the pool return of $1 failed; the bead stays with the refinery"

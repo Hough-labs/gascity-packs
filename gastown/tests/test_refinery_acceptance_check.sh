@@ -146,6 +146,10 @@ bd)
                 edit_bead "$file" --arg k "${2%%=*}" --arg v "${2#*=}" '.[0].metadata[$k] = $v'
                 shift
                 ;;
+            --unset-metadata)
+                edit_bead "$file" --arg k "$2" 'del(.[0].metadata[$k])'
+                shift
+                ;;
             --add-label)
                 edit_bead "$file" --arg v "$2" '.[0].labels = (((.[0].labels // []) + [$v]) | unique)'
                 shift
@@ -1086,6 +1090,10 @@ write_calls() { grep -E '^gc (bd (update|note) |session nudge |workflow )' "$T/g
 case_record_reject_miss() {
     new_case record-reject-miss
     record_rig
+    # The polecat's completed-submit marker. Every rejection clears it (upstream
+    # #322): left set, the witness's Step 3a would hand this rejected tip straight
+    # back to the refinery as a finished handoff.
+    set_meta gcp-r1 handoff_stage target_recorded
     printf '%s\n' 'AC1 OK — a | b' 'AC2 MISSING — c | absent' 'AC4 SUBSTITUTED — d | e' >"$T/stdin"
 
     run_ac record --work gcp-r1 --verdict MISS --tip "$X" --mode reject
@@ -1098,9 +1106,10 @@ gc session nudge testrig/crew.seat ACCEPTANCE MISS: gcp-r1 AC2,AC4 - note on gcp
 gc bd update gcp-r1 --set-metadata acceptance_check_nudge=delivered: testrig/crew.seat
 gc workflow delete-source gcp-r1 --apply
 gc workflow reopen-source gcp-r1
-gc bd update gcp-r1 --status=open --assignee= --set-metadata rejection_reason=acceptance: AC2,AC4 - see note --set-metadata gc.routed_to=testrig/gastown.polecat" \
+gc bd update gcp-r1 --status=open --assignee= --unset-metadata handoff_stage --set-metadata rejection_reason=acceptance: AC2,AC4 - see note --set-metadata gc.routed_to=testrig/gastown.polecat" \
         "$(write_calls)"
     assert_eq "status" open "$(bead_field gcp-r1 status)"
+    assert_eq "handoff_stage" "<unset>" "$(bead_meta gcp-r1 handoff_stage)"
     assert_eq "assignee" "" "$(bead_field gcp-r1 assignee)"
     assert_eq "rejection_reason" "acceptance: AC2,AC4 - see note" "$(bead_meta gcp-r1 rejection_reason)"
     assert_eq "gc.routed_to" testrig/gastown.polecat "$(bead_meta gcp-r1 gc.routed_to)"
