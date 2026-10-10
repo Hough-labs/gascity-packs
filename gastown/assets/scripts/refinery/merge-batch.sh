@@ -47,8 +47,12 @@
 #         conflicts, is ineligible, or collapses to no change ends the batch
 #         there: it and every later member are dropped, keep no new metadata and
 #         stay assigned. One exception: a member that collapses AND passes
-#         branch_already_landed is closed as already merged by the existing
-#         helper, and stacking continues past it. Any internal error resets
+#         branch_already_landed gets the head's artifact proof
+#         (mb_capture_artifact_proof), is closed as already merged by the existing
+#         helper, keeps its source branch, and has its task-artifact cleanup run;
+#         stacking continues past it. stack never stops the head's lane, so a
+#         cleanup there that does not converge is a WARN, its durable state left
+#         for find-work's sweep. Any internal error resets
 #         `temp` to the head tip recorded at entry, writes a one-member manifest,
 #         prints WARN and still exits 0.
 #         Writes the manifest `$(git rev-parse --git-dir)/refinery-batch.json`:
@@ -65,9 +69,14 @@
 #         runs merge-push.sh's merge_ff_push on `temp`, so the retry loop and the
 #         statuses are the lane's: 0 landed, 2 hard stop, 3 the re-rebase
 #         conflicted, 5 no-op, 6 retries exhausted, 7 the remote refused. Any of
-#         2/3/5/6/7 from the push writes no bead and leaves the manifest where it
-#         is. Status 4 cannot arise: land stops with 2 when the approval gate is
-#         on, because a batch of more than one never rode it.
+#         2/3/5/6/7 from the push writes nothing but the artifact proof below and
+#         leaves the manifest where it is. Status 4 cannot arise: land stops with
+#         2 when the approval gate is on, because a batch of more than one never
+#         rode it.
+#         Before the push, every member gets the task-artifact proof the patrol's
+#         rebase step records for the head (upstream #245): artifact_source_sha
+#         and artifact_cleanup_state=pending (mb_capture_artifact_proof). A member
+#         whose proof cannot be recorded stops land with 2 before anything lands.
 #         After a landing, member i's commit is found in the LANDED stack, not in
 #         the manifest, because a retry re-rebases temp and so rewrites every
 #         sha: with L the landed tip and offset_i the commit count of the members
@@ -76,8 +85,13 @@
 #         that check, or whose bead write or close fails, is LEFT OPEN with its
 #         branch kept, never given the batch tip or another member's commit, and
 #         never rolled back: the merge-state gate closes it as already merged on
-#         a later patrol. Status 0 when every member closed, 2 when one is left
-#         open. The manifest is removed after a landing. Once the manifest checks
+#         a later patrol. No member's source branch is ever deleted: it is the
+#         task artifact's recovery copy. After each member's close, its
+#         task-artifact cleanup runs; one that does not converge is handled as
+#         merge-push.sh's direct_cleanup handles it: the member stays closed, its
+#         durable pending/blocked state stays retryable, and land ends 2. Status
+#         0 when every member closed and cleaned up, 2 when one is left open or
+#         its cleanup did not converge. The manifest is removed after a landing. Once the manifest checks
 #         pass, every exit drops temp, success or failure, as merge-push.sh's
 #         drop_temp_on_exit does for the single-bead lane: a temp that outlived
 #         land would make the next patrol's rebase step STOP (upstream #374).
@@ -200,6 +214,51 @@ mb_check_member() {
   if [ -n "$mc_serial" ] && [ "$mc_serial" = "$(git rev-parse --verify -q "origin/$MB_BRANCH" 2>/dev/null)" ]; then
     MB_WHY="$mc_id already went red in a batch at its current tip (merge_batch_serial)"
     return 1
+  fi
+  return 0
+}
+
+# mb_capture_artifact_proof <id> <branch> — record the member's task-artifact
+# proof the way the patrol's rebase step records the head's (upstream #245):
+# with no artifact_source_sha on the bead, the sha origin/<branch> holds now,
+# together with artifact_cleanup_state=pending; with one, it is never overwritten
+# (the polecat's next submission clears it) and only the pending marker is
+# re-armed. The batch lane never rewrites a member's origin branch, so that sha
+# is the source the polecat pushed and its task worktree holds, which is what
+# task-artifact cleanup proves the worktree safe against. Returns 1, with MB_WHY
+# set, when the bead cannot be read, the branch cannot be resolved, or the write
+# fails; each path makes at most one write.
+mb_capture_artifact_proof() {
+  cap_id="$1"
+  cap_branch="$2"
+  MB_WHY=""
+  if ! mb_load_bead "$cap_id" ||
+    ! cap_meta=$(printf '%s' "$MB_JSON" | jq -ce '
+      if type == "array" and length == 1 and (.[0] | type) == "object" and
+         ((.[0].metadata // {}) | type) == "object"
+      then .[0].metadata // {}
+      else error("expected exactly one work bead object")
+      end' 2>/dev/null); then
+    MB_WHY="cannot read $cap_id to record its artifact proof"
+    return 1
+  fi
+  cap_source=$(printf '%s' "$cap_meta" | jq -r '.artifact_source_sha // empty')
+  cap_state=$(printf '%s' "$cap_meta" | jq -r '.artifact_cleanup_state // empty')
+  if [ -z "$cap_source" ]; then
+    if ! git fetch -q --no-tags origin "+refs/heads/$cap_branch:refs/remotes/origin/$cap_branch" >/dev/null 2>&1 ||
+      ! cap_source=$(git rev-parse --verify -q "refs/remotes/origin/$cap_branch^{commit}" 2>/dev/null); then
+      MB_WHY="cannot read origin/$cap_branch to record $cap_id's artifact proof"
+      return 1
+    fi
+    if ! gc bd update "$cap_id" --set-metadata artifact_source_sha="$cap_source" --set-metadata artifact_cleanup_state=pending; then
+      MB_WHY="cannot record $cap_id's artifact proof"
+      return 1
+    fi
+  elif [ "$cap_state" != pending ]; then
+    if ! gc bd update "$cap_id" --set-metadata artifact_cleanup_state=pending; then
+      MB_WHY="cannot re-arm $cap_id's artifact cleanup marker"
+      return 1
+    fi
   fi
   return 0
 }
@@ -409,6 +468,12 @@ sb_stack_member() {
     fi
     sm_sha=$(upstream_equivalent_sha "origin/$TARGET" "origin/$BRANCH") ||
       sm_sha=$(git rev-parse "origin/$TARGET")
+    # Closed here rather than by land, so it gets its artifact proof here: its
+    # cleanup below proves its task worktree safe against it.
+    if ! mb_capture_artifact_proof "$sm_id" "$BRANCH"; then
+      SB_WHY="$sm_id is already merged but $MB_WHY"
+      return 1
+    fi
     # The helper's stdout tells the agent to skip the merge script, which is the
     # lane's advice and not a batch's, so it is held back and summarised here.
     if ! sm_out=$(close_already_merged "$sm_sha" rebase_patch_id "every commit on origin/$BRANCH since $sm_fork is already upstream in origin/$TARGET by patch-id, and its rebase is empty"); then
@@ -416,9 +481,11 @@ sb_stack_member() {
       return 1
     fi
     echo "merge-batch: $sm_id is already merged to $TARGET at $(git rev-parse --short "$sm_sha" 2>/dev/null); closed it and stacked past it."
-    if [ "$CFG_DELETE_MERGED_BRANCHES" = "true" ]; then
-      git push -q origin --delete "$BRANCH" >/dev/null 2>&1 ||
-        mb_warn "could not delete the merged branch $BRANCH on origin."
+    # Upstream #245: its source branch stays as the recovery copy, and the close
+    # runs its task-artifact cleanup. stack never stops the head's lane, so a
+    # cleanup that does not converge is a WARN; find-work's sweep retries it.
+    if ! gc gastown task-artifact-cleanup "$sm_id"; then
+      mb_warn "task artifact cleanup for $sm_id did not converge; its durable pending/blocked state remains retryable."
     fi
     return 3
   fi
@@ -629,15 +696,16 @@ lb_record() {
 }
 
 # lb_land_members — after a verified landing, map each member to its own commit
-# in the landed stack and record it. Sets LB_LANDED and LB_LEFT_OPEN. Returns 0
-# when every member closed and 2 when one was left open.
+# in the landed stack, record it, and run its task-artifact cleanup. Sets
+# LB_LANDED, LB_LEFT_OPEN and LB_CLEANUP_FAILED. Returns 0 when every member
+# closed and cleaned up, and 2 when one was left open or its cleanup did not
+# converge.
 lb_land_members() {
   lm_landed_sha="$MERGED_SHA"
   LB_LANDED_SHORT=$(git rev-parse --short "$lm_landed_sha" 2>/dev/null) || LB_LANDED_SHORT="$lm_landed_sha"
   # A for loop, not a read loop, for the reason select gives.
   for lm_idx in $(seq 0 $((LB_SIZE - 1))); do
     lm_id=$(lb_member "$lm_idx" id)
-    lm_branch=$(lb_member "$lm_idx" branch)
     lm_pos=$((lm_idx + 1))
     lm_offset=$(printf '%s' "$LB_JSON" | jq -r --argjson i "$lm_idx" '[.members[$i + 1:][].commits] | add // 0')
     # The member's own commit in the landed stack. Never L itself, the
@@ -659,12 +727,16 @@ lb_land_members() {
       continue
     fi
     lb_append_landed "$lm_id"
-    if [ "$CFG_DELETE_MERGED_BRANCHES" = "true" ]; then
-      git push -q origin --delete "$lm_branch" >/dev/null 2>&1 ||
-        mb_warn "could not delete the merged branch $lm_branch on origin."
+    # Upstream #245: the source branch is never deleted; it is the recovery copy
+    # task-artifact cleanup proves the member's worktree safe against. A cleanup
+    # that does not converge is merge-push.sh's direct_cleanup case: the member
+    # stays closed, its durable state stays retryable, and land ends 2.
+    if ! gc gastown task-artifact-cleanup "$lm_id"; then
+      echo "merge-batch: task artifact cleanup for $lm_id did not converge. STOP; its durable pending/blocked state remains retryable."
+      LB_CLEANUP_FAILED="${LB_CLEANUP_FAILED:+$LB_CLEANUP_FAILED,}$lm_id"
     fi
   done
-  [ -z "$LB_LEFT_OPEN" ] && return 0
+  [ -z "$LB_LEFT_OPEN" ] && [ -z "$LB_CLEANUP_FAILED" ] && return 0
   return 2
 }
 
@@ -765,6 +837,16 @@ lb_land() {
     return 2
   fi
 
+  # Every member's task-artifact proof before anything lands, as the rebase
+  # step records the head's before its rebase; for the head it is already there.
+  # A proof that cannot be recorded stops here, as that step's capture does.
+  for lnd_idx in $(seq 0 $((LB_SIZE - 1))); do
+    if ! mb_capture_artifact_proof "$(lb_member "$lnd_idx" id)" "$(lb_member "$lnd_idx" branch)"; then
+      echo "merge-batch: $MB_WHY. Nothing landed." >&2
+      return 2
+    fi
+  done
+
   # merge_ff_push reads TARGET (set above), BRANCH (messages only) and
   # APPROVAL_REQUIRED, and is not copied here: the batch lands exactly as the
   # single-bead lane does.
@@ -781,7 +863,7 @@ lb_land() {
   lnd_rc=$?
   # The manifest describes a stack that now exists only on the target.
   rm -f "$LB_MANIFEST"
-  if [ "$lnd_rc" -ne 0 ]; then
+  if [ -n "$LB_LEFT_OPEN" ]; then
     echo "merge-batch: the batch landed on $TARGET at $MERGED_SHORT, but left open: $LB_LEFT_OPEN. The next patrol's merge-state gate closes each as already merged."
   fi
   return "$lnd_rc"
@@ -790,6 +872,7 @@ lb_land() {
 cmd_land() {
   LB_LANDED=""
   LB_LEFT_OPEN=""
+  LB_CLEANUP_FAILED=""
   # Read by merge-push.sh's drop_temp_on_exit; lb_land sets it once the manifest
   # names the target.
   # shellcheck disable=SC2034

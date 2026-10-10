@@ -1703,11 +1703,17 @@ What each status means, and what this step does about it:
 With a batch (a manifest of 2+ members) the block ran `merge-batch.sh land`
 instead, and its last output line is `merge-batch: RESULT <status> landed=<ids>
 left-open=<ids>`. Its statuses 0, 1, 2, 3, 5, 6 and 7 mean what the table says and
-this step does what the table says; `land` never returns 4, 9 or 11. Status 0 is
-every member closed. Status 2 after a landing means a member was LANDED but not
-recorded: name each `left-open` id in your patrol-summary, STOP and drain, and
-leave it alone. The next iteration's already-merged arm closes it when it comes
-up as the head. `land` removes the manifest after a landing, and once its manifest
+this step does what the table says; `land` never returns 4, 9 or 11. `land`
+records each member's task-artifact proof before its push, as the rebase step
+does for the head, keeps every member's source branch, and runs each member's
+task-artifact cleanup after its close. Status 0 is every member closed and
+cleaned up. Status 2 after a landing means a member was LANDED but not recorded,
+or a closed member's cleanup did not converge (its pending or blocked state
+stays on the bead; find-work's sweep retries a pending one). Name each
+`left-open` id, and each member whose cleanup the output says did not converge,
+in your patrol-summary, STOP and drain, and leave them alone. The next
+iteration's already-merged arm closes a left-open member when it comes up as the
+head. `land` removes the manifest after a landing, and once its manifest
 checks pass it drops `temp` on every exit, as the single-bead script does.
 
 Status 7 is the one that most invites a wrong next move: the remote refused the
