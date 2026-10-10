@@ -64,10 +64,17 @@ execs (order scripts, pack command and doctor `run.sh`) would fail with exit
 126. The runner rejects a source root whose exec'd pack scripts are not
 executable. It does not guess a sibling checkout; `--gascity-source-root
 remote` imports the packs from the gascity git remote, which is only correct
-for a gc built from its default branch. The inference workflows resolve the
-gascity ref once with `go mod download -json`, install gc at that exact
-version, check out the module's `.Origin.Hash` commit as a shallow git tree,
-and export that checkout as `GASCITY_SOURCE_ROOT`.
+for a gc built from its default branch. The inference workflows install gc
+from its published release archive (`.github/scripts/install-gascity-archive.sh`),
+which exports the commit that binary was built from as `GASCITY_SOURCE_REF`,
+read from the binary's own build info (`go version -m`, `vcs.revision`). They
+check out that commit as a shallow git tree and export the checkout as
+`GASCITY_SOURCE_ROOT`. The commit comes from the binary, not from resolving the
+requested ref a second time, because `main` installs the rolling `edge`
+pre-release, which can move between the two. A binary that records no revision
+falls back to its release tag. A ref with no archive (a branch or commit SHA)
+is built with `go install`, which records neither, so the install fails rather
+than name a source it cannot vouch for.
 
 The fixture rig gets a local bare `origin` (next to the rig, as
 `<rig>-origin.git`) with `origin/HEAD` set, because build formulas base
@@ -110,9 +117,10 @@ validation.
 
 ## Automation
 
-`.github/workflows/pack-release-compatibility.yml` installs a requested Gas City
-module ref with `go install github.com/gastownhall/gascity/cmd/gc@<ref>` and
-runs the compatibility runner.
+`.github/workflows/pack-release-compatibility.yml` installs the requested Gas
+City release from its published archive (`latest`, a release tag, or `main` for
+the rolling `edge` pre-release built from gascity `main`) and runs the
+compatibility runner.
 
 The workflow runs on:
 
@@ -163,7 +171,8 @@ changes, manual dispatch, and repository dispatch events named
 
 `.github/workflows/supported-pack-nightly.yml` is the scheduled intra-release
 regression run. It first runs the static pack flow contracts, then executes a
-one-pack-at-a-time inference matrix against `gc@main` by default. Each pack has
+one-pack-at-a-time inference matrix against gascity `main` (the rolling `edge`
+release archive) by default. Each pack has
 a matrix-specific gate timeout below the job timeout so diagnostics still upload;
 manual or release dispatch can override that timeout when deliberately needed:
 

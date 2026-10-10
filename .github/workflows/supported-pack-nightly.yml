@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       gascity_ref:
-        description: "Gas City module ref/version to install: latest, main, a tag such as v1.2.1, or a commit SHA. Not a branch name with a slash (release/v1.5.0 is rejected by go); pass its tag or commit SHA."
+        description: "Gas City release archive to install: latest (newest stable release), main (the rolling edge pre-release built from gascity main), or a release tag such as v1.2.1. A branch or commit SHA has no archive and fails the install: its go install fallback records no commit for the gascity source checkout."
         required: false
         default: main
       gascity_setup_ref:
