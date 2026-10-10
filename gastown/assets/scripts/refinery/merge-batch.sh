@@ -65,9 +65,9 @@
 #         runs merge-push.sh's merge_ff_push on `temp`, so the retry loop and the
 #         statuses are the lane's: 0 landed, 2 hard stop, 3 the re-rebase
 #         conflicted, 5 no-op, 6 retries exhausted, 7 the remote refused. Any of
-#         2/3/5/6/7 from the push writes no bead, and leaves temp and the manifest
-#         where they are. Status 4 cannot arise: land stops with 2 when the
-#         approval gate is on, because a batch of more than one never rode it.
+#         2/3/5/6/7 from the push writes no bead and leaves the manifest where it
+#         is. Status 4 cannot arise: land stops with 2 when the approval gate is
+#         on, because a batch of more than one never rode it.
 #         After a landing, member i's commit is found in the LANDED stack, not in
 #         the manifest, because a retry re-rebases temp and so rewrites every
 #         sha: with L the landed tip and offset_i the commit count of the members
@@ -77,8 +77,10 @@
 #         branch kept, never given the batch tip or another member's commit, and
 #         never rolled back: the merge-state gate closes it as already merged on
 #         a later patrol. Status 0 when every member closed, 2 when one is left
-#         open. The manifest is removed after a landing, and temp is cleaned up
-#         only on 0.
+#         open. The manifest is removed after a landing. Once the manifest checks
+#         pass, every exit drops temp, success or failure, as merge-push.sh's
+#         drop_temp_on_exit does for the single-bead lane: a temp that outlived
+#         land would make the next patrol's rebase step STOP (upstream #374).
 #         Every land exit, guards included, ends its stdout with
 #           merge-batch: RESULT <status> landed=<ids> left-open=<ids>
 #         (comma-separated ids, empty when none). Exit 1 is a usage, config or
@@ -743,6 +745,11 @@ lb_land() {
   resolve_approval_required
 
   lb_read_manifest "$lnd_head" land || return 1
+  # The target is known from here, so cmd_land drops temp on the way out
+  # (drop_temp_on_exit reads MP_TEMP_CONSUMED and TARGET).
+  LB_TARGET=$(printf '%s' "$LB_JSON" | jq -r '.target')
+  TARGET="$LB_TARGET"
+  MP_TEMP_CONSUMED=1
 
   # From here a guard is a hard stop (2): the manifest is well-formed, so what
   # fails is the state around it. Nothing is pushed or written.
@@ -751,7 +758,6 @@ lb_land() {
     return 2
   fi
   LB_HEAD="$lnd_head"
-  LB_TARGET=$(printf '%s' "$LB_JSON" | jq -r '.target')
   lnd_last_tip=$(lb_member $((LB_SIZE - 1)) tip)
   lnd_temp=$(git rev-parse --verify -q refs/heads/temp 2>/dev/null)
   if [ "$lnd_temp" != "$lnd_last_tip" ]; then
@@ -759,15 +765,15 @@ lb_land() {
     return 2
   fi
 
-  # merge_ff_push reads TARGET, BRANCH (messages only) and APPROVAL_REQUIRED, and
-  # is not copied here: the batch lands exactly as the single-bead lane does.
-  TARGET="$LB_TARGET"
+  # merge_ff_push reads TARGET (set above), BRANCH (messages only) and
+  # APPROVAL_REQUIRED, and is not copied here: the batch lands exactly as the
+  # single-bead lane does.
   BRANCH=$(lb_member 0 branch)
   APPROVAL_REQUIRED=0
   merge_ff_push
   lnd_push=$?
   if [ "$lnd_push" -ne 0 ]; then
-    echo "merge-batch: merge_ff_push did not land the batch on $TARGET (status $lnd_push). No member was written; temp and the manifest are left in place."
+    echo "merge-batch: merge_ff_push did not land the batch on $TARGET (status $lnd_push). No member was written; the manifest is left in place and temp is dropped on the way out."
     return "$lnd_push"
   fi
 
@@ -775,9 +781,7 @@ lb_land() {
   lnd_rc=$?
   # The manifest describes a stack that now exists only on the target.
   rm -f "$LB_MANIFEST"
-  if [ "$lnd_rc" -eq 0 ]; then
-    cleanup_temp
-  else
+  if [ "$lnd_rc" -ne 0 ]; then
     echo "merge-batch: the batch landed on $TARGET at $MERGED_SHORT, but left open: $LB_LEFT_OPEN. The next patrol's merge-state gate closes each as already merged."
   fi
   return "$lnd_rc"
@@ -786,8 +790,13 @@ lb_land() {
 cmd_land() {
   LB_LANDED=""
   LB_LEFT_OPEN=""
+  # Read by merge-push.sh's drop_temp_on_exit; lb_land sets it once the manifest
+  # names the target.
+  # shellcheck disable=SC2034
+  MP_TEMP_CONSUMED=0
   lb_land "$@"
   cl_rc=$?
+  drop_temp_on_exit
   echo "merge-batch: RESULT $cl_rc landed=$LB_LANDED left-open=$LB_LEFT_OPEN"
   return "$cl_rc"
 }

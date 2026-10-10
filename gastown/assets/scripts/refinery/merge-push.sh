@@ -23,7 +23,9 @@
 #                 [--delete-merged-branches V] [--gh BIN]
 #
 # Run it inside the refinery's clone, with `temp` rebased onto the target, as
-# the patrol's rebase step leaves it.
+# the patrol's rebase step leaves it. Every exit after the bead's target is
+# resolved drops `temp`, success or failure (drop_temp_on_exit), so the next
+# patrol's rebase step can build it again.
 #
 # Config, highest precedence first: the flag; the rig's FormulaVars (a key that
 # is PRESENT wins even when empty); a value derived from the session; the
@@ -718,7 +720,7 @@ merge_ff_push() {
       fi
       if ! git rebase "$BEFORE_SHA"; then
         git rebase --abort >/dev/null 2>&1 || true
-        echo "merge-ff-push: re-rebase of temp onto $BEFORE_SHA conflicted; aborted. STOP — a later patrol re-runs the rebase step, which rejects the branch back to the pool."
+        echo "merge-ff-push: re-rebase of temp onto $BEFORE_SHA conflicted; aborted. Nothing landed. STOP: the lane drops temp on its way out, so the next patrol rebuilds it from origin/$BRANCH in the rebase step and runs the tests again; if the conflict stands, the rebase step's conflict path rejects the branch back to the pool."
         return 3
       fi
       echo "merge-ff-push: re-rebased temp onto $BEFORE_SHA; retrying (attempt $mfp_attempt of $mfp_max used)."
@@ -851,6 +853,20 @@ esac
 cleanup_temp() {
 git checkout --detach "origin/$TARGET" >/dev/null 2>&1 || true
 git branch -d temp || git branch -D temp || true
+}
+
+# drop_temp_on_exit — the lane's last act on EVERY exit once main has resolved
+# the bead's target, success or failure. Upstream #374 made the rebase step's
+# `git checkout -b temp origin/$BRANCH` exit-checked, so a temp that outlived
+# this script made every later patrol STOP at that step and drain until a human
+# deleted it, and most non-zero statuses left one. Nothing needs temp after
+# the script exits: the next patrol rebuilds it from origin/$BRANCH and runs the
+# tests on it again. A usage or config error (status 1) returns before the
+# target is known, and touches nothing.
+drop_temp_on_exit() {
+[ "${MP_TEMP_CONSUMED:-0}" -eq 1 ] || return 0
+git rev-parse --verify --quiet refs/heads/temp >/dev/null || return 0
+cleanup_temp
 }
 
 # The direct lane's "2. Cleanup" after a verified close (upstream #245 and the
@@ -1294,6 +1310,8 @@ if [ -z "$TARGET" ] || [ "$TARGET" = null ]; then
   echo "merge-push: $WORK has no metadata.target and no target default resolved (--target-default, the rig's target_branch, or its DefaultBranch)."
   return 1
 fi
+# From here every exit drops temp (drop_temp_on_exit).
+MP_TEMP_CONSUMED=1
 
 resolve_origin_repo
 MERGE_STRATEGY=$(resolve_merge_strategy "$WORK")
@@ -1405,7 +1423,9 @@ if [ "${MERGE_PUSH_SOURCE_ONLY:-}" = 1 ]; then
 fi
 
 MP_SUMMARY=""
+MP_TEMP_CONSUMED=0
 main "$@"
 MP_STATUS=$?
+drop_temp_on_exit
 echo "merge-push: RESULT $MP_STATUS ${CFG_WORK:-<no work>}: ${MP_SUMMARY:-$(result_summary "$MP_STATUS")}"
 exit "$MP_STATUS"

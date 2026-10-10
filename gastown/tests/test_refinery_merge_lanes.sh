@@ -578,6 +578,15 @@ run_lane() {
     if grep -q '^merge-push: config ' "$T/lane.out" && [ -z "$SCRIPT_STATUS" ]; then
         fail "merge-push.sh ran but printed no RESULT line"
     fi
+    # Upstream #374 made the rebase step's `git checkout -b temp` exit-checked, so
+    # a temp that outlives the script STOPs every later patrol at that step. Only
+    # a usage or config error (1) returns before the lane consumes it. The config
+    # line says the real script ran, not a locator case's stand-in.
+    if grep -q '^merge-push: config ' "$T/lane.out" && [ -n "$SCRIPT_STATUS" ] &&
+        [ "$SCRIPT_STATUS" != 1 ] &&
+        git -C "$REFINERY" rev-parse --verify --quiet refs/heads/temp >/dev/null; then
+        fail "merge-push.sh exited $SCRIPT_STATUS and left refs/heads/temp behind; the next patrol's rebase step STOPs on it"
+    fi
 }
 
 # --- assertions -------------------------------------------------------------

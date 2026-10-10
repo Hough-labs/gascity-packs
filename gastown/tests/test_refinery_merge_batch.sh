@@ -29,14 +29,14 @@
 # in. SCRIPT may point at another copy of merge-batch.sh; it finds merge-push.sh
 # beside itself, so stage a copy as a pack tree.
 #
-# The suite fails unless all 20 cases ran.
+# The suite fails unless all 22 cases ran.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 PACK_DIR="$ROOT/gastown"
 SCRIPT="${SCRIPT:-$PACK_DIR/assets/scripts/refinery/merge-batch.sh}"
 PUSH_SCRIPT="$(dirname "$SCRIPT")/merge-push.sh"
-EXPECTED_CASES=20
+EXPECTED_CASES=22
 
 AGENT=testrig/gastown.refinery
 TARGET_NAME=integration
@@ -823,6 +823,15 @@ origin_tip() { git --git-dir="$ORIGIN" rev-parse refs/heads/integration; }
 last_line() { tail -n 1 "$T/out"; }
 branch_on_origin() { git --git-dir="$ORIGIN" rev-parse --verify -q "refs/heads/polecat/$1" 2>/dev/null; }
 
+# assert_no_temp <what> — land dropped `temp`. Upstream #374 made the rebase
+# step's `git checkout -b temp` exit-checked, so a temp that outlives land makes
+# every later patrol STOP at the rebase step and drain.
+assert_no_temp() {
+    git -C "$REFINERY" rev-parse --verify --quiet refs/heads/temp >/dev/null 2>&1 &&
+        fail "$1: refs/heads/temp was left behind; the next patrol's rebase step STOPs on it"
+    return 0
+}
+
 # snapshot_beads — the three beads' bytes, to prove a land run wrote none.
 snapshot_beads() { echo "$(bead_sum gcp-h1)|$(bead_sum gcp-h2)|$(bead_sum gcp-h3)"; }
 
@@ -940,6 +949,7 @@ HOOK
     assert_eq "no bead call was made" "$writes" "$(db_writes)"
     [ "$(wc -l <"$T/push-attempts" | tr -d ' ')" -gt 1 ] ||
         fail "harness bug: the hook saw fewer than two pushes, so nothing raced"
+    assert_no_temp "land status 6"
     end_case
 }
 
@@ -963,6 +973,7 @@ HOOK
     assert_eq "origin/integration is unchanged" "$tip" "$(origin_tip)"
     assert_eq "no member bead was written" "$before" "$(snapshot_beads)"
     assert_eq "no bead call was made" "$writes" "$(db_writes)"
+    assert_no_temp "land status 7"
     end_case
 }
 
@@ -984,6 +995,7 @@ case_land_left_open_recovery() {
     [ -n "$(branch_on_origin gcp-h2)" ] || fail "origin/polecat/gcp-h2 was deleted though member 2 is open"
     assert_eq "the last stdout line is the RESULT line" \
         "merge-batch: RESULT 2 landed=gcp-h1,gcp-h3 left-open=gcp-h2" "$(last_line)"
+    assert_no_temp "land status 2 with a member left open"
 
     # The recovery the single-bead lane gives it: the rebase step rebuilds temp
     # from the branch (every commit is already upstream, so it collapses to
@@ -1032,6 +1044,52 @@ case_land_dropped_commit() {
     for i in 1 2 3; do
         [ -n "$(branch_on_origin "gcp-h$i")" ] || fail "origin/polecat/gcp-h$i was deleted though the member is open"
     done
+    assert_no_temp "land status 2 with every member refused"
+    end_case
+}
+
+case_land_rerebase_conflict() {
+    new_case land-rerebase-conflict
+    stack_three
+    # Another bead lands a different member 2 file: land's re-rebase onto the
+    # moved target cannot apply member 2's commit.
+    git_q -C "$SEED" pull origin integration
+    echo "someone else's f2" >"$SEED/f2.txt"
+    git_q -C "$SEED" add f2.txt
+    git_q -C "$SEED" commit -m "feat: a concurrent bead writes f2.txt"
+    git_q -C "$SEED" push origin HEAD:integration
+    local before writes tip
+    before=$(snapshot_beads)
+    writes=$(db_writes)
+    tip=$(origin_tip)
+
+    run_batch land --head gcp-h1
+    assert_eq "land exits 3 when the re-rebase conflicts" 3 "$(last_rc)"
+    assert_eq "the last stdout line is the RESULT line" "merge-batch: RESULT 3 landed= left-open=" "$(last_line)"
+    assert_eq "origin/integration is unchanged" "$tip" "$(origin_tip)"
+    assert_eq "no member bead was written" "$before" "$(snapshot_beads)"
+    assert_eq "no bead call was made" "$writes" "$(db_writes)"
+    [ ! -d "$(git -C "$REFINERY" rev-parse --absolute-git-dir)/rebase-merge" ] ||
+        fail "a rebase was left in flight"
+    assert_no_temp "land status 3"
+    end_case
+}
+
+case_land_noop() {
+    new_case land-noop
+    stack_three
+    # The stacked tip is already the target's: the ff-merge is a no-op.
+    git_q -C "$REFINERY" push origin temp:integration
+    local before writes
+    before=$(snapshot_beads)
+    writes=$(db_writes)
+
+    run_batch land --head gcp-h1
+    assert_eq "land exits 5 when the target already holds the batch" 5 "$(last_rc)"
+    assert_eq "the last stdout line is the RESULT line" "merge-batch: RESULT 5 landed= left-open=" "$(last_line)"
+    assert_eq "no member bead was written" "$before" "$(snapshot_beads)"
+    assert_eq "no bead call was made" "$writes" "$(db_writes)"
+    assert_no_temp "land status 5"
     end_case
 }
 
@@ -1043,7 +1101,10 @@ case_land_guards() {
     tip=$(origin_tip)
     writes=$(db_writes)
 
-    # guard_holds <what> <want-status> — the guard that just ran touched nothing.
+    # guard_holds <what> <want-status> — the guard that just ran wrote nothing.
+    # A usage, config or manifest error (1) touches nothing, temp included. A
+    # stop after the manifest checks passed (2) drops temp like every other land
+    # stop; it is put back on the stacked tip for the guards that follow.
     guard_holds() {
         assert_eq "$1: exit status" "$2" "$(last_rc)"
         assert_eq "$1: the last stdout line is the RESULT line" \
@@ -1051,6 +1112,12 @@ case_land_guards() {
         assert_eq "$1: origin/integration is unchanged" "$tip" "$(origin_tip)"
         assert_eq "$1: no bead changed" "$before" "$(snapshot_beads)"
         assert_eq "$1: no bead call was made" "$writes" "$(db_writes)"
+        if [ "$2" = 1 ]; then
+            assert_eq "$1: temp is where stack left it" "$(saved '.members[2].tip')" "$(temp_sha)"
+        else
+            assert_no_temp "$1"
+            git_q -C "$REFINERY" checkout -B temp "$(saved '.members[2].tip')"
+        fi
     }
 
     run_batch land
@@ -1239,6 +1306,8 @@ case_land_retries_exhausted
 case_land_refused
 case_land_left_open_recovery
 case_land_dropped_commit
+case_land_rerebase_conflict
+case_land_noop
 case_land_guards
 case_serial_stamps
 case_serial_stamp_failure

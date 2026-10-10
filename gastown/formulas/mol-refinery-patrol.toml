@@ -1679,6 +1679,10 @@ esac
 ```
 
 The script's last output line is always `merge-push: RESULT <status> <summary>`.
+Whatever the status, except a usage or config error (1), the script has already
+dropped `temp`: a stranded `temp` would make the next rebase step STOP (#374). So
+a STOP never resumes at the push: when a later patrol picks the bead up again,
+its rebase step rebuilds `temp` from the branch and run-tests runs again first.
 What each status means, and what this step does about it:
 
 | Status | Meaning | This step |
@@ -1703,16 +1707,19 @@ this step does what the table says; `land` never returns 4, 9 or 11. Status 0 is
 every member closed. Status 2 after a landing means a member was LANDED but not
 recorded: name each `left-open` id in your patrol-summary, STOP and drain, and
 leave it alone. The next iteration's already-merged arm closes it when it comes
-up as the head. `land` removes the manifest after a landing and cleans up `temp`
-only on 0.
+up as the head. `land` removes the manifest after a landing, and once its manifest
+checks pass it drops `temp` on every exit, as the single-bead script does.
 
 Status 7 is the one that most invites a wrong next move: the remote refused the
 push while `$TARGET` stood still. Re-running the merge immediately just re-runs
 the pre-push gate, so if the gate is saturated the retry is what keeps it
 saturated. Read the push output for the refusal reason (a busy push-gate lane,
-a receive hook, permissions), clear that, and let the next patrol iteration pick
-the branch back up. Raise `REFINERY_PUSH_GATE_MAX_WAIT_SECONDS` if the refinery
-is losing slots to a genuinely busy gate rather than to a veto."""
+a receive hook, permissions) and clear it if you can. Do not push by hand: `temp`
+is already gone, and the step drains. The next patrol re-selects the bead,
+rebuilds `temp` in the rebase step and runs the tests again before it pushes, so
+a gate that is still refusing refuses that push too. Raise
+`REFINERY_PUSH_GATE_MAX_WAIT_SECONDS` if the refinery is losing slots to a
+genuinely busy gate rather than to a veto."""
 
 [[steps]]
 id = "patrol-summary"

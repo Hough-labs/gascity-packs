@@ -502,6 +502,271 @@ test_block_does_not_rely_on_set_e() {
     return 0
 }
 
+# --- the whole script: no stop strands `temp` ---------------------------------
+#
+# Upstream #374 made the rebase step's `git checkout -b temp origin/$BRANCH`
+# exit-checked, so a `temp` branch that outlives merge-push makes every later
+# patrol STOP at the rebase step and drain, until a human deletes it. The cases
+# below run the WHOLE script, not merge_ff_push alone, because dropping temp is
+# the lane's job on every exit: each reaches one status through the direct lane
+# and requires refs/heads/temp to be gone afterwards. Only gc is stubbed: the
+# work bead is a JSON file, updates and the close edit it, and any call the stub
+# does not know fails the case. The stub dispatches on one argv word at a time,
+# so no line of it spells a bare beads invocation.
+
+SCRIPT_BEAD_ID=gcp-mp
+
+write_script_gc_stub() {
+    cat >"$1/gc" <<'STUB'
+#!/usr/bin/env bash
+printf 'gc %s\n' "$*" >>"$GC_STUB_LOG"
+unexpected() {
+    printf 'gc %s\n' "$*" >>"$GC_STUB_UNEXPECTED"
+    echo "stub gc: unexpected invocation: gc $*" >&2
+    exit 64
+}
+edit_bead() {
+    local tmp
+    tmp=$(mktemp) || exit 70
+    jq "$@" "$GC_STUB_BEAD" >"$tmp" && mv -f "$tmp" "$GC_STUB_BEAD"
+}
+case "${1:-}" in
+bd)
+    case "${2:-}" in
+    show)
+        { [ "$#" -eq 4 ] && [ "$3" = "$GC_STUB_WORK" ] && [ "$4" = --json ]; } || unexpected "$@"
+        cat "$GC_STUB_BEAD"
+        ;;
+    update)
+        [ "${3:-}" = "$GC_STUB_WORK" ] || unexpected "$@"
+        if [ -n "${GC_STUB_FAIL_UPDATE:-}" ]; then
+            echo "stub gc: the bead update failed on request" >&2
+            exit 1
+        fi
+        shift 3
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+            --assignee=*) edit_bead --arg v "${1#*=}" '.[0].assignee = $v' ;;
+            --status=*) edit_bead --arg v "${1#*=}" '.[0].status = $v' ;;
+            --set-metadata)
+                edit_bead --arg k "${2%%=*}" --arg v "${2#*=}" '.[0].metadata[$k] = $v'
+                shift
+                ;;
+            --unset-metadata)
+                edit_bead --arg k "$2" 'del(.[0].metadata[$k])'
+                shift
+                ;;
+            *) unexpected "$@" ;;
+            esac
+            shift
+        done
+        ;;
+    close)
+        { [ "$#" -eq 5 ] && [ "$3" = "$GC_STUB_WORK" ] && [ "$4" = --reason ]; } || unexpected "$@"
+        edit_bead --arg r "$5" '.[0].status = "closed" | .[0].close_reason = $r'
+        ;;
+    *) unexpected "$@" ;;
+    esac
+    ;;
+gastown)
+    { [ "${2:-}" = task-artifact-cleanup ] && [ "$#" -eq 3 ] && [ "$3" = "$GC_STUB_WORK" ]; } || unexpected "$@"
+    ;;
+session | mail) : ;;
+*) unexpected "$@" ;;
+esac
+exit 0
+STUB
+    chmod +x "$1/gc"
+}
+
+# finish_script_rig <tmp> — what the script needs beyond make_rig's clone: the
+# bead's branch published as temp holds it, the stub gc, the city config and the
+# work bead, forked from the base commit under temp's one commit.
+finish_script_rig() {
+    local tmp="$1"
+    git_q -C "$WORK" push origin temp:polecat/test
+    mkdir -p "$tmp/bin"
+    write_script_gc_stub "$tmp/bin"
+    : >"$tmp/gc.log"
+    : >"$tmp/unexpected"
+    jq -n '{config: {Rigs: [{Name: "testrig", DefaultBranch: "dev", FormulaVars: {}}]}}' >"$tmp/config.json"
+    jq -n --arg id "$SCRIPT_BEAD_ID" --arg fork "$(git -C "$WORK" rev-parse temp~1)" \
+        '[{id: $id, title: "Bead", status: "in_progress", assignee: "testrig/gastown.refinery",
+           metadata: {branch: "polecat/test", target: "dev", fork_sha: $fork}}]' >"$tmp/bead.json"
+}
+
+# script_rig <tmp> — make_rig plus finish_script_rig: the target has not moved.
+script_rig() {
+    make_rig "$1"
+    finish_script_rig "$1"
+}
+
+# run_script <tmp> [env ...] — run merge-push.sh --work in the clone and echo its
+# exit status. Its output goes to <tmp>/script.out. --gh names a binary that
+# does not exist, so the lane never reaches a real gh.
+run_script() {
+    local tmp="$1"
+    shift
+    (
+        cd "$WORK" || exit 90
+        env -i \
+            PATH="$tmp/bin:$PATH" HOME="$HOME" TMPDIR="$tmp" \
+            GIT_CONFIG_GLOBAL="$GIT_CONFIG_GLOBAL" GIT_CONFIG_NOSYSTEM=1 \
+            GIT_AUTHOR_NAME=refinery GIT_AUTHOR_EMAIL=refinery@example.invalid \
+            GIT_COMMITTER_NAME=refinery GIT_COMMITTER_EMAIL=refinery@example.invalid \
+            GC_RIG=testrig GC_AGENT=testrig/gastown.refinery \
+            MERGE_PUSH_CONFIG_JSON="$tmp/config.json" \
+            GC_STUB_LOG="$tmp/gc.log" GC_STUB_UNEXPECTED="$tmp/unexpected" \
+            GC_STUB_BEAD="$tmp/bead.json" GC_STUB_WORK="$SCRIPT_BEAD_ID" \
+            "$@" \
+            "$BASH" "$MERGE_PUSH" --work "$SCRIPT_BEAD_ID" --gh "$tmp/no-gh"
+    ) >"$tmp/script.out" 2>&1
+    echo "$?"
+}
+
+# expect_stop_drops_temp <tmp> <what> <want-status> <got-status> — the script
+# stopped with <want-status> and left no `temp` for the next rebase step to trip on.
+expect_stop_drops_temp() {
+    local tmp="$1" what="$2" want="$3" got="$4"
+    [ "$got" = "$want" ] ||
+        fail "$what: merge-push.sh exited $got, want $want; output: $(tail -n 5 "$tmp/script.out" | tr '\n' ' ')"
+    git -C "$WORK" rev-parse --verify --quiet refs/heads/temp >/dev/null &&
+        fail "$what: status $got left refs/heads/temp behind; the next patrol's rebase step STOPs on it (#374)"
+    [ ! -s "$tmp/unexpected" ] || fail "$what: unmodelled gc call(s): $(tr '\n' ';' <"$tmp/unexpected")"
+    tail -n 1 "$tmp/script.out" | grep -q "^merge-push: RESULT $want " ||
+        fail "$what: the last line is not the RESULT line: $(tail -n 1 "$tmp/script.out")"
+}
+
+test_script_status_2_after_a_push_that_did_not_advance_drops_temp() {
+    local tmp before
+    tmp=$(mktemp -d)
+    script_rig "$tmp"
+    before=$(origin_tip)
+    cat >"$ORIGIN/hooks/post-receive" <<HOOK
+#!/bin/sh
+git --git-dir="$ORIGIN" update-ref refs/heads/dev $before
+HOOK
+    chmod +x "$ORIGIN/hooks/post-receive"
+    expect_stop_drops_temp "$tmp" "a push that did not advance the target" 2 "$(run_script "$tmp")"
+    rm -rf "$tmp"
+}
+
+test_script_status_2_after_a_landing_it_could_not_record_drops_temp() {
+    local tmp
+    tmp=$(mktemp -d)
+    script_rig "$tmp"
+    expect_stop_drops_temp "$tmp" "a landing whose bead write failed" 2 \
+        "$(run_script "$tmp" GC_STUB_FAIL_UPDATE=1)"
+    [ "$(origin_tip)" = "$(git --git-dir="$ORIGIN" rev-parse polecat/test)" ] ||
+        fail "harness bug: the branch should have landed before the bead write failed"
+    rm -rf "$tmp"
+}
+
+test_script_status_3_conflicting_rerebase_drops_temp() {
+    # test_failed_ff_with_conflicting_rebase_pushes_nothing's rig.
+    local tmp racer
+    tmp=$(mktemp -d)
+    make_rig "$tmp"
+    echo conflicting >"$WORK/feature.txt"
+    git_q -C "$WORK" add feature.txt
+    git_q -C "$WORK" commit --amend -m "feat: the work this bead carried"
+    racer="$tmp/racer"
+    git_q clone "$ORIGIN" "$racer"
+    echo "other side" >"$racer/feature.txt"
+    git_q -C "$racer" add feature.txt
+    git_q -C "$racer" commit -m "feat: someone else touched the same file"
+    git_q -C "$racer" push origin dev
+    finish_script_rig "$tmp"
+    expect_stop_drops_temp "$tmp" "a re-rebase that conflicted" 3 "$(run_script "$tmp")"
+    [ ! -d "$WORK/.git/rebase-merge" ] && [ ! -d "$WORK/.git/rebase-apply" ] ||
+        fail "a re-rebase was left in flight"
+    rm -rf "$tmp"
+}
+
+test_script_status_6_retries_exhausted_drops_temp() {
+    local tmp racer n
+    tmp=$(mktemp -d)
+    script_rig "$tmp"
+    racer="$tmp/racer"
+    git_q clone "$ORIGIN" "$racer"
+    : >"$tmp/chain"
+    for n in 1 2 3; do
+        echo "bump $n" >>"$racer/overlay.txt"
+        git_q -C "$racer" add overlay.txt
+        git_q -C "$racer" commit -m "chore: racing bump $n"
+        git -C "$racer" rev-parse HEAD >>"$tmp/chain"
+    done
+    git_q -C "$racer" push origin HEAD:refs/heads/racing
+    cat >"$ORIGIN/hooks/pre-receive" <<HOOK
+#!/bin/sh
+unset GIT_QUARANTINE_PATH GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+n=\$(wc -l <"$tmp/push-attempts" 2>/dev/null || echo 0)
+n=\$((n + 1))
+echo x >>"$tmp/push-attempts"
+racing=\$(sed -n "\${n}p" "$tmp/chain")
+if [ -n "\$racing" ]; then
+  git --git-dir="$ORIGIN" update-ref refs/heads/dev "\$racing"
+fi
+echo "push refused by the test (race \$n)" >&2
+exit 1
+HOOK
+    chmod +x "$ORIGIN/hooks/pre-receive"
+    expect_stop_drops_temp "$tmp" "a target that moved under every attempt" 6 "$(run_script "$tmp")"
+    rm -rf "$tmp"
+}
+
+test_script_status_7_refused_push_drops_temp() {
+    local tmp
+    tmp=$(mktemp -d)
+    script_rig "$tmp"
+    cat >"$ORIGIN/hooks/pre-receive" <<'HOOK'
+#!/bin/sh
+echo "push refused by the test" >&2
+exit 1
+HOOK
+    chmod +x "$ORIGIN/hooks/pre-receive"
+    expect_stop_drops_temp "$tmp" "a push the remote refused" 7 "$(run_script "$tmp")"
+    rm -rf "$tmp"
+}
+
+test_script_status_8_false_completion_drops_temp() {
+    local tmp
+    tmp=$(mktemp -d)
+    script_rig "$tmp"
+    # The polecat committed nothing: its branch and the rebased temp are the
+    # target's own tip.
+    git_q -C "$WORK" reset --hard origin/dev
+    git_q -C "$WORK" push -f origin temp:polecat/test
+    expect_stop_drops_temp "$tmp" "a false completion" 8 "$(run_script "$tmp")"
+    rm -rf "$tmp"
+}
+
+test_script_status_1_usage_error_touches_nothing() {
+    # The boundary: a usage or config error stops before the lane consumes temp,
+    # and status 1 promises nothing was touched.
+    local tmp
+    tmp=$(mktemp -d)
+    script_rig "$tmp"
+    jq '.[0].metadata |= del(.target)' "$tmp/bead.json" >"$tmp/bead.tmp" && mv -f "$tmp/bead.tmp" "$tmp/bead.json"
+    jq '.config.Rigs[0] |= del(.DefaultBranch)' "$tmp/config.json" >"$tmp/config.tmp" && mv -f "$tmp/config.tmp" "$tmp/config.json"
+    local got
+    got=$(run_script "$tmp")
+    [ "$got" = 1 ] || fail "a bead with no target and no default exited $got, want 1"
+    git -C "$WORK" rev-parse --verify --quiet refs/heads/temp >/dev/null ||
+        fail "status 1 deleted temp; a usage or config error touches nothing"
+    rm -rf "$tmp"
+}
+
+test_script_landing_drops_temp() {
+    local tmp
+    tmp=$(mktemp -d)
+    script_rig "$tmp"
+    expect_stop_drops_temp "$tmp" "a clean landing" 0 "$(run_script "$tmp")"
+    grep -q '^gc gastown task-artifact-cleanup ' "$tmp/gc.log" ||
+        fail "a clean landing did not run task-artifact cleanup"
+    rm -rf "$tmp"
+}
+
 BLOCK="$MERGE_PUSH"
 export BLOCK
 
@@ -518,6 +783,14 @@ test_rejected_push_with_a_moving_target_still_retries
 test_push_carries_an_explicit_gate_wait_budget
 test_cleanup_removes_emptied_parent
 test_cleanup_leaks_parent_loudly_when_worktree_remove_fails
+test_script_landing_drops_temp
+test_script_status_2_after_a_push_that_did_not_advance_drops_temp
+test_script_status_2_after_a_landing_it_could_not_record_drops_temp
+test_script_status_3_conflicting_rerebase_drops_temp
+test_script_status_6_retries_exhausted_drops_temp
+test_script_status_7_refused_push_drops_temp
+test_script_status_8_false_completion_drops_temp
+test_script_status_1_usage_error_touches_nothing
 
 if [ "$FAILURES" -ne 0 ]; then
     echo "refinery merge-push tests: $FAILURES failure(s)" >&2
