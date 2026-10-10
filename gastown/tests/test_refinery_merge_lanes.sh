@@ -23,14 +23,17 @@
 # staged as a pack tree, because the block finds the script, and the script finds
 # the approval gate, by position.
 #
-# The suite fails unless the 23 lane cases and the 2 locator cases ran. A handful
+# The suite fails unless the 24 lane cases and the 2 locator cases ran. A handful
 # of script-only cases (config resolution, invariants) run once, after them.
 #
 # The rig is real git: a bare origin, a polecat clone that pushed the branch,
 # and the refinery's clone with `temp` rebased onto the target, which is what
 # the `rebase` step leaves behind. Everything else is stubbed and journalled:
 #   gc    beads against a JSON fixture of the work bead, plus mail, nudges,
-#         drain-ack, the next-wisp pour/burn, and `formula list`. That last one
+#         drain-ack, the next-wisp pour/burn, and `formula list`. A case can
+#         set GC_STUB_REAL_CLEANUP to run the REAL task-artifact-cleanup.sh in
+#         place of journalling the call; the bead calls that script scopes
+#         with `--rig <rig>` reach the same fixture. `formula list`
 #         answers with no formulas, so the block falls back to GC_PACK_DIR, which
 #         points at the real pack: the lane runs the REAL merge-push.sh and, when
 #         approval is on, the REAL merge-approval-gate.sh beside it.
@@ -123,6 +126,12 @@ edit_bead() {
     tmp=$(mktemp) || exit 70
     jq "$@" "$GC_STUB_BEAD" >"$tmp" && mv -f "$tmp" "$GC_STUB_BEAD"
 }
+# task-artifact-cleanup.sh scopes its bead calls with `--rig <rig>` before the
+# verb; the fixture is that rig's.
+if [ "${1:-}" = bd ] && [ "${2:-}" = --rig ]; then
+    [ -n "${GC_STUB_RIG:-}" ] && [ "${3:-}" = "$GC_STUB_RIG" ] || unexpected
+    set -- bd "${@:4}"
+fi
 case "${1:-}" in
 bd)
     case "${2:-}" in
@@ -179,8 +188,12 @@ gastown)
     case "${2:-}" in
     task-artifact-cleanup)
         # Run after a verified close (upstream's task-artifact lifecycle).
-        # Journalled only; its own suite owns its behaviour.
+        # Journalled only, unless the case asked for the real script; its own
+        # suite owns its behaviour.
         { [ "$#" -eq 3 ] && [ "$3" = "$GC_STUB_WORK" ]; } || unexpected
+        if [ -n "${GC_STUB_REAL_CLEANUP:-}" ]; then
+            exec "$GC_STUB_REAL_CLEANUP" "$3"
+        fi
         ;;
     pr-merge-reconcile)
         # `record <work> <url> <number> <target> <head>`: upstream #245's
@@ -410,6 +423,8 @@ end_case() {
 #   empty           the polecat committed nothing; the target never moved
 #   empty_moved     the polecat committed nothing and the target moved on, so
 #                   `temp` is no longer the branch tip
+#   moved           an ordinary merge candidate whose target moved on after the
+#                   fork, so the rebase rewrote it: `temp` is not the branch tip
 build_rig() {
     local shape="$1" seed="$T/seed" polecat="$T/polecat"
     git_q init --bare "$ORIGIN"
@@ -449,7 +464,7 @@ build_rig() {
         LANDED_SHA=$(git -C "$seed" rev-parse HEAD)
         git_q -C "$seed" push "$ORIGIN" HEAD:integration
         ;;
-    empty_moved)
+    moved | empty_moved)
         echo "another bead's work" >"$seed/elsewhere.txt"
         git_q -C "$seed" add elsewhere.txt
         git_q -C "$seed" commit -m "feat: a different bead entirely"
@@ -1037,10 +1052,65 @@ test_lane_mr_4b_approved_lands_and_closes() {
     expect "merge_approval_state" "$(meta merge_approval_state)" approved
     expect "merge_approval_gate_reason" "$(meta merge_approval_gate_reason)" "<unset>"
     expect "origin/integration" "$(origin_tip)" "$TEMP_SHA"
-    expect "merge_result" "$(meta merge_result)" merged
+    # The verified-PR evidence task-artifact cleanup's mr_merged arm checks.
+    expect "merge_result" "$(meta merge_result)" mr_merged
+    expect "pr_head_sha" "$(meta pr_head_sha)" "$TEMP_SHA"
+    expect "pr_number" "$(meta pr_number)" 7
     expect "merged_sha" "$(meta merged_sha)" "$TEMP_SHA"
     expect "status" "$(bead status)" closed
     expect "close reason" "$(bead close_reason)" "Merged to $TARGET_NAME at $(short_sha "$TEMP_SHA")"
+    end_case
+}
+
+# The approved 4b landing, with the REAL task-artifact cleanup after it. The
+# target moved after the fork, so the rebase rewrote the branch and the mr lane's
+# force-push moved origin/$BRANCH off the pre-rebase sha the rebase step captured
+# as artifact_source_sha. A close as merge_result=merged sends cleanup down its
+# direct-merge arm, which requires origin/$BRANCH to still hold that sha: it does
+# not, so cleanup blocks and a real merge exits 2. The verified-PR evidence
+# (mr_merged, pr_head_sha, pr_number, merged_sha) is what this lane can prove.
+test_lane_mr_4b_approved_after_target_moved_cleans_up() {
+    local city artifact
+    new_case mr_4b_approved_after_target_moved_cleans_up
+    build_rig moved
+    [ "$TEMP_SHA" != "$BRANCH_SHA" ] || fail "harness bug: the rebase did not rewrite the branch"
+    # The polecat's task worktree, as the polecat leaves it: on its branch, at
+    # the sha it pushed, under the rig's artifact namespace.
+    city="$T/city"
+    artifact="$city/.gc/worktrees/testrig/artifacts/worktrees/$WORK_ID"
+    mkdir -p "$(dirname "$artifact")"
+    git_q -C "$T/polecat" checkout --detach
+    git_q -C "$T/polecat" worktree add "$artifact" "$BRANCH_NAME" ||
+        fail "harness bug: could not add the task worktree"
+    write_bead merge_strategy=mr \
+        merge_approval.verdict=approved \
+        merge_approval.pr_number=7 \
+        "merge_approval.head_sha=$TEMP_SHA" \
+        merge_approval.reviewer=testrig/specialists.iris \
+        merge_approval.recorded_at=2026-09-27T00:00:00Z \
+        "artifact_dir=$artifact" \
+        "artifact_source_sha=$BRANCH_SHA" \
+        artifact_cleanup_state=pending
+    LANE_ENV_EXTRA=(GC_STUB_REAL_CLEANUP="$ROOT/gastown/assets/scripts/task-artifact-cleanup.sh"
+        GC_STUB_RIG=testrig GC_CITY_PATH="$city" GC_RIG_ROOT="$T/polecat")
+    run_lane require_merge_approval=true
+    expect_lane mr
+    expect "merge-push.sh's status" "$SCRIPT_STATUS" 0
+    expect_status 0
+    expect_not_drained
+    expect "origin/integration" "$(origin_tip)" "$TEMP_SHA"
+    expect "status" "$(bead status)" closed
+    expect "merge_result" "$(meta merge_result)" mr_merged
+    expect "pr_head_sha" "$(meta pr_head_sha)" "$TEMP_SHA"
+    expect "pr_number" "$(meta pr_number)" 7
+    expect "merged_sha" "$(meta merged_sha)" "$TEMP_SHA"
+    expect "merged_target" "$(meta merged_target)" "$TARGET_NAME"
+    expect "artifact_cleanup_state" "$(meta artifact_cleanup_state)" complete
+    expect "artifact_dir" "$(meta artifact_dir)" "<unset>"
+    [ ! -e "$artifact" ] || fail "the task worktree $artifact was not removed"
+    output_has '^ARTIFACT_CLEANUP_COMPLETE ' || fail "the real cleanup did not report ARTIFACT_CLEANUP_COMPLETE"
+    # The source branch is the recovery copy, at the head that was validated.
+    expect "origin/$BRANCH_NAME" "$(origin_ref "$BRANCH_NAME")" "$TEMP_SHA"
     end_case
 }
 
@@ -1374,6 +1444,7 @@ run_all_cases() {
     test_lane_mr_4a_records_pending_pull_request
     test_lane_mr_4b_refused_parks
     test_lane_mr_4b_approved_lands_and_closes
+    test_lane_mr_4b_approved_after_target_moved_cleans_up
     test_lane_mr_zero_diff_halts
     test_lane_local_mails_mayor
     test_lane_direct_cleanup_with_target_in_second_worktree
@@ -1384,8 +1455,8 @@ run_all_cases() {
 }
 
 run_all_cases
-if [ "$PASS_CASES" -ne 25 ]; then
-    echo "FAIL: want 25 cases (23 lane, 2 locator); ran $PASS_CASES" >&2
+if [ "$PASS_CASES" -ne 26 ]; then
+    echo "FAIL: want 26 cases (24 lane, 2 locator); ran $PASS_CASES" >&2
     FAILURES=$((FAILURES + 1))
 fi
 

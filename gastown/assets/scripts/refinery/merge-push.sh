@@ -820,13 +820,22 @@ merge_ff_push() {
 # bodies, printf formats) whose content indentation would change.
 
 # "1. Merge, push, verify, and close work bead": land `temp` and close the
-# bead. Shared by the direct lane and 4b (approved). Cleanup is the caller's.
+# bead. Shared by the direct lane and 4b (approved); 4b passes `mr` and closes
+# with the verified-PR evidence its cleanup needs (see lane_mr). Cleanup is the
+# caller's.
 direct_close() {
+dc_lane="${1:-direct}"
 merge_ff_push
 MERGE_LAND_STATUS=$?
 case "$MERGE_LAND_STATUS" in
   0)
-    if gc bd update "$WORK" --set-metadata merge_result=merged --set-metadata merged_sha="$MERGED_SHA" --set-metadata merged_target="$TARGET" --unset-metadata rejection_reason && gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT"; then
+    if [ "$dc_lane" = mr ]; then
+      gc bd update "$WORK" --set-metadata merge_result=mr_merged --set-metadata merged_sha="$MERGED_SHA" --set-metadata merged_target="$TARGET" --set-metadata pr_head_sha="$PR_HEAD_SHA" --set-metadata pr_number="$PR_NUMBER" --unset-metadata rejection_reason
+    else
+      gc bd update "$WORK" --set-metadata merge_result=merged --set-metadata merged_sha="$MERGED_SHA" --set-metadata merged_target="$TARGET" --unset-metadata rejection_reason
+    fi
+    DC_RECORDED=$?
+    if [ "$DC_RECORDED" -eq 0 ] && gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT"; then
       MP_SUMMARY="merged to $TARGET at $MERGED_SHORT"
       return 0
     fi
@@ -1249,7 +1258,18 @@ if [ "$APPROVAL_GATE_STATUS" -ne 0 ]; then
   return 4
 fi
 gc bd update "$WORK" --set-metadata merge_approval_state=approved --unset-metadata merge_approval_gate_reason
-direct_close
+# The close records the verified-PR evidence (merge_result=mr_merged,
+# pr_head_sha, pr_number, merged_sha), not the direct lane's merged. The push
+# above moved origin/$BRANCH to the validated head, so cleanup's direct-merge arm,
+# which needs origin/$BRANCH still at the PRE-rebase artifact_source_sha, blocks
+# whenever the rebase rewrote the branch, and a real merge then exited 2. What
+# this lane can prove is the verified-PR arm's evidence: origin/$BRANCH (or
+# refs/pull/<n>/head) at pr_head_sha, the head GitHub reported and the gate
+# approved, and merged_sha on the target. They are one commit: with approval on,
+# merge_ff_push never re-rebases temp. GitHub's pr_state and pr_merged_at are
+# not written: the refinery landed the head itself, and those fields belong to
+# pr-merge-reconcile, which only scans beads carrying pr_reconcile_pending.
+direct_close mr
 LAND_STATUS=$?
 case "$LAND_STATUS" in
   0) direct_cleanup || return $? ;;
