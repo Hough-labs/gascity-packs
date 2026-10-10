@@ -352,10 +352,12 @@ test_claim_refuses_a_pour_onto_a_live_owner() {
         fail "live-owner guard must probe session liveness, not assume it"
 
     # The guard runs BEFORE the step re-point and the polecat_session stamp:
-    # both mutate bead state, and a declining polecat must touch nothing.
+    # both mutate bead state, and a declining polecat must touch nothing. The
+    # stamp is the write on the claimed bead; a resume's takeover of the WORK
+    # bead inside the guard also names this session, after the decline paths.
     local guard_line stamp_line
     guard_line=$(grep -n '# GUARD_END live-owner' "$prompt" | head -1 | cut -d: -f1)
-    stamp_line=$(grep -n 'set-metadata polecat_session="\$EXPECTED_ASSIGNEE"' "$prompt" | head -1 | cut -d: -f1)
+    stamp_line=$(grep -n '"\$WORK_ID" --set-metadata polecat_session="\$EXPECTED_ASSIGNEE"' "$prompt" | head -1 | cut -d: -f1)
     [[ -n "$guard_line" && -n "$stamp_line" && "$guard_line" -lt "$stamp_line" ]] ||
         fail "live-owner guard must run before the claim block stamps polecat_session"
 
@@ -1282,10 +1284,10 @@ block = text[text.index("bash <<'GC_CLAIM'"): text.index("GC_CLAIM\n```")]
 if "STEP_REPOINTED" not in block:
     raise SystemExit(1)
 # Match the STAMP precisely, not any polecat_session write: the live-owner
-# guard also writes that key when it restores a step to its owner, and that
-# write legitimately precedes the re-point (a declining polecat never reaches
-# it). The stamp is the one that names THIS session.
-if block.index("STEP_REPOINTED") >= block.index('--set-metadata polecat_session="$EXPECTED_ASSIGNEE"'):
+# guard also writes that key when it restores a step to its owner, and when a
+# resume takes the WORK bead over, and both legitimately precede the re-point.
+# The stamp is the one that names THIS session on the bead being executed.
+if block.index("STEP_REPOINTED") >= block.index('"$WORK_ID" --set-metadata polecat_session="$EXPECTED_ASSIGNEE"'):
     raise SystemExit(1)
 PY
 

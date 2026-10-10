@@ -70,6 +70,7 @@ run_guard() {
     local dir="$1" owner_assignee="$2" me="$3" step_ref="${4-mol-polecat-work.implement}"
     local root_meta="${5-\"gc.root_bead_id\":\"winnow-5azcp\",}"
     local claim_reason="${6-claimed}"
+    local work_meta="${7-}"
 
     cat >"$dir/root.json" <<'JSON'
 [{"id":"winnow-5azcp","status":"in_progress","metadata":{"gc.input_convoy_id":"winnow-0inqp"}}]
@@ -78,7 +79,7 @@ JSON
 {"children":[{"id":"winnow-pcpn6","status":"in_progress"}]}
 JSON
     cat >"$dir/work.json" <<JSON
-[{"id":"winnow-pcpn6","status":"in_progress","assignee":"$owner_assignee","metadata":{"gc.session_id":"gc-8a4d"}}]
+[{"id":"winnow-pcpn6","status":"in_progress","assignee":"$owner_assignee","metadata":{${work_meta}"gc.session_id":"gc-8a4d"}}]
 JSON
     cat >"$dir/guard-harness.sh" <<HARNESS
 WORK_ID="winnow-iaroy"
@@ -163,6 +164,66 @@ JSON
         fail "a dead prior owner was wrongly treated as a live duplicate: $out"
     ! grep -F -- '--assignee=gastown__polecat-gc-8a4d' "$dir/calls.log" >/dev/null ||
         fail "resume path wrote the dead owner back onto the step"
+}
+
+# bd >= 1.3.0 refuses a plain --assignee write over another actor's in_progress
+# claim, and the WORK bead is held in_progress for the whole run (0060). A resume
+# that leaves it under the dead owner therefore fails submit-and-exit's step-6
+# handoff to the refinery with the branch already pushed, so the resume takes
+# the bead over, as a compare-and-set on the owner it just found dead.
+takeover_line() {
+    grep -F -- "winnow-pcpn6 --assignee=$1" "$2/calls.log" | grep -F -- "--if-assignee $3" || true
+}
+
+test_dead_owner_resume_takes_the_work_bead_over() {
+    local dir out line
+    dir=$(new_case)
+    cat >"$dir/sessions.json" <<'JSON'
+{"sessions":[{"id":"gc-psfm","name":"winnow/gastown.nux","session_name":"gastown__polecat-gc-psfm","state":"active","closed":false}]}
+JSON
+
+    out=$(run_guard "$dir" "gastown__polecat-gc-8a4d" "gastown__polecat-gc-psfm")
+
+    grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null || fail "the resume did not proceed: $out"
+    line=$(takeover_line gastown__polecat-gc-psfm "$dir" gastown__polecat-gc-8a4d)
+    [[ -n "$line" ]] ||
+        fail "the resume left the work bead under its dead owner, so step 6's handoff will be refused: $(cat "$dir/calls.log")"
+    [[ "$line" == *"--set-metadata polecat_session=gastown__polecat-gc-psfm"* ]] ||
+        fail "the takeover moved the assignee without polecat_session, which must ride along with it: $line"
+}
+
+test_resume_never_takes_over_from_the_refinery_or_an_escalation() {
+    local dir out
+    # The refinery is not running, so it reads as a dead owner. Taking its bead
+    # would pull a handed-off bead out of the merge queue; workspace-setup's
+    # claim skips the same two owners.
+    dir=$(new_case)
+    printf '{"sessions":[]}' >"$dir/sessions.json"
+    out=$(run_guard "$dir" "winnow/{{ .BindingPrefix }}refinery" "gastown__polecat-gc-psfm")
+    grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null || fail "the resume did not proceed: $out"
+    [[ -z "$(takeover_line gastown__polecat-gc-psfm "$dir" "winnow/{{ .BindingPrefix }}refinery")" ]] ||
+        fail "the resume took a work bead over from the refinery"
+
+    dir=$(new_case)
+    printf '{"sessions":[]}' >"$dir/sessions.json"
+    out=$(run_guard "$dir" "winnow/crew.valkyrie" "gastown__polecat-gc-psfm" \
+        "mol-polecat-work.implement" '"gc.root_bead_id":"winnow-5azcp",' "claimed" '"gc.routed_to":"human",')
+    grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null || fail "the resume did not proceed: $out"
+    [[ -z "$(takeover_line gastown__polecat-gc-psfm "$dir" winnow/crew.valkyrie)" ]] ||
+        fail "the resume pulled a gc.routed_to=human bead out of its operator escalation"
+}
+
+test_refused_takeover_warns_and_still_resumes() {
+    local dir out
+    dir=$(new_case)
+    printf '{"sessions":[]}' >"$dir/sessions.json"
+
+    # 13 is bd's stale --if-assignee exit: the bead changed hands since the read.
+    out=$(GC_UPDATE_EXIT=13 run_guard "$dir" "gastown__polecat-gc-8a4d" "gastown__polecat-gc-psfm")
+
+    grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null || fail "a refused takeover stalled the resume: $out"
+    grep -F 'WARN could not take work bead winnow-pcpn6 over from gastown__polecat-gc-8a4d' <<<"$out" >/dev/null ||
+        fail "a refused takeover passed silently: $out"
 }
 
 test_closed_session_still_listed_is_not_live() {
@@ -279,6 +340,9 @@ test_unknown_claim_reason_still_checks() {
 
 test_live_owner_is_declined_and_the_step_restored
 test_dead_owner_is_a_resume_and_proceeds
+test_dead_owner_resume_takes_the_work_bead_over
+test_resume_never_takes_over_from_the_refinery_or_an_escalation
+test_refused_takeover_warns_and_still_resumes
 test_closed_session_still_listed_is_not_live
 test_own_molecule_proceeds_without_probing_liveness
 test_unreadable_liveness_fails_closed

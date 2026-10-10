@@ -393,6 +393,22 @@ if [ -n "$STEP_REF" ] && { [ -z "$CLAIM_REASON" ] || [ "$CLAIM_REASON" = "claime
       exit 0
     fi
     echo "WARN work bead $GUARD_WORK_BEAD still names $GUARD_OWNER, but no live session holds that identity — treating this as a resume and proceeding."
+    # Take the work bead over, as workspace-setup's claim would. It is held
+    # in_progress for the whole run, bd >= 1.3.0 refuses a plain --assignee
+    # write over another actor's in_progress claim, and nothing after this
+    # re-claims it: left under the dead owner, submit-and-exit's step-6 handoff
+    # to the refinery is refused with the branch already pushed. --if-assignee
+    # makes it a compare-and-set on the owner just found dead, so a bead that
+    # changed hands since is not stomped. The refinery and an operator
+    # escalation are never taken over; workspace-setup skips the same two.
+    GUARD_ROUTED_TO="$(printf '%s' "$GUARD_WORK_JSON" | jq -r '.[0].metadata."gc.routed_to" // empty' 2>/dev/null)"
+    if [ "$GUARD_OWNER" = "${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}refinery" ] || [ "$GUARD_ROUTED_TO" = "human" ]; then
+      echo "WARN work bead $GUARD_WORK_BEAD is held by the refinery or an operator escalation; leaving its assignee alone."
+    else
+      gc bd update "$GUARD_WORK_BEAD" --assignee="$EXPECTED_ASSIGNEE" \
+        --set-metadata polecat_session="$EXPECTED_ASSIGNEE" --if-assignee "$GUARD_OWNER" \
+        || echo "WARN could not take work bead $GUARD_WORK_BEAD over from $GUARD_OWNER; submit-and-exit cannot hand it to the refinery while another actor holds it — escalate to the witness"
+    fi
   fi
 fi
 # GUARD_END live-owner

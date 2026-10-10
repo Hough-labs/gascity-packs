@@ -62,6 +62,8 @@ PY
 # The stub answers `show` and `update` from a JSON fixture and logs every call.
 # `update` really mutates the fixture, and an empty --set-metadata value deletes
 # the key. GC_STUB_SHOW_FAIL makes `show` fail, as a transient store error does.
+# GC_STUB_UPDATE_FAIL makes `update` refuse and write nothing, as bd >= 1.3.0
+# does to an --assignee write over another actor's in_progress claim.
 write_gc_stub() {
     local dir="$1"
     cat >"$dir/gc" <<'STUB'
@@ -78,7 +80,13 @@ case "$verb" in
         [ -z "${GC_STUB_SHOW_FAIL:-}" ] || exit 1
         exec python3 "$GC_STUB_STORE" show "$GC_STUB_FIXTURE" "$@"
         ;;
-    update) exec python3 "$GC_STUB_STORE" update "$GC_STUB_FIXTURE" "$@" ;;
+    update)
+        if [ -n "${GC_STUB_UPDATE_FAIL:-}" ]; then
+            echo "Error: cannot reassign: another actor holds the in_progress claim" >&2
+            exit 1
+        fi
+        exec python3 "$GC_STUB_STORE" update "$GC_STUB_FIXTURE" "$@"
+        ;;
     *) echo "stub gc: unmodelled beads subcommand: $verb" >&2; exit 64 ;;
 esac
 STUB
@@ -263,6 +271,37 @@ test_unreadable_bead_is_not_stamped_fresh() {
         fail "last_submitted_at does not depend on the read and must still be written"
 }
 
+test_refused_handoff_fails_loudly() {
+    # The bead is held under another spelling of this polecat (a resume past a
+    # dead owner, or the gc 1.4.3 -> 1.5.0 identity change), so bd refuses the
+    # reassignment. The branch is already pushed. Walking on to steps 7 and 8
+    # would drain the session with the bead never handed to the refinery, so
+    # the block must stop non-zero and say so, and must not ack the drain.
+    seed_bead
+    : >"$TMP/calls.log"
+    local rc=0
+    PATH="$TMP/bin:$PATH" \
+    GC_STUB_FIXTURE="$TMP/fixture.json" \
+    GC_STUB_STORE="$TMP/bin/store.py" \
+    GC_STUB_LOG="$TMP/calls.log" \
+    GC_STUB_UPDATE_FAIL=1 \
+    WORK_BEAD_ID="$BEAD" \
+    REFINERY_TARGET="$REFINERY" \
+        bash -c 'set -uo pipefail; . "$1"' _ "$TMP/stamp.sh" >"$TMP/run.log" 2>&1 || rc=$?
+
+    [[ "$rc" -ne 0 ]] ||
+        fail "a refused handoff exited 0, so the agent walks on to drain: $(cat "$TMP/run.log")"
+    grep -q "^HANDOFF_FAILED $BEAD " "$TMP/run.log" ||
+        fail "a refused handoff must print a HANDOFF_FAILED line naming the bead: $(cat "$TMP/run.log")"
+    ! grep -q 'runtime drain-ack' "$TMP/run.log" ||
+        fail "a refused handoff must not drain"
+    ! grep -q '^stub gc' "$TMP/run.log" ||
+        fail "the failure path made a call the stub does not model: $(cat "$TMP/run.log")"
+    [[ $(update_calls | grep -c .) -eq 1 ]] ||
+        fail "a refused handoff must stop at the refused write, not retry or correct status: $(update_calls)"
+    [[ "$(field assignee)" == "$POLECAT" ]] || fail "the stub's refusal must leave the bead untouched"
+}
+
 test_auto_push_halt_is_not_stamped() {
     # auto_push=false halts at branch-ready with no refinery handoff, so nothing
     # has joined the merge queue and nothing may be stamped. The stamp keys are
@@ -294,6 +333,7 @@ test_first_handoff_stamps_both_keys_in_the_handoff_write
 test_resubmit_keeps_first_and_advances_last
 test_preseeded_first_submitted_at_is_kept
 test_unreadable_bead_is_not_stamped_fresh
+test_refused_handoff_fails_loudly
 test_auto_push_halt_is_not_stamped
 
 if [ "$FAILURES" -ne 0 ]; then
