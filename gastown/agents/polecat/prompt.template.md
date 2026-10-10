@@ -364,8 +364,9 @@ if [ -n "$STEP_REF" ] && { [ -z "$CLAIM_REASON" ] || [ "$CLAIM_REASON" = "claime
       echo "WARN work bead $GUARD_WORK_BEAD names $GUARD_OWNER, another identity of this session ($EXPECTED_ASSIGNEE); it is ours."
     else
       # Someone else's name is on the molecule. Only a LIVE someone blocks: a
-      # pool restart mints a fresh session identity, so a DEAD prior owner on
-      # the work bead is the ordinary resume case and must not stall the engine.
+      # restarted session usually claims under a new identity, so a DEAD prior
+      # owner on the work bead is the ordinary resume case and must not stall
+      # the engine.
       # `gc session list` omits closed sessions by default, so a hit there is
       # the liveness answer. asleep and draining count as alive — both still own
       # their work and get woken back onto it.
@@ -501,8 +502,9 @@ If the block prints `NO_ROUTED_WORK`, `CLAIM_REJECTED`, `CLAIM_RELEASED`, or
 `CLAIM_DECLINED_LIVE_OWNER`, it has already drain-acked — stop and exit.
 Only after it prints `CLAIMED_BEAD_ID` do you read the recipe with `gc bd formula show mol-polecat-work --rig "$GC_RIG"` and run
 `workspace-setup` before inspecting task source. The claim checks assigned work
-first (session bead ID, runtime session name, then alias) and only falls through
-to unassigned pool work routed to
+first (session bead ID, runtime session name, then alias; gc 1.5.0 records a new
+claim under the alias, or the bead id for an unaliased pool session) and only
+falls through to unassigned pool work routed to
 `${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat`.
 
 `CLAIM_DECLINED_LIVE_OWNER` means the claim itself was clean — the step bead was
@@ -522,8 +524,11 @@ tier handed back this session's own in-flight WORK bead — which
 cannot land on it — instead of your next formula step, and the block moved you
 onto that step. The `CLAIMED_BEAD_ID` printed after it is the bead to run.
 
-**Resume / crash re-verify (FIRST action on restart).** Pool restarts mint a
-NEW session identity. If you wake into a session that context says was already
+**Resume / crash re-verify (FIRST action on restart).** A restart is a new
+session, and usually a new claim identity: gc 1.4.x and an unaliased gc 1.5.0
+pool session claim under a fresh one, while a gc 1.5.0 namepool polecat claims
+under its alias, a chair the pool hands to whichever session sits in it next.
+If you wake into a session that context says was already
 mid-work on a claimed bead, your FIRST action — before touching code — is to
 re-check ownership against THIS session's identity:
 
@@ -712,7 +717,8 @@ done
 # in_progress for this session only from that step on, and never takes it from
 # the refinery or an operator escalation. Nor is a bare "assigned to
 # somebody else", which is equally true of a resumed molecule finding the bead
-# still held by its own PREVIOUS session (pool restarts mint a new identity) and
+# still held by its own PREVIOUS session (a restarted session usually claims
+# under a new identity) and
 # of any third party a bead can be parked on — an operator moving it to a crew
 # seat, a reviewer taking it. Name the refinery rather than enumerate the
 # identities that are not it.

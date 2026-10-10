@@ -87,7 +87,8 @@ done
 # in_progress for this session only from that step on, and never takes it from
 # the refinery or an operator escalation. Nor is a bare "assigned to
 # somebody else", which is equally true of a resumed molecule finding the bead
-# still held by its own PREVIOUS session (pool restarts mint a new identity) and
+# still held by its own PREVIOUS session (a restarted session usually claims
+# under a new identity) and
 # of any third party a bead can be parked on — an operator moving it to a crew
 # seat, a reviewer taking it. Name the refinery rather than enumerate the
 # identities that are not it.

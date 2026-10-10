@@ -505,12 +505,15 @@ queue starts stealing live work:
   merged.
 
 **Claim by writing `--assignee="$GC_AGENT"`, NOT with the `--claim` flag.**
-`gc bd update --claim` sets the assignee to `$BEADS_ACTOR`, which is the runtime *session
-name* (`gastown__refinery-gc-xxxx`), not the canonical role identity every
-other query in this formula and in the refinery prompt scans on. Claiming that
-way would hand the bead an assignee the primary query above cannot match, so a
-crash mid-merge would re-hide the bead behind a dead session's name — the exact
-invisibility this step exists to remove. Clearing `gc.routed_to` in the same
+`gc bd update --claim` sets the assignee to `$BEADS_ACTOR`, and whether that is
+the identity every other query in this formula and in the refinery prompt scans
+on (`$GC_AGENT`) depends on the gc version: on gc 1.4.x it is the runtime
+*session name* (`gastown__refinery-gc-xxxx`); on gc 1.5.0 a named seat's
+`$BEADS_ACTOR` is its alias, the same string as `$GC_AGENT`. Writing `$GC_AGENT`
+is right on both. A mismatched claim hands the bead an assignee the primary
+query above cannot match, so a crash mid-merge would re-hide the bead behind a
+dead session's name — the exact invisibility this step exists to remove.
+Clearing `gc.routed_to` in the same
 write completes the conversion: the bead is now assigned work, and the routed
 scan must not keep offering it.
 

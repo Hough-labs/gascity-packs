@@ -279,8 +279,10 @@ every identity form a session carries. Never pre-filter the naive way —
 — because a session is addressed by at least three
 different strings depending on what assigned the work: the agent alias
 (`gastown.deacon`, on molecule wisps), the session bead id (`gc-ttk`, on mail
-messages), and the session name (`gastown__polecat-gc-qkw`, on polecat
-claims). Filtering by any single one silently reports zero — which is the
+messages), and on polecat claims whichever form the claiming gc recorded (the
+session name `gastown__polecat-gc-qkw` on gc 1.4.x; on gc 1.5.0 the alias, or
+the session bead id for an unaliased pool session). Filtering by any single
+one silently reports zero — which is the
 very failure mode this step exists to catch.
 
 Match identities EXACTLY. `[.assignee] | inside($ids)` looks right and is not:
