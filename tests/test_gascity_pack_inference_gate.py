@@ -772,6 +772,37 @@ def test_manifold_dependent_steps_are_gated_on_the_detection_step() -> None:
         assert "manifold" not in str(step.get("run", "")), step.get("name")
 
 
+def test_nightly_steps_after_the_subset_decision_all_honour_it() -> None:
+    # A manual dispatch for one pack still starts every matrix entry, and the
+    # entries it did not select are meant to skip every step on run_gate. One
+    # step without the condition runs anyway in a job that installed nothing:
+    # the matching-source checkout did, and its `${GASCITY_SOURCE_REF:?}` turned
+    # every unselected entry of a manual run red. Parsed rather than grepped,
+    # and the clause has to be a top-level `&&` conjunct with no `||` beside
+    # it, so an expression that runs the step without run_gate fails here.
+    import yaml  # installed by every job that runs this file
+
+    run_gate = "steps.subset.outputs.run_gate == 'true'"
+    nightly = yaml.safe_load(
+        (
+            gascity_pack_inference_gate.REPO_ROOT
+            / ".github"
+            / "workflows"
+            / "supported-pack-nightly.yml"
+        ).read_text(encoding="utf-8")
+    )
+    steps = nightly["jobs"]["inference"]["steps"]
+    names = [step.get("name") for step in steps]
+    decide = names.index("Decide manual subset")
+    assert steps[decide]["id"] == "subset"
+    after = steps[decide + 1 :]
+    assert after, "no steps follow the subset decision -- the sweep below would vacuously pass"
+    for step in after:
+        condition = " ".join(str(step.get("if", "")).split())
+        assert "||" not in condition, step.get("name")
+        assert run_gate in [clause.strip() for clause in condition.split("&&")], step.get("name")
+
+
 def test_manifold_validation_step_bodies_are_unweakened() -> None:
     # The mitigation changes only WHETHER the validation runs, never WHAT it
     # checks. If configuration is ever supplied, the same eight assertions must

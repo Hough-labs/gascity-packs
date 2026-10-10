@@ -261,6 +261,7 @@ jobs:
       # only that commit, shallow, so the disk budget gcp-m0ei bought back
       # stays bought.
       - name: Check out the matching gascity source
+        if: steps.subset.outputs.run_gate == 'true'
         run: |
           gascity_src="${RUNNER_TEMP}/gascity-src"
           git init --quiet "$gascity_src"
