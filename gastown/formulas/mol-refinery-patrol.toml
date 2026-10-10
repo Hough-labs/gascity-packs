@@ -1474,17 +1474,19 @@ fi
      # [] — indistinguishable from a genuine miss. Use the failing test name,
      # the tool name, the CVE id (e.g. test_no_bare_bd_commands, govulncheck).
      #
-     # NO `--status` FILTER, deliberately (gcp-h98d). `gc bd search` already
-     # excludes closed issues, so its default is exactly the wanted set: open
-     # + in_progress. Do not "fix" this by narrowing it — both narrowings lie,
-     # and neither trips the fail-closed branch below because both exit 0:
+     # `--status=open,in_progress` is REQUIRED. bd 1.3.x searches every
+     # status, closed included, by default, so without it a bug that was fixed
+     # and closed counts as the duplicate and a REGRESSION of it is never
+     # filed. Do not narrow it further: neither wrong form trips the
+     # fail-closed branch below, because both exit 0:
+     #   no --status                counts closed bugs as live duplicates
      #   --status=open              drops in_progress, and a duplicate someone
      #                              already STARTED is still a duplicate
-     #   --status=open,in_progress  returns [] — the comma form is a
-     #                              `gc bd list` feature, not a search one
+     # (gcp-h98d forbade this filter for a bd that excluded closed issues from
+     # search and answered the comma form with []; bd 1.3.0 does neither.)
      DUP_KEYWORD="<distinctive keyword from the failure>"
      DUP_ERR=$(mktemp)
-     DUP_JSON=$(gc bd search "$DUP_KEYWORD" --type=bug --json 2>"$DUP_ERR")
+     DUP_JSON=$(gc bd search "$DUP_KEYWORD" --type=bug --status=open,in_progress --json 2>"$DUP_ERR")
      DUP_CODE=$?
      DUP_MSG=$(cat "$DUP_ERR"); if [ -n "$DUP_ERR" ]; then rm -f "${DUP_ERR:?}"; fi
      DUP_COUNT=$(printf '%s' "$DUP_JSON" | jq 'length' 2>/dev/null)
