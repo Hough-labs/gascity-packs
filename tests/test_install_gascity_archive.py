@@ -203,7 +203,10 @@ def run_installer(tmp_path, release: Path, cache: Path | None = None, **scenario
     requests = (release / "requests.log").read_text().splitlines() if (release / "requests.log").exists() else []
     return completed, {
         "cache": cache,
-        "gc_bin": github_env.read_text().strip(),
+        # The whole GITHUB_ENV file, not one variable of it: a failed install
+        # must leave it empty, and a successful one writes exactly GC_BIN and
+        # GASCITY_SOURCE_REF.
+        "github_env": github_env.read_text().strip(),
         "github_path": github_path.read_text().strip(),
         "archive_requests": [url for url in requests if url.endswith(".tar.gz")],
     }
@@ -220,8 +223,11 @@ def test_installer_verifies_and_installs_the_published_archive(tmp_path, release
     assert len(result["archive_requests"]) == 1
     # Keyed on the verified checksum, so a later `edge` cannot be served from
     # this entry.
-    assert sha_of(release, 0)[:16] in result["gc_bin"]
-    assert result["gc_bin"] == f"GC_BIN={result['github_path']}/gc"
+    assert sha_of(release, 0)[:16] in result["github_env"]
+    # Order-free, but sorted rather than a set so a doubled export still fails.
+    assert sorted(result["github_env"].splitlines()) == sorted(
+        [f"GC_BIN={result['github_path']}/gc", "GASCITY_SOURCE_REF=edge"]
+    )
     assert Path(result["github_path"], "gc").is_file()
 
 
@@ -260,8 +266,8 @@ def test_installer_absorbs_an_edge_rotation_between_checksum_and_download(tmp_pa
     assert sha_of(release, 1) in completed.stderr
     # The cache entry is keyed on what was verified and installed (build 1),
     # never on the checksum that was resolved first.
-    assert sha_of(release, 1)[:16] in result["gc_bin"]
-    assert sha_of(release, 0)[:16] not in result["gc_bin"]
+    assert sha_of(release, 1)[:16] in result["github_env"]
+    assert sha_of(release, 0)[:16] not in result["github_env"]
 
 
 def test_installer_bounds_its_retries_when_edge_will_not_hold_still(tmp_path, release):
@@ -277,9 +283,9 @@ def test_installer_bounds_its_retries_when_edge_will_not_hold_still(tmp_path, re
     assert "rotated on every one of 3 download attempts" in completed.stderr
     assert "retrying against the new checksum (attempt 2/3)" in completed.stderr
     assert "retrying against the new checksum (attempt 3/3)" in completed.stderr
-    # Nothing unverified is installed, and no GC_BIN is exported for a later
-    # step to trip over.
-    assert result["gc_bin"] == ""
+    # Nothing unverified is installed, and nothing is exported -- no GC_BIN,
+    # no GASCITY_SOURCE_REF -- for a later step to trip over.
+    assert result["github_env"] == ""
     assert list(result["cache"].rglob("gc")) == []
 
 
@@ -294,5 +300,5 @@ def test_installer_still_fails_loudly_on_a_real_checksum_mismatch(tmp_path, rele
     assert f"expected: {sha_of(release, 0)}" in completed.stderr
     assert "re-resolves unchanged" in completed.stderr
     assert len(result["archive_requests"]) == 1
-    assert result["gc_bin"] == ""
+    assert result["github_env"] == ""
     assert list(result["cache"].rglob("gc")) == []

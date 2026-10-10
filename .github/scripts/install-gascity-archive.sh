@@ -37,7 +37,9 @@
 # --cache installs under RUNNER_TOOL_CACHE and appends the bin directory to
 # GITHUB_PATH, as the sibling installers do. Either way the resolved binary path
 # is exported as GC_BIN via GITHUB_ENV so workflow steps can name it without
-# going through `go env GOPATH`.
+# going through `go env GOPATH`, alongside GASCITY_SOURCE_REF. Both are written
+# only after a verified install: a failed install exports nothing, so a later
+# step cannot pick up a ref for a gc that was never installed.
 
 set -euo pipefail
 
@@ -193,8 +195,6 @@ case "$ref" in
     install_from_source "${REPO} publishes no release archive for ref '${ref}'"
     ;;
 esac
-
-export_source_ref "$tag"
 
 archive="gascity_${version}_${platform_tuple}.tar.gz"
 download_base="https://github.com/${REPO}/releases/download/${tag}"
@@ -361,5 +361,6 @@ if $use_cache && [[ -n "${GITHUB_PATH:-}" ]]; then
   echo "$bin_dir" >> "$GITHUB_PATH"
 fi
 export_gc_bin "$target"
+export_source_ref "$tag"
 
 "$target" version
