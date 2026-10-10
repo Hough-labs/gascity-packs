@@ -32,8 +32,8 @@
 #                   script falls back to `go install` and says so loudly. That
 #                   path costs the 4.46 GiB above and is never taken by a
 #                   scheduled run. A `go install` build records no
-#                   vcs.revision and has no release tag, so the install then
-#                   fails: see resolve_source_ref below.
+#                   vcs.revision, so its source commit is looked up from the
+#                   module version it was built at: see resolve_source_ref.
 #
 # --cache installs under RUNNER_TOOL_CACHE and appends the bin directory to
 # GITHUB_PATH, as the sibling installers do. Either way the resolved binary path
@@ -141,12 +141,14 @@ export_source_ref() {
 # REF the go-install fallback builds (`latest`, a short sha) is nothing a shallow
 # `git fetch` can resolve. A release archive is built from a git checkout, so
 # its gc records the full commit as vcs.revision in its build info. Only when
-# that is absent does the release tag stand in for it, and with neither there is
-# nothing that names the source: fail rather than export a guess.
+# that is absent does something else stand in for it: the release tag for an
+# archive, the module's recorded commit for a go-install build (an empty TAG).
+# When nothing names the source, fail rather than export a guess.
 resolve_source_ref() {
   local binary="$1"
   local tag="$2"
   local revision
+  local origin
   # `|| true`: a binary go cannot read is the absent case below, not a silent
   # exit under `set -e`; go's own error still reaches the job log.
   revision="$(go version -m "$binary" |
@@ -156,13 +158,45 @@ resolve_source_ref() {
   elif [[ -n "$tag" ]]; then
     echo "WARNING: ${binary} records no vcs.revision; using release tag ${tag} as the gascity source ref." >&2
     printf '%s' "$tag"
+  elif origin="$(module_origin_hash "$binary")"; then
+    printf '%s' "$origin"
   else
-    echo "${binary} records no vcs.revision and was installed from no release tag, so nothing" >&2
-    echo "names the gascity commit it was built from. Exporting '${ref}' would point" >&2
-    echo "GASCITY_SOURCE_REF at a ref a shallow fetch cannot resolve, or at a different" >&2
-    echo "commit. Pass main, latest or a release tag instead." >&2
+    echo "${binary} records no vcs.revision and its module commit could not be looked up" >&2
+    echo "(above), so nothing names the gascity commit it was built from. Exporting '${ref}'" >&2
+    echo "would point GASCITY_SOURCE_REF at a ref a shallow fetch cannot resolve, or at a" >&2
+    echo "different commit. Pass main, latest or a release tag instead." >&2
     return 1
   fi
+}
+
+# The commit a module-mode build was made from. `go install pkg@REF` records no
+# vcs.revision, but its build info records the module version REF resolved to
+# (a release version or a pseudo-version), and the module proxy records that
+# exact version's commit as .Origin.Hash -- upstream's method (#476). Asking for
+# the exact version matters: a query such as @latest comes back without .Origin.
+# Each way the lookup can come up empty says why on stderr and returns 1.
+module_origin_hash() {
+  local binary="$1"
+  local module_path="github.com/${REPO}"
+  local version
+  local module
+  local origin
+  version="$(go version -m "$binary" |
+    awk -v path="$module_path" '$1 == "mod" && $2 == path { print $3 }' || true)"
+  if [[ -z "$version" ]]; then
+    echo "${binary} records no ${module_path} module version to look up." >&2
+    return 1
+  fi
+  if ! module="$(go mod download -json "${module_path}@${version}")"; then
+    echo "$module" >&2
+    return 1
+  fi
+  origin="$(jq -r '.Origin.Hash // empty' <<<"$module" || true)"
+  if [[ -z "$origin" ]]; then
+    echo "The module proxy records no .Origin.Hash for ${module_path}@${version}." >&2
+    return 1
+  fi
+  printf '%s' "$origin"
 }
 
 # `go install` is the escape hatch for a ref with no published archive. It is
@@ -177,8 +211,9 @@ install_from_source() {
   local bin_dir
   local source_ref
   bin_dir="$(go env GOPATH)/bin"
-  # Module mode records no vcs.revision and this path has no release tag, so
-  # this fails loudly before anything is exported.
+  # No release tag: module mode records no vcs.revision, so the source commit
+  # comes from the module version this build used, or the install fails here,
+  # before anything is exported.
   source_ref="$(resolve_source_ref "${bin_dir}/gc" "")" || exit 1
   if [[ -n "${GITHUB_PATH:-}" ]]; then
     echo "$bin_dir" >> "$GITHUB_PATH"

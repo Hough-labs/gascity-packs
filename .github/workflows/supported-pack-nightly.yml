@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       gascity_ref:
-        description: "Gas City release archive to install: latest (newest stable release), main (the rolling edge pre-release built from gascity main), or a release tag such as v1.2.1. A branch or commit SHA has no archive and fails the install: its go install fallback records no commit for the gascity source checkout."
+        description: "Gas City ref to install. latest (newest stable release), main (the rolling edge pre-release built from gascity main) or a release tag such as v1.2.1 installs the published archive. A commit SHA or branch has no archive and is built with go install instead (~4.46 GiB, may evict the runner); go rejects a branch name with a slash, so pass its commit SHA."
         required: false
         default: main
       gascity_setup_ref:

@@ -123,13 +123,18 @@ else:
 '''
 
 
-# The stand-in for the Go toolchain, covering the three calls the installer
+# The stand-in for the Go toolchain, covering the four calls the installer
 # makes. `go version -m` prints the build info of the binary it is given; a
 # fake gc carries that build info as `# go-build-info<TAB>...` comment lines, so
 # what is reported is a property of whichever build was actually installed.
 # `go install pkg@ref` builds in module mode, which is what the real toolchain
-# does for it: the binary records the module version and no vcs.* settings.
+# does for it: the binary records the module version REF resolved to
+# (FAKE_GO_MODULE_VERSION) and no vcs.* settings. `go mod download -json`
+# answers as the module proxy does: with the version's commit as .Origin.Hash
+# (FAKE_GO_ORIGIN_HASH, when a test sets one), but only when asked for that
+# exact version -- a query such as the REF itself comes back without .Origin.
 FAKE_GO = '''#!/usr/bin/env python3
+import json
 import os
 import sys
 from pathlib import Path
@@ -158,11 +163,19 @@ elif args[:1] == ["install"] and len(args) == 2:
         "#!/bin/sh\\n"
         "# go-build-info\\tpath\\tgithub.com/gastownhall/gascity/cmd/gc\\n"
         "# go-build-info\\tmod\\tgithub.com/gastownhall/gascity\\t"
-        "v1.5.1-0.20261010000000-f66474617d2b\\th1:fake=\\n"
+        + os.environ["FAKE_GO_MODULE_VERSION"]
+        + "\\th1:fake=\\n"
         "# go-build-info\\tbuild\\t-buildmode=exe\\n"
         "echo \\"gc version from-source\\"\\n"
     )
     gc.chmod(0o755)
+elif args[:3] == ["mod", "download", "-json"] and len(args) == 4:
+    path, _, version = args[3].partition("@")
+    module = {"Path": path, "Version": version}
+    origin = os.environ.get("FAKE_GO_ORIGIN_HASH", "")
+    if origin and version == os.environ["FAKE_GO_MODULE_VERSION"]:
+        module["Origin"] = {"VCS": "git", "URL": f"https://{path}", "Hash": origin}
+    print(json.dumps(module, indent="\\t"))
 else:
     sys.stderr.write(f"fake go: unexpected arguments {args!r}\\n")
     sys.exit(2)
@@ -180,6 +193,12 @@ def platform_tuple() -> str:
     if system is None or machine is None:
         pytest.skip(f"installer supports no archive for {platform.system()}/{platform.machine()}")
     return f"{system}_{machine}"
+
+
+# The pseudo-version `go install ...@f66474617d2b` resolves its REF to, as the
+# fallback's build info records it, and the full commit the proxy records for it.
+MODULE_VERSION = "v1.5.1-0.20261010000000-f66474617d2b"
+MODULE_ORIGIN = "f66474617d2bb7fbe51a3d746da5f3ceab2b8517"
 
 
 def revision_of(build: int) -> str:
@@ -263,6 +282,7 @@ def run_installer(tmp_path, release: Path, cache: Path | None = None, ref: str =
             "GITHUB_ENV": str(github_env),
             "GITHUB_PATH": str(github_path),
             "GOPATH": str(tmp_path / "gopath"),
+            "FAKE_GO_MODULE_VERSION": MODULE_VERSION,
         }
     )
     env.update({name: str(value) for name, value in scenario.items()})
@@ -405,18 +425,38 @@ def test_installer_falls_back_to_the_release_tag_when_gc_records_no_revision(tmp
     assert "release tag v1.5.0" in completed.stderr
 
 
-def test_installer_fails_loudly_when_no_source_revision_can_be_named(tmp_path, release):
+def test_installer_names_the_module_commit_a_go_install_build_was_made_from(tmp_path, release):
     # A short SHA has no release archive, so gc comes from `go install`, which
-    # builds in module mode and records no vcs.revision -- and there is no
-    # release tag to stand in. Exporting the ref as given would hand the
-    # checkout step a short SHA that a shallow fetch cannot resolve; exporting
-    # nothing and exiting 0 would push the failure to that step. The install
-    # fails here instead, and like every failed install it exports nothing.
+    # builds in module mode and records no vcs.revision. Its build info does
+    # record the module version the REF resolved to, and the module proxy
+    # records that exact version's commit as .Origin.Hash (upstream's method,
+    # #476): the full SHA, which a shallow fetch resolves where the short REF
+    # does not.
+    completed, result = run_installer(
+        tmp_path, release, ref="f66474617d2b", FAKE_GO_ORIGIN_HASH=MODULE_ORIGIN
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "falling back to 'go install" in completed.stderr
+    assert "gc version from-source" in completed.stdout
+    gopath_bin = tmp_path / "gopath" / "bin"
+    assert sorted(result["github_env"].splitlines()) == sorted(
+        [f"GC_BIN={gopath_bin}/gc", f"GASCITY_SOURCE_REF={MODULE_ORIGIN}"]
+    )
+    assert result["github_path"] == str(gopath_bin)
+
+
+def test_installer_fails_loudly_when_no_source_revision_can_be_named(tmp_path, release):
+    # The same go-install build, but the proxy has no commit for its version.
+    # Exporting the REF as given would hand the checkout step a short SHA that
+    # a shallow fetch cannot resolve; exporting nothing and exiting 0 would push
+    # the failure to that step. The install fails here instead, naming the
+    # version it looked up, and like every failed install it exports nothing.
     completed, result = run_installer(tmp_path, release, ref="f66474617d2b")
 
     assert completed.returncode == 1
     assert "falling back to 'go install" in completed.stderr
     assert "records no vcs.revision" in completed.stderr
-    assert "no release tag" in completed.stderr
+    assert f"no .Origin.Hash for github.com/gastownhall/gascity@{MODULE_VERSION}" in completed.stderr
     assert result["github_env"] == ""
     assert result["github_path"] == ""
