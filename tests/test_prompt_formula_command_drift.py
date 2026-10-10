@@ -505,6 +505,12 @@ def test_refinery_duplicate_check_counts_only_live_bugs() -> None:
         "(--status names closed or all), so a regression of a fixed bug is never "
         f"filed:\n    {command}"
     )
+    parked = {"blocked", "deferred"} - statuses
+    assert not parked, (
+        f"{REFINERY_PATROL}:{number}: the duplicate check skips {sorted(parked)} "
+        "bugs, so a failure someone parked on purpose is filed again:\n    "
+        f"{command}"
+    )
 
 
 def test_witness_orphan_recovery_resolves_the_rigs_default_branch() -> None:
