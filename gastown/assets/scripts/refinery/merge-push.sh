@@ -15,7 +15,9 @@
 # approval gate is found as this script's sibling; and the lane glue the step's
 # prose described became lane_direct, lane_mr and lane_local. Messages keep
 # their wording. gastown/tests/test_refinery_merge_lanes.sh runs every lane
-# case through both this script and the formula, with identical assertions.
+# case through this script, started by the merge-push step's own invoke block
+# taken from the formula. The formula no longer holds a copy of the lane to run
+# the cases through as well.
 #
 # Usage:
 #   merge-push.sh --work <id> [--rig R] [--target-default B] [--binding-prefix P]
@@ -61,10 +63,12 @@
 #       bead is BLOCKED until `gc gastown pr-merge-reconcile` verifies the merge
 #    1  usage or config error; nothing touched
 #    2  hard stop; do not mutate bead state. Also returned when a merge landed
-#       but its task-artifact cleanup did not converge (retryable: find-work's
-#       sweep picks it up), or when a merge landed but recording it on the bead
-#       failed: the next patrol's merge-state gate
-#       closes it as already merged.
+#       but its task-artifact cleanup did not converge (a pending state is
+#       retried by find-work's sweep; a blocked one waits for review), when a
+#       merge landed but recording it on the bead failed (the next patrol's
+#       merge-state gate closes it as already merged), and in mr when
+#       --force-with-lease failed (temp is dropped; the next patrol's rebase step
+#       re-runs its ancestry decision on the moved branch).
 #    3  the re-rebase onto the moved target conflicted
 #    4  parked awaiting review (the gate refused, or the approved head no longer
 #       fast-forwards the target)
