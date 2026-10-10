@@ -121,9 +121,11 @@ jobs:
       # The gate imports the builtin core/bd packs from a git checkout of the
       # SAME gascity revision gc was built from (GASCITY_SOURCE_ROOT): module
       # zips drop file modes, so pack scripts gc execs would exit 126. The
-      # archive install exports GASCITY_SOURCE_REF (the release tag, or the ref
-      # it fell back to building); fetch only that, shallow, so the disk budget
-      # gcp-m0ei bought back stays bought.
+      # archive install exports GASCITY_SOURCE_REF as the full commit SHA the
+      # installed gc records in its build info (vcs.revision), not a second
+      # resolution of GASCITY_REF: `edge` can rotate between the two. Fetch
+      # only that commit, shallow, so the disk budget gcp-m0ei bought back
+      # stays bought.
       - name: Check out the matching gascity source
         run: |
           gascity_src="${RUNNER_TEMP}/gascity-src"
@@ -132,7 +134,7 @@ jobs:
             "${GASCITY_SOURCE_REF:?the install step did not export GASCITY_SOURCE_REF}"
           git -C "$gascity_src" checkout --quiet --detach FETCH_HEAD
           echo "GASCITY_SOURCE_ROOT=${gascity_src}" >> "$GITHUB_ENV"
-          echo "gascity source ${GASCITY_SOURCE_REF} at ${gascity_src} ($(git -C "$gascity_src" rev-parse --short HEAD))"
+          echo "gascity source ${GASCITY_SOURCE_REF} at ${gascity_src} ($(git -C "$gascity_src" rev-parse HEAD))"
 
       # bd must embed the same beads module as gc (the gate refuses a
       # mismatch), so derive it from the gc just installed instead of pinning it.

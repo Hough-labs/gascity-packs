@@ -11,6 +11,12 @@ Asserting on the script's text cannot tell a rotation apart from a corrupt
 download, so these tests run the script for real against a scripted stand-in for
 the release: a `curl` on PATH that serves a release whose asset rotates exactly
 when a test says it does. Nothing here touches the network.
+
+The same race decides which gascity source the inference gates check out. The
+installer names it (GASCITY_SOURCE_REF) from the build info of the gc it
+installed, so a `go` stand-in reads that build info out of the fake gc itself:
+each build records its own vcs.revision, and a rotation that changes the
+installed build changes the revision with it.
 """
 
 from __future__ import annotations
@@ -117,6 +123,52 @@ else:
 '''
 
 
+# The stand-in for the Go toolchain, covering the three calls the installer
+# makes. `go version -m` prints the build info of the binary it is given; a
+# fake gc carries that build info as `# go-build-info<TAB>...` comment lines, so
+# what is reported is a property of whichever build was actually installed.
+# `go install pkg@ref` builds in module mode, which is what the real toolchain
+# does for it: the binary records the module version and no vcs.* settings.
+FAKE_GO = '''#!/usr/bin/env python3
+import os
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+if args[:2] == ["version", "-m"] and len(args) == 3:
+    binary = Path(args[2])
+    info = [
+        line.split("\\t", 1)[1]
+        for line in binary.read_text().splitlines()
+        if line.startswith("# go-build-info\\t")
+    ]
+    if not info:
+        sys.stderr.write(f"{binary}: could not read Go build info\\n")
+        sys.exit(1)
+    print(f"{binary}: go1.26.5")
+    for line in info:
+        print(f"\\t{line}")
+elif args == ["env", "GOPATH"]:
+    print(os.environ["GOPATH"])
+elif args[:1] == ["install"] and len(args) == 2:
+    bin_dir = Path(os.environ["GOPATH"]) / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    gc = bin_dir / "gc"
+    gc.write_text(
+        "#!/bin/sh\\n"
+        "# go-build-info\\tpath\\tgithub.com/gastownhall/gascity/cmd/gc\\n"
+        "# go-build-info\\tmod\\tgithub.com/gastownhall/gascity\\t"
+        "v1.5.1-0.20261010000000-f66474617d2b\\th1:fake=\\n"
+        "# go-build-info\\tbuild\\t-buildmode=exe\\n"
+        "echo \\"gc version from-source\\"\\n"
+    )
+    gc.chmod(0o755)
+else:
+    sys.stderr.write(f"fake go: unexpected arguments {args!r}\\n")
+    sys.exit(2)
+'''
+
+
 def platform_tuple() -> str:
     system = {"Darwin": "darwin", "Linux": "linux"}.get(platform.system())
     machine = {
@@ -130,9 +182,23 @@ def platform_tuple() -> str:
     return f"{system}_{machine}"
 
 
-def build_archive(build: int) -> bytes:
-    """A `gascity_edge_<platform>.tar.gz` whose gc identifies its build."""
-    script = f'#!/bin/sh\necho "gc version build-{build}"\n'.encode()
+def revision_of(build: int) -> str:
+    """The full commit a build was made from, as vcs.revision records it."""
+    return hashlib.sha1(f"gascity-build-{build}".encode()).hexdigest()
+
+
+def build_archive(build: int, *, stamped: bool = True) -> bytes:
+    """A release tarball whose gc identifies its build.
+
+    `stamped` is a goreleaser build from a git checkout, which records the
+    commit as vcs.revision; unstamped is a build that recorded none.
+    """
+    build_info = "# go-build-info\tpath\tgithub.com/gastownhall/gascity/cmd/gc\n"
+    build_info += "# go-build-info\tbuild\t-buildmode=exe\n"
+    if stamped:
+        build_info += "# go-build-info\tbuild\tvcs=git\n"
+        build_info += f"# go-build-info\tbuild\tvcs.revision={revision_of(build)}\n"
+    script = f'#!/bin/sh\n{build_info}echo "gc version build-{build}"\n'.encode()
     raw = io.BytesIO()
     with tarfile.open(fileobj=raw, mode="w") as tar:
         info = tarfile.TarInfo("gc")
@@ -145,40 +211,47 @@ def build_archive(build: int) -> bytes:
     return packed.getvalue()
 
 
-@pytest.fixture
-def release(tmp_path):
+def make_release(tmp_path, *, version: str = "edge", stamped: bool = True) -> Path:
     """A fixture release with enough builds for the worst rotation schedule."""
     fixture = tmp_path / "release"
     fixture.mkdir()
     tuple_ = platform_tuple()
-    (fixture / "asset").write_text(f"gascity_edge_{tuple_}.tar.gz")
+    (fixture / "asset").write_text(f"gascity_{version}_{tuple_}.tar.gz")
     (fixture / "current").write_text("0")
     # Three download attempts, each preceded by a digest request that may also
     # rotate, cannot consume more than eight builds.
     for build in range(12):
-        archive = build_archive(build)
+        archive = build_archive(build, stamped=stamped)
         (fixture / f"build_{build}.tar.gz").write_bytes(archive)
         (fixture / f"build_{build}.sha").write_text(hashlib.sha256(archive).hexdigest())
     return fixture
+
+
+@pytest.fixture
+def release(tmp_path):
+    return make_release(tmp_path)
 
 
 def sha_of(release: Path, build: int) -> str:
     return (release / f"build_{build}.sha").read_text().strip()
 
 
-def run_installer(tmp_path, release: Path, cache: Path | None = None, **scenario):
+def run_installer(tmp_path, release: Path, cache: Path | None = None, ref: str = "edge", **scenario):
     bin_stub = tmp_path / "stub-bin"
     bin_stub.mkdir(exist_ok=True)
-    curl = bin_stub / "curl"
-    curl.write_text(FAKE_CURL)
-    curl.chmod(0o755)
+    for name, body in (("curl", FAKE_CURL), ("go", FAKE_GO)):
+        stub = bin_stub / name
+        stub.write_text(body)
+        stub.chmod(0o755)
 
     cache = cache if cache is not None else tmp_path / "tool-cache"
     cache.mkdir(exist_ok=True)
     github_env = tmp_path / "github-env"
     github_path = tmp_path / "github-path"
-    github_env.touch()
-    github_path.touch()
+    # Emptied per run, as each Actions step starts with fresh files, so a run
+    # is judged on what it wrote and not on an earlier run's exports.
+    github_env.write_text("")
+    github_path.write_text("")
 
     env = dict(os.environ)
     env.pop("GITHUB_TOKEN", None)
@@ -189,12 +262,13 @@ def run_installer(tmp_path, release: Path, cache: Path | None = None, **scenario
             "RUNNER_TOOL_CACHE": str(cache),
             "GITHUB_ENV": str(github_env),
             "GITHUB_PATH": str(github_path),
+            "GOPATH": str(tmp_path / "gopath"),
         }
     )
     env.update({name: str(value) for name, value in scenario.items()})
 
     completed = subprocess.run(
-        [str(INSTALLER), "edge", "--cache"],
+        [str(INSTALLER), ref, "--cache"],
         env=env,
         capture_output=True,
         text=True,
@@ -225,8 +299,11 @@ def test_installer_verifies_and_installs_the_published_archive(tmp_path, release
     # this entry.
     assert sha_of(release, 0)[:16] in result["github_env"]
     # Order-free, but sorted rather than a set so a doubled export still fails.
+    # The source ref is the full commit the installed gc records, never the
+    # rolling tag: resolving `edge` again can name a later build, and a
+    # shallow `git fetch` resolves a full SHA where it cannot resolve a short one.
     assert sorted(result["github_env"].splitlines()) == sorted(
-        [f"GC_BIN={result['github_path']}/gc", "GASCITY_SOURCE_REF=edge"]
+        [f"GC_BIN={result['github_path']}/gc", f"GASCITY_SOURCE_REF={revision_of(0)}"]
     )
     assert Path(result["github_path"], "gc").is_file()
 
@@ -245,6 +322,8 @@ def test_installer_reuses_the_cache_entry_for_an_already_verified_checksum(tmp_p
     assert result["archive_requests"] == []
     assert "Reusing cached Gas City edge" in second.stdout
     assert "gc version build-0" in second.stdout
+    # Read from the cached binary, so a cache hit names the build it serves.
+    assert f"GASCITY_SOURCE_REF={revision_of(0)}" in result["github_env"].splitlines()
 
 
 def test_installer_absorbs_an_edge_rotation_between_checksum_and_download(tmp_path, release):
@@ -268,6 +347,12 @@ def test_installer_absorbs_an_edge_rotation_between_checksum_and_download(tmp_pa
     # never on the checksum that was resolved first.
     assert sha_of(release, 1)[:16] in result["github_env"]
     assert sha_of(release, 0)[:16] not in result["github_env"]
+    # And the source ref names build 1 too. Resolving `edge` once for the
+    # archive and again for the source is the race this rules out: the two
+    # resolutions can land on different builds, the one checked out matching
+    # neither the gc installed nor the other.
+    assert f"GASCITY_SOURCE_REF={revision_of(1)}" in result["github_env"].splitlines()
+    assert revision_of(0) not in result["github_env"]
 
 
 def test_installer_bounds_its_retries_when_edge_will_not_hold_still(tmp_path, release):
@@ -302,3 +387,36 @@ def test_installer_still_fails_loudly_on_a_real_checksum_mismatch(tmp_path, rele
     assert len(result["archive_requests"]) == 1
     assert result["github_env"] == ""
     assert list(result["cache"].rglob("gc")) == []
+
+
+def test_installer_falls_back_to_the_release_tag_when_gc_records_no_revision(tmp_path):
+    # A build with no vcs.revision in its build info. A version tag names one
+    # commit, so it is the one ref that can still stand in -- loudly, because
+    # the revision is then taken on the tag's word rather than read from gc.
+    release = make_release(tmp_path, version="1.5.0", stamped=False)
+    completed, result = run_installer(tmp_path, release, ref="v1.5.0")
+
+    assert completed.returncode == 0, completed.stderr
+    assert "gc version build-0" in completed.stdout
+    assert sorted(result["github_env"].splitlines()) == sorted(
+        [f"GC_BIN={result['github_path']}/gc", "GASCITY_SOURCE_REF=v1.5.0"]
+    )
+    assert "records no vcs.revision" in completed.stderr
+    assert "release tag v1.5.0" in completed.stderr
+
+
+def test_installer_fails_loudly_when_no_source_revision_can_be_named(tmp_path, release):
+    # A short SHA has no release archive, so gc comes from `go install`, which
+    # builds in module mode and records no vcs.revision -- and there is no
+    # release tag to stand in. Exporting the ref as given would hand the
+    # checkout step a short SHA that a shallow fetch cannot resolve; exporting
+    # nothing and exiting 0 would push the failure to that step. The install
+    # fails here instead, and like every failed install it exports nothing.
+    completed, result = run_installer(tmp_path, release, ref="f66474617d2b")
+
+    assert completed.returncode == 1
+    assert "falling back to 'go install" in completed.stderr
+    assert "records no vcs.revision" in completed.stderr
+    assert "no release tag" in completed.stderr
+    assert result["github_env"] == ""
+    assert result["github_path"] == ""

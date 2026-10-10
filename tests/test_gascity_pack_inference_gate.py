@@ -2507,14 +2507,21 @@ def test_inference_workflows_pin_gascity_source_root_to_installed_gc() -> None:
     # The gate imports core/bd from a git checkout of the SAME gascity revision
     # gc was built from. gc is installed from the release archive (gcp-m0ei: a
     # `go install` needs 4.46 GiB against a 4Gi runner), and the installer
-    # exports the release tag it resolved (or the ref it fell back to building)
-    # as GASCITY_SOURCE_REF; the checkout step fetches exactly that ref.
+    # exports the full commit the installed gc records (vcs.revision) as
+    # GASCITY_SOURCE_REF; the checkout step fetches exactly that commit. Its
+    # behaviour is tested in tests/test_install_gascity_archive.py; these pins
+    # keep the workflows wired to it.
     installer = (gascity_pack_inference_gate.REPO_ROOT / ".github" / "scripts" / "install-gascity-archive.sh").read_text(
         encoding="utf-8"
     )
     assert 'echo "GASCITY_SOURCE_REF=$1" >> "$GITHUB_ENV"' in installer
-    assert 'export_source_ref "$tag"' in installer
-    assert 'export_source_ref "$ref"' in installer
+    assert 'go version -m "$binary"' in installer
+    # Both install paths export what resolve_source_ref read from the binary,
+    # never the REF or tag they were given: `edge` resolved twice can name two
+    # builds, and a fallback REF can be a short sha no shallow fetch resolves.
+    assert installer.count('export_source_ref "$source_ref"') == 2
+    assert 'export_source_ref "$tag"' not in installer
+    assert 'export_source_ref "$ref"' not in installer
     for name in ("supported-pack-nightly.yml", "gascity-pack-inference.yml"):
         workflow = (gascity_pack_inference_gate.REPO_ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
         install_gc = workflow.index('.github/scripts/install-gascity-archive.sh "${GASCITY_REF}" --cache')

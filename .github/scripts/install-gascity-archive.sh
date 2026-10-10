@@ -30,16 +30,18 @@
 #   v1.4.1 | 1.4.1  that exact release tag
 #   anything else   no archive exists for it (a branch, a commit sha), so the
 #                   script falls back to `go install` and says so loudly. That
-#                   path costs the 4.46 GiB above; it exists only so a manual
-#                   workflow_dispatch against an unreleased gascity ref keeps
-#                   working, and it is never taken by a scheduled run.
+#                   path costs the 4.46 GiB above and is never taken by a
+#                   scheduled run. A `go install` build records no
+#                   vcs.revision and has no release tag, so the install then
+#                   fails: see resolve_source_ref below.
 #
 # --cache installs under RUNNER_TOOL_CACHE and appends the bin directory to
 # GITHUB_PATH, as the sibling installers do. Either way the resolved binary path
 # is exported as GC_BIN via GITHUB_ENV so workflow steps can name it without
-# going through `go env GOPATH`, alongside GASCITY_SOURCE_REF. Both are written
-# only after a verified install: a failed install exports nothing, so a later
-# step cannot pick up a ref for a gc that was never installed.
+# going through `go env GOPATH`, alongside GASCITY_SOURCE_REF, the gascity
+# commit that binary was built from. Both are written only after a verified
+# install: a failed install exports nothing, so a later step cannot pick up a
+# ref for a gc that was never installed.
 
 set -euo pipefail
 
@@ -133,6 +135,36 @@ export_source_ref() {
   fi
 }
 
+# Name that ref from the installed binary, never from the REF this script was
+# given. `edge` rotates several times a day (gcp-kinb), so resolving it a second
+# time for the source can land on a later build than the one installed; and the
+# REF the go-install fallback builds (`latest`, a short sha) is nothing a shallow
+# `git fetch` can resolve. A release archive is built from a git checkout, so
+# its gc records the full commit as vcs.revision in its build info. Only when
+# that is absent does the release tag stand in for it, and with neither there is
+# nothing that names the source: fail rather than export a guess.
+resolve_source_ref() {
+  local binary="$1"
+  local tag="$2"
+  local revision
+  # `|| true`: a binary go cannot read is the absent case below, not a silent
+  # exit under `set -e`; go's own error still reaches the job log.
+  revision="$(go version -m "$binary" |
+    awk '$1 == "build" && $2 ~ /^vcs\.revision=/ { sub(/^vcs\.revision=/, "", $2); print $2 }' || true)"
+  if [[ -n "$revision" ]]; then
+    printf '%s' "$revision"
+  elif [[ -n "$tag" ]]; then
+    echo "WARNING: ${binary} records no vcs.revision; using release tag ${tag} as the gascity source ref." >&2
+    printf '%s' "$tag"
+  else
+    echo "${binary} records no vcs.revision and was installed from no release tag, so nothing" >&2
+    echo "names the gascity commit it was built from. Exporting '${ref}' would point" >&2
+    echo "GASCITY_SOURCE_REF at a ref a shallow fetch cannot resolve, or at a different" >&2
+    echo "commit. Pass main, latest or a release tag instead." >&2
+    return 1
+  fi
+}
+
 # `go install` is the escape hatch for a ref with no published archive. It is
 # the pre-gcp-m0ei behaviour, disk cost included, so it warns rather than
 # failing silently into a 4.46 GiB build on a 4Gi budget.
@@ -143,12 +175,16 @@ install_from_source() {
   echo "WARNING: ephemeral storage (GOMODCACHE + GOCACHE + binary) and may evict the runner." >&2
   go install "github.com/${REPO}/cmd/gc@${ref}"
   local bin_dir
+  local source_ref
   bin_dir="$(go env GOPATH)/bin"
+  # Module mode records no vcs.revision and this path has no release tag, so
+  # this fails loudly before anything is exported.
+  source_ref="$(resolve_source_ref "${bin_dir}/gc" "")" || exit 1
   if [[ -n "${GITHUB_PATH:-}" ]]; then
     echo "$bin_dir" >> "$GITHUB_PATH"
   fi
   export_gc_bin "${bin_dir}/gc"
-  export_source_ref "$ref"
+  export_source_ref "$source_ref"
   "${bin_dir}/gc" version
   exit 0
 }
@@ -357,10 +393,14 @@ while true; do
   break
 done
 
+# Resolved before anything is exported, so a source that cannot be named leaves
+# GITHUB_ENV and GITHUB_PATH as untouched as any other failed install.
+source_ref="$(resolve_source_ref "$target" "$tag")" || exit 1
+
 if $use_cache && [[ -n "${GITHUB_PATH:-}" ]]; then
   echo "$bin_dir" >> "$GITHUB_PATH"
 fi
 export_gc_bin "$target"
-export_source_ref "$tag"
+export_source_ref "$source_ref"
 
 "$target" version
