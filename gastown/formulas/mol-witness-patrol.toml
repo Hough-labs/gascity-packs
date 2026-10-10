@@ -234,9 +234,15 @@ a NEW session with a different ID — the old one never comes back.
 
      if [ "$MAP_QUERY_RC" -eq 0 ]; then
        LIVENESS_MAP=$(jq -n --slurpfile sessions "$SESSIONS_FILE" --slurpfile session_beads "$SESSION_BEADS_FILE" '
+         # A key can sit on several rows: under gc v1.5.0 a namepool alias is a
+         # reused chair that closed sessions keep. A closed row must never
+         # overwrite a live one for the same key, or row order decides liveness.
          def add($m; $key; $state; $closed):
            if (($key // "") | length) == 0 then $m
-           else $m + {($key): (if $closed then "closed" else ($state // "") end)}
+           else (if $closed then "closed" else ($state // "") end) as $new
+             | if $new == "closed" and (($m[$key] // "closed") != "closed") then $m
+               else $m + {($key): $new}
+               end
            end;
          (reduce ($sessions[0].sessions // [])[] as $s ({};
              add(.; $s.id;         $s.state; ($s.closed // false))

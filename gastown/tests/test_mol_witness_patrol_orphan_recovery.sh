@@ -217,6 +217,19 @@ test_empty_session_bead_output_skips() {
     assert_verdict false "an empty session-bead read that exited 0"
 }
 
+test_reused_alias_with_a_live_holder_is_not_orphaned() {
+    # Under gc v1.5.0 a namepool polecat acts as its alias, and a closed
+    # session keeps that alias, so one alias can sit on a live row AND on
+    # closed rows of earlier occupants. Row order must not decide: if any
+    # row holding the key is live, the key is live.
+    set_roster '{"sessions":[
+      {"id":"s-new","alias":"rig/gastown.nux","state":"active","closed":false},
+      {"id":"s-old","alias":"rig/gastown.nux","state":"closed","closed":true}
+    ]}'
+    run_verdict "rig/gastown.nux" "rig/gastown.nux" OLD
+    assert_verdict false "a reused alias whose current holder is live"
+}
+
 test_missing_assignee_skips() {
     set_roster "$ROSTER_LIVE"
     run_verdict "" "" OLD
@@ -490,6 +503,7 @@ test_unusable_liveness_map_skips_instead_of_orphaning
 test_empty_map_with_live_sessions_skips
 test_empty_roster_output_skips
 test_empty_session_bead_output_skips
+test_reused_alias_with_a_live_holder_is_not_orphaned
 test_missing_assignee_skips
 test_unreadable_bead_skips
 test_missing_updated_at_skips
