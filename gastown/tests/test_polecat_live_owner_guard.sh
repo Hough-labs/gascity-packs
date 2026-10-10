@@ -65,7 +65,10 @@ SH
 
 # run_guard executes the guard with the claim block's inputs already bound, then
 # echoes GUARD_PROCEEDED. A decline exits before that marker, so its absence is
-# the assertion that the polecat never reached the work.
+# the assertion that the polecat never reached the work. The session's identity
+# variables are reset so the test runner's own cannot leak in: BEADS_ACTOR is
+# the session under test, and SELF_IDS may add its other spellings as
+# assignments (GC_SESSION_NAME=... GC_SESSION_ID=...).
 run_guard() {
     local dir="$1" owner_assignee="$2" me="$3" step_ref="${4-mol-polecat-work.implement}"
     local root_meta="${5-\"gc.root_bead_id\":\"winnow-5azcp\",}"
@@ -82,6 +85,9 @@ JSON
 [{"id":"winnow-pcpn6","status":"in_progress","assignee":"$owner_assignee","metadata":{${work_meta}"gc.session_id":"gc-8a4d"}}]
 JSON
     cat >"$dir/guard-harness.sh" <<HARNESS
+unset BEADS_ACTOR GC_ALIAS GC_SESSION_ID GC_SESSION_NAME GC_AGENT
+BEADS_ACTOR="$me"
+${SELF_IDS:-}
 WORK_ID="winnow-iaroy"
 EXPECTED_ASSIGNEE="$me"
 STEP_REF="$step_ref"
@@ -174,6 +180,35 @@ test_restore_takes_the_session_name_from_the_live_row() {
     grep -F 'CLAIM_DECLINED_LIVE_OWNER' <<<"$out" >/dev/null || fail "unreadable liveness did not decline: $out"
     grep -F -- '--set-metadata gc.session_name= ' "$dir/calls.log" >/dev/null ||
         fail "with no live row the restore must clear gc.session_name: $(cat "$dir/calls.log")"
+}
+
+# One session, two spellings. gc 1.4.3 claimed under the runtime session_name;
+# a gc 1.5.0 namepool polecat's BEADS_ACTOR is its alias. A molecule straddling
+# the upgrade finds its own work bead under the old spelling, and the live row
+# for that spelling is THIS session, so a one-string test declines the
+# session's own molecule. Upstream #360 (9f98ea4e) settled this for the claim:
+# any of BEADS_ACTOR, GC_ALIAS, GC_SESSION_ID, GC_SESSION_NAME, GC_AGENT is us.
+test_own_molecule_under_another_spelling_is_not_declined() {
+    local dir out line
+    dir=$(new_case)
+    live_sessions "$dir"
+
+    out=$(SELF_IDS="GC_ALIAS=winnow/gastown.nux GC_SESSION_ID=gc-psfm GC_SESSION_NAME=gastown__polecat-gc-psfm GC_AGENT=winnow/gastown.nux" \
+        run_guard "$dir" "gastown__polecat-gc-psfm" "winnow/gastown.nux")
+
+    ! grep -F 'CLAIM_DECLINED_LIVE_OWNER' <<<"$out" >/dev/null ||
+        fail "the guard declined this session's own molecule held under its session_name: $out"
+    grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null ||
+        fail "the guard did not proceed on this session's own molecule: $out"
+    ! grep -F 'session list' "$dir/calls.log" >/dev/null ||
+        fail "the guard probed liveness for an owner that is one of this session's own identities"
+    ! grep -F -- '--assignee=gastown__polecat-gc-psfm' "$dir/calls.log" >/dev/null ||
+        fail "the guard restored the step as if to another owner"
+    # bd checks writes against BEADS_ACTOR, so the bead moves to the spelling
+    # this session acts under, or step 6's handoff is refused.
+    line=$(takeover_line winnow/gastown.nux "$dir" gastown__polecat-gc-psfm)
+    [[ -n "$line" ]] ||
+        fail "the work bead was left under the old spelling of this session: $(cat "$dir/calls.log")"
 }
 
 test_dead_owner_is_a_resume_and_proceeds() {
@@ -371,6 +406,7 @@ test_unknown_claim_reason_still_checks() {
 test_live_owner_is_declined_and_the_step_restored
 test_restore_takes_the_session_name_from_the_live_row
 test_dead_owner_is_a_resume_and_proceeds
+test_own_molecule_under_another_spelling_is_not_declined
 test_dead_owner_resume_takes_the_work_bead_over
 test_resume_never_takes_over_from_the_refinery_or_an_escalation
 test_refused_takeover_warns_and_still_resumes
