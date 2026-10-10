@@ -77,6 +77,7 @@ fi
 
 # ── Reset and replay ─────────────────────────────────────────────────────────
 
+OLD_TIP=$(git rev-parse HEAD)
 info "Resetting integration to $TARGET_SHORT ($TARGET_SUBJ)..."
 git reset --hard "$BASELINE" --quiet
 ok "Reset to $TARGET_SHORT"
@@ -98,11 +99,13 @@ Patch conflict — resolve then continue:
 
   1. Edit the conflicting file(s)
   2. git add <file>
-  3. git am --continue
+  3. git am --continue   (repeat until every patch is applied)
+  4. This script has exited, so regenerate the export yourself:
+       make patches && git add patches/ && git commit -m "build(patches): refresh export after upgrade to $TARGET_SHORT"
 
-To bail out entirely:
+To bail out entirely and return to the pre-upgrade tip:
   git am --abort
-  git reset --hard $BASELINE
+  git reset --hard $OLD_TIP
 EOF
 )"
 fi

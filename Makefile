@@ -2,8 +2,9 @@
 # The `integration` branch carries fork-local patches on top of a pinned
 # upstream gascity-packs commit. BASELINE is the exact commit those patches
 # replay onto, so a fork build of the pack set is reproducible. To move to a
-# newer upstream commit, bump BASELINE (here and in the standalone default in
-# scripts/upgrade-integration.sh), then run `make upgrade`.
+# newer upstream commit, bump BASELINE (here and in the standalone defaults in
+# scripts/upgrade-integration.sh and scripts/check-patches.sh), then run
+# `make upgrade`.
 # Full workflow: docs/fork-patches.md
 BASELINE ?= 520e95cb22992a8a1017f7a60da267f203497c7e
 

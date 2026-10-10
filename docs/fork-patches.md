@@ -21,9 +21,10 @@ upstream `gastownhall/gascity-packs` commit**. The mechanism is a
 
 In `gascity` the baseline is deliberately a pinned upstream **release tag** SHA,
 so the fork tracks an LTS line rather than a moving `main`. This repo has no
-comparable release cadence — its newest tag (`v0.3.0`) is ~190 commits behind
-`upstream/main`, so pinning there would replay the fork onto a pack set nothing
-in production actually uses. The baseline here is therefore an upstream `main`
+comparable release cadence — when the fork started, its newest tag (`v0.4.0`,
+the first baseline `f69ec02b`) was already the last one, and `upstream/main`
+moved 116 commits past it before the first upgrade, so pinning a tag would
+replay the fork onto a pack set nothing in production actually uses. The baseline here is therefore an upstream `main`
 commit, still pinned **by SHA** so it can never move under the fork. When this
 repo starts cutting meaningful releases, move `BASELINE` onto a release SHA and
 this section becomes a note about how it used to work.
@@ -147,13 +148,60 @@ make check-patches REV=<commit-ish>
    it), resets `integration` to `BASELINE`, replays the patches with
    `git am --3way`, and regenerates `patches/`.
 4. On a conflict, `git am` stops with instructions: resolve, `git add`,
-   `git am --continue` — or `git am --abort` to bail.
-5. Re-validate the pack set against the new baseline:
+   `git am --continue`. The upgrade script has already exited by then, so its
+   last step does not run: once every patch is applied, regenerate the export
+   yourself (`make patches && git add patches/ && git commit`). To bail out,
+   `git am --abort` and reset to the PRE-upgrade tip, not to `BASELINE`: the
+   reset left `integration` at bare upstream and the script's tmpdir copy of
+   `patches/` is already gone.
+5. **When upstream already fixed what a patch fixes, drop the patch.** A patch
+   that only conflicts is adapted; a patch whose defect upstream fixed is
+   skipped (`git am --skip`) or removed from history afterwards, never
+   reverted on top. The bar is behaviour: run the patch's own test against
+   upstream's code, or cite the upstream test that covers the case. Where the
+   patch does more than upstream, keep upstream's change and re-apply only
+   the extra. A skip renumbers every later patch file, so refer to patches by
+   subject or bead id in notes, never by number.
+6. **Look for duplication that did not conflict.** `git am --3way` only
+   surfaces textual conflicts. An upstream fix in a different file, or a
+   redesign the patch now fights, replays cleanly. Classify every patch
+   (carried / adapted / partial / superseded) against the new upstream range,
+   not only the ones that stopped.
+7. **Run the full gates on the new tip and diff the reds** against the old
+   tip and against pristine upstream at the new baseline, with the `gc` the
+   city will run. A red that neither of those has is the upgrade's. Use a
+   clean git identity (`GIT_CONFIG_GLOBAL`): a signing global config fails
+   tests that create tags.
+8. **Check the `gc` the new baseline needs.** Upstream packs move with the
+   `gc` release they were written against; read that release's Upgrading
+   Notes against the pack content, and make sure the city gets that `gc`
+   before (or with) the pack pin.
+9. **Re-pin fork-only registry releases.** A release `commit` in
+   `registry.toml` that names a fork commit dies with the old history: the
+   replay rewrites every fork commit. Re-pin each such release to the
+   restacked commit carrying the identical subtree
+   (`git rev-parse <old>:<pack>` equals `git rev-parse <new>:<pack>`), inside
+   the patch that introduced the pin, and check
+   `git merge-base --is-ancestor <pin> HEAD`. Re-validate:
 
    ```bash
    make registry-format-validate
    make registry-validate GC=/path/to/gc
    ```
+
+   Before the force-push, `registry-validate` passes even with a stale pin,
+   because origin still carries the old history; only the ancestry check
+   catches it.
+10. **Publish without losing the old history.** Tag the old tip on origin
+    (`archive/integration-<old-baseline>`) and keep the tag: city lockfiles
+    and pins name old commits. Then
+    `git push --force-with-lease=integration:<old-tip> origin integration`.
+11. **Move in-flight branches.** A branch cut from the old `integration` does
+    not descend from the new `BASELINE`, so the pre-push guard reports it as
+    "not checked" and is blind to it. Rebase each with
+    `git rebase --onto origin/integration <old-tip> <branch>`; a plain rebase
+    would replay every adapted commit whose patch id changed. Beads already
+    queued at the refinery need the same rebase before they merge.
 
 ## Why patches/ is excluded from its own export
 
