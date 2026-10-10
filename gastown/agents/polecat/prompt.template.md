@@ -349,6 +349,7 @@ if [ -n "$STEP_REF" ] && { [ -z "$CLAIM_REASON" ] || [ "$CLAIM_REASON" = "claime
     # liveness answer. asleep and draining count as alive — both still own their
     # work and get woken back onto it.
     GUARD_ALIVE=""
+    GUARD_OWNER_SN=""
     GUARD_LIST_OK=0
     GUARD_TRY=0
     while [ "$GUARD_TRY" -lt 3 ]; do
@@ -356,10 +357,12 @@ if [ -n "$STEP_REF" ] && { [ -z "$CLAIM_REASON" ] || [ "$CLAIM_REASON" = "claime
       GUARD_LIST="$(gc session list --json 2>/dev/null)"
       if printf '%s' "$GUARD_LIST" | jq -e 'has("sessions")' >/dev/null 2>&1; then
         GUARD_LIST_OK=1
-        GUARD_ALIVE="$(printf '%s' "$GUARD_LIST" | jq -r --arg o "$GUARD_OWNER" \
+        GUARD_ROW="$(printf '%s' "$GUARD_LIST" | jq -c --arg o "$GUARD_OWNER" \
           '[.sessions[] | select(.closed != true)
             | select(.session_name == $o or .id == $o or .name == $o or .alias == $o)]
-           | .[0].id // empty' 2>/dev/null)"
+           | .[0] // empty' 2>/dev/null)"
+        GUARD_ALIVE="$(printf '%s' "$GUARD_ROW" | jq -r '.id // empty' 2>/dev/null)"
+        GUARD_OWNER_SN="$(printf '%s' "$GUARD_ROW" | jq -r '.session_name // empty' 2>/dev/null)"
         break
       fi
       sleep "$GUARD_TRY"
@@ -378,11 +381,14 @@ if [ -n "$STEP_REF" ] && { [ -z "$CLAIM_REASON" ] || [ "$CLAIM_REASON" = "claime
       fi
       echo "  Restoring the step to its owner and draining. No code, branch, or worktree touched."
       # The hook stamped OUR gc.session_id/gc.session_name onto the step during
-      # the claim. Put the owner's back. When the owner's session id cannot be
-      # read, clear the key rather than leave ours standing — a wrong binding
-      # is worse than an absent one, and the owner's next write restores it.
+      # the claim. Put the owner's back. The session name is the live row's:
+      # GUARD_OWNER is an assignee, which under gc 1.5.0 is an alias or a
+      # session bead id, not the runtime session name gc reads from this key.
+      # When either value cannot be read, clear the key rather than leave ours
+      # standing — a wrong binding is worse than an absent one, and the owner's
+      # next write restores it.
       gc bd update "$WORK_ID" --assignee="$GUARD_OWNER" \
-        --set-metadata gc.session_name="$GUARD_OWNER" \
+        --set-metadata gc.session_name="$GUARD_OWNER_SN" \
         --set-metadata polecat_session="$GUARD_OWNER" \
         --set-metadata gc.session_id="$GUARD_OWNER_SID" \
         || echo "WARN could not restore $WORK_ID to $GUARD_OWNER — the step is left claimed by a session that will not run it; escalate to the witness"

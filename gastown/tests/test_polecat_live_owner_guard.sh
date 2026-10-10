@@ -146,6 +146,36 @@ test_live_owner_is_declined_and_the_step_restored() {
         fail "declining polecat did not report the duplicate pour to the witness"
 }
 
+# gc reads the step's gc.session_name as a runtime session name. GUARD_OWNER is
+# an assignee, which under gc 1.5.0 is the session's alias (namepool polecats)
+# or its bead id, never its session_name. Restoring the key from GUARD_OWNER
+# binds the step to a session name that does not exist.
+test_restore_takes_the_session_name_from_the_live_row() {
+    local dir out
+    dir=$(new_case)
+    live_sessions "$dir"
+
+    out=$(run_guard "$dir" "winnow/gastown.furiosa" "winnow/gastown.nux")
+
+    grep -F 'CLAIM_DECLINED_LIVE_OWNER winnow-iaroy' <<<"$out" >/dev/null ||
+        fail "a duplicate pour onto a live owner held by alias was not declined: $out"
+    grep -F -- '--assignee=winnow/gastown.furiosa' "$dir/calls.log" >/dev/null ||
+        fail "the step was not restored to its owner's assignee spelling"
+    grep -F -- '--set-metadata gc.session_name=gastown__polecat-gc-8a4d ' "$dir/calls.log" >/dev/null ||
+        fail "the restore did not take gc.session_name from the live session row: $(cat "$dir/calls.log")"
+    ! grep -F -- 'gc.session_name=winnow/gastown.furiosa' "$dir/calls.log" >/dev/null ||
+        fail "the restore wrote an alias into gc.session_name"
+
+    # Unreadable liveness matched no row, so there is no session name to put
+    # back. Clear the key rather than guess one from the assignee.
+    dir=$(new_case)
+    printf 'not json at all' >"$dir/sessions.json"
+    out=$(run_guard "$dir" "winnow/gastown.furiosa" "winnow/gastown.nux")
+    grep -F 'CLAIM_DECLINED_LIVE_OWNER' <<<"$out" >/dev/null || fail "unreadable liveness did not decline: $out"
+    grep -F -- '--set-metadata gc.session_name= ' "$dir/calls.log" >/dev/null ||
+        fail "with no live row the restore must clear gc.session_name: $(cat "$dir/calls.log")"
+}
+
 test_dead_owner_is_a_resume_and_proceeds() {
     local dir out
     dir=$(new_case)
@@ -339,6 +369,7 @@ test_unknown_claim_reason_still_checks() {
 }
 
 test_live_owner_is_declined_and_the_step_restored
+test_restore_takes_the_session_name_from_the_live_row
 test_dead_owner_is_a_resume_and_proceeds
 test_dead_owner_resume_takes_the_work_bead_over
 test_resume_never_takes_over_from_the_refinery_or_an_escalation
