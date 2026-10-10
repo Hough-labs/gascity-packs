@@ -226,6 +226,11 @@ a NEW session with a different ID — the old one never comes back.
      SESSIONS_FILE=$(mktemp); SESSION_BEADS_FILE=$(mktemp)
      gc session list --state=all --json > "$SESSIONS_FILE" || MAP_QUERY_RC=1
      gc bd list --type=session --label=gc:session --include-infra --include-gates --all --json --limit=0 > "$SESSION_BEADS_FILE" || MAP_QUERY_RC=1
+     # Exit 0 with NO output is a broken read, not an empty roster: both
+     # queries print a JSON value even when nothing matches. Read as `{}` it
+     # would make every assignee absent.
+     [ -s "$SESSIONS_FILE" ] || MAP_QUERY_RC=1
+     [ -s "$SESSION_BEADS_FILE" ] || MAP_QUERY_RC=1
 
      if [ "$MAP_QUERY_RC" -eq 0 ]; then
        LIVENESS_MAP=$(jq -n --slurpfile sessions "$SESSIONS_FILE" --slurpfile session_beads "$SESSION_BEADS_FILE" '

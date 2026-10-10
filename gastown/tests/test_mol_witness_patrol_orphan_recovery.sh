@@ -198,6 +198,25 @@ test_empty_map_with_live_sessions_skips() {
     assert_verdict false "an empty map built while sessions are live"
 }
 
+test_empty_roster_output_skips() {
+    # A roster read that exits 0 and prints NOTHING is not an empty roster. A
+    # healthy `gc session list --json` always prints an object, so empty output
+    # means the read broke; read as `{}` it would make every assignee absent.
+    set_roster ''
+    run_verdict "pool-gone" "pool-gone" OLD
+    assert_verdict false "an empty roster read that exited 0"
+}
+
+test_empty_session_bead_output_skips() {
+    # Same rule for the session-bead half of the map: `gc bd list --json`
+    # prints `[]` when nothing matches, so no output at all is a broken read.
+    set_roster "$ROSTER_LIVE"
+    : >"$GC_SESSION_BEADS_JSON"
+    run_verdict "pool-gone" "pool-gone" OLD
+    printf '[]' >"$GC_SESSION_BEADS_JSON"
+    assert_verdict false "an empty session-bead read that exited 0"
+}
+
 test_missing_assignee_skips() {
     set_roster "$ROSTER_LIVE"
     run_verdict "" "" OLD
@@ -469,6 +488,8 @@ test_closed_assignee_is_still_orphaned
 test_live_assignee_is_not_orphaned
 test_unusable_liveness_map_skips_instead_of_orphaning
 test_empty_map_with_live_sessions_skips
+test_empty_roster_output_skips
+test_empty_session_bead_output_skips
 test_missing_assignee_skips
 test_unreadable_bead_skips
 test_missing_updated_at_skips
