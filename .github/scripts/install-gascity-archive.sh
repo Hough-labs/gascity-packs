@@ -264,7 +264,9 @@ case "$ref" in
     tag="$ref"
     version="${ref#v}"
     ;;
-  [0-9]*)
+  # A dot, not just a leading digit: most commit SHAs start with a decimal
+  # digit too, and one read as a version has no archive to find.
+  [0-9]*.*)
     tag="v${ref}"
     version="$ref"
     ;;

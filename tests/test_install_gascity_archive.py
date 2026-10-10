@@ -463,6 +463,34 @@ def test_installer_names_the_module_commit_a_go_install_build_was_made_from(tmp_
     assert result["github_path"] == str(gopath_bin)
 
 
+def test_installer_routes_a_digit_leading_commit_sha_to_the_fallback(tmp_path, release):
+    # Ten of sixteen hex digits are decimal, so most commit SHAs start with one.
+    # A bare-version pattern that matched any leading digit read such a SHA as
+    # a release tag (v164a7b32acd4), found no checksum for it and failed before
+    # the fallback could build it.
+    completed, result = run_installer(
+        tmp_path, release, ref="164a7b32acd4", FAKE_GO_ORIGIN_HASH=MODULE_ORIGIN
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "falling back to 'go install ...@164a7b32acd4'" in completed.stderr
+    assert result["archive_requests"] == []
+    assert f"GASCITY_SOURCE_REF={MODULE_ORIGIN}" in result["github_env"].splitlines()
+
+
+def test_installer_still_reads_a_bare_version_as_its_release_tag(tmp_path):
+    # The control for the routing above: `1.5.0` is the documented short form
+    # of v1.5.0 and must keep installing that release's archive.
+    release = make_release(tmp_path, version="1.5.0")
+    completed, result = run_installer(tmp_path, release, ref="1.5.0")
+
+    assert completed.returncode == 0, completed.stderr
+    assert "falling back to 'go install" not in completed.stderr
+    assert len(result["archive_requests"]) == 1
+    assert "/releases/download/v1.5.0/gascity_1.5.0_" in result["archive_requests"][0]
+    assert f"GASCITY_SOURCE_REF={revision_of(0)}" in result["github_env"].splitlines()
+
+
 def test_installer_fails_loudly_when_no_source_revision_can_be_named(tmp_path, release):
     # The same go-install build, but the proxy has no commit for its version.
     # Exporting the REF as given would hand the checkout step a short SHA that
