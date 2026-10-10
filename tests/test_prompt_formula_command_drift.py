@@ -15,7 +15,7 @@ indistinguishable by inspection from a healthy one.
 
 These checks encode the invariants that were lost, so the drift cannot silently
 reappear the next time a formula is edited. The convention the templates follow
-is documented in ``gastown/README.md`` ("Role prompts point at formulas").
+is documented in ``gastown/README.md`` ("Role prompts and formula commands").
 """
 
 from __future__ import annotations
@@ -165,8 +165,9 @@ def warrant_dedup_violations(path: Path, text: str) -> list[str]:
     the same target — a duplicate spawns a second shutdown dance racing the
     first. A prompt template that restates the create without the guard hands
     the agent a command that looks complete and is not. Templates should point
-    at the owning formula step instead; where a role has no formula to point at
-    (boot), the inline command has to carry the guard itself.
+    at the owning formula step instead (boot included: since upstream #261 its
+    warrant is filed by mol-boot-patrol's check-deacon step); an inline command
+    that remains has to carry the guard itself.
     """
     violations = []
     guarded = {

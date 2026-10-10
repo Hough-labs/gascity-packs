@@ -41,8 +41,10 @@ REFINERY_TARGET="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}refinery"
 # this guard could not run at all. Recover the convoy from the molecule root of
 # the step bead this session is holding rather than skipping the check. The
 # status filter is `open,in_progress`: a claimed step bead carries this
-# session's assignee but is still stored `open`, so `in_progress` alone matches
-# nothing and the recovery silently yields no convoy.
+# session's assignee, but its status depends on what claimed it — gc 1.4.x's
+# `gc hook --claim` leaves it `open`, gc 1.5.0's promotes it to `in_progress`,
+# and a `--claim` update always does. Either status alone can match nothing, and
+# then the recovery silently yields no convoy.
 CONVOY_ID="${GC_BEAD_ID:-}"
 if [ -z "$CONVOY_ID" ]; then
   ROOT_BEAD_ID=$(gc bd list --assignee="$EXPECTED_ASSIGNEE" --status=open,in_progress \
@@ -81,8 +83,9 @@ done
 # Only POSITIVE evidence counts: the bead is closed, or it is held by the
 # REFINERY — the one assignee submit-and-exit's handoff actually produces. Every
 # weaker test has been observed draining a session with the branch unpushed.
-# "Not in_progress for me" is not evidence: a molecule's work bead is never
-# assigned to the polecat session in the first place. Nor is a bare "assigned to
+# "Not in_progress for me" is not evidence: workspace-setup holds the work bead
+# in_progress for this session only from that step on, and never takes it from
+# the refinery or an operator escalation. Nor is a bare "assigned to
 # somebody else", which is equally true of a resumed molecule finding the bead
 # still held by its own PREVIOUS session (pool restarts mint a new identity) and
 # of any third party a bead can be parked on — an operator moving it to a crew

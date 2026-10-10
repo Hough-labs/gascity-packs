@@ -168,7 +168,7 @@ becomes the start of review instead of the pending-merge handoff, and a refused
 merge parks the bead (`merge_approval_state=awaiting_review`) for the next
 patrol iteration rather than closing or escalating it.
 
-## Role prompts point at formulas
+## Role prompts and formula commands
 
 `agents/*/prompt.template.md` is injected into an agent's context at spawn and
 reads as authoritative operating instructions. A formula step in `formulas/`
@@ -177,28 +177,41 @@ dangerous: when the formula gains a flag and the prompt's copy does not, the
 agent runs the lossy copy, it executes cleanly, and the dropped behaviour is
 simply gone. A partial command in injected context is worse than no command.
 
-**The rule: a prompt template names the formula step; it does not restate the
-step's command.** A pointer cannot drift; a copy can.
+**The rule: the formula step owns the command.** A prompt template either
+names the step, or carries a *complete* copy that names the step it copies; the
+formula is authoritative wherever the two disagree. A condensed copy is never
+acceptable. Commands an agent runs mid-cycle, such as filing a warrant or
+finding work, point at their step.
 
-Three narrow exceptions, each of which must be *complete*, not condensed:
+Copies exist where a pointer cannot do the job:
 
 - **Cold-start bootstrap.** The first wisp pour has no formula step to read
   yet. Marked as bootstrap-only in each template, with a pointer to the
   `next-iteration` step that owns every later pour.
-- **A role with no formula.** `boot` runs a single-pass watchdog with no
-  formula, so its warrant command is authoritative there — and therefore
-  carries the dedup guard that the formula-owned copies carry.
+- **Crash recovery.** A patrol session that exits a cycle without running
+  `next-iteration` has to restore the one-wisp invariant before it can read a
+  step at all, so the witness, deacon, refinery and boot prompts carry a copy
+  of that step. Upstream restates these blocks too and pins their queries in
+  its own tests (`test_witness_wisp_queries_pin_include_infra`), so the fork
+  keeps them rather than replacing them with pointers.
 - **A flag whose omission fails silently.** The refinery's Rejection Flow
   quotes the pool-return `gc bd update` verbatim, marked as a copy naming the
   authoritative step, because a rejection that drops
   `--set-metadata gc.routed_to=...` orphans the bead with no error, no stall
   signal, and no wake.
 
+Boot is no longer an exception. It used to be a single-pass watchdog with no
+formula, so its prompt carried the warrant command; upstream #261 gave it the
+`mol-boot-patrol` loop, its stuck warrant is now filed by that formula's
+`check-deacon` step, and its prompt points there.
+
 `tests/test_prompt_formula_command_drift.py` enforces the invariants whose loss
 was observed in practice: pool-returning updates declare their routing, warrant
 creation in injected context is deduped, a pool-routed warrant also declares
 `gc.kind=workflow` so it is a pollable workflow root, and a prompt bail-out path
-drain-acks.
+drain-acks. They run over every prompt template, copies included. Boot alone
+is exempt from the bail-out check: its always-mode patrol loop must never
+drain-ack, so its crash-recovery copy aborts with a bare `exit 1` on purpose.
 
 ## Dog Pool
 

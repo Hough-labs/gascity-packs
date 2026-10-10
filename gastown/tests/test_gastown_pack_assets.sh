@@ -1109,9 +1109,10 @@ PY
 
     # The prompt-side guard could not run at all in the observed session:
     # $GC_BEAD_ID was empty, so it never resolved a work bead. Both copies must
-    # recover the convoy, and both must key on POSITIVE evidence — a molecule's
-    # work bead is never assigned to the polecat session, so "not in_progress
-    # for me" reports already-submitted on work that was never submitted.
+    # recover the convoy, and both must key on POSITIVE evidence — the work
+    # bead is in_progress for this session only once workspace-setup claims it,
+    # so "not in_progress for me" reports already-submitted on work that was
+    # never submitted.
     local guard
     for guard in "$prompt" "$fragment"; do
         grep -F 'CONVOY_ID="${GC_BEAD_ID:-}"' "$guard" >/dev/null ||
@@ -1124,9 +1125,10 @@ PY
         # in-flight, hook-claimed step with in_progress ALONE (adding `open`
         # there would let it jump to a step whose predecessor has not closed).
         # The invariant that actually matters is local to this query — the step
-        # bead it recovers the convoy from is stored `open`, so in_progress
-        # alone matches nothing and the recovery silently yields no convoy.
-        python3 - "$guard" <<'PY' || fail "$(basename "$guard") must recover the convoy's held step bead with --status=open,in_progress; a pool-assigned step bead is stored open, so in_progress alone matches nothing"
+        # bead it recovers the convoy from is stored `open` by gc 1.4.x's hook
+        # and `in_progress` by gc 1.5.0's, so either status alone can match
+        # nothing and the recovery silently yields no convoy.
+        python3 - "$guard" <<'PY' || fail "$(basename "$guard") must recover the convoy's held step bead with --status=open,in_progress; a claimed step bead is stored open or in_progress depending on the gc that claimed it"
 import sys
 
 text = open(sys.argv[1], encoding="utf-8").read()
