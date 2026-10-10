@@ -22,7 +22,7 @@ on:
   workflow_dispatch:
     inputs:
       gascity_ref:
-        description: "Gas City module ref/version to install, such as latest, main, or v0.3.0."
+        description: "Gas City ref/version to install, such as latest, main, or v0.3.0."
         required: false
         default: latest
       registry_ref:
