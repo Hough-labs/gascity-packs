@@ -50,15 +50,10 @@ fail() {
 #       a remote; the remote calls share a 6s budget
 #       (GC_WORKTREE_SETUP_BUDGET_SECONDS) and are abandoned, not retried, when
 #       it expires — a worktree one fetch behind is fixed next cycle.
-#   gastown/agents/witness
-#       polecat-worktree-reap.sh. One bulk bead read plus per-worktree git
-#       status, held to 8s (GC_REAP_BUDGET_SECONDS); deferred candidates are
-#       reaped on the next patrol.
 EXPECTED_PRE_STARTS=$(
     cat <<'INVENTORY'
 gastown/agents/polecat/agent.toml	{{.ConfigDir}}/assets/scripts/worktree-setup.sh {{.RigRoot}} {{.WorkDir}} {{.AgentBase}} --sync
 gastown/agents/refinery/agent.toml	{{.ConfigDir}}/assets/scripts/worktree-setup.sh {{.RigRoot}} {{.WorkDir}} {{.AgentBase}} --sync
-gastown/agents/witness/agent.toml	{{.ConfigDir}}/assets/scripts/polecat-worktree-reap.sh {{.RigRoot}} --rig {{.Rig}}
 INVENTORY
 )
 
@@ -156,7 +151,6 @@ assert_bounded() {
 
 test_inventoried_scripts_enforce_their_budget() {
     assert_bounded worktree-setup.sh GC_WORKTREE_SETUP_BUDGET_SECONDS
-    assert_bounded polecat-worktree-reap.sh GC_REAP_BUDGET_SECONDS
 }
 
 # The deacon is the agent gcp-oo0v killed. Naming it directly means a revert of

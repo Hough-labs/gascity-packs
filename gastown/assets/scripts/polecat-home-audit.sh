@@ -2,14 +2,13 @@
 # polecat-home-audit.sh — find polecat AGENT-HOME worktrees no live session owns.
 #
 # The blind spot this closes (gcp-actg, reported as gascity-o963):
-#   A polecat has TWO kinds of worktree. The per-bead one at
-#   <home>/worktrees/<bead-id> is found through its bead, and
-#   polecat-worktree-reap.sh reaps it once that bead closes. The persistent
+#   A polecat has TWO kinds of worktree. The per-bead task worktree is found
+#   through its bead (metadata.artifact_dir), and the refinery's
+#   task-artifact-cleanup retires it after a verified merge. The persistent
 #   agent HOME at <city>/.gc/worktrees/<rig>/polecats/<agent> has no bead at
 #   all — so every existing guard, all of which key on a bead, is structurally
 #   blind to it:
-#     - polecat-worktree-reap.sh    excludes homes by construction (its gate 1
-#                                   requires a `worktrees/` parent segment).
+#     - task-artifact-cleanup       keys on a closed bead's metadata.artifact_dir.
 #     - recover-orphaned-beads      keys on a bead whose metadata.work_dir
 #                                   leads to the worktree.
 #     - the work_dir scan           same key, same blindness.
@@ -37,9 +36,11 @@
 #   out from under it. So a home with ANY per-bead child on disk is deferred,
 #   whoever owns that child. Resolving each child's owner would mean reading
 #   the child's bead — the exact bead-keying this script refuses — and the
-#   conservative rule needs no such read: children belong to
-#   polecat-worktree-reap.sh, and once it has cleared them the home becomes
-#   eligible on a later cycle. Deferring costs a cycle; guessing costs a
+#   conservative rule needs no such read. Children are legacy-layout task
+#   worktrees (<home>/worktrees/<bead-id>; new ones never live under a home):
+#   the refinery's task-artifact-cleanup retires an adopted one after its
+#   merge, any other is a one-time operator drain, and once they are gone the
+#   home becomes eligible on a later cycle. Deferring costs a cycle; guessing costs a
 #   working tree.
 #
 #   That deferral suppresses the TEARDOWN and nothing else (gcp-fzjo). The
@@ -53,10 +54,8 @@
 #   1. Path shape is an agent home: `<lane-tree>/<agent>` two levels under the
 #      rig's worktree root, i.e. `<city>/.gc/worktrees/<rig>/<tree>/<agent>`.
 #      That excludes the per-bead worktrees one level deeper (parent
-#      `worktrees`, and polecat-worktree-reap.sh's business), the rig root, and
-#      the refinery worktree, which sits beside the trees rather than in one.
-#      The candidate sets of this script and the per-bead reaper are disjoint
-#      by construction. The tree NAME is deliberately not tested — see THE
+#      `worktrees`), the rig root, and the refinery worktree, which sits
+#      beside the trees rather than in one. The tree NAME is deliberately not tested — see THE
 #      LANE-TREE BLIND SPOT below.
 #   2. The session roster holds no LIVE session for this home — matched on the
 #      session's own `work_dir`, and on `<rig>/<agent>` derived from the path.
@@ -64,13 +63,12 @@
 #      out or does not parse ends the whole run with nothing removed: an
 #      unreadable roster is not an empty one, and reading it as empty is how a
 #      sweep concludes that nobody owns anything and clears every home on the
-#      rig. That is mol-witness-patrol's absent-confirm discipline (gcp-g98) —
-#      a confirmation read that fails is not proof of absence.
+#      rig. mol-witness-patrol's orphan recovery holds its liveness map to the
+#      same rule: a confirmation read that fails is not proof of absence.
 #   3. `git status --porcelain` is empty AND `git rev-list HEAD --not --remotes`
-#      is empty. Unlike the per-bead reaper, this script DOES gate on
-#      unpublished commits: that reaper can skip the check because a closed
-#      bead is the refinery's own proof the work landed, and a home has no bead
-#      to close. The furiosa home was on a DETACHED HEAD holding two commits
+#      is empty. This script DOES gate on unpublished commits: a task
+#      worktree's cleanup proves its work landed from its closed bead's merge
+#      evidence, and a home has no bead to close. The furiosa home was on a DETACHED HEAD holding two commits
 #      that belonged to no branch; establishing they were superseded took
 #      reading content at origin, which a sweep must not attempt on its own.
 #      So unbranched commits are REPORTED, never silently removed.
@@ -111,8 +109,8 @@
 #   `home_removal_pending` set is reviewed. Excluding crew again would mean
 #   another tree literal, which is the bug this bead closes.
 #
-# Staged rollout: REAL REMOVAL IS OPT-IN, matching the per-bead reaper and the
-# city's posture for the native gascity reaper. Without --no-dry-run this
+# Staged rollout: REAL REMOVAL IS OPT-IN, matching the city's posture for the
+# native gascity reaper. Without --no-dry-run this
 # reports what it WOULD remove and removes nothing. Flip it only after the
 # logged would-remove set has been reviewed across several patrol cycles.
 #
@@ -121,15 +119,13 @@
 # [session] setup_timeout (10s) and SIGKILLed on overrun, which fails the whole
 # session start and, after six failures in an hour, latches the supervisor
 # circuit breaker so the agent never returns (gcp-ntbf on the witness,
-# gcp-oo0v on the deacon). The witness already spends most of that budget on
-# polecat-worktree-reap.sh. A periodic sweep belongs in a patrol cycle, which
+# gcp-oo0v on the deacon). A periodic sweep belongs in a patrol cycle, which
 # is also where it gets a budget generous enough to walk every home in one go.
 # It still enforces its own wall clock: a patrol step that hangs stalls a
 # patrol, and partial work here is free because the sweep is idempotent.
 #
 # Output: one JSON line per decision appended to LOG_FILE, plus a human
-# summary on stdout. Same log schema as polecat-worktree-reap.log — `ts` is
-# stamped at the event, `run_started` groups lines into cycles,
+# summary on stdout. `ts` is stamped at the event, `run_started` groups lines into cycles,
 # `budget_remaining` shows whether a decision was the clock's, and `reason` is
 # the machine-readable WHY, separating "the command ran and failed" from "the
 # command never ran".
@@ -378,7 +374,7 @@ CANDIDATES=$(printf '%s\n' "$WT_LIST" \
         lane_tree=${wt%/*}                  # <city>/.gc/worktrees/<rig>/<tree>
         rig_dir=${lane_tree%/*}             # <city>/.gc/worktrees/<rig>
         worktrees_root=${rig_dir%/*}        # <city>/.gc/worktrees
-        # One level deeper is a per-bead worktree — the reaper's business, and
+        # One level deeper is a legacy per-bead worktree, not a home, and
         # the one place a `worktrees` segment appears that is NOT the layout
         # root the next test looks for.
         [ "${lane_tree##*/}" != worktrees ] || continue
@@ -404,14 +400,13 @@ SESSIONS_FILE=$(mktemp)
 trap 'rm -f "$SESSIONS_FILE"' EXIT
 
 # The session roster is the ONLY ownership key here, so it is fetched up front
-# rather than lazily: unlike the per-bead reaper, which can decide most
-# candidates on bead status alone, every candidate in this sweep needs it.
+# rather than lazily: every candidate in this sweep needs it.
 #
 # A roster read that FAILS is not proof the owning session is gone. The state
 # starts at `unconfirmed` and is promoted only on a read that exited 0, wrote a
 # non-empty file, AND parsed as the expected shape; every failure path then
 # falls through to skip-this-home with no route to a removal. That is
-# mol-witness-patrol's absent-confirm discipline (gcp-g98): a confirmation read
+# the absent-confirm rule (gcp-g98): a confirmation read
 # that fails is not proof of absence.
 ROSTER_STATE="unconfirmed"
 ROSTER_REASON="roster_read_failed"
@@ -438,8 +433,7 @@ esac
 
 if [ "$ROSTER_STATE" != readable ]; then
     # The roster is the ONLY ownership key here, so a run without it cannot
-    # decide a single candidate — the same shape the per-bead reaper takes when
-    # its one bulk bead read comes back unusable. Report it once, at run level,
+    # decide a single candidate. Report it once, at run level,
     # and stop: a per-candidate line would repeat one fact $TOTAL times and
     # still say nothing more. Reported, never inferred — an unreadable roster
     # is not an empty one, and treating it as empty is how a sweep concludes
@@ -600,9 +594,9 @@ while IFS= read -r WT; do
     fi
 
     # Gate 3b: commits reachable from HEAD but from no remote-tracking ref.
-    # The per-bead reaper deliberately does NOT make this check, because a
-    # rebase-merging refinery rewrites hashes and a closed bead is its own
-    # proof the work landed. A home has no bead, so nothing else here can say
+    # A task worktree's cleanup proves its work landed from the closed bead's
+    # merge evidence; a rebase-merging refinery rewrites hashes, so ancestry
+    # alone could not. A home has no bead, so nothing else here can say
     # the commits are safe — and the furiosa home was on a detached HEAD
     # holding two of them. Establishing they were superseded took reading
     # content at origin, which a sweep must not attempt on its own, so this
@@ -650,16 +644,16 @@ while IFS= read -r WT; do
     # LIVE polecat from another namepool slot was working inside a dead home's
     # `worktrees/`. Any child at all defers, because establishing that a child
     # is dead means reading its bead, and bead-keyed guards are what this
-    # script exists to stop relying on. The per-bead reaper owns children; once
-    # it has cleared them the home becomes eligible.
+    # script exists to stop relying on. Children are legacy-layout task
+    # worktrees; once task-artifact-cleanup or an operator drain has retired
+    # them the home becomes eligible.
     #
     # This gate governs TEARDOWN ONLY, which is why it runs after the reports
     # above rather than before them (gcp-fzjo). It used to come first and skip
     # the rest of the loop, which coupled lost-work reporting to unrelated
     # per-bead state: a home with any child was never reached by 3a/3b, so its
-    # dirt stayed invisible for as long as the children lived — and the reaper
-    # correctly keeps a child whose bead is still open, which can be a long
-    # time. The two facts are not mutually exclusive: gastown.nux emitted
+    # dirt stayed invisible for as long as the children lived — and a child
+    # whose bead is still open is correctly kept, which can be a long time. The two facts are not mutually exclusive: gastown.nux emitted
     # `home_dirty_kept` on 2026-08-27 and 08-28, then went silent the moment
     # children appeared, with the same uncommitted path still on disk.
     CHILD_COUNT=0

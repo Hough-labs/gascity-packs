@@ -245,8 +245,7 @@ and the "Do NOT reach for `gc.routed_to`" note further down still stands as
 written — it is about the write.
 
 `polecat_session` rides along with the assignee so the two can never disagree.
-Downstream readers — the witness's worktree reaper and the resume re-verify —
-use `assignee == polecat_session` to tell "a polecat still holds this" from
+The resume re-verify uses `assignee == polecat_session` to tell "a polecat still holds this" from
 "somebody else took it". A claim that set only the assignee would leave a
 crashed predecessor's stamp in place and read as a completed handoff. The done
 sequence's already-submitted guard does not need that comparison at all: it

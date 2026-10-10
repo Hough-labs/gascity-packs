@@ -365,8 +365,7 @@ JSON
 }
 
 test_real_removal_is_opt_in() {
-    # Staged rollout, same posture as polecat-worktree-reap.sh and the native
-    # gascity reaper: the patrol step passes no --no-dry-run. If this
+    # Staged rollout, same posture as the native gascity reaper: the patrol step passes no --no-dry-run. If this
     # regresses, home removal goes live on the first pin bump with no
     # observation window.
     local tmp rig origin bin homes sessions logdir log

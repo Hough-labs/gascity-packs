@@ -905,7 +905,7 @@ test_polecat_home_teardown_has_an_owner() {
     grep -F '[ "${worktrees_root##*/}" = worktrees ]' "$audit" >/dev/null ||
         fail "home audit must restrict candidates to agent homes under the rig's worktree root"
     grep -F '[ "${lane_tree##*/}" != worktrees ]' "$audit" >/dev/null ||
-        fail "home audit must exclude the per-bead worktrees one level deeper; those are the reaper's"
+        fail "home audit must exclude the per-bead worktrees one level deeper; those are task worktrees, not homes"
     grep -F '[ "$wt" != "$MAIN_WT" ]' "$audit" >/dev/null ||
         fail "home audit must exclude the main worktree; it is the canonical checkout, never a candidate"
     ! grep -E '^[[:space:]]*\*/[A-Za-z]+/\*' "$audit" >/dev/null ||
