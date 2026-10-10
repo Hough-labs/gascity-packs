@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sat, 10 Oct 2026 16:27:33 -0400
+Subject: [PATCH 130/148] fix(ci): skip the nightly's source checkout on
+ unselected matrix entries (gcp-fooz4)
+
+A manual Supported Pack Nightly dispatch for one pack still starts every
+matrix entry, and the entries it did not select skip their steps on
+steps.subset.outputs.run_gate. "Check out the matching gascity source",
+added by the restack for upstream's #476, was the only step after the
+subset decision without that condition. On an unselected entry nothing
+had been installed, so `${GASCITY_SOURCE_REF:?}` exited 1 and turned
+every manual run red.
+
+The step now carries the condition. A new test parses the job and
+requires every step after "Decide manual subset" to carry the run_gate
+clause as a top-level `&&` conjunct.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .github/workflows/supported-pack-nightly.yml |  1 +
+ tests/test_gascity_pack_inference_gate.py    | 31 ++++++++++++++++++++
+ 2 files changed, 32 insertions(+)
+
+diff --git a/.github/workflows/supported-pack-nightly.yml b/.github/workflows/supported-pack-nightly.yml
+index 90cff79d..5cde193c 100644
+--- a/.github/workflows/supported-pack-nightly.yml
++++ b/.github/workflows/supported-pack-nightly.yml
+@@ -261,6 +261,7 @@ jobs:
+       # only that commit, shallow, so the disk budget gcp-m0ei bought back
+       # stays bought.
+       - name: Check out the matching gascity source
++        if: steps.subset.outputs.run_gate == 'true'
+         run: |
+           gascity_src="${RUNNER_TEMP}/gascity-src"
+           git init --quiet "$gascity_src"
+diff --git a/tests/test_gascity_pack_inference_gate.py b/tests/test_gascity_pack_inference_gate.py
+index 9db31033..fc1b6b91 100644
+--- a/tests/test_gascity_pack_inference_gate.py
++++ b/tests/test_gascity_pack_inference_gate.py
+@@ -772,6 +772,37 @@ def test_manifold_dependent_steps_are_gated_on_the_detection_step() -> None:
+         assert "manifold" not in str(step.get("run", "")), step.get("name")
+ 
+ 
++def test_nightly_steps_after_the_subset_decision_all_honour_it() -> None:
++    # A manual dispatch for one pack still starts every matrix entry, and the
++    # entries it did not select are meant to skip every step on run_gate. One
++    # step without the condition runs anyway in a job that installed nothing:
++    # the matching-source checkout did, and its `${GASCITY_SOURCE_REF:?}` turned
++    # every unselected entry of a manual run red. Parsed rather than grepped,
++    # and the clause has to be a top-level `&&` conjunct with no `||` beside
++    # it, so an expression that runs the step without run_gate fails here.
++    import yaml  # installed by every job that runs this file
++
++    run_gate = "steps.subset.outputs.run_gate == 'true'"
++    nightly = yaml.safe_load(
++        (
++            gascity_pack_inference_gate.REPO_ROOT
++            / ".github"
++            / "workflows"
++            / "supported-pack-nightly.yml"
++        ).read_text(encoding="utf-8")
++    )
++    steps = nightly["jobs"]["inference"]["steps"]
++    names = [step.get("name") for step in steps]
++    decide = names.index("Decide manual subset")
++    assert steps[decide]["id"] == "subset"
++    after = steps[decide + 1 :]
++    assert after, "no steps follow the subset decision -- the sweep below would vacuously pass"
++    for step in after:
++        condition = " ".join(str(step.get("if", "")).split())
++        assert "||" not in condition, step.get("name")
++        assert run_gate in [clause.strip() for clause in condition.split("&&")], step.get("name")
++
++
+ def test_manifold_validation_step_bodies_are_unweakened() -> None:
+     # The mitigation changes only WHETHER the validation runs, never WHAT it
+     # checks. If configuration is ever supplied, the same eight assertions must
+-- 
+2.54.0 (Apple Git-157)
+

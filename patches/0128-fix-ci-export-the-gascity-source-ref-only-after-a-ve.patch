@@ -1,0 +1,119 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sat, 10 Oct 2026 16:23:10 -0400
+Subject: [PATCH 128/148] fix(ci): export the gascity source ref only after a
+ verified install (gcp-fooz4)
+
+The restack adapted patch 0075 so the installer also exports
+GASCITY_SOURCE_REF for upstream's matching-source checkout, but it wrote
+the ref before the download. A checksum mismatch or an edge that would not
+hold still then failed the install with GASCITY_SOURCE_REF already in
+GITHUB_ENV, breaking 0090's invariant that a failed install exports
+nothing. The ref is now written next to GC_BIN, after the binary is
+verified and installed.
+
+The success-path test compares the env file's lines order-free (both
+exports, nothing else); the failure-path tests still require an empty
+env file.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .github/scripts/install-gascity-archive.sh |  7 ++++---
+ tests/test_install_gascity_archive.py      | 24 ++++++++++++++--------
+ 2 files changed, 19 insertions(+), 12 deletions(-)
+
+diff --git a/.github/scripts/install-gascity-archive.sh b/.github/scripts/install-gascity-archive.sh
+index 584503d6..b19502b7 100755
+--- a/.github/scripts/install-gascity-archive.sh
++++ b/.github/scripts/install-gascity-archive.sh
+@@ -37,7 +37,9 @@
+ # --cache installs under RUNNER_TOOL_CACHE and appends the bin directory to
+ # GITHUB_PATH, as the sibling installers do. Either way the resolved binary path
+ # is exported as GC_BIN via GITHUB_ENV so workflow steps can name it without
+-# going through `go env GOPATH`.
++# going through `go env GOPATH`, alongside GASCITY_SOURCE_REF. Both are written
++# only after a verified install: a failed install exports nothing, so a later
++# step cannot pick up a ref for a gc that was never installed.
+ 
+ set -euo pipefail
+ 
+@@ -194,8 +196,6 @@ case "$ref" in
+     ;;
+ esac
+ 
+-export_source_ref "$tag"
+-
+ archive="gascity_${version}_${platform_tuple}.tar.gz"
+ download_base="https://github.com/${REPO}/releases/download/${tag}"
+ 
+@@ -361,5 +361,6 @@ if $use_cache && [[ -n "${GITHUB_PATH:-}" ]]; then
+   echo "$bin_dir" >> "$GITHUB_PATH"
+ fi
+ export_gc_bin "$target"
++export_source_ref "$tag"
+ 
+ "$target" version
+diff --git a/tests/test_install_gascity_archive.py b/tests/test_install_gascity_archive.py
+index 706f5e99..6450da51 100644
+--- a/tests/test_install_gascity_archive.py
++++ b/tests/test_install_gascity_archive.py
+@@ -203,7 +203,10 @@ def run_installer(tmp_path, release: Path, cache: Path | None = None, **scenario
+     requests = (release / "requests.log").read_text().splitlines() if (release / "requests.log").exists() else []
+     return completed, {
+         "cache": cache,
+-        "gc_bin": github_env.read_text().strip(),
++        # The whole GITHUB_ENV file, not one variable of it: a failed install
++        # must leave it empty, and a successful one writes exactly GC_BIN and
++        # GASCITY_SOURCE_REF.
++        "github_env": github_env.read_text().strip(),
+         "github_path": github_path.read_text().strip(),
+         "archive_requests": [url for url in requests if url.endswith(".tar.gz")],
+     }
+@@ -220,8 +223,11 @@ def test_installer_verifies_and_installs_the_published_archive(tmp_path, release
+     assert len(result["archive_requests"]) == 1
+     # Keyed on the verified checksum, so a later `edge` cannot be served from
+     # this entry.
+-    assert sha_of(release, 0)[:16] in result["gc_bin"]
+-    assert result["gc_bin"] == f"GC_BIN={result['github_path']}/gc"
++    assert sha_of(release, 0)[:16] in result["github_env"]
++    # Order-free, but sorted rather than a set so a doubled export still fails.
++    assert sorted(result["github_env"].splitlines()) == sorted(
++        [f"GC_BIN={result['github_path']}/gc", "GASCITY_SOURCE_REF=edge"]
++    )
+     assert Path(result["github_path"], "gc").is_file()
+ 
+ 
+@@ -260,8 +266,8 @@ def test_installer_absorbs_an_edge_rotation_between_checksum_and_download(tmp_pa
+     assert sha_of(release, 1) in completed.stderr
+     # The cache entry is keyed on what was verified and installed (build 1),
+     # never on the checksum that was resolved first.
+-    assert sha_of(release, 1)[:16] in result["gc_bin"]
+-    assert sha_of(release, 0)[:16] not in result["gc_bin"]
++    assert sha_of(release, 1)[:16] in result["github_env"]
++    assert sha_of(release, 0)[:16] not in result["github_env"]
+ 
+ 
+ def test_installer_bounds_its_retries_when_edge_will_not_hold_still(tmp_path, release):
+@@ -277,9 +283,9 @@ def test_installer_bounds_its_retries_when_edge_will_not_hold_still(tmp_path, re
+     assert "rotated on every one of 3 download attempts" in completed.stderr
+     assert "retrying against the new checksum (attempt 2/3)" in completed.stderr
+     assert "retrying against the new checksum (attempt 3/3)" in completed.stderr
+-    # Nothing unverified is installed, and no GC_BIN is exported for a later
+-    # step to trip over.
+-    assert result["gc_bin"] == ""
++    # Nothing unverified is installed, and nothing is exported -- no GC_BIN,
++    # no GASCITY_SOURCE_REF -- for a later step to trip over.
++    assert result["github_env"] == ""
+     assert list(result["cache"].rglob("gc")) == []
+ 
+ 
+@@ -294,5 +300,5 @@ def test_installer_still_fails_loudly_on_a_real_checksum_mismatch(tmp_path, rele
+     assert f"expected: {sha_of(release, 0)}" in completed.stderr
+     assert "re-resolves unchanged" in completed.stderr
+     assert len(result["archive_requests"]) == 1
+-    assert result["gc_bin"] == ""
++    assert result["github_env"] == ""
+     assert list(result["cache"].rglob("gc")) == []
+-- 
+2.54.0 (Apple Git-157)
+

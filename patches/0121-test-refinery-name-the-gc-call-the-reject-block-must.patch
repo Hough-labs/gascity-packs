@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 8 Oct 2026 15:18:22 -0400
+Subject: [PATCH 121/148] test(refinery): name the gc call the reject block
+ must not make, not a bare bd (gcp-s7j4.4)
+
+tests/test_no_bare_bd_commands.py flags a bare bd show in any tracked file. The warn sub-run of case_reject_block greps the stub's journal for the read, and the journal line is a gc call, so the pattern is gc bd show.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ gastown/tests/test_refinery_acceptance_wiring.sh | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/gastown/tests/test_refinery_acceptance_wiring.sh b/gastown/tests/test_refinery_acceptance_wiring.sh
+index a8d10eab..9df9923e 100755
+--- a/gastown/tests/test_refinery_acceptance_wiring.sh
++++ b/gastown/tests/test_refinery_acceptance_wiring.sh
+@@ -844,7 +844,7 @@ case_reject_block() {
+     run_rej warn GC_STUB_ASSIGNEES="$SECOND_ID="
+     assert_eq "a. block status" 0 "$?"
+     assert_eq "a. stdout" "" "$(cat "$T/out")"
+-    ! grep -q 'bd show' "$T/gc.log" || fail "a. a warn run read a bead"
++    ! grep -q 'gc bd show' "$T/gc.log" || fail "a. a warn run read a bead"
+     assert_eq "a. the manifest" "$before" "$(cksum <"$MANIFEST")"
+     run_rej LITERAL GC_STUB_ASSIGNEES="$SECOND_ID="
+     assert_eq "a. unrendered: block status" 0 "$?"
+-- 
+2.54.0 (Apple Git-157)
+

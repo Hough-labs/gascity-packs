@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sun, 27 Sep 2026 17:32:55 -0400
+Subject: [PATCH 084/148] test(bare-bd): allowlist the handoff-stamp test's
+ stub call-log grep (gcp-et7g.1)
+
+test_polecat_handoff_stamp.sh:193 greps the stub's argv log for
+'^bd update ' and carries the gc-bd-argv-tail marker, but the scanner
+also needs the exact line in GC_BD_ARGV_TAIL_ALLOWLIST. Add it.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ tests/test_no_bare_bd_commands.py | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/tests/test_no_bare_bd_commands.py b/tests/test_no_bare_bd_commands.py
+index bdff0283..25889fad 100644
+--- a/tests/test_no_bare_bd_commands.py
++++ b/tests/test_no_bare_bd_commands.py
+@@ -169,6 +169,12 @@ GC_BD_ARGV_TAIL_ALLOWLIST: dict[Path, set[str]] = {
+         'fail "producer must write the whole signal in a single bd update"'
+         " # gc-bd-argv-tail: failure message, not an invocation",
+     },
++    Path("gastown/tests/test_polecat_handoff_stamp.sh"): {
++        (
++            "grep -E '^bd update ' \"$TMP/calls.log\" || true"
++            " # gc-bd-argv-tail: stub call log, not an invocation"
++        ),
++    },
+     Path("gastown/tests/test_polecat_live_owner_guard.sh"): {
+         '"bd show") # gc-bd-argv-tail: case label matching the fake gc\'s argv tail',
+         '"bd update") exit "${GC_UPDATE_EXIT:-0}" ;;'
+-- 
+2.54.0 (Apple Git-157)
+

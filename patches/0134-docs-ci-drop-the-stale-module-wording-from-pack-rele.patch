@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sat, 10 Oct 2026 16:39:42 -0400
+Subject: [PATCH 134/148] docs(ci): drop the stale "module" wording from
+ pack-release-compatibility's gascity_ref (gcp-fooz4)
+
+gc is installed from the release archive, and `main` now means the
+rolling edge pre-release rather than a Go module query. The listed
+values were already right.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .github/workflows/pack-release-compatibility.yml | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/.github/workflows/pack-release-compatibility.yml b/.github/workflows/pack-release-compatibility.yml
+index b3e3dcd7..ab6ea621 100644
+--- a/.github/workflows/pack-release-compatibility.yml
++++ b/.github/workflows/pack-release-compatibility.yml
+@@ -22,7 +22,7 @@ on:
+   workflow_dispatch:
+     inputs:
+       gascity_ref:
+-        description: "Gas City module ref/version to install, such as latest, main, or v0.3.0."
++        description: "Gas City ref/version to install, such as latest, main, or v0.3.0."
+         required: false
+         default: latest
+       registry_ref:
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,870 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sun, 27 Sep 2026 18:09:29 -0400
+Subject: [PATCH 086/148] fix(formulas): declare [requires] formula_compiler
+ instead of contract graph.v2 (gcp-hc5z.1)
+
+gc doctor's formula-requirements check warns on every formula that still
+uses the deprecated contract = "graph.v2" alias, which put 33 warnings on
+every deacon patrol from this pack. Hunter ruled on gcp-hc5z to fix it
+rather than wait on upstream, whose main has not migrated.
+
+All 34 gascity/formulas/*.formula.toml files drop the contract line and
+declare the table the gastown pack already uses:
+
+    [requires]
+    formula_compiler = ">=2.0.0"
+
+The table goes immediately before each file's first table header, not
+where the contract line was: in files like build-basic the contract line
+is followed by top-level extends and target_required, and a header above
+them would have moved those keys into [requires]. Each file was checked
+with tomllib: the parsed document equals the original minus contract plus
+the requires table. Every file declares it directly, without relying on
+extends.
+
+gc treats the two forms the same: both yield a >=2.0.0 compiler
+constraint, and the compiler stamps gc.kind=workflow and
+gc.formula_contract=graph.v2 on the root either way, so runtime root
+checks are unchanged.
+
+Tests: the four assertions that read gascity-pack formulas now require no
+contract key and an exact requires table. resolve_formula and
+resolve_formula_from_dirs merge contract and requires the same way (the
+child's value wins, otherwise the first parent that has one). They set a
+key only when some formula in the chain declares it, where before they
+always set contract, even to "". A new test requires every pack formula
+to parse with requires == {"formula_compiler": ">=2.0.0"} exactly, and
+that exact comparison is what would catch a misplaced header.
+Red-checked: it fails for all 34 files at origin/integration. The
+assertions against third-party packs and the user-override fixtures still
+use the alias and stay unchanged.
+
+Docs: README.md, REQUIREMENTS.md and formulas/REQUIREMENTS.md now state
+the [requires] rule.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ gascity/README.md                             | 11 ++--
+ gascity/REQUIREMENTS.md                       |  4 +-
+ gascity/formulas/REQUIREMENTS.md              |  2 +-
+ gascity/formulas/build-base.formula.toml      |  4 +-
+ .../formulas/build-basic-review.formula.toml  |  4 +-
+ gascity/formulas/build-basic.formula.toml     |  4 +-
+ .../build-from-convoy-base.formula.toml       |  4 +-
+ .../formulas/build-from-convoy.formula.toml   |  4 +-
+ .../build-from-decompose-base.formula.toml    |  4 +-
+ .../build-from-decompose.formula.toml         |  4 +-
+ .../build-from-plan-base.formula.toml         |  4 +-
+ gascity/formulas/build-from-plan.formula.toml |  4 +-
+ .../build-from-requirements-base.formula.toml |  4 +-
+ .../build-from-requirements.formula.toml      |  4 +-
+ .../build-from-review-base.formula.toml       |  4 +-
+ .../formulas/build-from-review.formula.toml   |  4 +-
+ .../formulas/code-review-base.formula.toml    |  4 +-
+ .../formulas/decomposition-base.formula.toml  |  4 +-
+ gascity/formulas/design-review.formula.toml   |  4 +-
+ gascity/formulas/do-work-item.formula.toml    |  4 +-
+ gascity/formulas/do-work.formula.toml         |  4 +-
+ gascity/formulas/fix-convoy.formula.toml      |  4 +-
+ gascity/formulas/fix-loop-base.formula.toml   |  4 +-
+ gascity/formulas/gap-analysis.formula.toml    |  4 +-
+ .../github-issue-fix-base.formula.toml        |  4 +-
+ ...-issue-fix-design-review-work.formula.toml |  4 +-
+ .../formulas/github-issue-fix.formula.toml    |  4 +-
+ .../github-issue-triage-base.formula.toml     |  4 +-
+ .../formulas/github-issue-triage.formula.toml |  4 +-
+ .../formulas/github-pr-review.formula.toml    |  4 +-
+ gascity/formulas/implement.formula.toml       |  4 +-
+ .../formulas/implementation-base.formula.toml |  4 +-
+ .../implementation-item-base.formula.toml     |  4 +-
+ gascity/formulas/planning-base.formula.toml   |  4 +-
+ gascity/formulas/publish.formula.toml         |  4 +-
+ gascity/formulas/review.formula.toml          |  4 +-
+ .../same-session-implement.formula.toml       |  4 +-
+ gascity/tests/test_formula_assets.py          | 51 +++++++++++++++----
+ 38 files changed, 152 insertions(+), 52 deletions(-)
+
+diff --git a/gascity/README.md b/gascity/README.md
+index 522ae7c9..56e9fe5f 100644
+--- a/gascity/README.md
++++ b/gascity/README.md
+@@ -168,11 +168,12 @@ records the entrypoint it started from, and refuses to finalize as a pass when
+ review or repair is still blocked — see "Choosing an entrypoint" above for
+ which one matches the artifacts you have.
+ 
+-Every formula in this pack uses `contract = "graph.v2"`. Targeted formulas take
+-the core-injected reserved convoy target; they do not declare `issue`,
+-`bead_id`, or `convoy_id` variables. `drain_policy=separate` is the standalone
+-default. Use `same-session` only when preserving one shared worktree and
+-conversation is explicitly desired and core shared drain support is available.
++Every formula in this pack declares `[requires] formula_compiler = ">=2.0.0"`.
++Targeted formulas take the core-injected reserved convoy target; they do not
++declare `issue`, `bead_id`, or `convoy_id` variables. `drain_policy=separate` is
++the standalone default. Use `same-session` only when preserving one shared
++worktree and conversation is explicitly desired and core shared drain support
++is available.
+ 
+ The pack ships its city-scoped claim command alongside formulas, plus
+ providerless rig role agents under `gascity/roles`. Standalone use requires
+diff --git a/gascity/REQUIREMENTS.md b/gascity/REQUIREMENTS.md
+index dd6eb1b9..abf3ba51 100644
+--- a/gascity/REQUIREMENTS.md
++++ b/gascity/REQUIREMENTS.md
+@@ -105,8 +105,8 @@ top-level stages only as anchored extensions:
+   delegates to the next suffix through an inherited handoff step.
+ - `build-from-*` formulas are cataloged default Gas City wrappers around the
+   matching continuation suffix bases.
+-- All formulas use `contract = "graph.v2"` and do not redeclare reserved
+-  runtime variables: `issue`, `bead_id`, or `convoy_id`.
++- All formulas declare `[requires] formula_compiler = ">=2.0.0"` and do not
++  redeclare reserved runtime variables: `issue`, `bead_id`, or `convoy_id`.
+ - Raw-framework subagents are converted to Gas City fanouts, drains, or formula
+   steps. The base pack must not preserve subagent functionality as opaque
+   provider-native dispatch.
+diff --git a/gascity/formulas/REQUIREMENTS.md b/gascity/formulas/REQUIREMENTS.md
+index 76aa8292..126e7656 100644
+--- a/gascity/formulas/REQUIREMENTS.md
++++ b/gascity/formulas/REQUIREMENTS.md
+@@ -45,7 +45,7 @@ For every formula change:
+ 
+ ## Global Invariants
+ 
+-- Every formula uses `contract = "graph.v2"`.
++- Every formula declares `[requires] formula_compiler = ">=2.0.0"`.
+ - No formula declares reserved runtime vars `issue`, `bead_id`, or `convoy_id`.
+ - Cataloged formulas are user-runnable; internal/base/helper formulas are not
+   cataloged unless deliberately promoted.
+diff --git a/gascity/formulas/build-base.formula.toml b/gascity/formulas/build-base.formula.toml
+index 8f127676..03b83af5 100644
+--- a/gascity/formulas/build-base.formula.toml
++++ b/gascity/formulas/build-base.formula.toml
+@@ -27,10 +27,12 @@ Launch inputs:
+ """
+ formula = "build-base"
+ version = 1
+-contract = "graph.v2"
+ target_required = true
+ internal = true
+ 
++[requires]
++formula_compiler = ">=2.0.0"
++
+ [metadata.gc.methodology]
+ allowed_drain_policies = ["separate", "same-session"]
+ implementation_strategy = "drain"
+diff --git a/gascity/formulas/build-basic-review.formula.toml b/gascity/formulas/build-basic-review.formula.toml
+index fe16add5..a1e00789 100644
+--- a/gascity/formulas/build-basic-review.formula.toml
++++ b/gascity/formulas/build-basic-review.formula.toml
+@@ -8,7 +8,9 @@ synthesize into one fix loop.
+ formula = "build-basic-review"
+ type = "expansion"
+ version = 1
+-contract = "graph.v2"
++
++[requires]
++formula_compiler = ">=2.0.0"
+ 
+ [vars]
+ [vars.implementation_target]
+diff --git a/gascity/formulas/build-basic.formula.toml b/gascity/formulas/build-basic.formula.toml
+index ef885b18..56f79114 100644
+--- a/gascity/formulas/build-basic.formula.toml
++++ b/gascity/formulas/build-basic.formula.toml
+@@ -7,10 +7,12 @@ same full-lifecycle stage contract exposed by build-base.
+ """
+ formula = "build-basic"
+ version = 1
+-contract = "graph.v2"
+ extends = ["build-base"]
+ target_required = true
+ 
++[requires]
++formula_compiler = ">=2.0.0"
++
+ [catalog]
+ name = "build-basic"
+ description = "Run the default Gas City full-lifecycle build workflow from requirements through clean review and optional publish."
+diff --git a/gascity/formulas/build-from-convoy-base.formula.toml b/gascity/formulas/build-from-convoy-base.formula.toml
+index 8248d260..37e51902 100644
+--- a/gascity/formulas/build-from-convoy-base.formula.toml
++++ b/gascity/formulas/build-from-convoy-base.formula.toml
+@@ -7,11 +7,13 @@ to `build-from-review-base` through the inherited `prepare-review` step.
+ """
+ formula = "build-from-convoy-base"
+ version = 1
+-contract = "graph.v2"
+ extends = ["build-from-review-base"]
+ target_required = false
+ internal = true
+ 
++[requires]
++formula_compiler = ">=2.0.0"
++
+ [metadata.gc.methodology]
+ allowed_drain_policies = ["separate", "same-session"]
+ implementation_strategy = "drain"
+diff --git a/gascity/formulas/build-from-convoy.formula.toml b/gascity/formulas/build-from-convoy.formula.toml
+index 62b37239..34867905 100644
+--- a/gascity/formulas/build-from-convoy.formula.toml
++++ b/gascity/formulas/build-from-convoy.formula.toml
+@@ -6,10 +6,12 @@ Gas City methodology defaults.
+ """
+ formula = "build-from-convoy"
+ version = 1
+-contract = "graph.v2"
+ extends = ["build-from-convoy-base"]
+ target_required = false
+ 
++[requires]
++formula_compiler = ">=2.0.0"
++
+ [catalog]
+ name = "build-from-convoy"
+ description = "Continue a build from an implementation convoy through implementation, review, finalization, and optional publish."
+diff --git a/gascity/formulas/build-from-decompose-base.formula.toml b/gascity/formulas/build-from-decompose-base.formula.toml
+index b7c23a66..262b274e 100644
+--- a/gascity/formulas/build-from-decompose-base.formula.toml
++++ b/gascity/formulas/build-from-decompose-base.formula.toml
+@@ -29,11 +29,13 @@ Launch inputs:
+ """
+ formula = "build-from-decompose-base"
+ version = 1
+-contract = "graph.v2"
+ extends = ["build-from-convoy-base"]
+ target_required = false
+ internal = true
+ 
++[requires]
++formula_compiler = ">=2.0.0"
++
+ [metadata.gc.methodology]
+ allowed_drain_policies = ["separate", "same-session"]
+ implementation_strategy = "drain"
+diff --git a/gascity/formulas/build-from-decompose.formula.toml b/gascity/formulas/build-from-decompose.formula.toml
+index c44e228a..a4579129 100644
+--- a/gascity/formulas/build-from-decompose.formula.toml
++++ b/gascity/formulas/build-from-decompose.formula.toml
+@@ -8,10 +8,12 @@ selectors, routes, drains, or review expansions they need.
+ """
+ formula = "build-from-decompose"
+ version = 1
+-contract = "graph.v2"
+ extends = ["build-from-decompose-base"]
+ target_required = false
+ 
++[requires]
++formula_compiler = ">=2.0.0"
++
+ [catalog]
+ name = "build-from-decompose"
+ description = "Continue a build from approved requirements and plan artifacts through decompose, implementation, review, and optional publish."
+diff --git a/gascity/formulas/build-from-plan-base.formula.toml b/gascity/formulas/build-from-plan-base.formula.toml
+index 0a83f3dc..c27e63b4 100644
+--- a/gascity/formulas/build-from-plan-base.formula.toml
++++ b/gascity/formulas/build-from-plan-base.formula.toml
+@@ -7,11 +7,13 @@ implementation plan and plan-review verdict, then hands off to
+ """
+ formula = "build-from-plan-base"
+ version = 1
+-contract = "graph.v2"
+ extends = ["build-from-decompose-base"]
+ target_required = false
+ internal = true
+ 
++[requires]
++formula_compiler = ">=2.0.0"
++
+ [metadata.gc.methodology]
+ allowed_drain_policies = ["separate", "same-session"]
+ implementation_strategy = "drain"
+diff --git a/gascity/formulas/build-from-plan.formula.toml b/gascity/formulas/build-from-plan.formula.toml
+index 5720974c..3759c8c2 100644
+--- a/gascity/formulas/build-from-plan.formula.toml
++++ b/gascity/formulas/build-from-plan.formula.toml
+@@ -6,10 +6,12 @@ City methodology defaults.
+ """
+ formula = "build-from-plan"
+ version = 1
+-contract = "graph.v2"
+ extends = ["build-from-plan-base"]
+ target_required = false
+ 
++[requires]
++formula_compiler = ">=2.0.0"
++
+ [catalog]
+ name = "build-from-plan"
+ description = "Continue a build from approved requirements through planning, decomposition, implementation, review, and optional publish."
+diff --git a/gascity/formulas/build-from-requirements-base.formula.toml b/gascity/formulas/build-from-requirements-base.formula.toml
+index d41d039a..643b86f4 100644
+--- a/gascity/formulas/build-from-requirements-base.formula.toml
++++ b/gascity/formulas/build-from-requirements-base.formula.toml
+@@ -7,11 +7,13 @@ inherited `prepare-plan` step.
+ """
+ formula = "build-from-requirements-base"
+ version = 1
+-contract = "graph.v2"
+ extends = ["build-from-plan-base"]
+ target_required = false
+ internal = true
+ 
++[requires]
++formula_compiler = ">=2.0.0"
++
+ [metadata.gc.methodology]
+ allowed_drain_policies = ["separate", "same-session"]
+ implementation_strategy = "drain"
+diff --git a/gascity/formulas/build-from-requirements.formula.toml b/gascity/formulas/build-from-requirements.formula.toml
+index 38b3af3a..bd8a765d 100644
+--- a/gascity/formulas/build-from-requirements.formula.toml
++++ b/gascity/formulas/build-from-requirements.formula.toml
+@@ -6,10 +6,12 @@ built-in Gas City methodology defaults.
+ """
+ formula = "build-from-requirements"
+ version = 1
+-contract = "graph.v2"
+ extends = ["build-from-requirements-base"]
+ target_required = false
+ 
++[requires]
++formula_compiler = ">=2.0.0"
++
+ [catalog]
+ name = "build-from-requirements"
+ description = "Run the nested Gas City suffix chain from requirements through optional publish."
+diff --git a/gascity/formulas/build-from-review-base.formula.toml b/gascity/formulas/build-from-review-base.formula.toml
+index 4973c1bb..c5a736d0 100644
+--- a/gascity/formulas/build-from-review-base.formula.toml
++++ b/gascity/formulas/build-from-review-base.formula.toml
+@@ -8,10 +8,12 @@ to `prepare-review` after producing implementation evidence.
+ """
+ formula = "build-from-review-base"
+ version = 1
+-contract = "graph.v2"
+ target_required = false
+ internal = true
+ 
++[requires]
++formula_compiler = ">=2.0.0"
++
+ [metadata.gc.methodology]
+ allowed_drain_policies = ["separate", "same-session"]
+ implementation_strategy = "drain"
+diff --git a/gascity/formulas/build-from-review.formula.toml b/gascity/formulas/build-from-review.formula.toml
+index 56a54603..2af4ac84 100644
+--- a/gascity/formulas/build-from-review.formula.toml
++++ b/gascity/formulas/build-from-review.formula.toml
+@@ -6,10 +6,12 @@ Gas City methodology defaults.
+ """
+ formula = "build-from-review"
+ version = 1
+-contract = "graph.v2"
+ extends = ["build-from-review-base"]
+ target_required = false
+ 
++[requires]
++formula_compiler = ">=2.0.0"
++
+ [catalog]
+ name = "build-from-review"
+ description = "Continue a build from implementation evidence through review, finalization, and optional publish."
+diff --git a/gascity/formulas/code-review-base.formula.toml b/gascity/formulas/code-review-base.formula.toml
+index 2e30e731..0ecd4b33 100644
+--- a/gascity/formulas/code-review-base.formula.toml
++++ b/gascity/formulas/code-review-base.formula.toml
+@@ -7,11 +7,13 @@ scoring while entrypoint adapters keep GitHub/comment lifecycle ownership.
+ """
+ formula = "code-review-base"
+ version = 1
+-contract = "graph.v2"
+ target_required = false
+ internal = true
+ mode = "report"
+ 
++[requires]
++formula_compiler = ">=2.0.0"
++
+ [vars]
+ [vars.context_path]
+ description = "Optional context bundle path."
+diff --git a/gascity/formulas/decomposition-base.formula.toml b/gascity/formulas/decomposition-base.formula.toml
+index f13cc464..53edbbd2 100644
+--- a/gascity/formulas/decomposition-base.formula.toml
++++ b/gascity/formulas/decomposition-base.formula.toml
+@@ -7,10 +7,12 @@ native output uses stories, cards, or another task shape.
+ """
+ formula = "decomposition-base"
+ version = 1
+-contract = "graph.v2"
+ target_required = false
+ internal = true
+ 
++[requires]
++formula_compiler = ">=2.0.0"
++
+ [vars]
+ [vars.context_path]
+ description = "Optional source context bundle path."
+diff --git a/gascity/formulas/design-review.formula.toml b/gascity/formulas/design-review.formula.toml
+index 3eeb60a9..788dbb19 100644
+--- a/gascity/formulas/design-review.formula.toml
++++ b/gascity/formulas/design-review.formula.toml
+@@ -8,9 +8,11 @@ graphs while preserving launch and finalization semantics.
+ """
+ formula = "design-review"
+ version = 1
+-contract = "graph.v2"
+ target_required = true
+ 
++[requires]
++formula_compiler = ">=2.0.0"
++
+ [catalog]
+ name = "design-review"
+ description = "Review and refine a design document until it is approved or blocked."
+diff --git a/gascity/formulas/do-work-item.formula.toml b/gascity/formulas/do-work-item.formula.toml
+index 94f5f171..bf60f525 100644
+--- a/gascity/formulas/do-work-item.formula.toml
++++ b/gascity/formulas/do-work-item.formula.toml
+@@ -8,12 +8,14 @@ Launch inputs:
+ """
+ formula = "do-work-item"
+ version = 1
+-contract = "graph.v2"
+ extends = ["implementation-item-base"]
+ target_required = true
+ internal = true
+ single_lane = true
+ 
++[requires]
++formula_compiler = ">=2.0.0"
++
+ [vars]
+ [vars.context_path]
+ description = "Optional context bundle path."
+diff --git a/gascity/formulas/do-work.formula.toml b/gascity/formulas/do-work.formula.toml
+index cdda08d4..f2d799f3 100644
+--- a/gascity/formulas/do-work.formula.toml
++++ b/gascity/formulas/do-work.formula.toml
+@@ -10,10 +10,12 @@ Launch inputs:
+ """
+ formula = "do-work"
+ version = 1
+-contract = "graph.v2"
+ extends = ["implementation-base"]
+ target_required = true
+ 
++[requires]
++formula_compiler = ">=2.0.0"
++
+ [vars]
+ [vars.context_path]
+ description = "Optional context bundle path."
+diff --git a/gascity/formulas/fix-convoy.formula.toml b/gascity/formulas/fix-convoy.formula.toml
+index cc9e14a4..487cfa90 100644
+--- a/gascity/formulas/fix-convoy.formula.toml
++++ b/gascity/formulas/fix-convoy.formula.toml
+@@ -8,10 +8,12 @@ Launch inputs:
+ """
+ formula = "fix-convoy"
+ version = 1
+-contract = "graph.v2"
+ target_required = true
+ internal = true
+ 
++[requires]
++formula_compiler = ">=2.0.0"
++
+ [vars]
+ [vars.report_path]
+ description = "Failed gap-analysis or review report path."
+diff --git a/gascity/formulas/fix-loop-base.formula.toml b/gascity/formulas/fix-loop-base.formula.toml
+index 1edde9d2..06f97ea3 100644
+--- a/gascity/formulas/fix-loop-base.formula.toml
++++ b/gascity/formulas/fix-loop-base.formula.toml
+@@ -8,10 +8,12 @@ discipline.
+ """
+ formula = "fix-loop-base"
+ version = 1
+-contract = "graph.v2"
+ target_required = false
+ internal = true
+ 
++[requires]
++formula_compiler = ">=2.0.0"
++
+ [vars]
+ [vars.context_path]
+ description = "Optional context bundle path."
+diff --git a/gascity/formulas/gap-analysis.formula.toml b/gascity/formulas/gap-analysis.formula.toml
+index f7684a93..098dc02c 100644
+--- a/gascity/formulas/gap-analysis.formula.toml
++++ b/gascity/formulas/gap-analysis.formula.toml
+@@ -8,10 +8,12 @@ Launch inputs:
+ """
+ formula = "gap-analysis"
+ version = 1
+-contract = "graph.v2"
+ target_required = false
+ mode = "report"
+ 
++[requires]
++formula_compiler = ">=2.0.0"
++
+ [catalog]
+ name = "gap-analysis"
+ description = "Write a report comparing implementation artifacts to approved requirements and design."
+diff --git a/gascity/formulas/github-issue-fix-base.formula.toml b/gascity/formulas/github-issue-fix-base.formula.toml
+index 251fa73a..86dcbc32 100644
+--- a/gascity/formulas/github-issue-fix-base.formula.toml
++++ b/gascity/formulas/github-issue-fix-base.formula.toml
+@@ -27,9 +27,11 @@ Launch inputs:
+ """
+ formula = "github-issue-fix-base"
+ version = 1
+-contract = "graph.v2"
+ target_required = false
+ 
++[requires]
++formula_compiler = ">=2.0.0"
++
+ [vars]
+ [vars.github_issue_url]
+ description = "Full GitHub issue URL: https://github.com/<owner>/<repo>/issues/<number>."
+diff --git a/gascity/formulas/github-issue-fix-design-review-work.formula.toml b/gascity/formulas/github-issue-fix-design-review-work.formula.toml
+index af2abd7c..32ae6a5e 100644
+--- a/gascity/formulas/github-issue-fix-design-review-work.formula.toml
++++ b/gascity/formulas/github-issue-fix-design-review-work.formula.toml
+@@ -10,7 +10,9 @@ contract for downstream bead creation.
+ formula = "github-issue-fix-design-review-work"
+ type = "expansion"
+ version = 1
+-contract = "graph.v2"
++
++[requires]
++formula_compiler = ">=2.0.0"
+ 
+ [vars.mode]
+ description = "Issue-fix front-half mode, recorded in artifacts."
+diff --git a/gascity/formulas/github-issue-fix.formula.toml b/gascity/formulas/github-issue-fix.formula.toml
+index 94799863..48f1b61a 100644
+--- a/gascity/formulas/github-issue-fix.formula.toml
++++ b/gascity/formulas/github-issue-fix.formula.toml
+@@ -18,9 +18,11 @@ Launch inputs:
+ formula = "github-issue-fix"
+ extends = ["github-issue-fix-base"]
+ version = 1
+-contract = "graph.v2"
+ target_required = false
+ 
++[requires]
++formula_compiler = ">=2.0.0"
++
+ [catalog]
+ name = "github-issue-fix"
+ description = "Fix a GitHub issue through triage, planning, build, review, and optional PR publication."
+diff --git a/gascity/formulas/github-issue-triage-base.formula.toml b/gascity/formulas/github-issue-triage-base.formula.toml
+index dffb9a0b..2611c20f 100644
+--- a/gascity/formulas/github-issue-triage-base.formula.toml
++++ b/gascity/formulas/github-issue-triage-base.formula.toml
+@@ -17,9 +17,11 @@ Launch inputs:
+ """
+ formula = "github-issue-triage-base"
+ version = 1
+-contract = "graph.v2"
+ target_required = false
+ 
++[requires]
++formula_compiler = ">=2.0.0"
++
+ [vars]
+ [vars.github_issue_url]
+ description = "Full GitHub issue URL: https://github.com/<owner>/<repo>/issues/<number>."
+diff --git a/gascity/formulas/github-issue-triage.formula.toml b/gascity/formulas/github-issue-triage.formula.toml
+index eef2e4fd..c0b2d225 100644
+--- a/gascity/formulas/github-issue-triage.formula.toml
++++ b/gascity/formulas/github-issue-triage.formula.toml
+@@ -16,9 +16,11 @@ Launch inputs:
+ formula = "github-issue-triage"
+ extends = ["github-issue-triage-base"]
+ version = 1
+-contract = "graph.v2"
+ target_required = false
+ 
++[requires]
++formula_compiler = ">=2.0.0"
++
+ [catalog]
+ name = "github-issue-triage"
+ description = "Triage a GitHub issue through the GitHub issue adapter workflow."
+diff --git a/gascity/formulas/github-pr-review.formula.toml b/gascity/formulas/github-pr-review.formula.toml
+index 912e2c0f..52be0c63 100644
+--- a/gascity/formulas/github-pr-review.formula.toml
++++ b/gascity/formulas/github-pr-review.formula.toml
+@@ -19,9 +19,11 @@ Launch inputs:
+ """
+ formula = "github-pr-review"
+ version = 1
+-contract = "graph.v2"
+ target_required = false
+ 
++[requires]
++formula_compiler = ">=2.0.0"
++
+ [catalog]
+ name = "github-pr-review"
+ description = "Review a GitHub pull request through the GitHub PR adapter workflow."
+diff --git a/gascity/formulas/implement.formula.toml b/gascity/formulas/implement.formula.toml
+index 803b20a7..a4a4e2f1 100644
+--- a/gascity/formulas/implement.formula.toml
++++ b/gascity/formulas/implement.formula.toml
+@@ -16,10 +16,12 @@ Launch inputs:
+ """
+ formula = "implement"
+ version = 2
+-contract = "graph.v2"
+ target_required = true
+ sling_container_mode = "source"
+ 
++[requires]
++formula_compiler = ">=2.0.0"
++
+ [catalog]
+ name = "implement"
+ description = "Launch implementation for an approved convoy without the full build loop."
+diff --git a/gascity/formulas/implementation-base.formula.toml b/gascity/formulas/implementation-base.formula.toml
+index 52f2c0f0..0aa804cb 100644
+--- a/gascity/formulas/implementation-base.formula.toml
++++ b/gascity/formulas/implementation-base.formula.toml
+@@ -8,10 +8,12 @@ source-anchor close contract.
+ """
+ formula = "implementation-base"
+ version = 1
+-contract = "graph.v2"
+ target_required = true
+ internal = true
+ 
++[requires]
++formula_compiler = ">=2.0.0"
++
+ [vars]
+ [vars.context_path]
+ description = "Optional context bundle path."
+diff --git a/gascity/formulas/implementation-item-base.formula.toml b/gascity/formulas/implementation-item-base.formula.toml
+index 6ec013d6..9b999786 100644
+--- a/gascity/formulas/implementation-item-base.formula.toml
++++ b/gascity/formulas/implementation-item-base.formula.toml
+@@ -7,11 +7,13 @@ per-item procedure while keeping shared-drain sequencing stable.
+ """
+ formula = "implementation-item-base"
+ version = 1
+-contract = "graph.v2"
+ target_required = true
+ internal = true
+ single_lane = true
+ 
++[requires]
++formula_compiler = ">=2.0.0"
++
+ [vars]
+ [vars.context_path]
+ description = "Optional context bundle path."
+diff --git a/gascity/formulas/planning-base.formula.toml b/gascity/formulas/planning-base.formula.toml
+index c0727018..90a9dd72 100644
+--- a/gascity/formulas/planning-base.formula.toml
++++ b/gascity/formulas/planning-base.formula.toml
+@@ -8,10 +8,12 @@ artifact paths consumed by entrypoint adapters.
+ """
+ formula = "planning-base"
+ version = 1
+-contract = "graph.v2"
+ target_required = false
+ internal = true
+ 
++[requires]
++formula_compiler = ">=2.0.0"
++
+ [vars]
+ [vars.artifact_root]
+ description = "Build or adapter artifact root."
+diff --git a/gascity/formulas/publish.formula.toml b/gascity/formulas/publish.formula.toml
+index 84ce20ca..212481e7 100644
+--- a/gascity/formulas/publish.formula.toml
++++ b/gascity/formulas/publish.formula.toml
+@@ -8,10 +8,12 @@ Launch inputs:
+ """
+ formula = "publish"
+ version = 1
+-contract = "graph.v2"
+ target_required = false
+ internal = true
+ 
++[requires]
++formula_compiler = ">=2.0.0"
++
+ [vars]
+ [vars.final_report]
+ description = "Final report path to publish from."
+diff --git a/gascity/formulas/review.formula.toml b/gascity/formulas/review.formula.toml
+index 65a4735d..40ba74b9 100644
+--- a/gascity/formulas/review.formula.toml
++++ b/gascity/formulas/review.formula.toml
+@@ -10,11 +10,13 @@ Launch inputs:
+ """
+ formula = "review"
+ version = 1
+-contract = "graph.v2"
+ extends = ["code-review-base"]
+ target_required = false
+ mode = "report"
+ 
++[requires]
++formula_compiler = ">=2.0.0"
++
+ [catalog]
+ name = "review"
+ description = "Write an implementation review report for a diff, branch, or artifact set."
+diff --git a/gascity/formulas/same-session-implement.formula.toml b/gascity/formulas/same-session-implement.formula.toml
+index d89caf9f..8d0164ae 100644
+--- a/gascity/formulas/same-session-implement.formula.toml
++++ b/gascity/formulas/same-session-implement.formula.toml
+@@ -9,10 +9,12 @@ Launch inputs:
+ """
+ formula = "same-session-implement"
+ version = 1
+-contract = "graph.v2"
+ target_required = true
+ internal = true
+ 
++[requires]
++formula_compiler = ">=2.0.0"
++
+ [vars]
+ [vars.context_path]
+ description = "Optional context bundle path."
+diff --git a/gascity/tests/test_formula_assets.py b/gascity/tests/test_formula_assets.py
+index 08349dc1..8fee9382 100755
+--- a/gascity/tests/test_formula_assets.py
++++ b/gascity/tests/test_formula_assets.py
+@@ -521,6 +521,12 @@ def merged_steps(parent_steps: list[dict], child_steps: list[dict]) -> list[dict
+     return result
+ 
+ 
++# Compiler-requirement declarations a child inherits from its extends parents
++# when it does not declare its own: the [requires] table, and the deprecated
++# top-level contract = "graph.v2" alias that third-party packs still use.
++INHERITED_REQUIREMENT_KEYS = ("contract", "requires")
++
++
+ def resolve_formula(root: pathlib.Path, name: str, seen: tuple[str, ...] = ()) -> dict:
+     if name in seen:
+         raise AssertionError(f"circular formula extends: {' -> '.join((*seen, name))}")
+@@ -533,15 +539,18 @@ def resolve_formula(root: pathlib.Path, name: str, seen: tuple[str, ...] = ()) -
+         "formula": data["formula"],
+         "description": data.get("description", ""),
+         "version": data.get("version", 1),
+-        "contract": data.get("contract", ""),
+         "target_required": data.get("target_required"),
+         "vars": {},
+         "steps": [],
+     }
++    for key in INHERITED_REQUIREMENT_KEYS:
++        if key in data:
++            merged[key] = data[key]
+     for parent in parents:
+         parent_data = resolve_formula(root, parent, (*seen, name))
+-        if not merged["contract"]:
+-            merged["contract"] = parent_data.get("contract", "")
++        for key in INHERITED_REQUIREMENT_KEYS:
++            if key not in merged and key in parent_data:
++                merged[key] = parent_data[key]
+         if merged["target_required"] is None:
+             merged["target_required"] = parent_data.get("target_required")
+         merged["vars"].update(parent_data.get("vars", {}))
+@@ -566,15 +575,18 @@ def resolve_formula_from_dirs(formula_dirs: list[pathlib.Path], name: str, seen:
+         "formula": data["formula"],
+         "description": data.get("description", ""),
+         "version": data.get("version", 1),
+-        "contract": data.get("contract", ""),
+         "target_required": data.get("target_required"),
+         "vars": {},
+         "steps": [],
+     }
++    for key in INHERITED_REQUIREMENT_KEYS:
++        if key in data:
++            merged[key] = data[key]
+     for parent in parents:
+         parent_data = resolve_formula_from_dirs(formula_dirs, parent, (*seen, name))
+-        if not merged["contract"]:
+-            merged["contract"] = parent_data.get("contract", "")
++        for key in INHERITED_REQUIREMENT_KEYS:
++            if key not in merged and key in parent_data:
++                merged[key] = parent_data[key]
+         if merged["target_required"] is None:
+             merged["target_required"] = parent_data.get("target_required")
+         merged["vars"].update(parent_data.get("vars", {}))
+@@ -770,12 +782,28 @@ class FormulaAssetTests(unittest.TestCase):
+             data = tomllib.loads(path.read_text(encoding="utf-8"))
+             name = path.name.removesuffix(".formula.toml")
+             self.assertEqual(data["formula"], name)
+-            self.assertEqual(data["contract"], "graph.v2")
++            self.assertNotIn("contract", data)
++            self.assertEqual(data["requires"], {"formula_compiler": ">=2.0.0"})
+             var_names = set(data.get("vars", {}))
+             self.assertNotIn("issue", var_names)
+             self.assertNotIn("bead_id", var_names)
+             self.assertNotIn("convoy_id", var_names, f"{path.name} must not redeclare reserved convoy_id")
+ 
++    def test_every_formula_declares_compiler_requirement_table(self) -> None:
++        # gc doctor warns on the deprecated contract = "graph.v2" alias, so every
++        # formula declares the [requires] table instead, without leaning on
++        # extends. The exact comparison also catches a [requires] header placed
++        # above top-level keys, which would pull them into the table.
++        root = pathlib.Path(__file__).resolve().parents[1]
++        paths = sorted((root / "formulas").glob("*.formula.toml"))
++
++        self.assertTrue(paths)
++        for path in paths:
++            with self.subTest(formula=path.name):
++                data = tomllib.loads(path.read_text(encoding="utf-8"))
++                self.assertNotIn("contract", data)
++                self.assertEqual(data.get("requires"), {"formula_compiler": ">=2.0.0"})
++
+     def test_expected_role_agents_are_providerless(self) -> None:
+         root = pathlib.Path(__file__).resolve().parents[1]
+         roles_pack = tomllib.loads((root / "roles" / "pack.toml").read_text(encoding="utf-8"))
+@@ -1397,7 +1425,8 @@ class FormulaAssetTests(unittest.TestCase):
+             with self.subTest(formula=name):
+                 data = load_formula(root, name)
+                 self.assertEqual(data["formula"], name)
+-                self.assertEqual(data["contract"], "graph.v2")
++                self.assertNotIn("contract", data)
++                self.assertEqual(data["requires"], {"formula_compiler": ">=2.0.0"})
+                 self.assertTrue(data["internal"])
+                 self.assertNotIn("catalog", data)
+                 self.assertNotIn("extends", data)
+@@ -1980,7 +2009,8 @@ class FormulaAssetTests(unittest.TestCase):
+         root = pathlib.Path(__file__).resolve().parents[1]
+         review = load_formula(root, "build-basic-review")
+         self.assertEqual(review["type"], "expansion")
+-        self.assertEqual(review["contract"], "graph.v2")
++        self.assertNotIn("contract", review)
++        self.assertEqual(review["requires"], {"formula_compiler": ">=2.0.0"})
+         self.assertEqual(
+             review["vars"]["implementation_target"]["default"],
+             "gc.implementation-worker",
+@@ -3930,7 +3960,8 @@ class FormulaAssetTests(unittest.TestCase):
+         for name, (url_var, optional_vars) in expected.items():
+             with self.subTest(name=name):
+                 data = resolve_formula(root, name)
+-                self.assertEqual(data["contract"], "graph.v2")
++                self.assertNotIn("contract", data)
++                self.assertEqual(data["requires"], {"formula_compiler": ">=2.0.0"})
+                 self.assertFalse(data["target_required"])
+                 self.assertTrue(data["vars"][url_var]["required"])
+                 self.assertEqual(set(data["vars"]) - {url_var}, optional_vars)
+-- 
+2.54.0 (Apple Git-157)
+

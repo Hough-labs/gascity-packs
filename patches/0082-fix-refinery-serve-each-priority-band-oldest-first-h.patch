@@ -1,0 +1,640 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sun, 27 Sep 2026 17:07:27 -0400
+Subject: [PATCH 082/148] fix(refinery): serve each priority band
+ oldest-first-handoff, not newest-created (gcp-et7g.1)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Both find-work queries took .[0] of `gc bd list ... --limit=1 --json` with
+no sort. This store's default order is priority ascending, then created_at
+DESCENDING, so the server-side limit took the newest bead in the top band on
+every pass: each band was LIFO, and old merge requests starved while newer
+same-priority work kept arriving. winnow on 2026-09-24 saw 47 same-band
+overtakes and a ~9h wait, and a witness nudge to reorder could not override
+it because the agent merges whatever find-work returns.
+
+`--sort=created` is not the fix: --sort takes a single key, and every single
+key drops priority (measured on the parent, gcp-et7g). And created_at is the
+wrong key anyway: queue fairness is about when a bead joined the queue, which
+nothing recorded. So (Option C, approved 2026-09-27):
+
+- mol-polecat-work submit-and-exit §8 stamps the handoff in the SAME update
+  that names the refinery, never a later one: last_submitted_at on every
+  handoff, first_submitted_at only when the bead has none. A rejected and
+  resubmitted bead keeps its original stamp, which is what puts it back in
+  its old place in line (resubmit-first stays implicit). The first stamp is
+  written only when a read that returned the bead shows the key absent, so a
+  transient read failure cannot overwrite an original stamp. The block sits
+  between handoff-stamp sentinels so a test can run it; the auto_push=false
+  halt is not a handoff and is not stamped.
+- mol-refinery-patrol find-work: both queries fetch every candidate
+  (--limit=0) and pick with
+  sort_by(.priority, (.metadata.first_submitted_at // .created_at)).
+  Filters, assigned-first/routed-second, and the claim read-back are
+  unchanged. Unstamped beads fall back to created_at; the stamp uses
+  created_at's exact UTC format so the two compare as one timeline.
+- The refinery prompt's "Uncertain merge order" row now says find-work's
+  order is the default and a deviation is deliberate and recorded in
+  patrol-summary, instead of inviting ad hoc reordering.
+
+Tests: the find-work stub now orders matches the way the store does before
+applying --limit (it returned fixture order, which is why the defect
+passed). New cases (a) FIFO, (a2) handoff key beats creation, (b) priority
+stays primary, (c) unstamped fallback, (d) routed scan. Against the
+8c983d75 block, (a), (c) and (d) fail; against a created_at-only sort, (a2)
+fails. New test_polecat_handoff_stamp.sh extracts the stamp block and runs
+it against a mutating gc stub: both keys set on first handoff in one update,
+first byte-identical and last strictly later on resubmit, a pre-seeded first
+kept, an unreadable bead not stamped fresh, the halt not stamped.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ gastown/agents/refinery/prompt.template.md  |   2 +-
+ gastown/formulas/mol-polecat-work.toml      |  20 +-
+ gastown/formulas/mol-refinery-patrol.toml   |  18 +-
+ gastown/tests/test_polecat_handoff_stamp.sh | 303 ++++++++++++++++++++
+ gastown/tests/test_refinery_find_work.sh    | 138 +++++++++
+ 5 files changed, 477 insertions(+), 4 deletions(-)
+ create mode 100755 gastown/tests/test_polecat_handoff_stamp.sh
+
+diff --git a/gastown/agents/refinery/prompt.template.md b/gastown/agents/refinery/prompt.template.md
+index 4cca303d..daf8515e 100644
+--- a/gastown/agents/refinery/prompt.template.md
++++ b/gastown/agents/refinery/prompt.template.md
+@@ -39,7 +39,7 @@ later patrol verifies that the PR merged. No separate MR beads.
+ | Tests fail after merge | Diagnose: branch regression or pre-existing? Reject or file bug. |
+ | Push fails | Retry with backoff, or abort and investigate |
+ | Pre-existing test failure | File bead for tracking (NEVER fix it yourself) — check for duplicates first |
+-| Uncertain merge order | Choose based on priority, dependencies, timing |
++| Uncertain merge order | Take the bead `find-work` returns: its order (priority, then earliest first handoff) is the default. Any deviation is deliberate, and you record it and why in the `patrol-summary` step |
+ 
+ {{ template "following-mol" . }}
+ 
+diff --git a/gastown/formulas/mol-polecat-work.toml b/gastown/formulas/mol-polecat-work.toml
+index bad12a2a..6014a63c 100644
+--- a/gastown/formulas/mol-polecat-work.toml
++++ b/gastown/formulas/mol-polecat-work.toml
+@@ -1425,7 +1425,25 @@ HUMAN_HALT
+     gc runtime drain-ack
+     exit 0
+ fi
+-gc bd update "$WORK_BEAD_ID" --status=open --assignee="$REFINERY_TARGET" --set-metadata gc.routed_to=""
++# --- handoff-stamp:begin ---
++# Stamp the handoff in THIS write, never a later one: once the assignee names
++# the refinery, find-work can take the bead, and it orders each priority band
++# by first_submitted_at (gcp-et7g). first_submitted_at is written once and kept
++# across rejections, so a resubmitted bead keeps its place in line;
++# last_submitted_at moves on every handoff and is for observability only.
++# Only a read that returned this bead proves the key is absent. An unreadable
++# bead gets no first stamp, so a transient read failure cannot overwrite an
++# original stamp and send a resubmit to the back of its band.
++HANDOFF_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
++HANDOFF_STAMP=(--set-metadata last_submitted_at="$HANDOFF_AT")
++STAMP_JSON=$(gc bd show "$WORK_BEAD_ID" --json 2>/dev/null)
++if [ "$(printf '%s' "$STAMP_JSON" | jq -r '.[0].id // empty' 2>/dev/null)" = "$WORK_BEAD_ID" ] &&
++   [ -z "$(printf '%s' "$STAMP_JSON" | jq -r '.[0].metadata.first_submitted_at // empty' 2>/dev/null)" ]; then
++    HANDOFF_STAMP+=(--set-metadata first_submitted_at="$HANDOFF_AT")
++fi
++gc bd update "$WORK_BEAD_ID" --status=open --assignee="$REFINERY_TARGET" --set-metadata gc.routed_to="" \
++    "${HANDOFF_STAMP[@]}"
++# --- handoff-stamp:end ---
+ # The handoff is the assignee write; `--status=open` is bookkeeping that has
+ # been observed not to stick (gcp-s14g). Read it back and correct it once, so
+ # the bead does not sit in_progress with nobody working it. This is best-effort
+diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
+index b052e344..dc4efd88 100644
+--- a/gastown/formulas/mol-refinery-patrol.toml
++++ b/gastown/formulas/mol-refinery-patrol.toml
+@@ -261,11 +261,13 @@ then for work merely routed to you:
+ # --- find-work-query:begin ---
+ REFINERY_SELF="${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery"
+ WORK=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee=$GC_AGENT --status=open,in_progress \
+-  --exclude-type=epic --has-metadata-key=branch --limit=1 --json | jq -r '.[0].id // empty')
++  --exclude-type=epic --has-metadata-key=branch --limit=0 --json |
++  jq -r 'sort_by(.priority, (.metadata.first_submitted_at // .created_at)) | .[0].id // empty')
+ if [ -z "$WORK" ]; then
+   ROUTED=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --no-assignee --status=open,in_progress \
+     --exclude-type=epic --has-metadata-key=branch \
+-    --metadata-field gc.routed_to="$REFINERY_SELF" --limit=1 --json | jq -r '.[0].id // empty')
++    --metadata-field gc.routed_to="$REFINERY_SELF" --limit=0 --json |
++    jq -r 'sort_by(.priority, (.metadata.first_submitted_at // .created_at)) | .[0].id // empty')
+   if [ -n "$ROUTED" ]; then
+     gc bd update "$ROUTED" --assignee="$GC_AGENT" --status=in_progress \
+       --set-metadata gc.routed_to=""
+@@ -286,6 +288,18 @@ sees rig-scoped work beads — the `assignee` field alone does not route
+ by namespace. For HQ-only refineries `$GC_RIG` is empty and the flag
+ expands to nothing.
+ 
++**Order: priority first, then earliest first handoff (gcp-et7g).** Each query
++fetches every candidate (`--limit=0`) and picks in jq, never `--limit=1`. The
++store's default order is priority ascending, then created_at DESCENDING, so a
++server-side limit of one serves every priority band newest-first and old merge
++requests starve while new same-priority work keeps arriving (winnow, 2026-09-24:
++47 same-band overtakes, one bead waited ~9h). `--sort` cannot fix it: it takes a
++single key, and every single key drops priority. `first_submitted_at` is
++stamped by the polecat's refinery handoff and kept across rejections, so a
++resubmitted bead goes back to its original place in line rather than the back
++of the band. A bead handed over without the stamp — before the stamp existed,
++or by hand — falls back to `created_at`.
++
+ `--status=open,in_progress` is what makes this query survive its own claim.
+ Claiming a bead moves it to `in_progress`, so a filter of `open` alone can
+ never see the work this patrol just took: the bead strands in `in_progress`
+diff --git a/gastown/tests/test_polecat_handoff_stamp.sh b/gastown/tests/test_polecat_handoff_stamp.sh
+new file mode 100755
+index 00000000..10661c49
+--- /dev/null
++++ b/gastown/tests/test_polecat_handoff_stamp.sh
+@@ -0,0 +1,303 @@
++#!/usr/bin/env bash
++# Contract tests for the polecat's refinery-handoff stamp (gcp-et7g).
++#
++# The refinery's find-work step orders each priority band by
++# `metadata.first_submitted_at`, falling back to `created_at`. That key only
++# means "when this bead joined the merge queue" if the polecat's handoff writes
++# it, writes it ONCE, and writes it in the same update that names the refinery:
++# a later write leaves a window where find-work sees an unstamped bead, and a
++# rewrite on resubmit sends a rejected bead to the back of its band instead of
++# back to its original place in line.
++#
++# The block under test is extracted from the shipped formula between its
++# handoff-stamp sentinels and EXECUTED against a stub `gc` that really mutates a
++# fixture, so every assertion reads what the block's writes left behind.
++# Assertions grep a literal shell snippet or the stub's call log, so
++# single-quoted `$VAR` is the point, not an error.
++# shellcheck disable=SC2016
++set -uo pipefail
++
++ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
++FORMULA="$ROOT/gastown/formulas/mol-polecat-work.toml"
++
++BEAD="gcp-et7g.1"
++REFINERY="gascity-packs/gastown.refinery"
++POLECAT="gastown__polecat-gc-fv7ot"
++RFC3339_UTC='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
++
++FAILURES=0
++
++fail() {
++    echo "FAIL: $*" >&2
++    FAILURES=$((FAILURES + 1))
++}
++
++# extract_stamp pulls the handoff block verbatim out of submit-and-exit. Any
++# `{{placeholder}}` left in it is a hard error: the harness cannot render it, and
++# an unrendered one would make the test pass against text the formula never runs.
++extract_stamp() {
++    python3 - "$FORMULA" "$1" <<'PY'
++import re
++import sys
++import tomllib
++
++formula, out = sys.argv[1:3]
++begin = "# --- handoff-stamp:begin ---"
++end = "# --- handoff-stamp:end ---"
++with open(formula, "rb") as handle:
++    doc = tomllib.load(handle)
++step = next(s for s in doc["steps"] if s["id"] == "submit-and-exit")
++text = step["description"]
++if text.count(begin) != 1 or text.count(end) != 1:
++    sys.exit("submit-and-exit must carry exactly one handoff-stamp block")
++block = text.split(begin, 1)[1].split(end, 1)[0]
++leftover = sorted(set(re.findall(r"\{\{[^}]*\}\}", block)))
++if leftover:
++    sys.exit(f"handoff-stamp block has unrendered placeholders: {leftover}")
++with open(out, "w") as handle:
++    handle.write(block)
++PY
++}
++
++# The stub answers `show` and `update` from a JSON fixture and logs every call.
++# `update` really mutates the fixture, and an empty --set-metadata value deletes
++# the key. GC_STUB_SHOW_FAIL makes `show` fail, as a transient store error does.
++write_gc_stub() {
++    local dir="$1"
++    cat >"$dir/gc" <<'STUB'
++#!/usr/bin/env bash
++if [ "${1:-}" != "bd" ]; then
++    echo "stub gc: unexpected invocation: $*" >&2
++    exit 64
++fi
++printf '%s\n' "$*" >>"$GC_STUB_LOG"
++verb="${2:-}"
++shift 2
++case "$verb" in
++    show)
++        [ -z "${GC_STUB_SHOW_FAIL:-}" ] || exit 1
++        exec python3 "$GC_STUB_STORE" show "$GC_STUB_FIXTURE" "$@"
++        ;;
++    update) exec python3 "$GC_STUB_STORE" update "$GC_STUB_FIXTURE" "$@" ;;
++    *) echo "stub gc: unmodelled beads subcommand: $verb" >&2; exit 64 ;;
++esac
++STUB
++    chmod +x "$dir/gc"
++
++    cat >"$dir/store.py" <<'PY'
++import json
++import sys
++
++verb, fixture, *args = sys.argv[1:]
++with open(fixture) as handle:
++    beads = json.load(handle)
++
++positional = [arg for arg in args if not arg.startswith("--")]
++bead_id = positional[0] if positional else None
++target = next((bead for bead in beads if bead["id"] == bead_id), None)
++
++if verb == "show":
++    print(json.dumps([target] if target else []))
++    sys.exit(0)
++
++if target is None:
++    sys.exit(f"stub gc update: no such bead {bead_id!r}")
++index = 0
++while index < len(args):
++    arg = args[index]
++    if not arg.startswith("--"):
++        index += 1
++        continue
++    if "=" in arg and not arg.startswith("--set-metadata"):
++        name, value = arg.split("=", 1)
++        index += 1
++    else:
++        name, value = arg, args[index + 1]
++        index += 2
++    if name in ("--status", "--assignee"):
++        target[name.lstrip("-")] = value
++    elif name == "--set-metadata":
++        key, _, new_value = value.partition("=")
++        metadata = target.setdefault("metadata", {})
++        if new_value:
++            metadata[key] = new_value
++        else:
++            metadata.pop(key, None)
++    else:
++        sys.exit(f"stub gc update: unmodelled flag {name!r}")
++with open(fixture, "w") as handle:
++    json.dump(beads, handle)
++PY
++}
++
++# seed_bead [first_submitted_at] — the work bead as a polecat holds it just
++# before the handoff.
++seed_bead() {
++    python3 - "$TMP/fixture.json" "$BEAD" "$POLECAT" "${1:-}" <<'PY'
++import json
++import sys
++
++path, bead_id, polecat, first = sys.argv[1:5]
++metadata = {"branch": f"polecat/{bead_id}", "target": "integration"}
++if first:
++    metadata["first_submitted_at"] = first
++with open(path, "w") as handle:
++    json.dump([{
++        "id": bead_id,
++        "status": "in_progress",
++        "assignee": polecat,
++        "metadata": metadata,
++    }], handle)
++PY
++}
++
++# run_stamp [show-fail] — runs the shipped block once, the way submit-and-exit
++# does, with a fresh call log.
++run_stamp() {
++    : >"$TMP/calls.log"
++    PATH="$TMP/bin:$PATH" \
++    GC_STUB_FIXTURE="$TMP/fixture.json" \
++    GC_STUB_STORE="$TMP/bin/store.py" \
++    GC_STUB_LOG="$TMP/calls.log" \
++    GC_STUB_SHOW_FAIL="${1:-}" \
++    WORK_BEAD_ID="$BEAD" \
++    REFINERY_TARGET="$REFINERY" \
++        bash -c 'set -uo pipefail; . "$1"' _ "$TMP/stamp.sh" >"$TMP/run.log" 2>&1 || {
++        fail "the handoff block exited non-zero: $(cat "$TMP/run.log")"
++        return 1
++    }
++    if grep -q '^stub gc' "$TMP/run.log"; then
++        fail "the handoff block made a call the stub does not model: $(cat "$TMP/run.log")"
++        return 1
++    fi
++}
++
++# field <key> — a top-level field, or metadata.<key>, of the fixture bead.
++field() {
++    python3 - "$TMP/fixture.json" "$1" <<'PY'
++import json
++import sys
++
++path, key = sys.argv[1:3]
++bead = json.load(open(path))[0]
++if key.startswith("metadata."):
++    print(bead.get("metadata", {}).get(key.split(".", 1)[1], ""))
++else:
++    print(bead.get(key, ""))
++PY
++}
++
++# The update calls the block made. The log holds the stub's argv, so every line
++# is an argv tail, never an invocation.
++update_calls() {
++    grep -E '^bd update ' "$TMP/calls.log" || true # gc-bd-argv-tail: stub call log, not an invocation
++}
++
++test_first_handoff_stamps_both_keys_in_the_handoff_write() {
++    seed_bead
++    run_stamp || return
++    local first last
++    first=$(field metadata.first_submitted_at)
++    last=$(field metadata.last_submitted_at)
++    [[ "$last" =~ $RFC3339_UTC ]] ||
++        fail "last_submitted_at must be UTC RFC3339 in created_at's format (find-work compares them as strings), got '$last'"
++    [[ -n "$first" && "$first" == "$last" ]] ||
++        fail "a first handoff must set first_submitted_at to the same instant as last_submitted_at, got first='$first' last='$last'"
++
++    # The handoff itself still happens, and in the SAME write as the stamp.
++    [[ "$(field assignee)" == "$REFINERY" ]] || fail "the bead must be handed to the refinery"
++    [[ "$(field status)" == "open" ]] || fail "the handoff must set status=open"
++    [[ -z "$(field metadata.gc.routed_to)" ]] || fail "the handoff must clear gc.routed_to"
++    local updates
++    updates=$(update_calls)
++    [[ $(printf '%s\n' "$updates" | grep -c .) -eq 1 ]] ||
++        fail "the stamp must ride the handoff write, not a separate update; got: $updates"
++    [[ "$updates" == *"--assignee=$REFINERY"*"last_submitted_at="*"first_submitted_at="* ]] ||
++        fail "the one update must carry the assignee and both stamps; got: $updates"
++}
++
++test_resubmit_keeps_first_and_advances_last() {
++    seed_bead
++    run_stamp || return
++    local first1 last1
++    first1=$(field metadata.first_submitted_at)
++    last1=$(field metadata.last_submitted_at)
++
++    # The refinery rejects it back to the pool; a polecat fixes and resubmits.
++    # The stamp has one-second resolution, so wait out the second.
++    sleep 1
++    run_stamp || return
++    local first2 last2
++    first2=$(field metadata.first_submitted_at)
++    last2=$(field metadata.last_submitted_at)
++    [[ "$first2" == "$first1" ]] ||
++        fail "a resubmit must keep first_submitted_at byte-identical, '$first1' became '$first2'"
++    [[ "$last2" > "$last1" ]] ||
++        fail "a resubmit must advance last_submitted_at, '$last1' -> '$last2'"
++    [[ "$(update_calls)" != *"first_submitted_at="* ]] ||
++        fail "a resubmit must not rewrite first_submitted_at at all"
++}
++
++test_preseeded_first_submitted_at_is_kept() {
++    local original="2026-09-01T06:00:00Z"
++    seed_bead "$original"
++    run_stamp || return
++    [[ "$(field metadata.first_submitted_at)" == "$original" ]] ||
++        fail "an existing first_submitted_at must survive the handoff, got '$(field metadata.first_submitted_at)'"
++    [[ "$(field metadata.last_submitted_at)" > "$original" ]] ||
++        fail "last_submitted_at must still be written, got '$(field metadata.last_submitted_at)'"
++}
++
++test_unreadable_bead_is_not_stamped_fresh() {
++    # A failed read is not evidence the key is absent. Writing a fresh first
++    # stamp there would overwrite the original and demote a resubmit to the back
++    # of its band. The handoff itself must still go through.
++    local original="2026-09-01T06:00:00Z"
++    seed_bead "$original"
++    run_stamp show-fail || return
++    [[ "$(field metadata.first_submitted_at)" == "$original" ]] ||
++        fail "an unreadable bead must not get a fresh first_submitted_at, got '$(field metadata.first_submitted_at)'"
++    [[ "$(field assignee)" == "$REFINERY" ]] ||
++        fail "a failed stamp read must not block the handoff"
++    [[ "$(field metadata.last_submitted_at)" =~ $RFC3339_UTC ]] ||
++        fail "last_submitted_at does not depend on the read and must still be written"
++}
++
++test_auto_push_halt_is_not_stamped() {
++    # auto_push=false halts at branch-ready with no refinery handoff, so nothing
++    # has joined the merge queue and nothing may be stamped. The stamp keys are
++    # written only inside the handoff block.
++    python3 - "$FORMULA" <<'PY' || fail "the stamp keys must be written only in the handoff-stamp block, never on the auto_push=false halt"
++import sys
++import tomllib
++
++doc = tomllib.load(open(sys.argv[1], "rb"))
++text = next(s for s in doc["steps"] if s["id"] == "submit-and-exit")["description"]
++halt = text[text.index('if [ "$AUTO_PUSH" = "false" ]'):]
++halt = halt[: halt.index("\nfi\n")]
++if "submitted_at" in halt:
++    raise SystemExit(1)
++outside = text.split("# --- handoff-stamp:begin ---")[0] + text.split("# --- handoff-stamp:end ---")[1]
++if "submitted_at=" in outside:
++    raise SystemExit(1)
++PY
++}
++
++TMP=$(mktemp -d "${TMPDIR:-/tmp}/gastown-handoff-stamp.XXXXXX") || exit 1
++trap 'rm -rf "$TMP"' EXIT
++mkdir -p "$TMP/bin"
++write_gc_stub "$TMP/bin"
++extract_stamp "$TMP/stamp.sh" || exit 1
++bash -n "$TMP/stamp.sh" || { echo "FAIL: extracted handoff-stamp block is not valid shell" >&2; exit 1; }
++
++test_first_handoff_stamps_both_keys_in_the_handoff_write
++test_resubmit_keeps_first_and_advances_last
++test_preseeded_first_submitted_at_is_kept
++test_unreadable_bead_is_not_stamped_fresh
++test_auto_push_halt_is_not_stamped
++
++if [ "$FAILURES" -ne 0 ]; then
++    echo "$FAILURES test(s) failed" >&2
++    exit 1
++fi
++echo "all handoff-stamp tests passed"
+diff --git a/gastown/tests/test_refinery_find_work.sh b/gastown/tests/test_refinery_find_work.sh
+index 4b036b79..88fad546 100755
+--- a/gastown/tests/test_refinery_find_work.sh
++++ b/gastown/tests/test_refinery_find_work.sh
+@@ -28,6 +28,14 @@
+ # ~31min). The step now converts routed -> assigned itself. The stub models the
+ # write and the read-back, so "found it" and "claimed it under the identity the
+ # primary scan can see" are separate, executed assertions.
++#
++# The third is gcp-et7g: each query took `.[0]` of `--limit=1` with no sort,
++# and the store's default order is priority ascending, then created_at
++# DESCENDING, so every priority band was served newest-first and old merge
++# requests starved (winnow, 2026-09-24: 47 same-band overtakes, one bead
++# waited ~9h). The stub orders its matches the way the store does BEFORE it
++# applies --limit, which is what makes that starvation visible here; the old
++# stub returned fixture order and the defect passed.
+ set -uo pipefail
+ 
+ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+@@ -101,6 +109,11 @@ PY
+ # else is an error, so a query that grows a flag this stub does not model fails
+ # loudly instead of passing vacuously.
+ #
++# Matches come back in the store's default order — priority ascending, then
++# created_at descending (measured on the live store for gcp-et7g) — and
++# --limit truncates AFTER that order, never in fixture order. --limit=0 means no
++# limit, as it does in gc.
++#
+ # The write really mutates the fixture, so the read-back the shipped block
+ # performs is a genuine read of what the write left behind — not a stub that
+ # agrees with itself. GC_STUB_CLAIM_HIJACK simulates another writer winning the
+@@ -211,6 +224,10 @@ if verb == "list":
+         )
+         and bead.get("issue_type") not in excluded_types
+     ]
++    # Two stable passes give (priority asc, created_at desc). A bead with no
++    # priority is P2, the store's default.
++    matched.sort(key=lambda bead: bead.get("created_at", ""), reverse=True)
++    matched.sort(key=lambda bead: bead.get("priority", 2))
+     if limit:
+         matched = matched[:limit]
+     emit(matched)
+@@ -344,6 +361,34 @@ fixture() {
+     python3 -c 'import json,sys; print(json.dumps([json.loads(a) for a in sys.argv[1:]]))' "$@"
+ }
+ 
++queued() {
++    # queued <id> <priority> <created_at> <first_submitted_at> <assignee> [routed_to]
++    # A merge candidate with the fields the store orders on. An empty
++    # first_submitted_at leaves the key off, as on a bead handed over before
++    # the handoff stamp existed.
++    python3 - "$@" <<'PY'
++import json
++import sys
++
++bead_id, priority, created_at, first_submitted_at, assignee = sys.argv[1:6]
++routed_to = sys.argv[6] if len(sys.argv) > 6 else ""
++metadata = {"branch": f"polecat/{bead_id}"}
++if first_submitted_at:
++    metadata["first_submitted_at"] = first_submitted_at
++if routed_to:
++    metadata["gc.routed_to"] = routed_to
++print(json.dumps({
++    "id": bead_id,
++    "status": "open",
++    "assignee": assignee,
++    "issue_type": "task",
++    "priority": int(priority),
++    "created_at": created_at,
++    "metadata": metadata,
++}))
++PY
++}
++
+ test_in_progress_bead_with_branch_is_found() {
+     # The regression. Before gcp-s14g this returned empty and the patrol wrote
+     # IDLE while a real merge candidate sat on its hook.
+@@ -598,6 +643,94 @@ test_polecat_handoff_verifies_the_status_it_writes() {
+         fail "a status that will not settle must not abort a handoff whose branch is already pushed"
+ }
+ 
++# ── gcp-et7g: each priority band is served oldest-first-handoff ──────────────
++# The store returns a band newest-created first, so a server-side --limit=1
++# took the newest bead every pass. Each case below names the bead the old query
++# would have taken.
++
++test_same_band_is_served_oldest_first() {
++    # (a) The starvation itself. The old query took winnow-new, and kept taking
++    # whatever arrived after it, while winnow-old waited.
++    local got
++    got=$(run_find_work \
++        "$(fixture \
++            "$(queued winnow-old 2 2026-09-01T06:00:00Z 2026-09-20T06:00:00Z "$REFINERY")" \
++            "$(queued winnow-new 2 2026-09-10T06:00:00Z 2026-09-24T06:00:00Z "$REFINERY")")" \
++        "$REFINERY" winnow "$BOUND_ONLY")
++    [[ "$got" == "winnow-old" ]] ||
++        fail "same priority: the bead handed over first must be served first, got '$got'"
++}
++
++test_band_order_keys_on_first_handoff_not_creation() {
++    # (a2) Queue fairness is about when a bead joined the queue, not when it was
++    # filed. winnow-early-handoff was created later but handed over first; a
++    # created_at-only sort would take winnow-early-filed.
++    local got
++    got=$(run_find_work \
++        "$(fixture \
++            "$(queued winnow-early-filed 2 2026-06-16T06:00:00Z 2026-09-24T06:35:00Z "$REFINERY")" \
++            "$(queued winnow-early-handoff 2 2026-09-20T06:00:00Z 2026-09-21T06:00:00Z "$REFINERY")")" \
++        "$REFINERY" winnow "$BOUND_ONLY")
++    [[ "$got" == "winnow-early-handoff" ]] ||
++        fail "the band must order on first_submitted_at, not created_at, got '$got'"
++}
++
++test_priority_stays_primary() {
++    # (b) FIFO is within a band. A P1 handed over today still beats a P2 that
++    # has waited since the start of the month.
++    local got
++    got=$(run_find_work \
++        "$(fixture \
++            "$(queued winnow-old-p2 2 2026-09-01T06:00:00Z 2026-09-01T07:00:00Z "$REFINERY")" \
++            "$(queued winnow-new-p1 1 2026-09-24T06:00:00Z 2026-09-24T07:00:00Z "$REFINERY")")" \
++        "$REFINERY" winnow "$BOUND_ONLY")
++    [[ "$got" == "winnow-new-p1" ]] ||
++        fail "a newer P1 must beat an older P2, got '$got'"
++}
++
++test_unstamped_bead_falls_back_to_created_at() {
++    # (c) Work handed over before the stamp existed, or assigned by hand, has no
++    # first_submitted_at. It queues by created_at, and the oldest still wins.
++    # winnow-stamped was created earliest of all, so this also shows its
++    # created_at is not the key once a stamp exists.
++    local got
++    got=$(run_find_work \
++        "$(fixture \
++            "$(queued winnow-stamped 2 2026-08-01T06:00:00Z 2026-09-15T06:00:00Z "$REFINERY")" \
++            "$(queued winnow-unstamped-old 2 2026-09-01T06:00:00Z "" "$REFINERY")" \
++            "$(queued winnow-unstamped-new 2 2026-09-10T06:00:00Z "" "$REFINERY")")" \
++        "$REFINERY" winnow "$BOUND_ONLY")
++    [[ "$got" == "winnow-unstamped-old" ]] ||
++        fail "an unstamped bead must queue by created_at, got '$got'"
++
++    # And a stamped bead that joined the queue before an unstamped one was even
++    # filed goes first: both keys sit on one timeline.
++    got=$(run_find_work \
++        "$(fixture \
++            "$(queued winnow-stamped 2 2026-08-01T06:00:00Z 2026-09-15T06:00:00Z "$REFINERY")" \
++            "$(queued winnow-unstamped-new 2 2026-09-20T06:00:00Z "" "$REFINERY")")" \
++        "$REFINERY" winnow "$BOUND_ONLY")
++    [[ "$got" == "winnow-stamped" ]] ||
++        fail "the stamped and unstamped keys must compare as one timeline, got '$got'"
++}
++
++test_routed_scan_is_served_oldest_first() {
++    # (d) The routed scan had the same --limit=1 and starved the same way. The
++    # oldest is the one claimed; the newer bead is left for a later pass.
++    local got
++    got=$(run_find_work \
++        "$(fixture \
++            "$(queued winnow-old 2 2026-09-01T06:00:00Z 2026-09-20T06:00:00Z "" "$REFINERY")" \
++            "$(queued winnow-new 2 2026-09-10T06:00:00Z 2026-09-24T06:00:00Z "" "$REFINERY")")" \
++        "$REFINERY" winnow "$BOUND_ONLY")
++    [[ "$got" == "winnow-old" ]] ||
++        fail "the routed scan must take the bead handed over first, got '$got'"
++    [[ "$(claimed_assignee winnow-old)" == "$REFINERY" ]] ||
++        fail "the routed scan must claim the bead it selected"
++    [[ -z "$(claimed_assignee winnow-new)" ]] ||
++        fail "the routed scan must leave the newer bead unclaimed this pass"
++}
++
+ TMP=$(mktemp -d "${TMPDIR:-/tmp}/gastown-find-work.XXXXXX") || exit 1
+ trap 'rm -rf "$TMP"' EXIT
+ mkdir -p "$TMP/bin"
+@@ -625,6 +758,11 @@ test_routed_bead_without_branch_is_not_merge_work
+ test_assigned_work_wins_and_the_routed_scan_is_not_consulted
+ test_routed_scan_composes_its_identity_from_the_binding
+ test_routed_scan_is_rig_scoped_when_gc_rig_is_set
++test_same_band_is_served_oldest_first
++test_band_order_keys_on_first_handoff_not_creation
++test_priority_stays_primary
++test_unstamped_bead_falls_back_to_created_at
++test_routed_scan_is_served_oldest_first
+ test_open_only_scans_are_not_reintroduced
+ test_prompt_points_at_the_step_instead_of_restating_it
+ test_polecat_handoff_verifies_the_status_it_writes
+-- 
+2.54.0 (Apple Git-157)
+

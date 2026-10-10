@@ -1,0 +1,148 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sat, 10 Oct 2026 16:49:52 -0400
+Subject: [PATCH 141/148] docs(gastown): describe claim identities for both gc
+ 1.4.x and 1.5.0 (gcp-fooz4)
+
+P5 follow-up, prose only. Several passages described claim identities as gc
+1.4.x recorded them. Under gc 1.5.0 a named seat's BEADS_ACTOR is its
+alias, a namepool polecat's BEADS_ACTOR and claim assignee are its alias,
+and an unaliased pool session's are its session bead id
+(session.AssigneeIdentifier).
+
+- mol-refinery-patrol.toml, the "Claim by writing --assignee=$GC_AGENT"
+  paragraph: `--claim` writes $BEADS_ACTOR, which is the runtime session
+  name on 1.4.x and the seat's alias, equal to $GC_AGENT, on 1.5.0.
+  Writing $GC_AGENT is right on both. No other line in the file changed.
+- mol-deacon-patrol.toml: a polecat claim carries whatever form the
+  claiming gc recorded (session name on 1.4.x; alias or session bead id
+  on 1.5.0).
+- polecat prompt, the claim-order sentence: the lookup order (session bead
+  ID, runtime session name, then alias) is still what gc 1.5.0's default
+  work query uses (internal/config/workquery.go:982-983), so it stays.
+  The sentence now adds which identity 1.5.0 records a new claim under.
+- polecat prompt, resume re-verify: "Pool restarts mint a NEW session
+  identity" is false for a 1.5.0 namepool polecat, whose alias is a chair
+  the pool reuses. The same claim, in the live-owner guard comment and in
+  both copies of the approval-fallacy guard comment, now reads "usually".
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ gastown/agents/polecat/prompt.template.md     | 20 ++++++++++++-------
+ gastown/formulas/mol-deacon-patrol.toml       |  6 ++++--
+ gastown/formulas/mol-refinery-patrol.toml     | 15 ++++++++------
+ .../approval-fallacy.template.md              |  3 ++-
+ 4 files changed, 28 insertions(+), 16 deletions(-)
+
+diff --git a/gastown/agents/polecat/prompt.template.md b/gastown/agents/polecat/prompt.template.md
+index 3eee5aef..8f16470d 100644
+--- a/gastown/agents/polecat/prompt.template.md
++++ b/gastown/agents/polecat/prompt.template.md
+@@ -364,8 +364,9 @@ if [ -n "$STEP_REF" ] && { [ -z "$CLAIM_REASON" ] || [ "$CLAIM_REASON" = "claime
+       echo "WARN work bead $GUARD_WORK_BEAD names $GUARD_OWNER, another identity of this session ($EXPECTED_ASSIGNEE); it is ours."
+     else
+       # Someone else's name is on the molecule. Only a LIVE someone blocks: a
+-      # pool restart mints a fresh session identity, so a DEAD prior owner on
+-      # the work bead is the ordinary resume case and must not stall the engine.
++      # restarted session usually claims under a new identity, so a DEAD prior
++      # owner on the work bead is the ordinary resume case and must not stall
++      # the engine.
+       # `gc session list` omits closed sessions by default, so a hit there is
+       # the liveness answer. asleep and draining count as alive — both still own
+       # their work and get woken back onto it.
+@@ -501,8 +502,9 @@ If the block prints `NO_ROUTED_WORK`, `CLAIM_REJECTED`, `CLAIM_RELEASED`, or
+ `CLAIM_DECLINED_LIVE_OWNER`, it has already drain-acked — stop and exit.
+ Only after it prints `CLAIMED_BEAD_ID` do you read the recipe with `gc bd formula show mol-polecat-work --rig "$GC_RIG"` and run
+ `workspace-setup` before inspecting task source. The claim checks assigned work
+-first (session bead ID, runtime session name, then alias) and only falls through
+-to unassigned pool work routed to
++first (session bead ID, runtime session name, then alias; gc 1.5.0 records a new
++claim under the alias, or the bead id for an unaliased pool session) and only
++falls through to unassigned pool work routed to
+ `${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat`.
+ 
+ `CLAIM_DECLINED_LIVE_OWNER` means the claim itself was clean — the step bead was
+@@ -522,8 +524,11 @@ tier handed back this session's own in-flight WORK bead — which
+ cannot land on it — instead of your next formula step, and the block moved you
+ onto that step. The `CLAIMED_BEAD_ID` printed after it is the bead to run.
+ 
+-**Resume / crash re-verify (FIRST action on restart).** Pool restarts mint a
+-NEW session identity. If you wake into a session that context says was already
++**Resume / crash re-verify (FIRST action on restart).** A restart is a new
++session, and usually a new claim identity: gc 1.4.x and an unaliased gc 1.5.0
++pool session claim under a fresh one, while a gc 1.5.0 namepool polecat claims
++under its alias, a chair the pool hands to whichever session sits in it next.
++If you wake into a session that context says was already
+ mid-work on a claimed bead, your FIRST action — before touching code — is to
+ re-check ownership against THIS session's identity:
+ 
+@@ -712,7 +717,8 @@ done
+ # in_progress for this session only from that step on, and never takes it from
+ # the refinery or an operator escalation. Nor is a bare "assigned to
+ # somebody else", which is equally true of a resumed molecule finding the bead
+-# still held by its own PREVIOUS session (pool restarts mint a new identity) and
++# still held by its own PREVIOUS session (a restarted session usually claims
++# under a new identity) and
+ # of any third party a bead can be parked on — an operator moving it to a crew
+ # seat, a reviewer taking it. Name the refinery rather than enumerate the
+ # identities that are not it.
+diff --git a/gastown/formulas/mol-deacon-patrol.toml b/gastown/formulas/mol-deacon-patrol.toml
+index 8c08a6d0..52f65704 100644
+--- a/gastown/formulas/mol-deacon-patrol.toml
++++ b/gastown/formulas/mol-deacon-patrol.toml
+@@ -279,8 +279,10 @@ every identity form a session carries. Never pre-filter the naive way —
+ — because a session is addressed by at least three
+ different strings depending on what assigned the work: the agent alias
+ (`gastown.deacon`, on molecule wisps), the session bead id (`gc-ttk`, on mail
+-messages), and the session name (`gastown__polecat-gc-qkw`, on polecat
+-claims). Filtering by any single one silently reports zero — which is the
++messages), and on polecat claims whichever form the claiming gc recorded (the
++session name `gastown__polecat-gc-qkw` on gc 1.4.x; on gc 1.5.0 the alias, or
++the session bead id for an unaliased pool session). Filtering by any single
++one silently reports zero — which is the
+ very failure mode this step exists to catch.
+ 
+ Match identities EXACTLY. `[.assignee] | inside($ids)` looks right and is not:
+diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
+index f595a22d..946e3090 100644
+--- a/gastown/formulas/mol-refinery-patrol.toml
++++ b/gastown/formulas/mol-refinery-patrol.toml
+@@ -505,12 +505,15 @@ queue starts stealing live work:
+   merged.
+ 
+ **Claim by writing `--assignee="$GC_AGENT"`, NOT with the `--claim` flag.**
+-`gc bd update --claim` sets the assignee to `$BEADS_ACTOR`, which is the runtime *session
+-name* (`gastown__refinery-gc-xxxx`), not the canonical role identity every
+-other query in this formula and in the refinery prompt scans on. Claiming that
+-way would hand the bead an assignee the primary query above cannot match, so a
+-crash mid-merge would re-hide the bead behind a dead session's name — the exact
+-invisibility this step exists to remove. Clearing `gc.routed_to` in the same
++`gc bd update --claim` sets the assignee to `$BEADS_ACTOR`, and whether that is
++the identity every other query in this formula and in the refinery prompt scans
++on (`$GC_AGENT`) depends on the gc version: on gc 1.4.x it is the runtime
++*session name* (`gastown__refinery-gc-xxxx`); on gc 1.5.0 a named seat's
++`$BEADS_ACTOR` is its alias, the same string as `$GC_AGENT`. Writing `$GC_AGENT`
++is right on both. A mismatched claim hands the bead an assignee the primary
++query above cannot match, so a crash mid-merge would re-hide the bead behind a
++dead session's name — the exact invisibility this step exists to remove.
++Clearing `gc.routed_to` in the same
+ write completes the conversion: the bead is now assigned work, and the routed
+ scan must not keep offering it.
+ 
+diff --git a/gastown/template-fragments/approval-fallacy.template.md b/gastown/template-fragments/approval-fallacy.template.md
+index 6f1f901d..7c8f8f2b 100644
+--- a/gastown/template-fragments/approval-fallacy.template.md
++++ b/gastown/template-fragments/approval-fallacy.template.md
+@@ -87,7 +87,8 @@ done
+ # in_progress for this session only from that step on, and never takes it from
+ # the refinery or an operator escalation. Nor is a bare "assigned to
+ # somebody else", which is equally true of a resumed molecule finding the bead
+-# still held by its own PREVIOUS session (pool restarts mint a new identity) and
++# still held by its own PREVIOUS session (a restarted session usually claims
++# under a new identity) and
+ # of any third party a bead can be parked on — an operator moving it to a crew
+ # seat, a reviewer taking it. Name the refinery rather than enumerate the
+ # identities that are not it.
+-- 
+2.54.0 (Apple Git-157)
+

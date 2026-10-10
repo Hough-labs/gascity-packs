@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sat, 10 Oct 2026 16:28:18 -0400
+Subject: [PATCH 131/148] docs(ci): describe the archive install, not the
+ go-module flow (gcp-fooz4)
+
+The release-compatibility design doc said the inference workflows
+resolve gascity with `go mod download -json` and check out the module's
+`.Origin.Hash`. It also said pack-release-compatibility runs
+`go install ...@<ref>` and that the nightly runs against `gc@main`. All
+of that predates patch 0075's archive install. The doc now says that gc
+comes from the release archive, that the source commit is read from the
+binary's vcs.revision with the tag as a fallback, and that `main` means
+the rolling `edge` pre-release.
+
+The gascity_ref input descriptions on both inference workflows still
+gave go-module semantics, including commit SHAs and go's slash rule.
+They now list the values that have an archive and say that a branch or
+commit SHA fails the install.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .github/workflows/gascity-pack-inference.yml |  2 +-
+ .github/workflows/supported-pack-nightly.yml |  2 +-
+ docs/design/release-compatibility-testing.md | 25 +++++++++++++-------
+ 3 files changed, 19 insertions(+), 10 deletions(-)
+
+diff --git a/.github/workflows/gascity-pack-inference.yml b/.github/workflows/gascity-pack-inference.yml
+index 7d99c8cb..51800ba2 100644
+--- a/.github/workflows/gascity-pack-inference.yml
++++ b/.github/workflows/gascity-pack-inference.yml
+@@ -4,7 +4,7 @@ on:
+   workflow_dispatch:
+     inputs:
+       gascity_ref:
+-        description: "Gas City module ref/version to install: latest, main, a tag such as v1.2.1, or a commit SHA. Not a branch name with a slash (release/v1.5.0 is rejected by go); pass its tag or commit SHA."
++        description: "Gas City release archive to install: latest (newest stable release), main (the rolling edge pre-release built from gascity main), or a release tag such as v1.2.1. A branch or commit SHA has no archive and fails the install: its go install fallback records no commit for the gascity source checkout."
+         required: false
+         default: latest
+       gascity_setup_ref:
+diff --git a/.github/workflows/supported-pack-nightly.yml b/.github/workflows/supported-pack-nightly.yml
+index 5cde193c..8720ba17 100644
+--- a/.github/workflows/supported-pack-nightly.yml
++++ b/.github/workflows/supported-pack-nightly.yml
+@@ -6,7 +6,7 @@ on:
+   workflow_dispatch:
+     inputs:
+       gascity_ref:
+-        description: "Gas City module ref/version to install: latest, main, a tag such as v1.2.1, or a commit SHA. Not a branch name with a slash (release/v1.5.0 is rejected by go); pass its tag or commit SHA."
++        description: "Gas City release archive to install: latest (newest stable release), main (the rolling edge pre-release built from gascity main), or a release tag such as v1.2.1. A branch or commit SHA has no archive and fails the install: its go install fallback records no commit for the gascity source checkout."
+         required: false
+         default: main
+       gascity_setup_ref:
+diff --git a/docs/design/release-compatibility-testing.md b/docs/design/release-compatibility-testing.md
+index 9a6346ec..b70130a5 100644
+--- a/docs/design/release-compatibility-testing.md
++++ b/docs/design/release-compatibility-testing.md
+@@ -64,10 +64,17 @@ execs (order scripts, pack command and doctor `run.sh`) would fail with exit
+ 126. The runner rejects a source root whose exec'd pack scripts are not
+ executable. It does not guess a sibling checkout; `--gascity-source-root
+ remote` imports the packs from the gascity git remote, which is only correct
+-for a gc built from its default branch. The inference workflows resolve the
+-gascity ref once with `go mod download -json`, install gc at that exact
+-version, check out the module's `.Origin.Hash` commit as a shallow git tree,
+-and export that checkout as `GASCITY_SOURCE_ROOT`.
++for a gc built from its default branch. The inference workflows install gc
++from its published release archive (`.github/scripts/install-gascity-archive.sh`),
++which exports the commit that binary was built from as `GASCITY_SOURCE_REF`,
++read from the binary's own build info (`go version -m`, `vcs.revision`). They
++check out that commit as a shallow git tree and export the checkout as
++`GASCITY_SOURCE_ROOT`. The commit comes from the binary, not from resolving the
++requested ref a second time, because `main` installs the rolling `edge`
++pre-release, which can move between the two. A binary that records no revision
++falls back to its release tag. A ref with no archive (a branch or commit SHA)
++is built with `go install`, which records neither, so the install fails rather
++than name a source it cannot vouch for.
+ 
+ The fixture rig gets a local bare `origin` (next to the rig, as
+ `<rig>-origin.git`) with `origin/HEAD` set, because build formulas base
+@@ -110,9 +117,10 @@ validation.
+ 
+ ## Automation
+ 
+-`.github/workflows/pack-release-compatibility.yml` installs a requested Gas City
+-module ref with `go install github.com/gastownhall/gascity/cmd/gc@<ref>` and
+-runs the compatibility runner.
++`.github/workflows/pack-release-compatibility.yml` installs the requested Gas
++City release from its published archive (`latest`, a release tag, or `main` for
++the rolling `edge` pre-release built from gascity `main`) and runs the
++compatibility runner.
+ 
+ The workflow runs on:
+ 
+@@ -163,7 +171,8 @@ changes, manual dispatch, and repository dispatch events named
+ 
+ `.github/workflows/supported-pack-nightly.yml` is the scheduled intra-release
+ regression run. It first runs the static pack flow contracts, then executes a
+-one-pack-at-a-time inference matrix against `gc@main` by default. Each pack has
++one-pack-at-a-time inference matrix against gascity `main` (the rolling `edge`
++release archive) by default. Each pack has
+ a matrix-specific gate timeout below the job timeout so diagnostics still upload;
+ manual or release dispatch can override that timeout when deliberately needed:
+ 
+-- 
+2.54.0 (Apple Git-157)
+

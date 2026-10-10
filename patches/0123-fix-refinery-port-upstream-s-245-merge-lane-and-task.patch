@@ -1,0 +1,625 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 8 Oct 2026 16:46:07 -0400
+Subject: [PATCH 123/148] fix(refinery): port upstream's #245 merge lane and
+ task-artifact cleanup into merge-push.sh (gcp-fooz4)
+
+merge-push.sh (gcp-l8td.5/.6) is the merge-push step's lane moved out of the
+formula, and gcp-l8td.6 retired the formula copy. Upstream 520e95cb rewrote
+that lane (f709abe5 #245, the task-artifact lifecycle, #374), so after the
+BASELINE upgrade the script still ran the pre-#245 lane. Port the new lane:
+
+- mr, approval off: record the pending PR with `gc gastown pr-merge-reconcile
+  record` (bead BLOCKED until a later patrol verifies the merge) and mail the
+  mayor, instead of closing at publication. Breadcrumbs move into the
+  approval-on lane, which still lands the approved head itself.
+- lookup_pr_info reads headRefOid (gh and REST); the PR head must equal the
+  validated temp before anything is recorded.
+- direct, approved mr, and already-merged closes keep origin/$BRANCH (the
+  artifact's recovery copy; delete_merged_branches is deprecated) and run
+  `gc gastown task-artifact-cleanup "$WORK"` after the verified close.
+- force-with-lease failure drops temp and re-enters the rebase step's
+  ancestry decision on the next patrol; never an in-place rebase (#374).
+- PR body says "Based on", not "Rebased on".
+
+Tests follow the lane: merge-lanes/merge-batch stubs model the two pack
+commands, mr cases expect the pending record, the direct cleanup case expects
+the source branch kept; upstream's test_pr_merge_reconcile and rebase-guard
+legs 9/10 read the publication-path and lease-recovery contract from the
+script; inference-gate script pins follow.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ gastown/assets/scripts/refinery/merge-push.sh | 86 ++++++++++++-----
+ gastown/formulas/mol-refinery-patrol.toml     |  2 +-
+ .../test_mol_refinery_patrol_rebase_guard.sh  | 96 +++++++------------
+ gastown/tests/test_pr_merge_reconcile.sh      | 14 ++-
+ gastown/tests/test_refinery_merge_batch.sh    |  6 ++
+ gastown/tests/test_refinery_merge_lanes.sh    | 75 ++++++++++++---
+ scripts/gascity_pack_inference_gate.py        | 10 +-
+ tests/test_gascity_pack_inference_gate.py     |  3 +-
+ 8 files changed, 182 insertions(+), 110 deletions(-)
+
+diff --git a/gastown/assets/scripts/refinery/merge-push.sh b/gastown/assets/scripts/refinery/merge-push.sh
+index b864317d..5126b7a3 100755
+--- a/gastown/assets/scripts/refinery/merge-push.sh
++++ b/gastown/assets/scripts/refinery/merge-push.sh
+@@ -30,7 +30,9 @@
+ # embedded default.
+ #   require_merge_approval  --require-approval        default false
+ #   review_agent            --review-agent            default ""
+-#   delete_merged_branches  --delete-merged-branches  default true
++#   delete_merged_branches  --delete-merged-branches  default true; deprecated,
++#                           deletes nothing: a verified merge keeps its source
++#                           branch as the task artifact's recovery copy
+ #   target_branch           --target-default          derived: the rig's
+ #                           DefaultBranch. Used only when the bead has no
+ #                           metadata.target.
+@@ -51,11 +53,15 @@
+ #
+ # Exit status. The merge-push step owns patrol-loop control for every status;
+ # this script never ends the agent's session and never pours or burns a wisp.
+-#    0  the work bead is closed: landed (direct, or mr after approval), handed
+-#       off as a pull request (mr, approval off), or closed as already merged
++#    0  handed off: the work bead is closed and its task artifact cleaned
++#       (landed direct, or mr after approval, or closed as already merged), or,
++#       for mr with approval off, the pull request is recorded pending and the
++#       bead is BLOCKED until `gc gastown pr-merge-reconcile` verifies the merge
+ #    1  usage or config error; nothing touched
+ #    2  hard stop; do not mutate bead state. Also returned when a merge landed
+-#       but recording it on the bead failed: the next patrol's merge-state gate
++#       but its task-artifact cleanup did not converge (retryable: find-work's
++#       sweep picks it up), or when a merge landed but recording it on the bead
++#       failed: the next patrol's merge-state gate
+ #       closes it as already merged.
+ #    3  the re-rebase onto the moved target conflicted
+ #    4  parked awaiting review (the gate refused, or the approved head no longer
+@@ -590,7 +596,7 @@ lookup_pr_info() {
+     return 1
+   fi
+   if command -v "$GH" >/dev/null 2>&1; then
+-    "$GH" pr view --repo "$ORIGIN_REPO" --json url,number,state,headRefName,baseRefName,headRepositoryOwner,headRepository -- "$ref" 2>"$err_file"
++    "$GH" pr view --repo "$ORIGIN_REPO" --json url,number,state,headRefName,headRefOid,baseRefName,headRepositoryOwner,headRepository -- "$ref" 2>"$err_file"
+     return $?
+   fi
+   if ! init_github_rest 2>"$err_file"; then
+@@ -615,7 +621,7 @@ lookup_pr_info() {
+   fi
+   PR_RAW=$(curl_gh_api "$err_file" "$API/pulls/$PR_NUMBER") || return 1
+   printf '%s
+-' "$PR_RAW" | jq '{url:.html_url, number, state:(.state | ascii_upcase), headRefName:.head.ref, baseRefName:.base.ref, headRepositoryOwner:{login:.head.repo.owner.login}, headRepository:{name:.head.repo.name}}'
++' "$PR_RAW" | jq '{url:.html_url, number, state:(.state | ascii_upcase), headRefName:.head.ref, headRefOid:.head.sha, baseRefName:.base.ref, headRepositoryOwner:{login:.head.repo.owner.login}, headRepository:{name:.head.repo.name}}'
+ }
+ 
+ # --- merge_ff_push ----------------------------------------------------------
+@@ -847,13 +853,18 @@ git checkout --detach "origin/$TARGET" >/dev/null 2>&1 || true
+ git branch -d temp || git branch -D temp || true
+ }
+ 
+-# The direct lane's "2. Cleanup", including the branch delete the step gave in
+-# prose: If delete_merged_branches = "true": `git push origin --delete $BRANCH`
++# The direct lane's "2. Cleanup" after a verified close (upstream #245 and the
++# task-artifact lifecycle): drop temp, then run the successful task-artifact
++# cleanup. origin/$BRANCH is deliberately kept: it is the durable recovery copy,
++# and the cleanup proves a worktree safe to remove against it. delete_merged_branches
++# is retained only for formula compatibility and deletes nothing.
+ direct_cleanup() {
+ cleanup_temp
+-if [ "$CFG_DELETE_MERGED_BRANCHES" = "true" ]; then
+-  git push origin --delete "$BRANCH"
++if ! gc gastown task-artifact-cleanup "$WORK"; then
++  echo "Task artifact cleanup did not converge. STOP; its durable pending/blocked state remains retryable."
++  return 2
+ fi
++return 0
+ }
+ 
+ # The already-merged close is a real completion: skip the merge and run
+@@ -862,7 +873,7 @@ fi
+ after_already_merged_close() {
+   if [ "$1" -eq 0 ]; then
+     MP_SUMMARY="closed as already merged to $TARGET"
+-    direct_cleanup
++    direct_cleanup || return $?
+   fi
+   return "$1"
+ }
+@@ -968,7 +979,8 @@ esac
+ direct_close
+ LAND_STATUS=$?
+ case "$LAND_STATUS" in
+-  0|4) direct_cleanup ;;
++  0) direct_cleanup || return $? ;;
++  4) cleanup_temp ;;
+ esac
+ return "$LAND_STATUS"
+ }
+@@ -991,7 +1003,12 @@ case "$BHRC_STATUS" in
+ esac
+ git checkout temp
+ if ! git push origin HEAD:$BRANCH --force-with-lease; then
+-  echo "git push --force-with-lease of $BRANCH failed: the existing PR branch moved after your fetch. STOP, fetch the latest branch, rebase your temp branch again, and retry with --force-with-lease. Do not use plain --force."
++  # Upstream #374/#245: temp is stale, and on the rebase step's skip path it is
++  # origin/$BRANCH with its merge topology intact, so rebasing it here would
++  # flatten exactly what the ancestry decision preserved. Drop temp and let the
++  # next patrol re-run the rebase step's decision on the moved branch.
++  cleanup_temp
++  echo "git push --force-with-lease of $BRANCH failed: the existing PR branch moved after your fetch and temp is stale. Dropped temp; the next patrol re-runs the rebase step's ancestry decision on the moved branch. Do NOT rebase temp in place, and do not use plain --force."
+   return 2
+ fi
+ WORK_JSON=$(gc bd show $WORK --json)
+@@ -1029,7 +1046,9 @@ PR_BODY_FILE=$(mktemp)
+ ' "$BRANCH"
+   printf -- '- Target: `%s`
+ ' "$TARGET"
+-  printf -- '- Rebased on `%s` via Gastown Refinery.
++  # "Based on", not "Rebased on": on the rebase step's skip path temp was never
++  # rebased; both paths end with origin/$TARGET an ancestor of temp.
++  printf -- '- Based on `%s` via Gastown Refinery.
+ ' "$TARGET"
+ } > "$PR_BODY_FILE"
+ 
+@@ -1123,6 +1142,8 @@ PR_REPO=$(printf '%s
+ ' "$PR_URL" | sed -E 's#^https://github.com/([^/]+/[^/]+)/pull/[0-9]+$#\1#')
+ PR_HEAD_REPO=$(printf '%s
+ ' "$PR_INFO" | jq -r '.headRepositoryOwner.login + "/" + .headRepository.name')
++PR_HEAD_SHA=$(printf '%s
++' "$PR_INFO" | jq -r '.headRefOid')
+ echo "$PR_URL $PR_NUMBER $PR_STATE $PR_HEAD $PR_BASE $PR_REPO $PR_HEAD_REPO"
+ if [ "$PR_STATE" != "OPEN" ]; then
+   if [ -n "$EXISTING_PR" ]; then
+@@ -1164,25 +1185,43 @@ if [ "$PR_HEAD_REPO" != "$ORIGIN_REPO" ]; then
+   echo "Pull request $PR_REF head repo $PR_HEAD_REPO, want $ORIGIN_REPO."
+   return 2
+ fi
++# Upstream #245: the pending-merge record binds completion to the exact head
++# that passed this refinery's validation, so the PR must point at it now.
++EXPECTED_PR_HEAD=$(git rev-parse temp)
++if [ "$PR_HEAD_SHA" != "$EXPECTED_PR_HEAD" ]; then
++  echo "Pull request $PR_REF head is $PR_HEAD_SHA, want validated branch head $EXPECTED_PR_HEAD."
++  return 2
++fi
+ # The step's "If this command fails or prints empty output: STOP."
+ if [ -z "$PR_URL" ] || [ "$PR_URL" = null ] || [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = null ]; then
+   echo "Pull request $PR_REF verified without a URL or number. STOP. Debug and retry. Do NOT continue."
+   return 2
+ fi
+ 
+-gc bd update $WORK --set-metadata pr_url="$PR_URL" --set-metadata pr_number="$PR_NUMBER" --set-metadata merged_target="$TARGET" --unset-metadata rejection_reason
+ if [ "$APPROVAL_REQUIRED" -eq 0 ]; then
+-  # 4a. Approval gate off: PR publication is the terminal handoff.
+-if gc bd update $WORK --set-metadata merge_result=pull_request && gc bd close $WORK --reason "Pull request ready: $PR_URL"; then
+-  MP_SUMMARY="pull request ready: $PR_URL"
+-else
+-  echo "Could not record the pull request handoff on $WORK; the bead is still open. STOP. Debug and retry."
+-  return 2
+-fi
++  # 4a. Approval gate off: record the pending PR WITHOUT closing the work bead
++  # (upstream #245). The bead moves to blocked, so its dependents stay blocked,
++  # until `gc gastown pr-merge-reconcile` verifies the merge on a later patrol.
++  # No task-artifact cleanup here: reconciliation runs it after the verified
++  # close.
++  if ! gc gastown pr-merge-reconcile record "$WORK" "$PR_URL" "$PR_NUMBER" "$TARGET" "$PR_HEAD_SHA"; then
++    echo "Failed to record pending PR state. STOP. Do not close $WORK."
++    return 2
++  fi
++  if ! gc mail send mayor/ -s "PR ready for review: $WORK" -m "Work bead: $WORK
++Pull request: $PR_URL
++ The bead and its dependents remain blocked until a refinery patrol verifies the merge."; then
++    echo "Pending PR state is safe, but mayor notification failed; report the delivery failure."
++  fi
++  MP_SUMMARY="pull request pending merge: $PR_URL"
+   cleanup_temp
+   return 0
+ fi
+ 
++# 4b. Breadcrumbs first: the approval gate reads pr_number back to check the
++# reviewer approved THIS pull request.
++gc bd update $WORK --set-metadata pr_url="$PR_URL" --set-metadata pr_number="$PR_NUMBER" --set-metadata merged_target="$TARGET" --unset-metadata rejection_reason
++
+ # 4b. Approval gate on: refused parks the bead; approved lands it with the
+ # direct path's merge.
+ APPROVAL_GATE_OUTPUT=$(run_approval_gate "$(git rev-parse temp)" 2>&1)
+@@ -1197,7 +1236,8 @@ gc bd update "$WORK" --set-metadata merge_approval_state=approved --unset-metada
+ direct_close
+ LAND_STATUS=$?
+ case "$LAND_STATUS" in
+-  0|4) cleanup_temp ;;
++  0) direct_cleanup || return $? ;;
++  4) cleanup_temp ;;
+ esac
+ return "$LAND_STATUS"
+ }
+diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
+index 1bbb12b1..f595a22d 100644
+--- a/gastown/formulas/mol-refinery-patrol.toml
++++ b/gastown/formulas/mol-refinery-patrol.toml
+@@ -1678,7 +1678,7 @@ What each status means, and what this step does about it:
+ 
+ | Status | Meaning | This step |
+ |---|---|---|
+-| 0 | The work bead is closed: landed (direct, or mr after approval), handed off as a pull request (mr, approval off), or closed as already merged. | Continue to patrol-summary. The script already ran its cleanup; do not run another. |
++| 0 | Handed off: the work bead is closed and its task artifact cleaned (landed direct, or mr after approval, or closed as already merged), or, for mr with approval off, the pull request is recorded pending and the bead is blocked until `gc gastown pr-merge-reconcile` verifies the merge on a later patrol. | Continue to patrol-summary. The script already ran its cleanup; do not run another. |
+ | 1 | Usage or config error; nothing was touched. | STOP and drain. Read the output above the RESULT line. |
+ | 2 | Hard stop; do not mutate bead state. Also returned when a merge landed but recording it on the bead failed: the next patrol's merge-state gate closes it as already merged. | STOP and drain. |
+ | 3 | The re-rebase onto the moved target conflicted. | STOP and drain. |
+diff --git a/gastown/tests/test_mol_refinery_patrol_rebase_guard.sh b/gastown/tests/test_mol_refinery_patrol_rebase_guard.sh
+index a3dbd972..29b6b52b 100755
+--- a/gastown/tests/test_mol_refinery_patrol_rebase_guard.sh
++++ b/gastown/tests/test_mol_refinery_patrol_rebase_guard.sh
+@@ -29,6 +29,9 @@ set -euo pipefail
+ 
+ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+ FORMULA="${REBASE_GUARD_FORMULA:-$ROOT/gastown/formulas/mol-refinery-patrol.toml}"
++# The mr lane, and so its lease-failure recovery, lives in merge-push.sh in this
++# fork (gcp-l8td.6); legs 9 and 10 read it there.
++MERGE_PUSH="${REBASE_GUARD_MERGE_PUSH:-$ROOT/gastown/assets/scripts/refinery/merge-push.sh}"
+ 
+ # The halt leg pipes the wisp-pour answer through real `jq`, so jq is a hard
+ # test dependency.  Declare it rather than shadowing jq in the stub PATH: the
+@@ -686,75 +689,36 @@ leg8() {
+ # so pin it the way leg 7 pins the fence: the two halves drifted apart once
+ # already.  This leg is the executable counterpart of that contract.
+ leg9() {
+-    local mr="$tmp/mr-section.md" off_clear off_probe off_rematerialize
++    # This fork runs the merge-push lane from merge-push.sh (gcp-l8td.6), so the
++    # `mr` lease-failure recovery is pinned where it lives: the script's lane_mr.
++    # The contract is upstream's (#374): never rebase temp in place, never claim
++    # a rebase in the PR body, and re-enter the rebase step's ancestry decision.
++    local mr="$tmp/mr-lane.sh" lease="$tmp/mr-lease-arm.sh" cleanup="$tmp/cleanup-temp.sh"
++    awk '/^lane_mr\(\) \{/ { on = 1 } on { print } on && /^}/ { exit }' "$MERGE_PUSH" >"$mr"
++    [ -s "$mr" ] || fail "leg 9: could not slice lane_mr out of $MERGE_PUSH"
++    awk '/^if ! git push origin HEAD:\$BRANCH --force-with-lease; then/ { on = 1 } on { print } on && /^fi$/ { exit }' "$mr" >"$lease"
++    [ -s "$lease" ] || fail "leg 9: could not slice the lease-failure arm out of lane_mr"
+ 
+-    # Prefix marker, matching the slice in gastown/tests/test_gastown_pack_assets.sh:
+-    # the heading closes its bold run after the colon, so anchoring on `"mr"**`
+-    # would match nothing.
+-    awk 'index($0, "**If MERGE_STRATEGY = \"mr\"") { on = 1 } on' "$FORMULA" >"$mr"
+-    [ -s "$mr" ] || fail "leg 9: could not slice the mr strategy section out of $FORMULA"
+-
+-    # The retired instruction must be gone, not merely supplemented: left in
+-    # place it is still the literal thing an agent follows on lease failure.
+     ! grep -Fq -- 'rebase your temp branch again' "$mr" ||
+-        fail "leg 9: the mr lease-failure recovery still instructs an in-place rebase of temp; on the skip path that flattens the source branch and force-pushes the result"
+-
+-    # The heading is part of the contract: on the skip path `temp` was never
+-    # rebased, so a heading promising a rebased branch is false.
+-    grep -Fq -- '**1. Push the branch back to origin:**' "$mr" ||
+-        fail "leg 9: the mr push heading must not claim the branch is rebased -- the skip path pushes an unrebased temp"
+-
+-    # The recovery has to route back through the ancestry decision rather than
+-    # describe a push-level fixup.
+-    grep -Fq -- 're-enter the `rebase` step' "$mr" ||
+-        fail "leg 9: the mr lease-failure recovery must re-enter the rebase step's ancestry decision"
+-    grep -Fq -- 'git merge-base --is-ancestor "origin/$TARGET" "origin/$BRANCH"' "$mr" ||
+-        fail "leg 9: the mr lease-failure recovery must re-probe ancestry, direction-locked like the decision itself"
+-    # Single-line literals throughout: `grep -F` treats an embedded newline as a
+-    # pattern separator, so a two-line pattern would quietly become an OR.
+-    grep -Fq -- 'rc=0 re-materializes `temp` at the freshly fetched `origin/$BRANCH`, unrebased' "$mr" ||
+-        fail "leg 9: the mr recovery must keep an already-based temp unrebased (probe rc=0)"
+-    grep -Fq -- 'any other status STOPs without mutating bead state' "$mr" ||
+-        fail "leg 9: the mr recovery must fail closed on a probe error, like the decision's third arm"
+-
+-    # "Re-materialize" is a verb, not a command.  Bind it: the recovery names the
+-    # exact pair an agent runs, and leg 10 executes that pair out of the formula.
+-    grep -Fq -- 'git checkout --detach "origin/$TARGET" && git branch -D temp' "$mr" ||
+-        fail "leg 9: the mr lease-failure recovery must name the concrete command that clears temp, not an unbound \"re-materialize\""
+-    grep -Fq -- 'git checkout -B temp' "$mr" ||
+-        fail "leg 9: the mr recovery must warn off re-materializing in place with git checkout -B temp, which keeps the branch alive across the probe"
+-
+-    # The provenance line is published to human reviewers.  On the skip path temp
+-    # was never rebased, so it may not claim it was; both paths do leave
+-    # origin/$TARGET an ancestor of temp, which is what "Based on" asserts.
++        fail "leg 9: the mr lease-failure recovery still instructs an in-place rebase of temp"
++    ! grep -Eq -- '(^|[^-])git rebase' "$lease" ||
++        fail "leg 9: the lease-failure arm rebases temp in place; on the skip path that flattens the source branch"
++    grep -Fq -- 'cleanup_temp' "$lease" ||
++        fail "leg 9: the lease-failure arm must drop the stale temp before the step is re-entered"
++    grep -Fq -- "re-runs the rebase step's ancestry decision" "$lease" ||
++        fail "leg 9: the lease-failure arm must route back through the rebase step's ancestry decision"
+     grep -Fq -- "printf -- '- Based on \`%s\` via Gastown Refinery." "$mr" ||
+         fail "leg 9: the mr PR body must not advertise a rebase that the skip path never ran"
+     ! grep -Fq -- "printf -- '- Rebased on \`%s\` via Gastown Refinery." "$mr" ||
+         fail "leg 9: the mr PR body still publishes '- Rebased on ...' provenance, false on the skip path"
+-    grep -Fq -- 'a step re-entry' "$mr" ||
+-        fail "leg 9: the mr recovery re-materializes temp, so it must say the retry re-enters the step and re-runs run-tests rather than reading as a push-level fixup"
+-    grep -Fq -- 'run-tests` runs again' "$mr" ||
+-        fail "leg 9: the mr recovery must state that run-tests re-runs on the re-materialized temp"
+-
+-    # Ordering is the load-bearing half, and it is the DECISION's order that wins:
+-    # the rebase step probes before any branch exists ("so every STOP leaves the
+-    # worktree clean"), and legs 4/6 assert it.  An earlier revision of this
+-    # recovery mandated the inverse -- re-materialize, then probe -- which left a
+-    # mutated temp behind a probe error and put the two halves of one contract in
+-    # contradiction.  So: clear temp FIRST, then the probe, and only then the
+-    # re-materialization the arms perform.  Byte offsets, so a reflow of the
+-    # paragraph cannot break the check.
+-    off_clear=$(grep -Fob -m1 -- 'git checkout --detach "origin/$TARGET" && git branch -D temp' "$mr" | cut -d: -f1) || true
+-    [ -n "$off_clear" ] ||
+-        fail "leg 9: the mr recovery must clear temp with a concrete command before re-entering the step"
+-    off_probe=$(grep -Fob -m1 -- 'git merge-base --is-ancestor "origin/$TARGET" "origin/$BRANCH"' "$mr" | cut -d: -f1) || true
+-    [ -n "$off_probe" ] || fail "leg 9: the re-probe literal vanished between checks"
+-    off_rematerialize=$(grep -Fob -m1 -- 'rc=0 re-materializes `temp` at the freshly fetched `origin/$BRANCH`, unrebased' "$mr" | cut -d: -f1) || true
+-    [ -n "$off_rematerialize" ] || fail "leg 9: the rc=0 re-materialization literal vanished between checks"
+-    [ "$off_clear" -lt "$off_probe" ] ||
+-        fail "leg 9: the mr recovery must clear temp before re-probing (clear at byte $off_clear, probe at byte $off_probe)"
+-    [ "$off_probe" -lt "$off_rematerialize" ] ||
+-        fail "leg 9: the mr recovery must probe before re-materializing temp, matching the rebase step's probe-first rationale (probe at byte $off_probe, re-materialize at byte $off_rematerialize)"
++
++    # The clear is concrete and detaches: leg 10 executes exactly this body.
++    awk '/^cleanup_temp\(\) \{/ { on = 1; next } on && /^}/ { exit } on { print }' "$MERGE_PUSH" >"$cleanup"
++    grep -Fq -- 'git checkout --detach "origin/$TARGET"' "$cleanup" ||
++        fail "leg 9: cleanup_temp must detach onto origin/\$TARGET before deleting temp"
++    grep -Fq -- 'git branch -D temp' "$cleanup" ||
++        fail "leg 9: cleanup_temp must delete temp"
++    return 0
+ }
+ 
+ # Leg 10 -- the `mr` lease-failure recovery, EXECUTED rather than pinned.
+@@ -774,7 +738,11 @@ leg9() {
+ leg10() {
+     local ex d recovery first_temp moved
+     recovery="$tmp/mr-recovery.sh"
+-    lift_block 'git checkout --detach "origin/$TARGET" && git branch -D temp' "$recovery"
++    # The recovery merge-push.sh's lane_mr runs on a lease failure: its own
++    # cleanup_temp body, lifted from the script rather than transcribed.
++    awk '/^cleanup_temp\(\) \{/ { on = 1; next } on && /^}/ { exit } on { print }' "$MERGE_PUSH" >"$recovery"
++    [ -s "$recovery" ] || fail "leg 10: could not lift cleanup_temp out of $MERGE_PUSH"
++    bash -n "$recovery" || fail "leg 10: the lifted cleanup_temp body does not parse"
+ 
+     for ex in ex1 ex3a; do
+         d="$tmp/leg10-$ex"
+diff --git a/gastown/tests/test_pr_merge_reconcile.sh b/gastown/tests/test_pr_merge_reconcile.sh
+index 64d5be45..f3c4132b 100755
+--- a/gastown/tests/test_pr_merge_reconcile.sh
++++ b/gastown/tests/test_pr_merge_reconcile.sh
+@@ -1058,8 +1058,12 @@ PY
+ }
+ 
+ test_formula_uses_pending_merge_gate() {
+-    grep -F 'gc gastown pr-merge-reconcile record' "$FORMULA" >/dev/null ||
+-        fail "refinery formula must record PR handoffs through the reconciler"
++    # This fork runs the merge-push lane from merge-push.sh (gcp-l8td.6), not
++    # from fenced blocks of the formula, so the publication-path contract is
++    # read where the lane lives; the find-work ordering stays in the formula.
++    local merge_push="$ROOT/gastown/assets/scripts/refinery/merge-push.sh"
++    grep -F 'gc gastown pr-merge-reconcile record' "$merge_push" >/dev/null ||
++        fail "the merge-push lane must record PR handoffs through the reconciler"
+     grep -F 'Every time this open step is entered or re-entered after an idle wake' "$FORMULA" >/dev/null ||
+         fail "open refinery work scan must repeat pending-merge reconciliation after idle wakes"
+     [ "$(grep -c '^id = "find-work"$' "$FORMULA")" -eq 1 ] ||
+@@ -1070,10 +1074,10 @@ test_formula_uses_pending_merge_gate() {
+     search_line=$(grep -nF 'Search for work beads assigned to you' "$FORMULA" | head -n1 | cut -d: -f1)
+     [[ "$reconcile_line" -lt "$cleanup_line" && "$cleanup_line" -lt "$search_line" ]] ||
+         fail "find-work must order reconciliation, bounded cleanup, then normal work search"
+-    grep -F 'Do not invoke task-artifact cleanup on this publication path.' "$FORMULA" >/dev/null ||
++    grep -F 'No task-artifact cleanup here: reconciliation runs it after the verified' "$merge_push" >/dev/null ||
+         fail "MR publication path must defer cleanup until verified close"
+-    ! grep -F 'gc bd close $WORK --reason "Pull request ready:' "$FORMULA" >/dev/null ||
+-        fail "refinery formula must not close source beads at PR publication"
++    ! grep -F 'gc bd close $WORK --reason "Pull request ready:' "$FORMULA" "$merge_push" >/dev/null ||
++        fail "neither the formula nor the merge-push lane may close source beads at PR publication"
+ }
+ 
+ test_record_blocks_without_closing
+diff --git a/gastown/tests/test_refinery_merge_batch.sh b/gastown/tests/test_refinery_merge_batch.sh
+index fd37a3d7..4f101ccf 100755
+--- a/gastown/tests/test_refinery_merge_batch.sh
++++ b/gastown/tests/test_refinery_merge_batch.sh
+@@ -157,6 +157,12 @@ bd)
+     *) unexpected ;;
+     esac
+     ;;
++gastown)
++    # gc gastown task-artifact-cleanup <id>: the pack command a lane runs after
++    # a verified close (upstream's task-artifact lifecycle). Journalled only;
++    # its own suite owns its behaviour.
++    { [ "${2:-}" = task-artifact-cleanup ] && [ "$#" -eq 3 ]; } || unexpected
++    ;;
+ *) unexpected ;;
+ esac
+ exit 0
+diff --git a/gastown/tests/test_refinery_merge_lanes.sh b/gastown/tests/test_refinery_merge_lanes.sh
+index be75e840..8b4c4d2d 100644
+--- a/gastown/tests/test_refinery_merge_lanes.sh
++++ b/gastown/tests/test_refinery_merge_lanes.sh
+@@ -175,6 +175,28 @@ formula)
+         printf '{"formulas":[]}\n'
+     fi
+     ;;
++gastown)
++    case "${2:-}" in
++    task-artifact-cleanup)
++        # Run after a verified close (upstream's task-artifact lifecycle).
++        # Journalled only; its own suite owns its behaviour.
++        { [ "$#" -eq 3 ] && [ "$3" = "$GC_STUB_WORK" ]; } || unexpected
++        ;;
++    pr-merge-reconcile)
++        # `record <work> <url> <number> <target> <head>`: upstream #245's
++        # pending-merge handoff. Modelled on the bead it leaves: the PR
++        # identity and validated head recorded, merge_result=pull_request_pending,
++        # stale rejection cleared, and the bead BLOCKED, never closed.
++        { [ "${3:-}" = record ] && [ "$#" -eq 8 ] && [ "$4" = "$GC_STUB_WORK" ]; } || unexpected
++        edit_bead --arg url "$5" --arg num "$6" --arg target "$7" --arg head "$8" \
++            '.[0].metadata.pr_url = $url | .[0].metadata.pr_number = $num
++             | .[0].metadata.merged_target = $target | .[0].metadata.pr_head_sha = $head
++             | .[0].metadata.merge_result = "pull_request_pending"
++             | del(.[0].metadata.rejection_reason) | .[0].status = "blocked"'
++        ;;
++    *) unexpected ;;
++    esac
++    ;;
+ runtime) [ "${2:-}" = drain-ack ] || unexpected ;;
+ mail) [ "${2:-}" = send ] || unexpected ;;
+ session) [ "${2:-}" = nudge ] || unexpected ;;
+@@ -263,6 +285,12 @@ while [ "$#" -gt 0 ]; do
+     shift
+ done
+ [ -f "${STUB_REST_PR:-}" ] || unexpected
++# The live head sha is read off the bare origin, as GitHub would report it.
++rest_pr() {
++    local oid
++    oid=$(git --git-dir="$STUB_ORIGIN_DIR" rev-parse --verify -q "refs/heads/$(jq -r '.head.ref' "$STUB_REST_PR")" || true)
++    jq --arg oid "$oid" '.head.sha = $oid' "$STUB_REST_PR"
++}
+ case "$method $url" in
+ "GET $STUB_API/pulls")
+     if [ -e "$STUB_REST_CREATED" ]; then
+@@ -273,10 +301,10 @@ case "$method $url" in
+     ;;
+ "POST $STUB_API/pulls")
+     : >"$STUB_REST_CREATED"
+-    cat "$STUB_REST_PR"
++    rest_pr
+     ;;
+ "GET $STUB_API/pulls/$(jq -r '.number' "$STUB_REST_PR")")
+-    cat "$STUB_REST_PR"
++    rest_pr
+     ;;
+ *) unexpected ;;
+ esac
+@@ -658,6 +686,8 @@ test_lane_direct_lands_and_closes() {
+     expect "rejection_reason" "$(meta rejection_reason)" "<unset>"
+     expect "status" "$(bead status)" closed
+     expect "close reason" "$(bead close_reason)" "Merged to $TARGET_NAME at $(short_sha "$TEMP_SHA")"
++    logged gc "gc gastown task-artifact-cleanup $WORK_ID" ||
++        fail "no task-artifact cleanup after the verified close"
+     expect_not_drained
+     end_case
+ }
+@@ -808,7 +838,10 @@ test_lane_direct_cleanup_with_target_in_second_worktree() {
+     git -C "$REFINERY" rev-parse --verify -q refs/heads/temp >/dev/null &&
+         fail "temp still exists after cleanup"
+     expect "the second worktree's branch" "$(git -C "$T/second" symbolic-ref -q HEAD)" refs/heads/integration
+-    origin_ref "$BRANCH_NAME" >/dev/null && fail "origin still has $BRANCH_NAME after delete_merged_branches=true"
++    # Upstream #245: a verified merge KEEPS its source branch as the task
++    # artifact's recovery copy; delete_merged_branches no longer deletes.
++    origin_ref "$BRANCH_NAME" >/dev/null ||
++        fail "origin lost $BRANCH_NAME; a verified merge keeps its source branch even with delete_merged_branches=true"
+     end_case
+ }
+ 
+@@ -842,8 +875,10 @@ test_lane_mr_reuses_existing_pr() {
+     # (:1420-1472) before any lane runs, and mr-verify reads it again as
+     # PR_REF (:2115).
+     expect "scoped views of the existing PR" \
+-        "$(count_logged gh "gh pr view --repo $ORIGIN_REPO --json url,number,state,headRefName,baseRefName,headRepositoryOwner,headRepository -- $PR_URL")" 2
+-    expect "close reason" "$(bead close_reason)" "Pull request ready: $PR_URL"
++        "$(count_logged gh "gh pr view --repo $ORIGIN_REPO --json url,number,state,headRefName,headRefOid,baseRefName,headRepositoryOwner,headRepository -- $PR_URL")" 2
++    expect "status" "$(bead status)" blocked
++    expect "merge_result" "$(meta merge_result)" pull_request_pending
++    expect "close reason" "$(bead close_reason)" "<unset>"
+     end_case
+ }
+ 
+@@ -864,7 +899,9 @@ test_lane_mr_rest_fallback_without_gh() {
+         fail "no create-or-find call to $API_URL/pulls; curl calls: $(tr '\n' ';' <"$T/curl.log")"
+     expect "pr_url" "$(meta pr_url)" "https://github.com/acme/widgets/pull/42"
+     expect "pr_number" "$(meta pr_number)" 42
+-    expect "close reason" "$(bead close_reason)" "Pull request ready: https://github.com/acme/widgets/pull/42"
++    expect "status" "$(bead status)" blocked
++    expect "merge_result" "$(meta merge_result)" pull_request_pending
++    expect "close reason" "$(bead close_reason)" "<unset>"
+     end_case
+ }
+ 
+@@ -931,18 +968,26 @@ test_lane_mr_existing_pr_wrong_head_repo_blocks() {
+     end_case
+ }
+ 
+-test_lane_mr_4a_closes_pull_request_ready() {
+-    new_case mr_4a_closes_pull_request_ready
++# Upstream #245: approval off, PR publication is a PENDING handoff, never a
++# close. The bead is blocked (so its dependents stay blocked) until
++# `gc gastown pr-merge-reconcile` verifies the merge on a later patrol.
++test_lane_mr_4a_records_pending_pull_request() {
++    new_case mr_4a_records_pending_pull_request
+     build_rig unmerged
+     write_bead merge_strategy=mr
+     run_lane
+     expect_lane mr
+     expect_status 0
+-    expect "merge_result" "$(meta merge_result)" pull_request
++    logged gc "gc gastown pr-merge-reconcile record $WORK_ID $PR_URL 7 $TARGET_NAME $TEMP_SHA" ||
++        fail "no pending-merge record of the validated head; gc calls: $(tr '\n' ';' <"$T/gc.log")"
++    logged gc "gc mail send mayor/ -s PR ready for review: $WORK_ID" || fail "the mayor was not told the PR is ready for review"
++    grep -qF "gc gastown task-artifact-cleanup" "$T/gc.log" && fail "task-artifact cleanup ran at PR publication"
++    expect "merge_result" "$(meta merge_result)" pull_request_pending
+     expect "merged_target" "$(meta merged_target)" "$TARGET_NAME"
++    expect "pr_head_sha" "$(meta pr_head_sha)" "$TEMP_SHA"
+     expect "rejection_reason" "$(meta rejection_reason)" "<unset>"
+-    expect "status" "$(bead status)" closed
+-    expect "close reason" "$(bead close_reason)" "Pull request ready: $PR_URL"
++    expect "status" "$(bead status)" blocked
++    expect "close reason" "$(bead close_reason)" "<unset>"
+     expect "origin/$BRANCH_NAME" "$(origin_ref "$BRANCH_NAME")" "$TEMP_SHA"
+     expect_target_unchanged
+     expect_not_drained
+@@ -1010,7 +1055,7 @@ test_lane_mr_cleanup_with_target_in_second_worktree() {
+     run_lane
+     expect_lane mr
+     expect_status 0
+-    expect "status" "$(bead status)" closed
++    expect "status" "$(bead status)" blocked
+     # The mr cleanup detaches onto the target, as the direct lane's does, so the
+     # target being checked out in another worktree no longer stops it (gcp-l8td.6).
+     ! output_has "already (checked out|used by worktree)" ||
+@@ -1265,7 +1310,9 @@ test_script_honors_refinery_gh() {
+     grep -qE '^gh pr (create|view) ' "$T/gh.log" ||
+         fail "refinery-gh received no pull request call; its calls: $(tr '\n' ';' <"$T/gh.log")"
+     expect "pr_url" "$(meta pr_url)" "$PR_URL"
+-    expect "close reason" "$(bead close_reason)" "Pull request ready: $PR_URL"
++    expect "status" "$(bead status)" blocked
++    expect "merge_result" "$(meta merge_result)" pull_request_pending
++    expect "close reason" "$(bead close_reason)" "<unset>"
+     end_case
+ }
+ 
+@@ -1315,7 +1362,7 @@ run_all_cases() {
+     test_lane_mr_existing_pr_wrong_base_blocks
+     test_lane_mr_existing_pr_wrong_repo_blocks
+     test_lane_mr_existing_pr_wrong_head_repo_blocks
+-    test_lane_mr_4a_closes_pull_request_ready
++    test_lane_mr_4a_records_pending_pull_request
+     test_lane_mr_4b_refused_parks
+     test_lane_mr_4b_approved_lands_and_closes
+     test_lane_mr_zero_diff_halts
+diff --git a/scripts/gascity_pack_inference_gate.py b/scripts/gascity_pack_inference_gate.py
+index 50a66aad..72397055 100644
+--- a/scripts/gascity_pack_inference_gate.py
++++ b/scripts/gascity_pack_inference_gate.py
+@@ -349,8 +349,14 @@ GASTOWN_SCRIPT_CONTRACTS = {
+         '--set-metadata merged_sha="$MERGED_SHA"',
+         'gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT"',
+         '"$GH" pr create',
+-        "--set-metadata pr_url=\"$PR_URL\"",
+-        "gc bd close $WORK --reason \"Pull request ready: $PR_URL\"",
++        # Upstream #245: approval off, a PR is a PENDING handoff recorded with
++        # the validated head; the bead is blocked, never closed at publication.
++        "gc gastown pr-merge-reconcile record",
++        '"$WORK" "$PR_URL" "$PR_NUMBER" "$TARGET" "$PR_HEAD_SHA"',
++        'if [ "$PR_HEAD_SHA" != "$EXPECTED_PR_HEAD" ]; then',
++        # A verified close runs the task-artifact cleanup and keeps the source
++        # branch as its recovery copy.
++        'gc gastown task-artifact-cleanup "$WORK"',
+     ),
+     # The batch lane's mechanics (gcp-l8td.8-.11). Each fragment is the line that
+     # makes one guarantee real: a member is closed against ITS landed commit, a
+diff --git a/tests/test_gascity_pack_inference_gate.py b/tests/test_gascity_pack_inference_gate.py
+index 815daaa6..711bbd5f 100644
+--- a/tests/test_gascity_pack_inference_gate.py
++++ b/tests/test_gascity_pack_inference_gate.py
+@@ -1974,7 +1974,8 @@ def test_gastown_build_workflow_contract_covers_orchestration_roles() -> None:
+     assert 'git worktree add --detach "$mfp_wt" "$BEFORE_SHA"' in script_contracts
+     assert 'git merge-base --is-ancestor "$TEMP_SHA" "$AFTER_SHA"' in script_contracts
+     assert 'gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT"' in script_contracts
+-    assert "gc bd close $WORK --reason \"Pull request ready: $PR_URL\"" in script_contracts
++    assert "gc gastown pr-merge-reconcile record" in script_contracts
++    assert 'gc gastown task-artifact-cleanup "$WORK"' in script_contracts
+     assert '"$GH" pr create' in script_contracts
+     for fragment in ("merge-batch.sh", 'land --head "$WORK"', 'stack --head "$WORK"', 'serial --head "$WORK"'):
+         assert fragment in contracts["mol-refinery-patrol"]
+-- 
+2.54.0 (Apple Git-157)
+

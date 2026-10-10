@@ -1,0 +1,683 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sat, 10 Oct 2026 16:54:45 -0400
+Subject: [PATCH 146/148] fix(refinery): port the batch lane to upstream's
+ task-artifact lifecycle (gcp-fooz4)
+
+f709abe5 (#245) made every verified close keep the source branch ("MUST NOT
+delete") and run gc gastown task-artifact-cleanup, with the head's
+artifact_source_sha and artifact_cleanup_state=pending captured before its
+rebase. The port (a1f35244) covered merge-push.sh only. merge-batch.sh,
+live on winnow (merge_batch_max=3), still deleted every landed member's
+branch and the stack-time already-merged member's branch, never ran
+cleanup, and never gave members an artifact proof. A left-open member then
+reached the single-bead lane with no proof, and its cleanup blocked on
+"missing artifact_source_sha", so merge-push exited 2 after closing it.
+
+merge-batch.sh now:
+- never deletes a member's source branch, in land or in stack;
+- records each member's proof in land before the push, with the same keys
+  and semantics as the rebase step's capture of the head
+  (mb_capture_artifact_proof: capture origin/<branch> and arm pending when
+  absent, never overwrite, re-arm pending otherwise). A proof that cannot
+  be recorded stops land with 2 before anything lands. The stack-time
+  already-merged member gets its proof right before its close;
+- runs task-artifact cleanup after each member's verified close. A cleanup
+  that does not converge is handled as direct_cleanup handles it: the
+  member stays closed, its pending/blocked state stays, land ends 2 with a
+  "did not converge" line, and the other members still close and clean
+  up. stack cannot stop the head's lane (it always exits 0), so there a
+  non-converging cleanup is a WARN, left for find-work's sweep.
+
+A push that fails (2/3/5/6/7) now writes the members' artifact proof and
+nothing else. That proof is exactly what the rebase step leaves on a head
+whose push fails.
+
+test_refinery_merge_batch.sh: the gc stub now runs the REAL
+task-artifact-cleanup.sh (its --rig scoped bead calls reach the fixture),
+and every bead has a real task worktree in the city's artifact namespace,
+so cleanup's evidence matrix runs against the real origin. The head carries
+the proof the rebase step captures; members must get theirs from
+merge-batch.sh. Before this change: land-green, target-moved-once,
+left-open-recovery and stack-already-landed failed on deleted branches and
+missing cleanup, the push-failure cases on missing proof, and the
+left-open recovery's merge-push exited 2 on "missing artifact_source_sha".
+After: every case passes, including a new case_land_cleanup_blocked
+(dirty worktree: blocked, member closed, land 2). 23 cases.
+
+The formula's batch paragraph now names the cleanup arm of land's status 2.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .../assets/scripts/refinery/merge-batch.sh    | 119 +++++++++--
+ gastown/formulas/mol-refinery-patrol.toml     |  16 +-
+ gastown/tests/test_refinery_merge_batch.sh    | 190 ++++++++++++++----
+ 3 files changed, 264 insertions(+), 61 deletions(-)
+
+diff --git a/gastown/assets/scripts/refinery/merge-batch.sh b/gastown/assets/scripts/refinery/merge-batch.sh
+index bccc6562..2e43d99c 100755
+--- a/gastown/assets/scripts/refinery/merge-batch.sh
++++ b/gastown/assets/scripts/refinery/merge-batch.sh
+@@ -47,8 +47,12 @@
+ #         conflicts, is ineligible, or collapses to no change ends the batch
+ #         there: it and every later member are dropped, keep no new metadata and
+ #         stay assigned. One exception: a member that collapses AND passes
+-#         branch_already_landed is closed as already merged by the existing
+-#         helper, and stacking continues past it. Any internal error resets
++#         branch_already_landed gets the head's artifact proof
++#         (mb_capture_artifact_proof), is closed as already merged by the existing
++#         helper, keeps its source branch, and has its task-artifact cleanup run;
++#         stacking continues past it. stack never stops the head's lane, so a
++#         cleanup there that does not converge is a WARN, its durable state left
++#         for find-work's sweep. Any internal error resets
+ #         `temp` to the head tip recorded at entry, writes a one-member manifest,
+ #         prints WARN and still exits 0.
+ #         Writes the manifest `$(git rev-parse --git-dir)/refinery-batch.json`:
+@@ -65,9 +69,14 @@
+ #         runs merge-push.sh's merge_ff_push on `temp`, so the retry loop and the
+ #         statuses are the lane's: 0 landed, 2 hard stop, 3 the re-rebase
+ #         conflicted, 5 no-op, 6 retries exhausted, 7 the remote refused. Any of
+-#         2/3/5/6/7 from the push writes no bead and leaves the manifest where it
+-#         is. Status 4 cannot arise: land stops with 2 when the approval gate is
+-#         on, because a batch of more than one never rode it.
++#         2/3/5/6/7 from the push writes nothing but the artifact proof below and
++#         leaves the manifest where it is. Status 4 cannot arise: land stops with
++#         2 when the approval gate is on, because a batch of more than one never
++#         rode it.
++#         Before the push, every member gets the task-artifact proof the patrol's
++#         rebase step records for the head (upstream #245): artifact_source_sha
++#         and artifact_cleanup_state=pending (mb_capture_artifact_proof). A member
++#         whose proof cannot be recorded stops land with 2 before anything lands.
+ #         After a landing, member i's commit is found in the LANDED stack, not in
+ #         the manifest, because a retry re-rebases temp and so rewrites every
+ #         sha: with L the landed tip and offset_i the commit count of the members
+@@ -76,8 +85,13 @@
+ #         that check, or whose bead write or close fails, is LEFT OPEN with its
+ #         branch kept, never given the batch tip or another member's commit, and
+ #         never rolled back: the merge-state gate closes it as already merged on
+-#         a later patrol. Status 0 when every member closed, 2 when one is left
+-#         open. The manifest is removed after a landing. Once the manifest checks
++#         a later patrol. No member's source branch is ever deleted: it is the
++#         task artifact's recovery copy. After each member's close, its
++#         task-artifact cleanup runs; one that does not converge is handled as
++#         merge-push.sh's direct_cleanup handles it: the member stays closed, its
++#         durable pending/blocked state stays retryable, and land ends 2. Status
++#         0 when every member closed and cleaned up, 2 when one is left open or
++#         its cleanup did not converge. The manifest is removed after a landing. Once the manifest checks
+ #         pass, every exit drops temp, success or failure, as merge-push.sh's
+ #         drop_temp_on_exit does for the single-bead lane: a temp that outlived
+ #         land would make the next patrol's rebase step STOP (upstream #374).
+@@ -204,6 +218,51 @@ mb_check_member() {
+   return 0
+ }
+ 
++# mb_capture_artifact_proof <id> <branch> — record the member's task-artifact
++# proof the way the patrol's rebase step records the head's (upstream #245):
++# with no artifact_source_sha on the bead, the sha origin/<branch> holds now,
++# together with artifact_cleanup_state=pending; with one, it is never overwritten
++# (the polecat's next submission clears it) and only the pending marker is
++# re-armed. The batch lane never rewrites a member's origin branch, so that sha
++# is the source the polecat pushed and its task worktree holds, which is what
++# task-artifact cleanup proves the worktree safe against. Returns 1, with MB_WHY
++# set, when the bead cannot be read, the branch cannot be resolved, or the write
++# fails; each path makes at most one write.
++mb_capture_artifact_proof() {
++  cap_id="$1"
++  cap_branch="$2"
++  MB_WHY=""
++  if ! mb_load_bead "$cap_id" ||
++    ! cap_meta=$(printf '%s' "$MB_JSON" | jq -ce '
++      if type == "array" and length == 1 and (.[0] | type) == "object" and
++         ((.[0].metadata // {}) | type) == "object"
++      then .[0].metadata // {}
++      else error("expected exactly one work bead object")
++      end' 2>/dev/null); then
++    MB_WHY="cannot read $cap_id to record its artifact proof"
++    return 1
++  fi
++  cap_source=$(printf '%s' "$cap_meta" | jq -r '.artifact_source_sha // empty')
++  cap_state=$(printf '%s' "$cap_meta" | jq -r '.artifact_cleanup_state // empty')
++  if [ -z "$cap_source" ]; then
++    if ! git fetch -q --no-tags origin "+refs/heads/$cap_branch:refs/remotes/origin/$cap_branch" >/dev/null 2>&1 ||
++      ! cap_source=$(git rev-parse --verify -q "refs/remotes/origin/$cap_branch^{commit}" 2>/dev/null); then
++      MB_WHY="cannot read origin/$cap_branch to record $cap_id's artifact proof"
++      return 1
++    fi
++    if ! gc bd update "$cap_id" --set-metadata artifact_source_sha="$cap_source" --set-metadata artifact_cleanup_state=pending; then
++      MB_WHY="cannot record $cap_id's artifact proof"
++      return 1
++    fi
++  elif [ "$cap_state" != pending ]; then
++    if ! gc bd update "$cap_id" --set-metadata artifact_cleanup_state=pending; then
++      MB_WHY="cannot re-arm $cap_id's artifact cleanup marker"
++      return 1
++    fi
++  fi
++  return 0
++}
++
+ # --- select -----------------------------------------------------------------
+ 
+ cmd_select() {
+@@ -409,6 +468,12 @@ sb_stack_member() {
+     fi
+     sm_sha=$(upstream_equivalent_sha "origin/$TARGET" "origin/$BRANCH") ||
+       sm_sha=$(git rev-parse "origin/$TARGET")
++    # Closed here rather than by land, so it gets its artifact proof here: its
++    # cleanup below proves its task worktree safe against it.
++    if ! mb_capture_artifact_proof "$sm_id" "$BRANCH"; then
++      SB_WHY="$sm_id is already merged but $MB_WHY"
++      return 1
++    fi
+     # The helper's stdout tells the agent to skip the merge script, which is the
+     # lane's advice and not a batch's, so it is held back and summarised here.
+     if ! sm_out=$(close_already_merged "$sm_sha" rebase_patch_id "every commit on origin/$BRANCH since $sm_fork is already upstream in origin/$TARGET by patch-id, and its rebase is empty"); then
+@@ -416,9 +481,11 @@ sb_stack_member() {
+       return 1
+     fi
+     echo "merge-batch: $sm_id is already merged to $TARGET at $(git rev-parse --short "$sm_sha" 2>/dev/null); closed it and stacked past it."
+-    if [ "$CFG_DELETE_MERGED_BRANCHES" = "true" ]; then
+-      git push -q origin --delete "$BRANCH" >/dev/null 2>&1 ||
+-        mb_warn "could not delete the merged branch $BRANCH on origin."
++    # Upstream #245: its source branch stays as the recovery copy, and the close
++    # runs its task-artifact cleanup. stack never stops the head's lane, so a
++    # cleanup that does not converge is a WARN; find-work's sweep retries it.
++    if ! gc gastown task-artifact-cleanup "$sm_id"; then
++      mb_warn "task artifact cleanup for $sm_id did not converge; its durable pending/blocked state remains retryable."
+     fi
+     return 3
+   fi
+@@ -629,15 +696,16 @@ lb_record() {
+ }
+ 
+ # lb_land_members — after a verified landing, map each member to its own commit
+-# in the landed stack and record it. Sets LB_LANDED and LB_LEFT_OPEN. Returns 0
+-# when every member closed and 2 when one was left open.
++# in the landed stack, record it, and run its task-artifact cleanup. Sets
++# LB_LANDED, LB_LEFT_OPEN and LB_CLEANUP_FAILED. Returns 0 when every member
++# closed and cleaned up, and 2 when one was left open or its cleanup did not
++# converge.
+ lb_land_members() {
+   lm_landed_sha="$MERGED_SHA"
+   LB_LANDED_SHORT=$(git rev-parse --short "$lm_landed_sha" 2>/dev/null) || LB_LANDED_SHORT="$lm_landed_sha"
+   # A for loop, not a read loop, for the reason select gives.
+   for lm_idx in $(seq 0 $((LB_SIZE - 1))); do
+     lm_id=$(lb_member "$lm_idx" id)
+-    lm_branch=$(lb_member "$lm_idx" branch)
+     lm_pos=$((lm_idx + 1))
+     lm_offset=$(printf '%s' "$LB_JSON" | jq -r --argjson i "$lm_idx" '[.members[$i + 1:][].commits] | add // 0')
+     # The member's own commit in the landed stack. Never L itself, the
+@@ -659,12 +727,16 @@ lb_land_members() {
+       continue
+     fi
+     lb_append_landed "$lm_id"
+-    if [ "$CFG_DELETE_MERGED_BRANCHES" = "true" ]; then
+-      git push -q origin --delete "$lm_branch" >/dev/null 2>&1 ||
+-        mb_warn "could not delete the merged branch $lm_branch on origin."
++    # Upstream #245: the source branch is never deleted; it is the recovery copy
++    # task-artifact cleanup proves the member's worktree safe against. A cleanup
++    # that does not converge is merge-push.sh's direct_cleanup case: the member
++    # stays closed, its durable state stays retryable, and land ends 2.
++    if ! gc gastown task-artifact-cleanup "$lm_id"; then
++      echo "merge-batch: task artifact cleanup for $lm_id did not converge. STOP; its durable pending/blocked state remains retryable."
++      LB_CLEANUP_FAILED="${LB_CLEANUP_FAILED:+$LB_CLEANUP_FAILED,}$lm_id"
+     fi
+   done
+-  [ -z "$LB_LEFT_OPEN" ] && return 0
++  [ -z "$LB_LEFT_OPEN" ] && [ -z "$LB_CLEANUP_FAILED" ] && return 0
+   return 2
+ }
+ 
+@@ -765,6 +837,16 @@ lb_land() {
+     return 2
+   fi
+ 
++  # Every member's task-artifact proof before anything lands, as the rebase
++  # step records the head's before its rebase; for the head it is already there.
++  # A proof that cannot be recorded stops here, as that step's capture does.
++  for lnd_idx in $(seq 0 $((LB_SIZE - 1))); do
++    if ! mb_capture_artifact_proof "$(lb_member "$lnd_idx" id)" "$(lb_member "$lnd_idx" branch)"; then
++      echo "merge-batch: $MB_WHY. Nothing landed." >&2
++      return 2
++    fi
++  done
++
+   # merge_ff_push reads TARGET (set above), BRANCH (messages only) and
+   # APPROVAL_REQUIRED, and is not copied here: the batch lands exactly as the
+   # single-bead lane does.
+@@ -781,7 +863,7 @@ lb_land() {
+   lnd_rc=$?
+   # The manifest describes a stack that now exists only on the target.
+   rm -f "$LB_MANIFEST"
+-  if [ "$lnd_rc" -ne 0 ]; then
++  if [ -n "$LB_LEFT_OPEN" ]; then
+     echo "merge-batch: the batch landed on $TARGET at $MERGED_SHORT, but left open: $LB_LEFT_OPEN. The next patrol's merge-state gate closes each as already merged."
+   fi
+   return "$lnd_rc"
+@@ -790,6 +872,7 @@ lb_land() {
+ cmd_land() {
+   LB_LANDED=""
+   LB_LEFT_OPEN=""
++  LB_CLEANUP_FAILED=""
+   # Read by merge-push.sh's drop_temp_on_exit; lb_land sets it once the manifest
+   # names the target.
+   # shellcheck disable=SC2034
+diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
+index cbd60db3..c53bcaf6 100644
+--- a/gastown/formulas/mol-refinery-patrol.toml
++++ b/gastown/formulas/mol-refinery-patrol.toml
+@@ -1703,11 +1703,17 @@ What each status means, and what this step does about it:
+ With a batch (a manifest of 2+ members) the block ran `merge-batch.sh land`
+ instead, and its last output line is `merge-batch: RESULT <status> landed=<ids>
+ left-open=<ids>`. Its statuses 0, 1, 2, 3, 5, 6 and 7 mean what the table says and
+-this step does what the table says; `land` never returns 4, 9 or 11. Status 0 is
+-every member closed. Status 2 after a landing means a member was LANDED but not
+-recorded: name each `left-open` id in your patrol-summary, STOP and drain, and
+-leave it alone. The next iteration's already-merged arm closes it when it comes
+-up as the head. `land` removes the manifest after a landing, and once its manifest
++this step does what the table says; `land` never returns 4, 9 or 11. `land`
++records each member's task-artifact proof before its push, as the rebase step
++does for the head, keeps every member's source branch, and runs each member's
++task-artifact cleanup after its close. Status 0 is every member closed and
++cleaned up. Status 2 after a landing means a member was LANDED but not recorded,
++or a closed member's cleanup did not converge (its pending or blocked state
++stays on the bead; find-work's sweep retries a pending one). Name each
++`left-open` id, and each member whose cleanup the output says did not converge,
++in your patrol-summary, STOP and drain, and leave them alone. The next
++iteration's already-merged arm closes a left-open member when it comes up as the
++head. `land` removes the manifest after a landing, and once its manifest
+ checks pass it drops `temp` on every exit, as the single-bead script does.
+ 
+ Status 7 is the one that most invites a wrong next move: the remote refused the
+diff --git a/gastown/tests/test_refinery_merge_batch.sh b/gastown/tests/test_refinery_merge_batch.sh
+index 5bacd5aa..c02b1546 100755
+--- a/gastown/tests/test_refinery_merge_batch.sh
++++ b/gastown/tests/test_refinery_merge_batch.sh
+@@ -22,6 +22,13 @@
+ #   gc bd note <id> --stdin   appends stdin to $GC_STUB_BEADS/<id>.notes
+ #   gc bd close <id>  status closed and the close reason; fails for the ids in
+ #                     GC_STUB_FAIL_CLOSE
++#   gc gastown task-artifact-cleanup <id>
++#                     runs the REAL task-artifact-cleanup.sh, whose bead calls
++#                     (scoped with --rig) reach the same fixture. Every bead has
++#                     a real task worktree in the city's artifact namespace, so
++#                     cleanup's evidence matrix is enforced against the real
++#                     origin: the source branch must still hold
++#                     artifact_source_sha and merged_sha must be on the target.
+ # Every call is journalled to $T/gc.log. A call the model does not know fails
+ # loudly (exit 64) and fails the case.
+ #
+@@ -29,14 +36,15 @@
+ # in. SCRIPT may point at another copy of merge-batch.sh; it finds merge-push.sh
+ # beside itself, so stage a copy as a pack tree.
+ #
+-# The suite fails unless all 22 cases ran.
++# The suite fails unless all 23 cases ran.
+ set -uo pipefail
+ 
+ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+ PACK_DIR="$ROOT/gastown"
+ SCRIPT="${SCRIPT:-$PACK_DIR/assets/scripts/refinery/merge-batch.sh}"
+ PUSH_SCRIPT="$(dirname "$SCRIPT")/merge-push.sh"
+-EXPECTED_CASES=22
++CLEANUP_SCRIPT="$ROOT/gastown/assets/scripts/task-artifact-cleanup.sh"
++EXPECTED_CASES=23
+ 
+ AGENT=testrig/gastown.refinery
+ TARGET_NAME=integration
+@@ -72,6 +80,12 @@ edit_bead() {
+     tmp=$(mktemp) || exit 70
+     jq "$@" "$file" >"$tmp" && mv -f "$tmp" "$file"
+ }
++# task-artifact-cleanup.sh scopes its bead calls with `--rig <rig>` before the
++# verb; the fixture is that rig's.
++if [ "${1:-}" = bd ] && [ "${2:-}" = --rig ]; then
++    [ "${3:-}" = "$GC_STUB_RIG" ] || unexpected
++    set -- bd "${@:4}"
++fi
+ case "${1:-}" in
+ bd)
+     case "${2:-}" in
+@@ -159,9 +173,10 @@ bd)
+     ;;
+ gastown)
+     # gc gastown task-artifact-cleanup <id>: the pack command a lane runs after
+-    # a verified close (upstream's task-artifact lifecycle). Journalled only;
+-    # its own suite owns its behaviour.
++    # a verified close (upstream's task-artifact lifecycle). The real script,
++    # as the pack command execs it.
+     { [ "${2:-}" = task-artifact-cleanup ] && [ "$#" -eq 3 ]; } || unexpected
++    exec "$GC_STUB_REAL_CLEANUP" "$3"
+     ;;
+ *) unexpected ;;
+ esac
+@@ -183,7 +198,9 @@ new_case() {
+     POLECAT="$T/polecat"
+     REFINERY="$T/refinery"
+     BEADS="$T/beads"
+-    mkdir -p "$T/home" "$T/tmp" "$T/bin" "$BEADS"
++    CITY="$T/city"
++    HEAD_ID=""
++    mkdir -p "$T/home" "$T/tmp" "$T/bin" "$BEADS" "$CITY/.gc/worktrees/testrig/artifacts/worktrees"
+     cat >"$T/home/.gitconfig" <<'CFG'
+ [init]
+ 	defaultBranch = integration
+@@ -299,8 +316,11 @@ land_by_patch_id() {
+ }
+ 
+ # finish_rig <head-id> — the refinery's clone with `temp` rebased onto the target,
+-# as the rebase step leaves it. Sets ENTRY_SHA, the head tip the script records.
++# as the rebase step leaves it. Sets ENTRY_SHA, the head tip the script records,
++# and HEAD_ID, whose bead write_bead gives the artifact proof the rebase step
++# captures for the head.
+ finish_rig() {
++    HEAD_ID="$1"
+     git_q clone "$ORIGIN" "$REFINERY"
+     git_q -C "$REFINERY" checkout -b temp "origin/polecat/$1"
+     git_q -C "$REFINERY" rebase origin/integration ||
+@@ -309,16 +329,32 @@ finish_rig() {
+     [ -n "$ENTRY_SHA" ] || fail "harness bug: finish_rig left no temp branch"
+ }
+ 
++# artifact_of <bead-id> — the bead's task worktree in the city's artifact namespace.
++artifact_of() { echo "$CITY/.gc/worktrees/testrig/artifacts/worktrees/$1"; }
++
+ # write_bead <id> <priority> <created_at> [key=value ...] — a bead as `gc bd show`
+-# returns it, assigned to the refinery, with the polecat's branch metadata.
++# returns it, assigned to the refinery, with the polecat's branch metadata and
++# its task worktree: a worktree of the polecat clone at the branch tip it pushed,
++# made once. The head (finish_rig's) also carries the artifact proof the rebase
++# step captures; every other member must get its proof from merge-batch.sh.
+ write_bead() {
+-    local id="$1" prio="$2" created="$3" kv tmp
++    local id="$1" prio="$2" created="$3" kv tmp artifact source
+     shift 3
++    artifact=$(artifact_of "$id")
++    if [ ! -d "$artifact" ] && git -C "$POLECAT" rev-parse --verify -q "refs/heads/polecat/$id" >/dev/null 2>&1; then
++        git_q -C "$POLECAT" worktree add --detach "$artifact" "polecat/$id" ||
++            fail "harness bug: could not add the task worktree for $id"
++    fi
+     jq -n --arg id "$id" --argjson prio "$prio" --arg created "$created" --arg agent "$AGENT" \
+         --arg branch "polecat/$id" --arg target "$TARGET_NAME" --arg fork "$FORK_SHA" \
+         '[{id: $id, title: ("Bead " + $id), priority: $prio, created_at: $created,
+            issue_type: "task", status: "in_progress", assignee: $agent,
+            metadata: {branch: $branch, target: $target, fork_sha: $fork}}]' >"$BEADS/$id.json"
++    [ ! -d "$artifact" ] || set_meta "$id" artifact_dir "$artifact"
++    if [ "$id" = "$HEAD_ID" ] && source=$(branch_on_origin "$id"); then
++        set_meta "$id" artifact_source_sha "$source"
++        set_meta "$id" artifact_cleanup_state pending
++    fi
+     for kv in "$@"; do
+         set_meta "$id" "${kv%%=*}" "${kv#*=}"
+     done
+@@ -359,6 +395,8 @@ run_batch() {
+             GC_STUB_FAIL_SHOW="$FAIL_SHOW" GC_STUB_FAIL_CLOSE="$FAIL_CLOSE" \
+             GC_STUB_FAIL_UPDATE="$FAIL_UPDATE" \
+             STUB_UNEXPECTED="$T/unexpected" \
++            GC_STUB_RIG=testrig GC_STUB_REAL_CLEANUP="$CLEANUP_SCRIPT" \
++            GC_CITY_PATH="$CITY" GC_RIG_ROOT="$POLECAT" \
+             ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"} \
+             "$BASH" "$SCRIPT" "$@"
+     ) >"$T/out" 2>"$T/err"
+@@ -383,6 +421,8 @@ run_push() {
+             GC_STUB_FAIL_SHOW="$FAIL_SHOW" GC_STUB_FAIL_CLOSE="$FAIL_CLOSE" \
+             GC_STUB_FAIL_UPDATE="$FAIL_UPDATE" \
+             STUB_UNEXPECTED="$T/unexpected" \
++            GC_STUB_RIG=testrig GC_STUB_REAL_CLEANUP="$CLEANUP_SCRIPT" \
++            GC_CITY_PATH="$CITY" GC_RIG_ROOT="$POLECAT" \
+             "$BASH" "$PUSH_SCRIPT" --gh "$T/bin/no-gh" "$@"
+     ) >"$T/out" 2>"$T/err"
+     RC=$?
+@@ -674,8 +714,9 @@ case_stack_already_landed() {
+     "Already merged to integration at "*) ;;
+     *) fail "unexpected close reason: $(bead_field gcp-l2 close_reason)" ;;
+     esac
+-    [ -z "$(git -C "$REFINERY" ls-remote origin refs/heads/polecat/gcp-l2)" ] ||
+-        fail "the merged member's branch was not deleted (delete_merged_branches defaults on)"
++    # Upstream #245: the closed member keeps its source branch, gets the artifact
++    # proof the head gets, and its task-artifact cleanup runs after the close.
++    assert_member_cleaned gcp-l2
+     assert_eq "the head's bead is untouched" "$before_l1" "$(bead_sum gcp-l1)"
+     assert_eq "the stacked member's bead is untouched" "$before_l3" "$(bead_sum gcp-l3)"
+     git -C "$REFINERY" cat-file -e "temp:f3.txt" 2>/dev/null || fail "stacking did not continue past the closed member"
+@@ -835,6 +876,49 @@ assert_no_temp() {
+ # snapshot_beads — the three beads' bytes, to prove a land run wrote none.
+ snapshot_beads() { echo "$(bead_sum gcp-h1)|$(bead_sum gcp-h2)|$(bead_sum gcp-h3)"; }
+ 
++# snapshot_beads_sans_proof — the same, less the artifact proof land records
++# before its push.
++snapshot_beads_sans_proof() {
++    local i
++    for i in 1 2 3; do
++        jq -cS '.[0] | .metadata |= del(.artifact_source_sha, .artifact_cleanup_state)' "$BEADS/gcp-h$i.json" | cksum
++    done | tr '\n' '|'
++}
++
++# assert_member_proof <id> <state> — the bead carries the artifact proof the
++# rebase step captures for a head (upstream #245): artifact_source_sha is the
++# source sha the polecat pushed, which origin still holds, and the cleanup
++# marker is <state>.
++assert_member_proof() {
++    assert_eq "$1's artifact_source_sha is its pushed source sha" \
++        "$(git -C "$(artifact_of "$1")" rev-parse HEAD 2>/dev/null || echo "<worktree gone>")" \
++        "$(bead_meta "$1" artifact_source_sha)"
++    assert_eq "$1's artifact_cleanup_state" "$2" "$(bead_meta "$1" artifact_cleanup_state)"
++}
++
++# assert_member_cleaned <id> — after the close, task-artifact cleanup ran for
++# the member and converged against the real origin: its worktree is gone, and
++# its source branch survives at artifact_source_sha as the recovery copy.
++assert_member_cleaned() {
++    grep -qx "gc gastown task-artifact-cleanup $1" "$T/gc.log" ||
++        fail "no task-artifact cleanup ran for $1"
++    assert_eq "$1's artifact_cleanup_state" complete "$(bead_meta "$1" artifact_cleanup_state)"
++    assert_eq "$1's artifact_dir" "<unset>" "$(bead_meta "$1" artifact_dir)"
++    [ ! -e "$(artifact_of "$1")" ] || fail "$1's task worktree was not removed"
++    assert_eq "origin/polecat/$1 is kept at artifact_source_sha" \
++        "$(bead_meta "$1" artifact_source_sha)" "$(branch_on_origin "$1" || echo "<deleted>")"
++}
++
++# assert_only_proof_written <what> <sans-proof snapshot before> — land wrote the
++# artifact proof of each member without one, before its push, and nothing else.
++assert_only_proof_written() {
++    local id
++    assert_eq "$1: no bead changed but for its artifact proof" "$2" "$(snapshot_beads_sans_proof)"
++    assert_eq "$1: every bead write was an artifact proof" \
++        "$(grep -cE '^gc bd update gcp-h[0-9] --set-metadata artifact_source_sha=' "$T/gc.log")" "$(db_writes)"
++    for id in gcp-h1 gcp-h2 gcp-h3; do assert_member_proof "$id" pending; done
++}
++
+ # assert_landed_member <index 0-2> <offset> — member <index+1> closed on its own
+ # commit, <offset> commits behind the landed tip.
+ assert_landed_member() {
+@@ -876,8 +960,10 @@ case_land_green() {
+         "$(for i in 1 2 3; do bead_meta "gcp-h$i" merged_sha; done | sort -u | wc -l | tr -d ' ')"
+     [ "$(bead_meta gcp-h1 merged_sha)" != "$tip" ] || fail "member 1 was given the batch tip as its merged_sha"
+     assert_eq "member 3's rejection_reason is unset" "<unset>" "$(bead_meta gcp-h3 rejection_reason)"
++    # Upstream #245: a verified merge keeps every source branch and runs the
++    # task-artifact cleanup for each member it closed.
+     for i in 1 2 3; do
+-        [ -z "$(branch_on_origin "gcp-h$i")" ] || fail "origin/polecat/gcp-h$i was not deleted"
++        assert_member_cleaned "gcp-h$i"
+     done
+     git -C "$REFINERY" rev-parse --verify -q refs/heads/temp >/dev/null 2>&1 && fail "the temp branch was left behind"
+     [ ! -f "$(manifest_path)" ] || fail "the manifest was left behind"
+@@ -902,6 +988,7 @@ case_land_target_moved_once() {
+         git -C "$REFINERY" merge-base --is-ancestor "$sha" origin/integration ||
+             fail "member $((i + 1))'s merged_sha is not on origin/integration"
+         assert_eq "member $((i + 1)) is closed" closed "$(bead_field "gcp-h$((i + 1))" status)"
++        assert_member_cleaned "gcp-h$((i + 1))"
+     done
+     git -C "$REFINERY" cat-file -e "origin/integration:elsewhere.txt" 2>/dev/null ||
+         fail "origin/integration lost the commit that moved in"
+@@ -938,15 +1025,13 @@ echo "push refused by the test (race \$n)" >&2
+ exit 1
+ HOOK
+     chmod +x "$ORIGIN/hooks/pre-receive"
+-    local before writes
+-    before=$(snapshot_beads)
+-    writes=$(db_writes)
++    local before
++    before=$(snapshot_beads_sans_proof)
+ 
+     run_batch land --head gcp-h1
+     assert_eq "land exits 6 when the target moved under every attempt" 6 "$(last_rc)"
+     assert_eq "the last stdout line is the RESULT line" "merge-batch: RESULT 6 landed= left-open=" "$(last_line)"
+-    assert_eq "no member bead was written" "$before" "$(snapshot_beads)"
+-    assert_eq "no bead call was made" "$writes" "$(db_writes)"
++    assert_only_proof_written "land status 6" "$before"
+     [ "$(wc -l <"$T/push-attempts" | tr -d ' ')" -gt 1 ] ||
+         fail "harness bug: the hook saw fewer than two pushes, so nothing raced"
+     assert_no_temp "land status 6"
+@@ -962,17 +1047,15 @@ echo "push refused by the test" >&2
+ exit 1
+ HOOK
+     chmod +x "$ORIGIN/hooks/pre-receive"
+-    local before writes tip
+-    before=$(snapshot_beads)
+-    writes=$(db_writes)
++    local before tip
++    before=$(snapshot_beads_sans_proof)
+     tip=$(origin_tip)
+ 
+     run_batch land --head gcp-h1
+     assert_eq "land exits 7 when the remote refuses and the target stood still" 7 "$(last_rc)"
+     assert_eq "the last stdout line is the RESULT line" "merge-batch: RESULT 7 landed= left-open=" "$(last_line)"
+     assert_eq "origin/integration is unchanged" "$tip" "$(origin_tip)"
+-    assert_eq "no member bead was written" "$before" "$(snapshot_beads)"
+-    assert_eq "no bead call was made" "$writes" "$(db_writes)"
++    assert_only_proof_written "land status 7" "$before"
+     assert_no_temp "land status 7"
+     end_case
+ }
+@@ -990,6 +1073,11 @@ case_land_left_open_recovery() {
+     assert_eq "origin/integration is the manifest's last tip" "$tip" "$(origin_tip)"
+     assert_landed_member 0 2
+     assert_landed_member 2 0
++    assert_member_cleaned gcp-h1
++    assert_member_cleaned gcp-h3
++    # The open member keeps its proof and its worktree: no cleanup before a close.
++    assert_member_proof gcp-h2 pending
++    grep -qx "gc gastown task-artifact-cleanup gcp-h2" "$T/gc.log" && fail "cleanup ran for the member left open"
+     assert_eq "member 2 is not closed: it keeps the in-flight status" in_progress "$(bead_field gcp-h2 status)"
+     assert_eq "member 2's assignee is unchanged" "$m2_assignee" "$(bead_field gcp-h2 assignee)"
+     [ -n "$(branch_on_origin gcp-h2)" ] || fail "origin/polecat/gcp-h2 was deleted though member 2 is open"
+@@ -1012,6 +1100,8 @@ case_land_left_open_recovery() {
+     assert_eq "it records how that was established" rebase_patch_id "$(bead_meta gcp-h2 already_merged_via)"
+     assert_eq "its merged_sha carries member 2's stacked patch" \
+         "$(saved '.members[1].patch_id')" "$(patch_id_of "$(bead_meta gcp-h2 merged_sha)")"
++    # The proof land recorded is what the single-bead lane's cleanup proves against.
++    assert_member_cleaned gcp-h2
+     end_case
+ }
+ 
+@@ -1021,10 +1111,8 @@ case_land_dropped_commit() {
+     # Member 3's patch reaches the target by another route, so land's re-rebase
+     # drops member 3's commit and every offset behind the landed tip shifts.
+     land_by_patch_id gcp-h3
+-    local before_h1 before_h2 before_h3 tip i sha
+-    before_h1=$(bead_sum gcp-h1)
+-    before_h2=$(bead_sum gcp-h2)
+-    before_h3=$(bead_sum gcp-h3)
++    local before tip i sha
++    before=$(snapshot_beads_sans_proof)
+     tip=$(origin_tip)
+ 
+     run_batch land --head gcp-h1
+@@ -1036,9 +1124,7 @@ case_land_dropped_commit() {
+         assert_eq "gcp-h$((i + 1))'s merged_sha has its own stacked patch-id" \
+             "$(saved ".members[$i].patch_id")" "$(patch_id_of "$sha")"
+     done
+-    assert_eq "member 1 stays untouched" "$before_h1" "$(bead_sum gcp-h1)"
+-    assert_eq "member 2 stays untouched" "$before_h2" "$(bead_sum gcp-h2)"
+-    assert_eq "member 3 stays untouched" "$before_h3" "$(bead_sum gcp-h3)"
++    assert_only_proof_written "every member refused" "$before"
+     assert_eq "the last stdout line names every refused member" \
+         "merge-batch: RESULT 2 landed= left-open=gcp-h1,gcp-h2,gcp-h3" "$(last_line)"
+     for i in 1 2 3; do
+@@ -1058,17 +1144,15 @@ case_land_rerebase_conflict() {
+     git_q -C "$SEED" add f2.txt
+     git_q -C "$SEED" commit -m "feat: a concurrent bead writes f2.txt"
+     git_q -C "$SEED" push origin HEAD:integration
+-    local before writes tip
+-    before=$(snapshot_beads)
+-    writes=$(db_writes)
++    local before tip
++    before=$(snapshot_beads_sans_proof)
+     tip=$(origin_tip)
+ 
+     run_batch land --head gcp-h1
+     assert_eq "land exits 3 when the re-rebase conflicts" 3 "$(last_rc)"
+     assert_eq "the last stdout line is the RESULT line" "merge-batch: RESULT 3 landed= left-open=" "$(last_line)"
+     assert_eq "origin/integration is unchanged" "$tip" "$(origin_tip)"
+-    assert_eq "no member bead was written" "$before" "$(snapshot_beads)"
+-    assert_eq "no bead call was made" "$writes" "$(db_writes)"
++    assert_only_proof_written "land status 3" "$before"
+     [ ! -d "$(git -C "$REFINERY" rev-parse --absolute-git-dir)/rebase-merge" ] ||
+         fail "a rebase was left in flight"
+     assert_no_temp "land status 3"
+@@ -1080,19 +1164,48 @@ case_land_noop() {
+     stack_three
+     # The stacked tip is already the target's: the ff-merge is a no-op.
+     git_q -C "$REFINERY" push origin temp:integration
+-    local before writes
+-    before=$(snapshot_beads)
+-    writes=$(db_writes)
++    local before
++    before=$(snapshot_beads_sans_proof)
+ 
+     run_batch land --head gcp-h1
+     assert_eq "land exits 5 when the target already holds the batch" 5 "$(last_rc)"
+     assert_eq "the last stdout line is the RESULT line" "merge-batch: RESULT 5 landed= left-open=" "$(last_line)"
+-    assert_eq "no member bead was written" "$before" "$(snapshot_beads)"
+-    assert_eq "no bead call was made" "$writes" "$(db_writes)"
++    assert_only_proof_written "land status 5" "$before"
+     assert_no_temp "land status 5"
+     end_case
+ }
+ 
++# A member's task-artifact cleanup that does not converge is handled as
++# merge-push.sh's direct_cleanup handles the head's: the member stays closed,
++# its durable cleanup state stays for a retry, and land stops with 2. The other
++# members still close and clean up.
++case_land_cleanup_blocked() {
++    new_case land-cleanup-blocked
++    stack_three
++    # A dirty task worktree is one cleanup will not remove.
++    echo scratch >"$(artifact_of gcp-h2)/scratch.txt"
++    local tip
++    tip=$(saved '.members[2].tip')
++
++    run_batch land --head gcp-h1
++    assert_eq "land exits 2 when a member's cleanup did not converge" 2 "$(last_rc)"
++    assert_eq "origin/integration is the manifest's last tip" "$tip" "$(origin_tip)"
++    assert_landed_member 0 2
++    assert_landed_member 1 1
++    assert_landed_member 2 0
++    assert_member_cleaned gcp-h1
++    assert_member_cleaned gcp-h3
++    grep -qx "gc gastown task-artifact-cleanup gcp-h2" "$T/gc.log" || fail "no task-artifact cleanup ran for gcp-h2"
++    assert_eq "gcp-h2's artifact_cleanup_state" blocked "$(bead_meta gcp-h2 artifact_cleanup_state)"
++    [ -d "$(artifact_of gcp-h2)" ] || fail "gcp-h2's dirty task worktree was removed"
++    [ -n "$(branch_on_origin gcp-h2)" ] || fail "origin/polecat/gcp-h2 was deleted"
++    grep -q "gcp-h2.*did not converge" "$T/out" || fail "land did not say gcp-h2's cleanup did not converge"
++    assert_eq "the last stdout line is the RESULT line" \
++        "merge-batch: RESULT 2 landed=gcp-h1,gcp-h2,gcp-h3 left-open=" "$(last_line)"
++    assert_no_temp "land status 2 after a cleanup that did not converge"
++    end_case
++}
++
+ case_land_guards() {
+     new_case land-guards
+     stack_three
+@@ -1308,6 +1421,7 @@ case_land_left_open_recovery
+ case_land_dropped_commit
+ case_land_rerebase_conflict
+ case_land_noop
++case_land_cleanup_blocked
+ case_land_guards
+ case_serial_stamps
+ case_serial_stamp_failure
+-- 
+2.54.0 (Apple Git-157)
+

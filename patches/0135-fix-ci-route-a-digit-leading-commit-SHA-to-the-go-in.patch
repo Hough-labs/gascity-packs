@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sat, 10 Oct 2026 16:40:31 -0400
+Subject: [PATCH 135/148] fix(ci): route a digit-leading commit SHA to the
+ go-install fallback (gcp-fooz4)
+
+The bare-version case `[0-9]*)` matched any ref starting with a decimal
+digit, and 10 of the 16 hex digits are decimal. So most commit SHAs,
+for example 164a7b32acd4 (gascity main today), were read as release tag
+v164a7b32acd4. The install then failed with "No Gas City checksum
+found" before the fallback could build them, which defeated the branch
+and SHA dispatch that 88d241d2 restores. The pattern now requires a
+dot, so `1.5.0` still means v1.5.0 and a SHA reaches `go install`.
+
+Tests: a digit-leading SHA takes the fallback and exports its module's
+commit (red before: "No Gas City checksum found for v164a7b32acd4"). A
+bare `1.5.0` still installs the v1.5.0 archive; this control test
+passes both before and after.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .github/scripts/install-gascity-archive.sh |  4 +++-
+ tests/test_install_gascity_archive.py      | 28 ++++++++++++++++++++++
+ 2 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/.github/scripts/install-gascity-archive.sh b/.github/scripts/install-gascity-archive.sh
+index 43f3df9f..61a65ff4 100755
+--- a/.github/scripts/install-gascity-archive.sh
++++ b/.github/scripts/install-gascity-archive.sh
+@@ -264,7 +264,9 @@ case "$ref" in
+     tag="$ref"
+     version="${ref#v}"
+     ;;
+-  [0-9]*)
++  # A dot, not just a leading digit: most commit SHAs start with a decimal
++  # digit too, and one read as a version has no archive to find.
++  [0-9]*.*)
+     tag="v${ref}"
+     version="$ref"
+     ;;
+diff --git a/tests/test_install_gascity_archive.py b/tests/test_install_gascity_archive.py
+index 17ea9a99..90e98d80 100644
+--- a/tests/test_install_gascity_archive.py
++++ b/tests/test_install_gascity_archive.py
+@@ -463,6 +463,34 @@ def test_installer_names_the_module_commit_a_go_install_build_was_made_from(tmp_
+     assert result["github_path"] == str(gopath_bin)
+ 
+ 
++def test_installer_routes_a_digit_leading_commit_sha_to_the_fallback(tmp_path, release):
++    # Ten of sixteen hex digits are decimal, so most commit SHAs start with one.
++    # A bare-version pattern that matched any leading digit read such a SHA as
++    # a release tag (v164a7b32acd4), found no checksum for it and failed before
++    # the fallback could build it.
++    completed, result = run_installer(
++        tmp_path, release, ref="164a7b32acd4", FAKE_GO_ORIGIN_HASH=MODULE_ORIGIN
++    )
++
++    assert completed.returncode == 0, completed.stderr
++    assert "falling back to 'go install ...@164a7b32acd4'" in completed.stderr
++    assert result["archive_requests"] == []
++    assert f"GASCITY_SOURCE_REF={MODULE_ORIGIN}" in result["github_env"].splitlines()
++
++
++def test_installer_still_reads_a_bare_version_as_its_release_tag(tmp_path):
++    # The control for the routing above: `1.5.0` is the documented short form
++    # of v1.5.0 and must keep installing that release's archive.
++    release = make_release(tmp_path, version="1.5.0")
++    completed, result = run_installer(tmp_path, release, ref="1.5.0")
++
++    assert completed.returncode == 0, completed.stderr
++    assert "falling back to 'go install" not in completed.stderr
++    assert len(result["archive_requests"]) == 1
++    assert "/releases/download/v1.5.0/gascity_1.5.0_" in result["archive_requests"][0]
++    assert f"GASCITY_SOURCE_REF={revision_of(0)}" in result["github_env"].splitlines()
++
++
+ def test_installer_fails_loudly_when_no_source_revision_can_be_named(tmp_path, release):
+     # The same go-install build, but the proxy has no commit for its version.
+     # Exporting the REF as given would hand the checkout step a short SHA that
+-- 
+2.54.0 (Apple Git-157)
+

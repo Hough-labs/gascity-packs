@@ -1,0 +1,85 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sat, 10 Oct 2026 16:13:22 -0400
+Subject: [PATCH 125/148] fix(witness): read an empty roster as a failed read
+ in the liveness map (gcp-g98)
+
+Upstream #320's build_liveness_map (Step 1, rebuilt per candidate in Step
+2a) fails closed on a query that exits non-zero and on an empty map built
+while sessions are live, but not on a query that exits 0 and prints
+nothing. An empty $SESSIONS_FILE leaves SESSION_COUNT empty, which reads as
+0 in the guard, so the map comes back `{}` with rc 0 and every assignee
+resolves as absent: the fail-open shape gcp-g98 was filed for.
+
+Both queries print a JSON value even when nothing matches, so no output at
+all is a broken read: mark MAP_QUERY_RC=1 for either empty file. This is
+the only behaviour of the old 0011 that upstream does not already cover;
+the rest of 0010/0011 is superseded by Step 2a and is no longer carried.
+
+Two harness cases, each shown red alone against the unpatched block:
+an empty roster and an empty session-bead read, both exiting 0.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ gastown/formulas/mol-witness-patrol.toml      |  5 +++++
+ ...test_mol_witness_patrol_orphan_recovery.sh | 21 +++++++++++++++++++
+ 2 files changed, 26 insertions(+)
+
+diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
+index bd5cbcc1..8efc2dd5 100644
+--- a/gastown/formulas/mol-witness-patrol.toml
++++ b/gastown/formulas/mol-witness-patrol.toml
+@@ -226,6 +226,11 @@ a NEW session with a different ID — the old one never comes back.
+      SESSIONS_FILE=$(mktemp); SESSION_BEADS_FILE=$(mktemp)
+      gc session list --state=all --json > "$SESSIONS_FILE" || MAP_QUERY_RC=1
+      gc bd list --type=session --label=gc:session --include-infra --include-gates --all --json --limit=0 > "$SESSION_BEADS_FILE" || MAP_QUERY_RC=1
++     # Exit 0 with NO output is a broken read, not an empty roster: both
++     # queries print a JSON value even when nothing matches. Read as `{}` it
++     # would make every assignee absent.
++     [ -s "$SESSIONS_FILE" ] || MAP_QUERY_RC=1
++     [ -s "$SESSION_BEADS_FILE" ] || MAP_QUERY_RC=1
+ 
+      if [ "$MAP_QUERY_RC" -eq 0 ]; then
+        LIVENESS_MAP=$(jq -n --slurpfile sessions "$SESSIONS_FILE" --slurpfile session_beads "$SESSION_BEADS_FILE" '
+diff --git a/gastown/tests/test_mol_witness_patrol_orphan_recovery.sh b/gastown/tests/test_mol_witness_patrol_orphan_recovery.sh
+index 2be89965..c0d14683 100755
+--- a/gastown/tests/test_mol_witness_patrol_orphan_recovery.sh
++++ b/gastown/tests/test_mol_witness_patrol_orphan_recovery.sh
+@@ -198,6 +198,25 @@ test_empty_map_with_live_sessions_skips() {
+     assert_verdict false "an empty map built while sessions are live"
+ }
+ 
++test_empty_roster_output_skips() {
++    # A roster read that exits 0 and prints NOTHING is not an empty roster. A
++    # healthy `gc session list --json` always prints an object, so empty output
++    # means the read broke; read as `{}` it would make every assignee absent.
++    set_roster ''
++    run_verdict "pool-gone" "pool-gone" OLD
++    assert_verdict false "an empty roster read that exited 0"
++}
++
++test_empty_session_bead_output_skips() {
++    # Same rule for the session-bead half of the map: `gc bd list --json`
++    # prints `[]` when nothing matches, so no output at all is a broken read.
++    set_roster "$ROSTER_LIVE"
++    : >"$GC_SESSION_BEADS_JSON"
++    run_verdict "pool-gone" "pool-gone" OLD
++    printf '[]' >"$GC_SESSION_BEADS_JSON"
++    assert_verdict false "an empty session-bead read that exited 0"
++}
++
+ test_missing_assignee_skips() {
+     set_roster "$ROSTER_LIVE"
+     run_verdict "" "" OLD
+@@ -469,6 +488,8 @@ test_closed_assignee_is_still_orphaned
+ test_live_assignee_is_not_orphaned
+ test_unusable_liveness_map_skips_instead_of_orphaning
+ test_empty_map_with_live_sessions_skips
++test_empty_roster_output_skips
++test_empty_session_bead_output_skips
+ test_missing_assignee_skips
+ test_unreadable_bead_skips
+ test_missing_updated_at_skips
+-- 
+2.54.0 (Apple Git-157)
+

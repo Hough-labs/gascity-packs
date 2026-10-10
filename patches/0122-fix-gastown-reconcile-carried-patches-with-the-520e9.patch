@@ -1,0 +1,593 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 8 Oct 2026 16:29:23 -0400
+Subject: [PATCH 122/148] fix(gastown): reconcile carried patches with the
+ 520e95cb baseline (gcp-fooz4)
+
+The BASELINE upgrade f69ec02b (v0.4.0) -> 520e95cb replayed every fork
+patch with conflicts resolved in place. These are the follow-up adaptations
+that only showed up once the whole stack was replayed and the suites ran
+against the new baseline. Each hunk names the carried patch whose behaviour
+it keeps true on top of what upstream changed.
+
+- 0016 (gcp-co9) role prompts. Upstream still restates the pour/burn fallback
+  in the witness, deacon and refinery prompts, and pins those copies with
+  tests (test_work_bead_resolution_discriminator_is_pinned: >=1
+  CURRENT_WISP=${GC_BEAD_ID:-} per prompt; test_witness_wisp_queries_pin_include_infra:
+  >=5 witness queries). Our 0016 had replaced them with pointers. Restore the
+  copies, as copies of next-iteration, and keep 0016's actual fix: every bail
+  drain-acks. Queries use the 0009/0033 form. tests/test_prompt_formula_command_drift.py
+  learns upstream's --labels spelling (WARRANT_LABEL), which #330 made the
+  create flag; keyed on --label alone both warrant detectors (0016 dedup,
+  0103 gc.kind) went blind. A plural-flag fixture pins it.
+- 0009/0033 (gcp-xbl, gcp-ah8h) wisp queries. Upstream #374 added a
+  target-branch-missing halt to the refinery rebase step whose CURRENT_WISP
+  fallback was bare (--status=in_progress --limit=1, no --include-infra).
+  Give it the open,in_progress --include-infra --limit=0 form. The witness
+  startup comment keeps --include-infra on the --type=molecule line.
+  tests/test_wisp_molecule_queries.py skips test harnesses (they quote the
+  tokens in greps) and holds the live-status facet to the three patrol roles
+  it was measured on: boot's loop arrived upstream (#261) with in_progress
+  resolvers that upstream pins (test_boot_patrol_burn_resolves_current_wisp),
+  so boot is left as upstream wrote it.
+- 0068/0069 (gcp-5ddt) witness default branch. Upstream's test pins
+  STILL_ORPHANED=false exactly once, and our fail-closed arm demoted it a
+  second time. Move the default-branch resolution ahead of Step 2a and fail
+  closed through upstream's own RECOVERY_BLOCKED=true, which Step 2a already
+  skips and escalates. The inference gate pins the $DEFAULT_BRANCH form of
+  the witness content check instead of upstream's literal origin/main.
+- 0083 (gcp-oz57) the Manifold step-body pin follows upstream #489 to kimi-k3.
+- 0086 (gcp-mjjg) the CLAIM_DECLINED_LIVE_OWNER prose keeps the phrase the
+  live-owner test pins on one line.
+- 0110 (gcp-l8td.2) restart cadence. #374's halt pour continues the
+  conversation, so it is stamped like every other continuing pour, and
+  test_refinery_restart_cadence.sh checks one identical stamp block per
+  continuing pour (six) instead of exactly one pour per step.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ gastown/agents/deacon/prompt.template.md      | 44 +++++++++---
+ gastown/agents/polecat/prompt.template.md     |  5 +-
+ gastown/agents/refinery/prompt.template.md    | 29 ++++++++
+ gastown/agents/witness/prompt.template.md     | 50 ++++++++++----
+ gastown/formulas/mol-refinery-patrol.toml     | 27 +++++++-
+ gastown/formulas/mol-witness-patrol.toml      | 69 +++++++++----------
+ .../tests/test_refinery_restart_cadence.sh    | 58 +++++++++-------
+ scripts/gascity_pack_inference_gate.py        |  2 +-
+ tests/test_gascity_pack_inference_gate.py     |  4 +-
+ tests/test_prompt_formula_command_drift.py    | 16 ++++-
+ tests/test_wisp_molecule_queries.py           | 12 +++-
+ 11 files changed, 221 insertions(+), 95 deletions(-)
+
+diff --git a/gastown/agents/deacon/prompt.template.md b/gastown/agents/deacon/prompt.template.md
+index 41f24d76..2966861a 100644
+--- a/gastown/agents/deacon/prompt.template.md
++++ b/gastown/agents/deacon/prompt.template.md
+@@ -98,19 +98,41 @@ is a bug indicator. Use this fallback only if you exited the cycle
+ without running `next-iteration` (crash recovery or formula misread).
+ If `next-iteration` already ran, do not pour again; run `gc hook`.
+ 
+-The fallback is the same work `next-iteration` does, so read it from there
+-rather than from a copy here:
+-
+-```bash
+-gc bd formula show mol-deacon-patrol   # step `next-iteration`, sections 3-4
+-```
+-
+-Section 3 resolves the current wisp, reconciles your queued patrol wisps to
+-exactly one — reusing an already-queued successor instead of pouring a duplicate
+-and burning the surplus — and drain-acks before it bails if a pour or an
+-assignment fails; section 4 burns the current wisp. Run them, then:
++This fallback is a copy of `mol-deacon-patrol` step `next-iteration`, kept
++here for crash recovery; the formula is authoritative if they ever disagree,
++and `tests/test_prompt_formula_command_drift.py` holds the copy to its
++invariants (every bail drain-acks):
+ 
+ ```bash
++CURRENT_WISP=${GC_BEAD_ID:-}
++if [ -z "$CURRENT_WISP" ]; then
++  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json | jq -r '.[0].id // empty')
++fi
++# Reconcile queued patrol wisps to exactly one. Wisps are poured open and
++# nothing transitions them, so both live statuses are queried with one filter
++# (gcp-ah8h), and the wisp being resumed is excluded so this can never burn it.
++SURPLUS_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json \
++  | jq -r --arg cur "$CURRENT_WISP" '.[] | select(.id != $cur) | .id')
++ASSIGNED_WISP=$(printf '%s\n' $SURPLUS_WISPS | sed -n '1p')
++for extra in $(printf '%s\n' $SURPLUS_WISPS | sed '1d'); do
++  gc bd mol burn "$extra" --force
++done
++if [ -z "$ASSIGNED_WISP" ]; then
++  NEXT=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id // empty')
++  if [ -z "$NEXT" ]; then
++    echo "Could not pour next deacon wisp; not burning."
++    gc runtime drain-ack
++    exit 1
++  fi
++  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
++    echo "Could not assign next deacon wisp; not burning."
++    gc runtime drain-ack
++    exit 1
++  fi
++fi
++if [ -n "$CURRENT_WISP" ]; then
++  gc bd mol burn "$CURRENT_WISP" --force
++fi
+ gc hook
+ ```
+ 
+diff --git a/gastown/agents/polecat/prompt.template.md b/gastown/agents/polecat/prompt.template.md
+index 94fff30e..a1e43894 100644
+--- a/gastown/agents/polecat/prompt.template.md
++++ b/gastown/agents/polecat/prompt.template.md
+@@ -453,9 +453,8 @@ GC_CLAIM
+ ```
+ 
+ If the block prints `NO_ROUTED_WORK`, `CLAIM_REJECTED`, `CLAIM_RELEASED`, or
+-`CLAIM_DECLINED_LIVE_OWNER`, it
+-has already drain-acked — stop and exit. Only after it prints `CLAIMED_BEAD_ID` do you read
+-the recipe with `gc bd formula show mol-polecat-work --rig "$GC_RIG"` and run
++`CLAIM_DECLINED_LIVE_OWNER`, it has already drain-acked — stop and exit.
++Only after it prints `CLAIMED_BEAD_ID` do you read the recipe with `gc bd formula show mol-polecat-work --rig "$GC_RIG"` and run
+ `workspace-setup` before inspecting task source. The claim checks assigned work
+ first (session bead ID, runtime session name, then alias) and only falls through
+ to unassigned pool work routed to
+diff --git a/gastown/agents/refinery/prompt.template.md b/gastown/agents/refinery/prompt.template.md
+index 2ca11b3a..e4bf4fcf 100644
+--- a/gastown/agents/refinery/prompt.template.md
++++ b/gastown/agents/refinery/prompt.template.md
+@@ -77,6 +77,35 @@ and the failure handling get lost.
+ The same block appears in the rejection paths of steps `rebase` and
+ `handle-failures` — those copies are the formula's own and stay in sync with it.
+ 
++For crash recovery the block is copied below; the formula is authoritative if
++they ever disagree, and `tests/test_prompt_formula_command_drift.py` holds the
++copy to its invariants (every bail drain-acks):
++
++```bash
++CURRENT_WISP=${GC_BEAD_ID:-}
++if [ -z "$CURRENT_WISP" ]; then
++  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json | jq -r '.[0].id // empty')
++fi
++NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id // empty')
++if [ -z "$NEXT" ]; then
++  echo "Could not pour next refinery wisp; not burning."
++  gc runtime drain-ack
++  exit 1
++fi
++if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
++  echo "Could not assign next refinery wisp; not burning."
++  gc runtime drain-ack
++  exit 1
++fi
++if [ -n "$CURRENT_WISP" ]; then
++  gc bd mol burn "$CURRENT_WISP" --force
++else
++  echo "Could not resolve current wisp; not burning."
++  gc runtime drain-ack
++  exit 1
++fi
++```
++
+ **This rule applies UNCONDITIONALLY, including when:**
+ 
+ - The merge-queue scan returned zero beads at this wisp's scan time.
+diff --git a/gastown/agents/witness/prompt.template.md b/gastown/agents/witness/prompt.template.md
+index c5a77d0b..0b5c82e3 100644
+--- a/gastown/agents/witness/prompt.template.md
++++ b/gastown/agents/witness/prompt.template.md
+@@ -186,10 +186,9 @@ nothing).
+ # Step 1: Reconcile your patrol wisps to exactly one (town ledger, via gc bd).
+ # Collect every open/in_progress patrol wisp assigned to you, keep one, and
+ # burn the surplus so restarts never accumulate duplicates. Wisp roots are
+-# molecules — filter --type=molecule, never --type=wisp. They are also
+-# ephemeral, so they live in the wisps tier that gc bd list hides without
+-# --include-infra; drop that flag and these queries return [] even when a
+-# wisp is assigned, and you pour a duplicate.
++# molecules — filter --type=molecule, never --type=wisp. `--include-infra` is
++# REQUIRED: wisp roots are ephemeral beads in the wisps table, which gc bd list
++# skips unless asked for, so a query without it silently returns nothing.
+ WISP_IDS=$(
+   gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=0 --json | jq -r '.[].id'
+   gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r '.[].id'
+@@ -228,18 +227,41 @@ is a bug indicator. Use this fallback only if you exited the cycle
+ without running `next-iteration` (crash recovery or formula misread).
+ If `next-iteration` already ran, do not pour again; run `gc hook`.
+ 
+-The fallback is the same work `next-iteration` does, so read it from there
+-rather than from a copy here:
+-
+-```bash
+-gc bd formula show mol-witness-patrol   # step `next-iteration`, sections 2-3
+-```
+-
+-Sections 2 and 3 reconcile the queued patrol wisps to exactly one — reusing an
+-already-queued wisp instead of pouring a duplicate, and burning the surplus —
+-then burn the current wisp. Run them, then:
++This fallback is a copy of `mol-witness-patrol` step `next-iteration`, kept
++here for crash recovery; the formula is authoritative if they ever disagree,
++and `tests/test_prompt_formula_command_drift.py` holds the copy to its
++invariants (every bail drain-acks):
+ 
+ ```bash
++CURRENT_WISP=${GC_BEAD_ID:-}
++if [ -z "$CURRENT_WISP" ]; then
++  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json | jq -r '.[0].id // empty')
++fi
++# Reconcile queued patrol wisps to exactly one. Wisps are poured open and
++# nothing transitions them, so both live statuses are queried with one filter
++# (gcp-ah8h), and the wisp being resumed is excluded so this can never burn it.
++SURPLUS_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json \
++  | jq -r --arg cur "$CURRENT_WISP" '.[] | select(.id != $cur) | .id')
++ASSIGNED_WISP=$(printf '%s\n' $SURPLUS_WISPS | sed -n '1p')
++for extra in $(printf '%s\n' $SURPLUS_WISPS | sed '1d'); do
++  gc bd mol burn "$extra" --force
++done
++if [ -z "$ASSIGNED_WISP" ]; then
++  NEXT=$(gc bd mol wisp mol-witness-patrol --root-only --var binding_prefix='{{ .BindingPrefix }}' --json | jq -r '.new_epic_id // empty')
++  if [ -z "$NEXT" ]; then
++    echo "Could not pour next witness wisp; not burning."
++    gc runtime drain-ack
++    exit 1
++  fi
++  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
++    echo "Could not assign next witness wisp; not burning."
++    gc runtime drain-ack
++    exit 1
++  fi
++fi
++if [ -n "$CURRENT_WISP" ]; then
++  gc bd mol burn "$CURRENT_WISP" --force
++fi
+ gc hook
+ ```
+ 
+diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
+index cc6a428f..1bbb12b1 100644
+--- a/gastown/formulas/mol-refinery-patrol.toml
++++ b/gastown/formulas/mol-refinery-patrol.toml
+@@ -884,7 +884,7 @@ Target: $TARGET"
+   # bead must not end the merge lane.
+   CURRENT_WISP=${GC_BEAD_ID:-}
+   if [ -z "$CURRENT_WISP" ]; then
+-    CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
++    CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=open,in_progress --type=molecule --include-infra --limit=0 --json | jq -r '.[0].id // empty')
+   fi
+   NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
+   if [ -z "$NEXT" ]; then
+@@ -892,11 +892,34 @@ Target: $TARGET"
+     gc runtime drain-ack
+     exit 1
+   fi
+-  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
++  # --- session-iteration-stamp:begin ---
++  # Carry the conversation's iteration count onto NEXT in the same write that
++  # assigns it, so check-inbox can restart at restart_after_iterations. The count
++  # continues only while CURRENT was stamped under this GC_CONTINUATION_EPOCH;
++  # any other epoch was an earlier conversation, so NEXT starts again at 1. With
++  # the epoch unset nothing is stamped and the cadence check reads "off".
++  set -- --assignee="$GC_AGENT"
++  if [ -n "${GC_CONTINUATION_EPOCH:-}" ]; then
++    if ! STAMP_JSON=$(gc bd show "$CURRENT_WISP" --json 2>/dev/null); then
++      echo "WARN: could not read $CURRENT_WISP; the next wisp's iteration count restarts at 1."
++      STAMP_JSON=""
++    fi
++    STAMP_EPOCH=$(printf '%s' "$STAMP_JSON" | jq -r '.[0].metadata.session_epoch // empty' 2>/dev/null)
++    STAMP_K=$(printf '%s' "$STAMP_JSON" | jq -r '.[0].metadata.session_iterations // empty' 2>/dev/null)
++    case "$STAMP_K" in ''|*[!0-9]*) STAMP_K=0 ;; esac
++    if [ "$STAMP_EPOCH" = "$GC_CONTINUATION_EPOCH" ]; then
++      STAMP_K=$((STAMP_K + 1))
++    else
++      STAMP_K=1
++    fi
++    set -- "$@" --set-metadata session_epoch="$GC_CONTINUATION_EPOCH" --set-metadata session_iterations="$STAMP_K"
++  fi
++  if ! gc bd update "$NEXT" "$@"; then
+     echo "Could not assign next refinery wisp; not burning."
+     gc runtime drain-ack
+     exit 1
+   fi
++  # --- session-iteration-stamp:end ---
+   if [ -n "$CURRENT_WISP" ]; then
+     gc bd mol burn "$CURRENT_WISP" --force
+   else
+diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
+index fecd974e..bd5cbcc1 100644
+--- a/gastown/formulas/mol-witness-patrol.toml
++++ b/gastown/formulas/mol-witness-patrol.toml
+@@ -508,6 +508,40 @@ if [ -n "$BRANCH" ] && ! git check-ref-format --branch "$BRANCH" >/dev/null 2>&1
+ fi
+ ```
+ 
++Resolve the rig's default branch before you go any further. Case C and Step 3
++both compare against it, and neither may assume `main`: rigs run on `master`
++(gauntlet), `dev` (winnow) and `edge-integration` (gascity) too. Against those,
++a hardcoded `origin/main` does not resolve at all — git exits 128 and the
++caller reads a plain negative, which in Step 3 means "not merged" and sends
++finished work back to the pool (gcp-5ddt).
++
++```bash
++# Run from the rig root or the bead's worktree — either is inside the repo.
++DEFAULT_REF=$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null || true)
++DEFAULT_BRANCH=${DEFAULT_REF#refs/remotes/origin/}
++if [ -z "$DEFAULT_BRANCH" ]; then
++  # origin/HEAD is not set in every clone — a worktree cut with --detach never
++  # gets one. Ask the remote instead of guessing a name.
++  DEFAULT_BRANCH=$(git ls-remote --symref origin HEAD 2>/dev/null |
++    awk '$1 == "ref:" { sub("refs/heads/", "", $2); print $2; exit }')
++fi
++if [ -n "$DEFAULT_BRANCH" ]; then
++  git fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1 || true
++fi
++if [ -z "$DEFAULT_BRANCH" ] ||
++   ! git rev-parse --verify --quiet "origin/$DEFAULT_BRANCH" >/dev/null; then
++  # FAIL CLOSED: RECOVERY_BLOCKED makes Step 2a skip this bead. Step 3's
++  # already-merged guard cannot run without this ref, and the cost of guessing
++  # wrong is re-dispatching completed work. Leaving the bead orphaned for one
++  # more cycle is cheap; re-dispatching merged work is not.
++  RECOVERY_BLOCKED=true
++  echo "SKIP <bead>: cannot resolve origin's default branch in $(pwd)"
++  gc mail send mayor/ -s "WITNESS: orphan recovery skipped — unresolvable default branch" \
++    -m "Bead <bead>: could not resolve origin's default branch (origin/HEAD unset and git ls-remote --symref gave nothing). Skipped recovery rather than risk re-dispatching already-merged work. Fix by setting origin/HEAD on this rig: git remote set-head origin --auto"
++  # Continue with the next orphaned bead.
++fi
++```
++
+ If `RECOVERY_BLOCKED=true`, escalate and stop processing this bead. Do not run
+ Cases A-E, cleanup, or workflow reset for it during this patrol.
+ 
+@@ -602,41 +636,6 @@ the worktree. Everything from here to Step 4 assumes `STILL_ORPHANED=true`
+ and each destructive site re-states the check, so a step reached out of order
+ still fails closed.
+ 
+-Resolve the rig's default branch before you go any further. Case C and Step 3
+-both compare against it, and neither may assume `main`: rigs run on `master`
+-(gauntlet), `dev` (winnow) and `edge-integration` (gascity) too. Against those,
+-a hardcoded `origin/main` does not resolve at all — git exits 128 and the
+-caller reads a plain negative, which in Step 3 means "not merged" and sends
+-finished work back to the pool (gcp-5ddt).
+-
+-```bash
+-# Run from the rig root or the bead's worktree — either is inside the repo.
+-DEFAULT_REF=$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null || true)
+-DEFAULT_BRANCH=${DEFAULT_REF#refs/remotes/origin/}
+-if [ -z "$DEFAULT_BRANCH" ]; then
+-  # origin/HEAD is not set in every clone — a worktree cut with --detach never
+-  # gets one. Ask the remote instead of guessing a name.
+-  DEFAULT_BRANCH=$(git ls-remote --symref origin HEAD 2>/dev/null |
+-    awk '$1 == "ref:" { sub("refs/heads/", "", $2); print $2; exit }')
+-fi
+-if [ -n "$DEFAULT_BRANCH" ]; then
+-  git fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1 || true
+-fi
+-if [ -z "$DEFAULT_BRANCH" ] ||
+-   ! git rev-parse --verify --quiet "origin/$DEFAULT_BRANCH" >/dev/null; then
+-  # FAIL CLOSED: skip this bead entirely, do not recover it. Step 3's
+-  # already-merged guard cannot run without this ref, and the cost of guessing
+-  # wrong is re-dispatching completed work. Leaving the bead orphaned for one
+-  # more cycle is cheap; re-dispatching merged work is not.
+-  STILL_ORPHANED=false
+-  echo "SKIP <bead>: cannot resolve origin's default branch in $(pwd)"
+-  gc mail send mayor/ -s "WITNESS: orphan recovery skipped — unresolvable default branch" \
+-    -m "Bead <bead>: could not resolve origin's default branch (origin/HEAD unset and git ls-remote --symref gave nothing). Skipped recovery rather than risk re-dispatching already-merged work. Fix by setting origin/HEAD on this rig: git remote set-head origin --auto"
+-  # Continue with the next orphaned bead.
+-fi
+-```
+-
+-
+ Only Cases B-D apply when `WORKTREE` is non-empty after this validation.
+ Never `cd` to, scan, or remove the unvalidated candidate. Check the bead and
+ validated worktree state, then act:
+diff --git a/gastown/tests/test_refinery_restart_cadence.sh b/gastown/tests/test_refinery_restart_cadence.sh
+index c4530a72..da431c9e 100755
+--- a/gastown/tests/test_refinery_restart_cadence.sh
++++ b/gastown/tests/test_refinery_restart_cadence.sh
+@@ -35,7 +35,7 @@ fail() {
+ # The stamp must sit at every pour that continues the conversation, and only
+ # there. The check-inbox pour starts a NEW conversation: the epoch bump makes
+ # its unstamped wisp read correctly as one, so stamping it would be wrong.
+-test_stamp_blocks_sit_at_exactly_the_five_continuing_pours() {
++test_stamp_blocks_sit_at_exactly_the_six_continuing_pours() {
+     python3 - "$FORMULA" <<'PY' || fail "the session-iteration-stamp blocks are misplaced or have drifted apart (see above)"
+ import sys
+ import tomllib
+@@ -51,35 +51,45 @@ holders = sorted(sid for sid, text in steps.items() if begin in text)
+ expected = sorted(["acceptance-check", "rebase", "handle-failures", "merge-push", "next-iteration"])
+ if holders != expected:
+     problems.append(f"stamp blocks live in {holders}, want exactly {expected}")
++# One block per continuing pour. The rebase step carries two: its rejection
++# pour and upstream's target-branch-missing halt (#374), which also continues
++# the conversation and so is stamped too.
+ total = sum(text.count(begin) for text in steps.values())
+-if total != 5:
+-    problems.append(f"formula carries {total} stamp blocks, want 5")
++if total != 6:
++    problems.append(f"formula carries {total} stamp blocks, want 6")
+ 
+ blocks = {}
+ for sid, text in steps.items():
+     if begin not in text:
+         continue
+-    if text.count(begin) != 1 or text.count(end) != 1:
+-        problems.append(f"{sid}: want exactly one begin and one end sentinel")
++    n = text.count(begin)
++    if text.count(end) != n:
++        problems.append(f"{sid}: want one end sentinel per begin sentinel")
+         continue
+-    before, rest = text.split(begin, 1)
+-    body, after = rest.split(end, 1)
+-    blocks[sid] = [line.lstrip() for line in body.strip().split("\n")]
+-    # In place: after this step's pour, before its burn, and it is the ONLY
+-    # assignment of NEXT in the step, so no unstamped write survives beside it.
+-    if pour not in before:
+-        problems.append(f"{sid}: the stamp block must follow the successor pour")
+-    if "gc bd mol burn" not in after:
+-        problems.append(f"{sid}: the stamp block must precede the burn of the current wisp")
+-    if text.count('gc bd update "$NEXT"') != 1 or 'gc bd update "$NEXT"' not in body:
+-        problems.append(f"{sid}: NEXT must be assigned once, inside the stamp block")
+-    if text.count(pour) != 1:
+-        problems.append(f"{sid}: want exactly one successor pour, found {text.count(pour)}")
+-
+-reference = blocks.get("next-iteration")
+-for sid, lines in blocks.items():
+-    if reference is not None and lines != reference:
+-        problems.append(f"{sid}: stamp block differs from next-iteration's after stripping leading whitespace")
++    if text.count(pour) != n:
++        problems.append(f"{sid}: want one successor pour per stamp block, found {text.count(pour)} pours for {n} blocks")
++    if text.count('gc bd update "$NEXT"') != n:
++        problems.append(f"{sid}: NEXT must be assigned once per stamp block, inside it")
++    rest = text
++    for k in range(n):
++        before, rest = rest.split(begin, 1)
++        body, rest = rest.split(end, 1)
++        # In place: after this pour, before the next one and before its burn,
++        # and holding the only assignment of NEXT for that pour.
++        if pour not in before:
++            problems.append(f"{sid}: stamp block {k + 1} must follow its successor pour")
++        if 'gc bd update "$NEXT"' not in body:
++            problems.append(f"{sid}: stamp block {k + 1} must hold the assignment of NEXT")
++        upto_next_pour = rest.split(pour, 1)[0]
++        if "gc bd mol burn" not in upto_next_pour:
++            problems.append(f"{sid}: stamp block {k + 1} must precede the burn of the current wisp")
++        blocks.setdefault(sid, []).append([line.lstrip() for line in body.strip().split("\n")])
++
++reference = blocks.get("next-iteration", [None])[0]
++for sid, copies in blocks.items():
++    for lines in copies:
++        if reference is not None and lines != reference:
++            problems.append(f"{sid}: stamp block differs from next-iteration's after stripping leading whitespace")
+ 
+ inbox = steps["check-inbox"]
+ if begin in inbox:
+@@ -483,7 +493,7 @@ trap 'rm -rf "$TMP"' EXIT
+ mkdir -p "$TMP/bin"
+ write_gc_stub "$TMP/bin"
+ 
+-test_stamp_blocks_sit_at_exactly_the_five_continuing_pours
++test_stamp_blocks_sit_at_exactly_the_six_continuing_pours
+ test_cadence_check_runs_first_in_check_inbox
+ 
+ extract_block session-iteration-stamp "$TMP/stamp.sh" || exit 1
+diff --git a/scripts/gascity_pack_inference_gate.py b/scripts/gascity_pack_inference_gate.py
+index 64e04651..50a66aad 100644
+--- a/scripts/gascity_pack_inference_gate.py
++++ b/scripts/gascity_pack_inference_gate.py
+@@ -207,7 +207,7 @@ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
+         # becomes a pathspec matching nothing, `git diff --quiet` exits 0, and an
+         # unmerged branch reads as merged and is force-closed.
+         'done < <(git diff --name-only -z "$MERGE_BASE" "origin/$BRANCH")',
+-        'elif git diff --quiet "origin/main" "origin/$BRANCH" -- "${CHANGED[@]}"; then',
++        'elif git diff --quiet "origin/$DEFAULT_BRANCH" "origin/$BRANCH" -- "${CHANGED[@]}"; then',
+         # All three destructive sites re-state the verdict. Step 3a is not
+         # redundant with Step 3b: it skips to Step 4, so a guard placed only at
+         # the pool reset would never cover it.
+diff --git a/tests/test_gascity_pack_inference_gate.py b/tests/test_gascity_pack_inference_gate.py
+index df39aa05..815daaa6 100644
+--- a/tests/test_gascity_pack_inference_gate.py
++++ b/tests/test_gascity_pack_inference_gate.py
+@@ -785,7 +785,7 @@ def test_manifold_validation_step_bodies_are_unweakened() -> None:
+         'test -n "$ANTHROPIC_DEFAULT_SONNET_MODEL"',
+         'test -n "$ANTHROPIC_DEFAULT_OPUS_MODEL"',
+         'test -n "$CLAUDE_CODE_SUBAGENT_MODEL"',
+-        'test "$GC_INFERENCE_EXPECTED_MODEL" = "kimi-k2.7-code"',
++        'test "$GC_INFERENCE_EXPECTED_MODEL" = "kimi-k3"',
+     )
+     for relative_path in (
+         ".github/workflows/supported-pack-nightly.yml",
+@@ -2027,7 +2027,7 @@ WITNESS_ORPHAN_GUARD_PINS = (
+     'elif ! [[ "$BEAD_UPDATED_AT" < "$CYCLE_MAP_BUILT_AT" ]]; then',
+     # Content test: -z and the quoted array are jointly load-bearing.
+     'done < <(git diff --name-only -z "$MERGE_BASE" "origin/$BRANCH")',
+-    'elif git diff --quiet "origin/main" "origin/$BRANCH" -- "${CHANGED[@]}"; then',
++    'elif git diff --quiet "origin/$DEFAULT_BRANCH" "origin/$BRANCH" -- "${CHANGED[@]}"; then',
+     # All three destructive sites re-state the verdict.  Step 3a skips to Step
+     # 4, so a guard placed only at the pool reset would never cover it.
+     'if [ "$STILL_ORPHANED" = "true" ] && [ "$ON_MAIN" = "true" ]; then',
+diff --git a/tests/test_prompt_formula_command_drift.py b/tests/test_prompt_formula_command_drift.py
+index e40215a0..cf5f8691 100644
+--- a/tests/test_prompt_formula_command_drift.py
++++ b/tests/test_prompt_formula_command_drift.py
+@@ -32,6 +32,10 @@ AGENT_PROMPT_GLOB = "gastown/agents/*/prompt.template.md"
+ 
+ FENCE_OPEN = re.compile(r"^\s*```(\w*)\s*$")
+ FENCE_CLOSE = re.compile(r"^\s*```\s*$")
++# Warrant creation, by either spelling of the label flag. Upstream renamed the
++# create flag from --label to --labels (#330), so a detector keyed on the old
++# spelling would stop seeing every warrant it exists to check.
++WARRANT_LABEL = re.compile(r"--labels?[= ]warrant\b")
+ 
+ POOL_RETURN_ASSIGNEE = re.compile(r"""--assignee=(?:""|'')""")
+ 
+@@ -172,7 +176,7 @@ def warrant_dedup_violations(path: Path, text: str) -> list[str]:
+         for number in range(start, start + body.count("\n") + 1)
+     }
+     for number, command in logical_commands(text):
+-        if "gc bd create" not in command or "--label=warrant" not in command:
++        if "gc bd create" not in command or not WARRANT_LABEL.search(command):
+             continue
+         if number in guarded:
+             continue
+@@ -199,7 +203,7 @@ def warrant_workflow_kind_violations(path: Path, text: str) -> list[str]:
+     """
+     violations = []
+     for number, command in logical_commands(text):
+-        if "gc bd create" not in command or "--label=warrant" not in command:
++        if "gc bd create" not in command or not WARRANT_LABEL.search(command):
+             continue
+         if "gc.routed_to" not in command:
+             continue
+@@ -584,6 +588,14 @@ def test_detectors_catch_the_drift_they_are_named_for() -> None:
+         ]
+     )
+     assert warrant_dedup_violations(fixture, unguarded_warrant)
++    unguarded_plural = "\n".join(
++        [
++            "```bash",
++            "gc bd create --type=task --labels=warrant --metadata '{\"target\":\"x\"}'",
++            "```",
++        ]
++    )
++    assert warrant_dedup_violations(fixture, unguarded_plural)
+     guarded_warrant = "\n".join(
+         [
+             "```bash",
+diff --git a/tests/test_wisp_molecule_queries.py b/tests/test_wisp_molecule_queries.py
+index 77d3ad9c..f9734a6f 100644
+--- a/tests/test_wisp_molecule_queries.py
++++ b/tests/test_wisp_molecule_queries.py
+@@ -51,6 +51,14 @@ THIS_FILE = Path(__file__).resolve()
+ # still containing the broken form. Skipping it loses no coverage: the shipped
+ # post-image of that same content is scanned directly.
+ DERIVED_PREFIXES = ("patches/",)
++# Test harnesses quote the flag tokens in grep patterns and fixtures; they are
++# not queries anything runs.
++TEST_PREFIXES = ("tests/", "gastown/tests/")
++# Boot's patrol loop arrived upstream (#261) after the open-wisp facet below was
++# measured (gcp-ah8h), and upstream pins its resolvers in the in_progress form
++# (test_boot_patrol_burn_resolves_current_wisp). The live-status facet is held to
++# the three patrol roles it was measured on; boot keeps the --include-infra rule.
++LIVE_STATUS_EXEMPT = ("gastown/agents/boot/", "gastown/formulas/mol-boot-patrol.toml")
+ 
+ # Match the flag form only (`--type=molecule` / `--type molecule`), never the
+ # prose spelling `issue_type=molecule` that documents what a wisp root is.
+@@ -101,7 +109,7 @@ def tracked_files() -> list[Path]:
+     return [
+         REPO_ROOT / path
+         for path in result.stdout.decode().split("\0")
+-        if path and not path.startswith(DERIVED_PREFIXES)
++        if path and not path.startswith(DERIVED_PREFIXES + TEST_PREFIXES)
+     ]
+ 
+ 
+@@ -248,6 +256,8 @@ def test_shipped_live_wisp_queries_cover_open_and_in_progress() -> None:
+     for path in tracked_files():
+         if path.resolve() == THIS_FILE:
+             continue
++        if path.relative_to(REPO_ROOT).as_posix().startswith(LIVE_STATUS_EXEMPT):
++            continue
+         try:
+             text = path.read_text(encoding="utf-8")
+         except UnicodeDecodeError:
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,182 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Tue, 6 Oct 2026 14:36:14 -0400
+Subject: [PATCH 117/148] fix(refinery): guard patrol rm targets with ${NAME:?}
+ so fences run verbatim (gcp-s7j4.6)
+
+Claude Code's built-in safety check denies an rm whose target is an
+unguarded shell variable, because an unset or empty variable would turn it
+into a removal at the filesystem root. A refinery session has no person to
+approve the prompt, so the command waits out a 2 minute timeout and does not
+run, and sessions then hand-edit or retype the fence before running it.
+During the first acceptance_check=warn window this meant most sessions
+stopped running the acceptance-check fence as written, and several hardcoded
+the script path, which skips the formula's locator and its not-runnable WARN.
+
+Each of the six rm commands in mol-refinery-patrol now takes a "${NAME:?}"
+target, the form the check exempts by its own message. Every line stays an
+rm -f, with no trash and no find -delete, so the form stays portable. Where
+the variable is set, which holds at all six lines, behavior is unchanged.
+Two lines change shape beyond the guard:
+- the prose instruction now sets BATCH_DIR itself, so its target is a
+  variable rather than a command substitution;
+- the duplicate check wraps its rm in an if [ -n "$DUP_ERR" ], so an empty
+  DUP_ERR (mktemp failed) skips the rm instead of aborting the block halfway,
+  which a careless retry turns into a duplicate bead.
+
+case_rm_targets_guarded fails, naming each line, if any rm target starts with
+"$ and then a letter, underscore or (. It was written first and fails at
+f10c843f listing 324, 366, 389, 515, 656 and 1114, and it also proves it can
+fail by unguarding one target in a copy of the formula. The byte-exact fence
+pin in write_fence takes the new acceptance-check line.
+
+Validation: test_refinery_acceptance_wiring.sh, test_refinery_batch_wiring.sh
+and test_refinery_merge_batch.sh each exit 0.
+
+Out of scope: the witness and deacon patrols have the same unguarded shape
+but show no denials, so they are unchanged.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ gastown/formulas/mol-refinery-patrol.toml     | 12 +++---
+ .../tests/test_refinery_acceptance_wiring.sh  | 41 +++++++++++++++++--
+ 2 files changed, 44 insertions(+), 9 deletions(-)
+
+diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
+index 90e367f1..65dd38d2 100644
+--- a/gastown/formulas/mol-refinery-patrol.toml
++++ b/gastown/formulas/mol-refinery-patrol.toml
+@@ -373,7 +373,7 @@ fi
+ # even when no work was found.
+ BATCH_DIR=$(git rev-parse --git-dir 2>/dev/null) || BATCH_DIR=""
+ if [ -n "$BATCH_DIR" ]; then
+-  rm -f "$BATCH_DIR/refinery-batch.json" "$BATCH_DIR/refinery-batch.path"
++  rm -f "${BATCH_DIR:?}/refinery-batch.json" "${BATCH_DIR:?}/refinery-batch.path"
+ fi
+ BATCH_MAX="{{merge_batch_max}}"
+ case "$BATCH_MAX" in
+@@ -415,7 +415,7 @@ if [ -n "$WORK" ] && [ "$BATCH_MAX" -gt 1 ]; then
+         && printf '%s\\n' "$MERGE_BATCH" >"$BATCH_DIR/refinery-batch.path"; then
+         echo "BATCH: $(printf '%s' "$BATCH_IDS" | tr '\\n' ' ' | sed 's/ *$//')"
+       else
+-        rm -f "$BATCH_DIR/refinery-batch.json" "$BATCH_DIR/refinery-batch.path"
++        rm -f "${BATCH_DIR:?}/refinery-batch.json" "${BATCH_DIR:?}/refinery-batch.path"
+         echo "INFO: could not write the batch manifest; batching off."
+       fi
+     fi
+@@ -438,7 +438,7 @@ never extend them. The only shortening on offer is to one: if the mail
+ check-inbox handled asked to hold any printed bead, do not batch this iteration
+ and run
+ ```bash
+-rm -f "$(git rev-parse --git-dir)/refinery-batch.json"
++BATCH_DIR=$(git rev-parse --git-dir) && rm -f "${BATCH_DIR:?}/refinery-batch.json"
+ ```
+ 
+ `${GC_RIG:+--rig="$GC_RIG"}` scopes the query to this refinery's rig
+@@ -561,7 +561,7 @@ case "$ACK_MODE" in
+ esac
+ if [ "$ACK_MODE" = warn ]; then
+   ACK_DIR="$(git rev-parse --git-dir)/acceptance"
+-  mkdir -p "$ACK_DIR" && rm -f "$ACK_DIR"/*.packet "$ACK_DIR"/*.err "$ACK_DIR/script.path"
++  mkdir -p "$ACK_DIR" && rm -f "${ACK_DIR:?}"/*.packet "${ACK_DIR:?}"/*.err "${ACK_DIR:?}/script.path"
+   ACK_CITY="${GC_CITY:-${GC_CITY_PATH:-}}"
+   if [ -n "$ACK_CITY" ]; then
+     ACK_FORMULA_JSON=$(gc formula list --city "$ACK_CITY" --json 2>/dev/null)
+@@ -885,7 +885,7 @@ if [ "$BATCH_N" -gt 1 ]; then
+   if [ -x "$MERGE_BATCH" ] && "$MERGE_BATCH" stack --head "$WORK"; then
+     echo "BATCH STACKED: see the manifest's members for what rides behind the head."
+   else
+-    rm -f "$BATCH_DIR/refinery-batch.json"
++    rm -f "${BATCH_DIR:?}/refinery-batch.json"
+     echo "INFO: batch of 1."
+   fi
+ fi
+@@ -1354,7 +1354,7 @@ fi
+      DUP_ERR=$(mktemp)
+      DUP_JSON=$(gc bd search "$DUP_KEYWORD" --type=bug --json 2>"$DUP_ERR")
+      DUP_CODE=$?
+-     DUP_MSG=$(cat "$DUP_ERR"); rm -f "$DUP_ERR"
++     DUP_MSG=$(cat "$DUP_ERR"); if [ -n "$DUP_ERR" ]; then rm -f "${DUP_ERR:?}"; fi
+      DUP_COUNT=$(printf '%s' "$DUP_JSON" | jq 'length' 2>/dev/null)
+      if [ "$DUP_CODE" -ne 0 ] || [ -z "$DUP_COUNT" ]; then
+        # FAIL CLOSED. An errored or unparseable duplicate check is NOT
+diff --git a/gastown/tests/test_refinery_acceptance_wiring.sh b/gastown/tests/test_refinery_acceptance_wiring.sh
+index 7fccd9e7..63e9af7b 100755
+--- a/gastown/tests/test_refinery_acceptance_wiring.sh
++++ b/gastown/tests/test_refinery_acceptance_wiring.sh
+@@ -25,12 +25,12 @@
+ # and the script is its sibling), and appends its argv, one line per call, to a
+ # log, then prints and exits as its env says.
+ #
+-# The suite fails unless all 13 cases ran.
++# The suite fails unless all 14 cases ran.
+ set -uo pipefail
+ 
+ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+ FORMULA="${FORMULA:-$ROOT/gastown/formulas/mol-refinery-patrol.toml}"
+-EXPECTED_CASES=13
++EXPECTED_CASES=14
+ 
+ REFINERY_AGENT=testrig/gastown.refinery
+ HEAD_ID=wa-head
+@@ -397,7 +397,7 @@ case "$ACK_MODE" in
+ esac
+ if [ "$ACK_MODE" = warn ]; then
+   ACK_DIR="$(git rev-parse --git-dir)/acceptance"
+-  mkdir -p "$ACK_DIR" && rm -f "$ACK_DIR"/*.packet "$ACK_DIR"/*.err "$ACK_DIR/script.path"
++  mkdir -p "$ACK_DIR" && rm -f "${ACK_DIR:?}"/*.packet "${ACK_DIR:?}"/*.err "${ACK_DIR:?}/script.path"
+   ACK_CITY="${GC_CITY:-${GC_CITY_PATH:-}}"
+   if [ -n "$ACK_CITY" ]; then
+     ACK_FORMULA_JSON=$(gc formula list --city "$ACK_CITY" --json 2>/dev/null)
+@@ -673,6 +673,40 @@ case_prose() {
+     end_case
+ }
+ 
++# rm_unguarded <formula> — "<line>:<text>" for each rm command whose target starts with
++# `"$` and then a letter, underscore or `(`: an unguarded variable or command
++# substitution. Claude Code's built-in safety check denies such an rm unless a person
++# approves it, and a refinery session has none, so a session hand-edits the fence
++# before it runs (gcp-s7j4.6). `"${NAME:?}"` is the form the check exempts.
++rm_unguarded() {
++    grep -nE '(^|[;&|(]|then|do|else)[[:space:]]*rm[[:space:]][^;&|]*"\$[A-Za-z_(]' "$1"
++}
++
++case_rm_targets_guarded() {
++    new_case rm_targets_guarded
++    local found
++    found=$(rm_unguarded "$FORMULA")
++    if [ -n "$found" ]; then
++        fail "rm commands with an unguarded target; write \"\${NAME:?}\" (line:text):
++$found"
++        end_case
++        return
++    fi
++
++    # The check must be able to FAIL: unguard one target in a copy of the formula.
++    local guarded="\"\${ACK_DIR:?}\"/*.packet" unguarded="\"\$ACK_DIR\"/*.packet" text
++    text=$(<"$FORMULA")
++    case "$text" in
++        *"$guarded"*) ;;
++        *) fail "harness bug: the acceptance-check fence's rm no longer holds $guarded" ;;
++    esac
++    printf '%s\n' "${text//"$guarded"/"$unguarded"}" >"$T/formula-unguarded.toml"
++    cmp -s "$FORMULA" "$T/formula-unguarded.toml" && fail "harness bug: the formula copy was not changed"
++    [ -n "$(rm_unguarded "$T/formula-unguarded.toml")" ] ||
++        fail "the guard check passed with an rm target unguarded"
++    end_case
++}
++
+ case_steps_and_needs
+ case_var
+ case_unrendered
+@@ -686,6 +720,7 @@ case_not_runnable
+ case_stale_files
+ case_rubric_verbatim
+ case_prose
++case_rm_targets_guarded
+ 
+ if [ "$PASS_CASES" -ne "$EXPECTED_CASES" ]; then
+     echo "FAIL: $PASS_CASES of $EXPECTED_CASES cases ran" >&2
+-- 
+2.54.0 (Apple Git-157)
+

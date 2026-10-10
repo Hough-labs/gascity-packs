@@ -1,0 +1,1105 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Mon, 5 Oct 2026 22:08:33 -0400
+Subject: [PATCH 113/148] test(refinery): prove acceptance-check.sh against
+ real git (gcp-s7j4.1)
+
+acceptance-check.sh is inert until gcp-s7j4.2, so this suite is its whole
+proof. It is modeled on test_refinery_merge_batch.sh: a bare origin, a polecat
+clone that pushes one branch per bead, the refinery's clone after
+`git fetch --prune origin`, a gc stub over a directory of bead files that
+journals every call and exits 64 on any call it does not model, every script run
+under env -i, and EXPECTED_CASES so the suite fails unless all 19 cases ran.
+
+The cases are the bead's acceptance items 1 to 19, named as the bead names them.
+Every case that runs packet also asserts the gc log has no update, note, close or
+nudge call. All fixture text is synthetic: this repository is public.
+
+Validation: the suite passes, and it fails against copies of the script with one
+defect each (no suffix boundary, a diff from the target tip, the wrong label, no
+hunk cap, no message cut, a short notes tail, a skipped already-judged check, a
+note cap of 400 lines, a nudge to this agent, a write chain that continues past a
+failed note, and a wrong RESULT default).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../tests/test_refinery_acceptance_check.sh   | 1067 +++++++++++++++++
+ 1 file changed, 1067 insertions(+)
+ create mode 100755 gastown/tests/test_refinery_acceptance_check.sh
+
+diff --git a/gastown/tests/test_refinery_acceptance_check.sh b/gastown/tests/test_refinery_acceptance_check.sh
+new file mode 100755
+index 00000000..52a1bff4
+--- /dev/null
++++ b/gastown/tests/test_refinery_acceptance_check.sh
+@@ -0,0 +1,1067 @@
++#!/usr/bin/env bash
++# Black-box proof of acceptance-check.sh `packet` and `record` against real git
++# repositories (gcp-s7j4.1).
++#
++# acceptance-check.sh is the mechanics of the refinery's acceptance read: `packet`
++# builds what the reader reads, `record` writes down the verdict the reader
++# reached. It is inert until the formula calls it (gcp-s7j4.2), so these cases are
++# its whole proof: each one asserts what the script PRINTED and what it WROTE,
++# never how it is written, except case_text_invariants, whose subject is the
++# script's text.
++#
++# The rig is real git: a bare origin, a polecat clone that pushes one branch per
++# bead, and the refinery's clone after `git fetch --prune origin`. Only gc is
++# stubbed. The stub is modeled on test_refinery_merge_batch.sh's, over a fixture
++# DIRECTORY with one JSON file per bead:
++#   gc bd show <id> --json    that bead's file; fails for the ids in GC_STUB_FAIL_SHOW
++#   gc bd update <id> ...     --set-metadata k=v and --add-label <label>; fails for
++#                             the ids in GC_STUB_FAIL_UPDATE, and, for a call that
++#                             adds a label, for the ids in GC_STUB_FAIL_LABEL
++#   gc bd note <id> --stdin   appends the note to $GC_STUB_BEADS/<id>.notelog;
++#                             fails for the ids in GC_STUB_FAIL_NOTE
++#   gc session nudge <target> <message>
++#                             journals "<target><TAB><message>" to $GC_STUB_NUDGES,
++#                             failed attempts too; fails for the targets in
++#                             GC_STUB_FAIL_NUDGE
++# Every call is journalled to $T/gc.log. A call the model does not know fails
++# loudly (exit 64) and fails the case.
++#
++# Each script run is under `env -i`, so no agent-session GC_* variable can leak
++# in. SCRIPT may point at another copy of acceptance-check.sh; it finds
++# merge-push.sh beside itself, so stage a copy as a pack tree.
++#
++# ALL fixture text is synthetic: this repository is public. The cases reproduce
++# the SHAPES the design measured (three named test files with one changed, a hunk
++# that fails the second of two calls where the criteria fail the first, a value
++# of 47 where the criteria say 0, a keep-passing file named but unchanged), with
++# invented paths and wording.
++#
++# The suite fails unless all 19 cases ran.
++set -uo pipefail
++
++ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
++PACK_DIR="$ROOT/gastown"
++SCRIPT="${SCRIPT:-$PACK_DIR/assets/scripts/refinery/acceptance-check.sh}"
++EXPECTED_CASES=19
++
++AGENT=testrig/gastown.refinery
++TARGET_NAME=integration
++FAILURES=0
++PASS_CASES=0
++CASE=""
++
++fail() {
++    echo "FAIL[$CASE]: $*" >&2
++    FAILURES=$((FAILURES + 1))
++}
++
++assert_eq() {
++    # assert_eq <what> <want> <got>
++    [ "$2" = "$3" ] || fail "$1: want '$2', got '$3'"
++}
++
++# assert_match <what> <extended regex> <got>
++assert_match() {
++    grep -Eq -- "$2" <<<"$3" || fail "$1: '$3' does not match /$2/"
++}
++
++# --- stubs ------------------------------------------------------------------
++
++write_gc_stub() {
++    cat >"$1/gc" <<'STUB'
++#!/usr/bin/env bash
++ARGS=("$@")
++printf 'gc %s\n' "$*" >>"$GC_STUB_LOG"
++unexpected() {
++    printf 'gc %s\n' "${ARGS[*]}" >>"$STUB_UNEXPECTED"
++    echo "stub gc: unexpected invocation: gc ${ARGS[*]}" >&2
++    exit 64
++}
++edit_bead() {
++    local file="$1" tmp
++    shift
++    tmp=$(mktemp) || exit 70
++    jq "$@" "$file" >"$tmp" && mv -f "$tmp" "$file"
++}
++case "${1:-}" in
++bd)
++    case "${2:-}" in
++    show)
++        { [ "$#" -eq 4 ] && [ "$4" = --json ]; } || unexpected
++        case " ${GC_STUB_FAIL_SHOW:-} " in
++        *" $3 "*)
++            echo "stub gc: gc bd show $3 failed on request" >&2
++            exit 1
++            ;;
++        esac
++        [ -f "$GC_STUB_BEADS/$3.json" ] || {
++            echo "stub gc: no such bead: $3" >&2
++            exit 1
++        }
++        cat "$GC_STUB_BEADS/$3.json"
++        ;;
++    update)
++        id="${3:-}"
++        file="$GC_STUB_BEADS/$id.json"
++        [ -f "$file" ] || unexpected
++        case " ${GC_STUB_FAIL_UPDATE:-} " in
++        *" $id "*)
++            echo "stub gc: gc bd update $id failed on request" >&2
++            exit 1
++            ;;
++        esac
++        case " ${ARGS[*]} " in
++        *" --add-label"*)
++            case " ${GC_STUB_FAIL_LABEL:-} " in
++            *" $id "*)
++                echo "stub gc: gc bd update $id --add-label failed on request" >&2
++                exit 1
++                ;;
++            esac
++            ;;
++        esac
++        shift 3
++        while [ "$#" -gt 0 ]; do
++            case "$1" in
++            --set-metadata)
++                edit_bead "$file" --arg k "${2%%=*}" --arg v "${2#*=}" '.[0].metadata[$k] = $v'
++                shift
++                ;;
++            --add-label)
++                edit_bead "$file" --arg v "$2" '.[0].labels = (((.[0].labels // []) + [$v]) | unique)'
++                shift
++                ;;
++            *) unexpected ;;
++            esac
++            shift
++        done
++        ;;
++    note)
++        # gc bd note <id> --stdin: the note text is appended to <id>.notelog.
++        { [ "$#" -eq 4 ] && [ "$4" = --stdin ] && [ -f "$GC_STUB_BEADS/${3:-}.json" ]; } || unexpected
++        case " ${GC_STUB_FAIL_NOTE:-} " in
++        *" $3 "*)
++            echo "stub gc: gc bd note $3 failed on request" >&2
++            exit 1
++            ;;
++        esac
++        cat >>"$GC_STUB_BEADS/$3.notelog"
++        ;;
++    *) unexpected ;;
++    esac
++    ;;
++session)
++    { [ "${2:-}" = nudge ] && [ "$#" -eq 4 ]; } || unexpected
++    printf '%s\t%s\n' "$3" "$4" >>"$GC_STUB_NUDGES"
++    case " ${GC_STUB_FAIL_NUDGE:-} " in
++    *" $3 "*)
++        echo "stub gc: gc session nudge $3 failed on request" >&2
++        exit 1
++        ;;
++    esac
++    ;;
++*) unexpected ;;
++esac
++exit 0
++STUB
++    chmod +x "$1/gc"
++}
++
++# --- rig --------------------------------------------------------------------
++
++git_q() { git "$@" >/dev/null 2>&1; }
++
++new_case() {
++    CASE="$1"
++    CASE_START_FAILURES=$FAILURES
++    T=$(mktemp -d "${TMPDIR:-/tmp}/acceptance-check.XXXXXX")
++    ORIGIN="$T/origin.git"
++    SEED="$T/seed"
++    POLECAT="$T/polecat"
++    REFINERY="$T/refinery"
++    BEADS="$T/beads"
++    mkdir -p "$T/home" "$T/tmp" "$T/bin" "$BEADS"
++    cat >"$T/home/.gitconfig" <<'CFG'
++[init]
++	defaultBranch = integration
++[user]
++	name = refinery
++	email = refinery@example.invalid
++[advice]
++	detachedHead = false
++[protocol "file"]
++	allow = always
++[commit]
++	gpgsign = false
++CFG
++    export HOME="$T/home"
++    export GIT_CONFIG_GLOBAL="$T/home/.gitconfig"
++    export GIT_CONFIG_NOSYSTEM=1
++    export GIT_AUTHOR_NAME=refinery GIT_AUTHOR_EMAIL=refinery@example.invalid
++    export GIT_COMMITTER_NAME=refinery GIT_COMMITTER_EMAIL=refinery@example.invalid
++    write_gc_stub "$T/bin"
++    : >"$T/gc.log"
++    : >"$T/unexpected"
++    : >"$T/out"
++    : >"$T/err"
++    : >"$T/stdin"
++    : >"$T/nudges"
++    FAIL_SHOW=""
++    FAIL_UPDATE=""
++    FAIL_LABEL=""
++    FAIL_NOTE=""
++    FAIL_NUDGE=""
++    EXTRA_ENV=()
++    CONFIG_DEFAULT_BRANCH="$TARGET_NAME"
++    CONFIG_JSON="$T/config.json"
++    write_config
++}
++
++end_case() {
++    [ ! -s "$T/unexpected" ] || fail "unmodelled stub call(s): $(tr '\n' ';' <"$T/unexpected")"
++    if [ "$FAILURES" -ne "$CASE_START_FAILURES" ]; then
++        {
++            echo "--- $CASE: last run (status $(cat "$T/rc" 2>/dev/null)) stdout ---"
++            cat "$T/out"
++            echo "--- $CASE: last run stderr ---"
++            cat "$T/err"
++            echo "--- $CASE: gc calls ---"
++            cat "$T/gc.log"
++        } >&2
++    fi
++    trash "$T" 2>/dev/null || rm -rf "$T"
++    PASS_CASES=$((PASS_CASES + 1))
++}
++
++# write_config — the city config the script reads through MERGE_PUSH_CONFIG_JSON.
++write_config() {
++    jq -n --arg d "$CONFIG_DEFAULT_BRANCH" \
++        '{config: {Rigs: [{Name: "testrig", DefaultBranch: $d, FormulaVars: {}}]}}' >"$CONFIG_JSON"
++}
++
++# init_rig — a bare origin holding the baseline, and the clone polecats work in.
++init_rig() {
++    git_q init --bare "$ORIGIN"
++    git_q init "$SEED"
++    echo baseline >"$SEED/README.md"
++    git_q -C "$SEED" add -A
++    git_q -C "$SEED" commit -m "chore: baseline"
++    git_q -C "$SEED" remote add origin "$ORIGIN"
++    git_q -C "$SEED" push origin HEAD:integration
++    FORK_SHA=$(git -C "$SEED" rev-parse HEAD)
++    git_q clone "$ORIGIN" "$POLECAT"
++}
++
++# start_branch <bead-id> — polecat/<bead-id> forks from the baseline.
++start_branch() { git_q -C "$POLECAT" checkout -B "polecat/$1" "$FORK_SHA"; }
++
++# put_file <path> <content> — write one file in the polecat clone.
++put_file() {
++    mkdir -p "$(dirname "$POLECAT/$1")"
++    printf '%s\n' "$2" >"$POLECAT/$1"
++}
++
++commit_all() {
++    git_q -C "$POLECAT" add -A
++    git_q -C "$POLECAT" commit -m "$1"
++}
++
++push_branch() { git_q -C "$POLECAT" push -f origin "polecat/$1"; }
++
++# sync_refinery — the refinery's clone, then the fetch the patrol runs once before
++# it reads any packet.
++sync_refinery() {
++    [ -d "$REFINERY" ] || git_q clone "$ORIGIN" "$REFINERY"
++    git_q -C "$REFINERY" fetch --prune origin
++}
++
++# move_target <file> — another bead's work lands on the target after the fork.
++move_target() {
++    git_q -C "$SEED" pull origin integration
++    echo "someone else" >"$SEED/$1"
++    git_q -C "$SEED" add "$1"
++    git_q -C "$SEED" commit -m "feat: a concurrent bead"
++    git_q -C "$SEED" push origin HEAD:integration
++}
++
++branch_tip() { git -C "$REFINERY" rev-parse --verify "refs/remotes/origin/polecat/$1"; }
++
++# --- beads ------------------------------------------------------------------
++
++# write_bead <id> [key=value ...] — a bead as `gc bd show` returns it, assigned to
++# the refinery, with the polecat's branch metadata and empty criteria and notes.
++write_bead() {
++    local id="$1" kv
++    shift
++    jq -n --arg id "$id" --arg agent "$AGENT" --arg branch "polecat/$id" --arg target "$TARGET_NAME" \
++        '[{id: $id, title: ("Bead " + $id), status: "in_progress", assignee: $agent,
++           issue_type: "task", acceptance_criteria: "", notes: "",
++           metadata: {branch: $branch, target: $target}}]' >"$BEADS/$id.json"
++    for kv in "$@"; do
++        set_meta "$id" "${kv%%=*}" "${kv#*=}"
++    done
++}
++
++set_meta() {
++    local tmp
++    tmp=$(mktemp)
++    jq --arg k "$2" --arg v "$3" '.[0].metadata[$k] = $v' "$BEADS/$1.json" >"$tmp" && mv -f "$tmp" "$BEADS/$1.json"
++}
++
++unset_meta() {
++    local tmp
++    tmp=$(mktemp)
++    jq --arg k "$2" 'del(.[0].metadata[$k])' "$BEADS/$1.json" >"$tmp" && mv -f "$tmp" "$BEADS/$1.json"
++}
++
++# set_field <id> <top-level key> <value>
++set_field() {
++    local tmp
++    tmp=$(mktemp)
++    jq --arg k "$2" --arg v "$3" '.[0][$k] = $v' "$BEADS/$1.json" >"$tmp" && mv -f "$tmp" "$BEADS/$1.json"
++}
++
++bead_meta() { jq -r --arg k "$2" '.[0].metadata[$k] // "<unset>"' "$BEADS/$1.json"; }
++bead_field() { jq -r --arg k "$2" '.[0][$k] // "<unset>"' "$BEADS/$1.json"; }
++bead_sum() { cksum <"$BEADS/$1.json"; }
++bead_has_label() { jq -e --arg l "$2" '(.[0].labels // []) | index($l) != null' "$BEADS/$1.json" >/dev/null 2>&1; }
++
++# --- running the script -----------------------------------------------------
++
++# run_ac <args...> — run acceptance-check.sh inside the refinery clone, as the
++# patrol does, with $T/stdin as its stdin. Sets RC, and leaves stdout in $T/out and
++# stderr in $T/err. The cd fails closed: a script run anywhere else would read the
++# refs of whatever checkout the suite started in.
++run_ac() {
++    (
++        cd "$REFINERY" || exit 90
++        env -i \
++            PATH="$T/bin:$PATH" HOME="$T/home" TMPDIR="$T/tmp" \
++            GIT_CONFIG_GLOBAL="$T/home/.gitconfig" GIT_CONFIG_NOSYSTEM=1 \
++            GIT_AUTHOR_NAME=refinery GIT_AUTHOR_EMAIL=refinery@example.invalid \
++            GIT_COMMITTER_NAME=refinery GIT_COMMITTER_EMAIL=refinery@example.invalid \
++            GC_RIG=testrig GC_AGENT="$AGENT" MERGE_PUSH_CONFIG_JSON="$CONFIG_JSON" \
++            GC_STUB_LOG="$T/gc.log" GC_STUB_BEADS="$BEADS" GC_STUB_NUDGES="$T/nudges" \
++            GC_STUB_FAIL_SHOW="$FAIL_SHOW" GC_STUB_FAIL_UPDATE="$FAIL_UPDATE" \
++            GC_STUB_FAIL_LABEL="$FAIL_LABEL" GC_STUB_FAIL_NOTE="$FAIL_NOTE" \
++            GC_STUB_FAIL_NUDGE="$FAIL_NUDGE" STUB_UNEXPECTED="$T/unexpected" \
++            ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"} \
++            "$BASH" "$SCRIPT" "$@" <"$T/stdin"
++    ) >"$T/out" 2>"$T/err"
++    RC=$?
++    echo "$RC" >"$T/rc"
++}
++
++last_line() { tail -n 1 "$T/out"; }
++
++# calls <extended regex> — how many journalled gc calls match.
++calls() { grep -cE -- "$1" "$T/gc.log"; }
++
++# assert_read_only <what> — packet never writes: no update, note, close or nudge.
++assert_read_only() {
++    assert_eq "$1: the gc log has no write call" 0 "$(calls '^gc (bd (update|note|close) |session nudge )')"
++}
++
++# section <header prefix> — the body of one packet section: the lines after
++# "== <prefix>..." up to the next "== " header.
++section() {
++    awk -v h="== $1" 'index($0, h) == 1 { on = 1; next } /^== / { on = 0 } on' "$T/out"
++}
++
++# section_grep <header prefix> <grep args...> — grep one packet section. The
++# section goes to a file first: `grep -q` quits at its first match, and with
++# pipefail on, a producer that takes SIGPIPE would fail the pipeline spuriously.
++section_grep() {
++    local header="$1"
++    shift
++    section "$header" >"$T/section"
++    grep "$@" "$T/section"
++}
++
++# hunk_body — the TEST HUNKS lines printed before the cut line.
++hunk_body() { section 'TEST HUNKS' | awk '/^\[cut: / { exit } { print }'; }
++
++# --- cases: packet ----------------------------------------------------------
++
++# One packet run against a one-branch rig. packet_rig <bead-id> <AC> <path> <content>...
++# adds each <path>/<content> pair to the branch, in one commit.
++packet_rig() {
++    local id="$1" ac="$2"
++    shift 2
++    init_rig
++    start_branch "$id"
++    while [ "$#" -ge 2 ]; do
++        put_file "$1" "$2"
++        shift 2
++    done
++    commit_all "feat: $id"
++    push_branch "$id"
++    sync_refinery
++    write_bead "$id"
++    set_field "$id" acceptance_criteria "$ac"
++}
++
++# assert_no_verdict <what> — packet never prints a verdict.
++assert_no_verdict() {
++    grep -Eq 'CONFORMS|DECLARED|MISS' "$T/out" && fail "$1: a stdout line carries a verdict word"
++    return 0
++}
++
++case_packet_missing_named_files() {
++    new_case packet-missing-named-files
++    packet_rig gcp-n1 "1. Jest in app/features/alpha/alpha-list.test.tsx: a case. The same case in features/beta/beta-screen.test.tsx and features/gamma/gamma-screen.test.tsx." \
++        app/features/alpha/alpha-list.test.tsx "it('lists the alpha rows', () => {})" \
++        app/features/alpha/alpha.ts "export const alpha = 1"
++    run_ac packet --work gcp-n1
++    assert_eq "packet exits 0" 0 "$RC"
++    assert_eq "NAMED TEST FILES, sorted by the named path" \
++        "IN-DIFF app/features/alpha/alpha-list.test.tsx (app/features/alpha/alpha-list.test.tsx)
++NOT-IN-DIFF features/beta/beta-screen.test.tsx
++NOT-IN-DIFF features/gamma/gamma-screen.test.tsx" \
++        "$(section 'NAMED TEST FILES')"
++    assert_read_only "packet"
++    end_case
++}
++
++case_packet_setup_substitution() {
++    new_case packet-setup-substitution
++    local ac='2. Jest in app/lib/lib-screen.test.tsx: two concurrent saves, first held; failing the FIRST names that row.'
++    local hunk_line='    saveSpy.mockImplementationOnce(held).mockRejectedValueOnce(boom)'
++    packet_rig gcp-s1 "$ac" \
++        app/lib/lib-screen.test.tsx "describe('lib screen', () => {
++  it('names the row whose save failed', async () => {
++    const held = new Promise(() => {})
++    const boom = new Error('boom')
++$hunk_line
++  })
++})"
++    run_ac packet --work gcp-s1
++    assert_eq "packet exits 0" 0 "$RC"
++    section_grep 'ACCEPTANCE' -Fxq -- "$ac" || fail "the ACCEPTANCE section does not hold the AC line byte for byte"
++    section_grep 'TEST HUNKS' -Fxq -- "+$hunk_line" || fail "the TEST HUNKS section does not hold the setup line prefixed with +"
++    assert_no_verdict "packet"
++    assert_read_only "packet"
++    end_case
++}
++
++case_packet_value_substitution() {
++    new_case packet-value-substitution
++    packet_rig gcp-v1 "2. app/nav/bar.test.tsx: the first height published at inset 0 is 45." \
++        app/nav/bar.test.tsx "const METRICS = { inset: 47 }
++it('publishes the first height', () => {
++expect(published).toEqual([92])
++})"
++    run_ac packet --work gcp-v1
++    assert_eq "packet exits 0" 0 "$RC"
++    section_grep 'TEST HUNKS' -Fxq -- '+const METRICS = { inset: 47 }' || fail "TEST HUNKS lacks the metrics line prefixed with +"
++    section_grep 'TEST HUNKS' -Fxq -- '+expect(published).toEqual([92])' || fail "TEST HUNKS lacks the assertion line prefixed with +"
++    assert_read_only "packet"
++    end_case
++}
++
++case_packet_keep_passing_file() {
++    new_case packet-keep-passing-file
++    packet_rig gcp-k1 "5. NO REGRESSION: bats tests/one.bats tests/two.bats exits 0." \
++        tests/three.bats "@test 'three' { true; }"
++    run_ac packet --work gcp-k1
++    assert_eq "packet exits 0, not a skip" 0 "$RC"
++    assert_match "the first line is the PACKET line" '^acceptance-check: PACKET gcp-k1 ' "$(head -n 1 "$T/out")"
++    assert_eq "NAMED TEST FILES" \
++        "NOT-IN-DIFF tests/one.bats
++NOT-IN-DIFF tests/two.bats" \
++        "$(section 'NAMED TEST FILES')"
++    assert_no_verdict "packet"
++    assert_read_only "packet"
++    end_case
++}
++
++case_packet_suffix_boundary() {
++    new_case packet-suffix-boundary
++    # The backticks are the AC's own markdown, not a command substitution.
++    # shellcheck disable=SC2016
++    packet_rig gcp-b1 'The AC names `features/x/widget.test.ts` and `gadget.test.ts`.' \
++        src/features/x/widget.test.ts "it('widget', () => {})" \
++        src/supergadget.test.ts "it('supergadget', () => {})"
++    run_ac packet --work gcp-b1
++    assert_eq "packet exits 0" 0 "$RC"
++    assert_eq "a named path matches on a whole trailing path, never a partial name" \
++        "IN-DIFF features/x/widget.test.ts (src/features/x/widget.test.ts)
++NOT-IN-DIFF gadget.test.ts" \
++        "$(section 'NAMED TEST FILES')"
++    assert_read_only "packet"
++    end_case
++}
++
++case_packet_pattern_table() {
++    new_case packet-pattern-table
++    local paths="a/one_test.go a/two.test.jsx a/three.spec.ts a/four.bats a/five_test.py a/test_six.py a/seven_test.sh a/test_eight.sh"
++    local p ac="The AC names" args=()
++    for p in $paths; do
++        ac="$ac $p,"
++        args+=("$p" "content of $p")
++    done
++    packet_rig gcp-t1 "$ac" "${args[@]}" src/app.ts "export const app = 1"
++    run_ac packet --work gcp-t1
++    assert_eq "packet exits 0" 0 "$RC"
++    for p in $paths; do
++        section_grep 'NAMED TEST FILES' -Fxq -- "IN-DIFF $p ($p)" || fail "no IN-DIFF line for $p"
++        section_grep 'TEST HUNKS' -Fxq -- "diff --git a/$p b/$p" || fail "no diff --git header for $p"
++    done
++    assert_eq "TEST HUNKS holds no header for src/app.ts" 0 "$(section_grep 'TEST HUNKS' -c 'src/app.ts')"
++    assert_read_only "packet"
++    end_case
++}
++
++case_packet_merge_base_diff() {
++    new_case packet-merge-base-diff
++    init_rig
++    start_branch gcp-m1
++    put_file app/m.test.ts "it('first', () => {})"
++    commit_all "feat: first"
++    put_file app/m2.test.ts "it('second', () => {})"
++    commit_all "feat: second"
++    push_branch gcp-m1
++    sync_refinery
++    # The target moves on after the fork, and the refinery fetches again.
++    move_target target-only.txt
++    sync_refinery
++    write_bead gcp-m1
++    set_field gcp-m1 acceptance_criteria "1. A case in app/m.test.ts."
++    local x m
++    x=$(branch_tip gcp-m1)
++    m=$(git -C "$REFINERY" merge-base "refs/remotes/origin/$TARGET_NAME" "$x")
++    [ "$(git -C "$REFINERY" rev-parse "refs/remotes/origin/$TARGET_NAME")" != "$m" ] ||
++        fail "harness bug: origin/$TARGET_NAME is still the merge-base"
++
++    run_ac packet --work gcp-m1
++    assert_eq "packet exits 0" 0 "$RC"
++    assert_eq "the PACKET line" \
++        "acceptance-check: PACKET gcp-m1 branch=polecat/gcp-m1 target=$TARGET_NAME base=$m tip=$x commits=2" \
++        "$(head -n 1 "$T/out")"
++    assert_eq "CHANGED FILES holds no target-only line" 0 "$(section_grep 'CHANGED FILES' -c 'target-only.txt')"
++    assert_read_only "packet"
++    end_case
++}
++
++case_packet_target_default() {
++    new_case packet-target-default
++    CONFIG_DEFAULT_BRANCH=release
++    write_config
++    init_rig
++    git_q -C "$SEED" push origin HEAD:release
++    start_branch gcp-d1
++    put_file app/d.test.ts "it('d', () => {})"
++    commit_all "feat: d"
++    push_branch gcp-d1
++    sync_refinery
++    write_bead gcp-d1
++    unset_meta gcp-d1 target
++    set_field gcp-d1 acceptance_criteria "1. A case in app/d.test.ts."
++    run_ac packet --work gcp-d1
++    assert_eq "packet exits 0" 0 "$RC"
++    assert_match "the PACKET line names the rig's default branch" ' target=release ' "$(head -n 1 "$T/out")"
++    assert_read_only "packet"
++    end_case
++}
++
++case_packet_cap() {
++    new_case packet-cap
++    init_rig
++    start_branch gcp-c1
++    mkdir -p "$POLECAT/tests"
++    awk 'BEGIN { for (i = 1; i <= 3000; i++) printf "%030d\n", i }' >"$POLECAT/tests/big_test.go"
++    put_file tests/small_test.go "package tests"
++    commit_all "test: big and small"
++    push_branch gcp-c1
++    sync_refinery
++    write_bead gcp-c1
++    set_field gcp-c1 acceptance_criteria "1. Go cases in tests/big_test.go and tests/small_test.go."
++    local x m full_lines body_chars body_lines cut n h
++    x=$(branch_tip gcp-c1)
++    m=$(git -C "$REFINERY" merge-base "refs/remotes/origin/$TARGET_NAME" "$x")
++    full_lines=$(git -C "$REFINERY" diff -U3 "$m" "$x" -- tests/big_test.go tests/small_test.go | wc -l | tr -d ' ')
++
++    run_ac packet --work gcp-c1
++    assert_eq "packet exits 0" 0 "$RC"
++    body_chars=$(hunk_body | wc -c | tr -d ' ')
++    body_lines=$(hunk_body | wc -l | tr -d ' ')
++    [ "$body_chars" -gt 17900 ] && [ "$body_chars" -le 18000 ] ||
++        fail "the hunk lines before the cut total $body_chars characters, want more than 17900 and at most 18000"
++    cut=$(section_grep 'TEST HUNKS' -E '^\[cut: ' || true)
++    assert_match "the cut line" '^\[cut: [0-9]+ more lines; headers follow\]$' "$cut"
++    n="${cut#\[cut: }"
++    n="${n%% *}"
++    assert_eq "N plus the printed hunk lines is the full diff's line count" "$full_lines" "$((n + body_lines))"
++    section 'TEST HUNKS' >"$T/hunks"
++    while IFS= read -r h; do
++        grep -Fxq -- "$h" "$T/hunks" || fail "the full diff's header line is missing from the section: $h"
++    done < <(git -C "$REFINERY" diff -U3 "$m" "$x" -- tests/big_test.go tests/small_test.go | grep -E '^(diff --git|@@)')
++    [ "$(wc -c <"$T/out" | tr -d ' ')" -lt 30000 ] || fail "the whole packet is not under 30000 characters"
++    assert_read_only "packet at the default cap"
++
++    run_ac packet --work gcp-c1 --cap-chars 500
++    assert_eq "packet --cap-chars 500 exits 0" 0 "$RC"
++    body_chars=$(hunk_body | wc -c | tr -d ' ')
++    [ "$body_chars" -le 500 ] || fail "--cap-chars 500: the hunk lines before the cut total $body_chars characters"
++    section_grep 'TEST HUNKS' -Eq '^\[cut: ' || fail "--cap-chars 500 did not cut"
++    assert_read_only "packet --cap-chars 500"
++    end_case
++}
++
++# The notes field is five lines, then filler, then a last line, 5000 characters in
++# all: the declaration on line 5 is far outside the 2000-character tail.
++case_packet_notes() {
++    new_case packet-notes
++    packet_rig gcp-o1 "1. A case in app/o.test.ts." app/o.test.ts "it('o', () => {})"
++    local first5 last pad notes
++    first5=$'first filler line\nsecond filler line\nUNRELATED EARLY LINE\nfourth filler line\nAC3 DEVIATION: the footnote case is not written, because the screen has no footnotes\n'
++    last="LAST LINE MARKER"
++    pad=$((5000 - ${#first5} - ${#last} - 1))
++    notes="$first5$(printf '%*s' "$pad" '' | tr ' ' x)"$'\n'"$last"
++    assert_eq "harness: the notes are 5000 characters" 5000 "${#notes}"
++    set_field gcp-o1 notes "$notes"
++
++    run_ac packet --work gcp-o1
++    assert_eq "packet exits 0" 0 "$RC"
++    assert_eq "the departure section holds the declared line, with its line number" \
++        "5:AC3 DEVIATION: the footnote case is not written, because the screen has no footnotes" \
++        "$(section 'NOTE LINES THAT MAY DECLARE A DEPARTURE')"
++    section_grep 'NOTE LINES THAT MAY DECLARE A DEPARTURE' -q 'UNRELATED EARLY LINE' &&
++        fail "the early unrelated line is in the departure section"
++    section_grep 'LATEST NOTES' -q 'UNRELATED EARLY LINE' &&
++        fail "the early unrelated line is in the latest-notes section"
++    assert_eq "the LATEST NOTES body is the last 2000 bytes of the notes" \
++        "$(printf '%s' "$notes" | tail -c 2000)" "$(section 'LATEST NOTES')"
++    assert_read_only "packet"
++
++    # Forty matching lines of 600 characters: the first 30, each cut to 400.
++    local i line want="" got
++    notes=""
++    for i in $(seq 1 40); do
++        line="departure $i "
++        line="$line$(printf '%*s' $((600 - ${#line})) '' | tr ' ' x)"
++        notes="$notes$line"$'\n'
++        if [ "$i" -le 30 ]; then want="$want$i:${line:0:400}"$'\n'; fi
++    done
++    set_field gcp-o1 notes "$notes"
++    run_ac packet --work gcp-o1
++    assert_eq "the second packet exits 0" 0 "$RC"
++    got=$(section 'NOTE LINES THAT MAY DECLARE A DEPARTURE')
++    assert_eq "the departure section holds the first 30 lines, each cut to 400 characters" "${want%$'\n'}" "$got"
++    assert_read_only "the second packet"
++    end_case
++}
++
++case_packet_skips() {
++    new_case packet-skips
++    init_rig
++    start_branch gcp-k1
++    put_file app/k.test.ts "it('first', () => {})"
++    commit_all "feat: first"
++    local older
++    older=$(git -C "$POLECAT" rev-parse HEAD)
++    put_file app/k2.test.ts "it('second', () => {})"
++    commit_all "feat: second"
++    push_branch gcp-k1
++    # gcp-k2 is the baseline itself: it adds nothing past the merge-base.
++    git_q -C "$POLECAT" push origin "$FORK_SHA:refs/heads/polecat/gcp-k2"
++    sync_refinery
++    local x x2
++    x=$(branch_tip gcp-k1)
++    x2=$(branch_tip gcp-k2)
++    reset_beads() {
++        write_bead gcp-k1
++        set_field gcp-k1 acceptance_criteria "1. A case in app/k.test.ts."
++        write_bead gcp-k2
++        set_field gcp-k2 acceptance_criteria "1. A case in app/k.test.ts."
++    }
++    # expect_skip <what> <bead> <line>
++    expect_skip() {
++        local before
++        before=$(bead_sum "$2")
++        : >"$T/gc.log"
++        run_ac packet --work "$2"
++        assert_eq "$1: exit status" 3 "$RC"
++        assert_eq "$1: stdout is the SKIP line" "$3" "$(cat "$T/out")"
++        assert_eq "$1: stdout is one line" 1 "$(wc -l <"$T/out" | tr -d ' ')"
++        assert_read_only "$1"
++        assert_eq "$1: the bead is unchanged" "$before" "$(bead_sum "$2")"
++    }
++
++    reset_beads
++    set_meta gcp-k1 branch ""
++    expect_skip "an empty metadata.branch" gcp-k1 "acceptance-check: SKIP gcp-k1 no-branch tip=none"
++
++    reset_beads
++    set_meta gcp-k1 branch polecat/never-pushed
++    expect_skip "a branch origin does not have" gcp-k1 "acceptance-check: SKIP gcp-k1 no-branch tip=none"
++
++    reset_beads
++    set_meta gcp-k1 target nosuch
++    expect_skip "a target origin does not have" gcp-k1 "acceptance-check: SKIP gcp-k1 no-branch tip=none"
++
++    reset_beads
++    set_field gcp-k1 acceptance_criteria ""
++    expect_skip "empty criteria" gcp-k1 "acceptance-check: SKIP gcp-k1 no-ac tip=$x"
++
++    reset_beads
++    expect_skip "a branch with no change past the merge-base" gcp-k2 "acceptance-check: SKIP gcp-k2 no-change tip=$x2"
++
++    reset_beads
++    set_meta gcp-k1 acceptance_check_tip "$x"
++    expect_skip "a branch already judged at its tip" gcp-k1 "acceptance-check: SKIP gcp-k1 already-judged tip=$x"
++
++    # The order the codes are checked in.
++    reset_beads
++    set_meta gcp-k1 branch ""
++    set_field gcp-k1 acceptance_criteria ""
++    expect_skip "an empty branch and empty criteria" gcp-k1 "acceptance-check: SKIP gcp-k1 no-branch tip=none"
++    reset_beads
++    set_field gcp-k2 acceptance_criteria ""
++    expect_skip "empty criteria and no change" gcp-k2 "acceptance-check: SKIP gcp-k2 no-ac tip=$x2"
++    reset_beads
++    set_meta gcp-k2 acceptance_check_tip "$x2"
++    expect_skip "no change and already judged" gcp-k2 "acceptance-check: SKIP gcp-k2 no-change tip=$x2"
++
++    # A judgment of an OLDER tip is not a skip: a resubmission is read again.
++    reset_beads
++    set_meta gcp-k1 acceptance_check_tip "$older"
++    run_ac packet --work gcp-k1
++    assert_eq "an older judged tip: exit status" 0 "$RC"
++    assert_match "an older judged tip: the first line is the PACKET line" '^acceptance-check: PACKET gcp-k1 ' "$(head -n 1 "$T/out")"
++    assert_read_only "an older judged tip"
++
++    # A bead the store cannot read is an error, not a skip.
++    reset_beads
++    FAIL_SHOW=gcp-k1
++    run_ac packet --work gcp-k1
++    assert_eq "an unreadable bead: exit status" 1 "$RC"
++    assert_eq "an unreadable bead: nothing on stdout" "" "$(cat "$T/out")"
++    end_case
++}
++
++# --- cases: record ----------------------------------------------------------
++
++# record_rig — a rig with one pushed branch and the bead gcp-r1, which a seat slung.
++# Sets X, the branch's full tip.
++record_rig() {
++    packet_rig gcp-r1 "1. A case in app/lib/lib-screen.test.tsx." app/lib/lib-screen.test.tsx "it('r', () => {})"
++    set_meta gcp-r1 slung_by testrig/crew.seat
++    X=$(branch_tip gcp-r1)
++}
++
++ITEM_MISS='AC2 SUBSTITUTED — fails the second | app/lib/lib-screen.test.tsx:12'
++
++# reset_record — clear what a record run wrote, so a case can run record again.
++reset_record() {
++    : >"$T/gc.log"
++    : >"$T/nudges"
++    : >"$T/stdin"
++    rm -f "$BEADS/gcp-r1.notelog"
++    write_bead gcp-r1 slung_by=testrig/crew.seat
++}
++
++nudge_count() { wc -l <"$T/nudges" | tr -d ' '; }
++nudge_target() { sed -n "${1}p" "$T/nudges" | cut -f1; }
++nudge_message() { sed -n "${1}p" "$T/nudges" | cut -f2; }
++note_first_line() { head -n 1 "$BEADS/$1.notelog"; }
++
++case_record_miss() {
++    new_case record-miss
++    record_rig
++    set_meta gcp-r1 gc.routed_to testrig/gastown.polecat
++    set_meta gcp-r1 rejection_reason "kept as is"
++    local untouched
++    untouched=$(jq -c '[.[0].status, .[0].assignee, .[0].metadata.rejection_reason, .[0].metadata["gc.routed_to"]]' "$BEADS/gcp-r1.json")
++    printf '%s\n' "$ITEM_MISS" >"$T/stdin"
++
++    run_ac record --work gcp-r1 --verdict MISS --tip "$X"
++    assert_eq "record exits 0" 0 "$RC"
++    assert_eq "acceptance_check" MISS "$(bead_meta gcp-r1 acceptance_check)"
++    assert_eq "acceptance_check_tip" "$X" "$(bead_meta gcp-r1 acceptance_check_tip)"
++    assert_eq "acceptance_check_mode" warn "$(bead_meta gcp-r1 acceptance_check_mode)"
++    assert_eq "acceptance_check_nudge" "delivered: testrig/crew.seat" "$(bead_meta gcp-r1 acceptance_check_nudge)"
++    assert_eq "exactly one note call" 1 "$(calls '^gc bd note gcp-r1 ')"
++    assert_match "the note's first line" \
++        "^\[acceptance-check warn [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}Z testrig/gastown\.refinery\] MISS at ${X:0:8}\$" \
++        "$(note_first_line gcp-r1)"
++    grep -Fxq -- "$ITEM_MISS" "$BEADS/gcp-r1.notelog" || fail "the note does not hold the stdin line"
++    grep -q '^Merged anyway (warn mode)\.' "$BEADS/gcp-r1.notelog" || fail "the note has no 'Merged anyway (warn mode).' line"
++    bead_has_label gcp-r1 acceptance-miss || fail "the bead lacks the label acceptance-miss"
++    assert_eq "exactly one nudge" 1 "$(nudge_count)"
++    assert_eq "the nudge goes to the seat" testrig/crew.seat "$(nudge_target 1)"
++    assert_eq "the nudge message" \
++        "ACCEPTANCE MISS: gcp-r1 AC2 - note on gcp-r1 (refinery, warn: merging)" "$(nudge_message 1)"
++    assert_eq "status, assignee, rejection and routing are untouched" "$untouched" \
++        "$(jq -c '[.[0].status, .[0].assignee, .[0].metadata.rejection_reason, .[0].metadata["gc.routed_to"]]' "$BEADS/gcp-r1.json")"
++    assert_eq "the last stdout line" "acceptance-check: RESULT 0 gcp-r1 MISS nudge=testrig/crew.seat" "$(last_line)"
++    end_case
++}
++
++case_record_declared() {
++    new_case record-declared
++    record_rig
++    printf '%s\n' "$ITEM_MISS" >"$T/stdin"
++
++    run_ac record --work gcp-r1 --verdict DECLARED --tip "$X"
++    assert_eq "record exits 0" 0 "$RC"
++    assert_eq "acceptance_check" DECLARED "$(bead_meta gcp-r1 acceptance_check)"
++    bead_has_label gcp-r1 acceptance-declared || fail "the bead lacks the label acceptance-declared"
++    bead_has_label gcp-r1 acceptance-miss && fail "a DECLARED bead carries the label acceptance-miss"
++    assert_match "the note's first line ends with the verdict and the tip" \
++        "DECLARED at ${X:0:8}\$" "$(note_first_line gcp-r1)"
++    grep -q 'Merged anyway' "$BEADS/gcp-r1.notelog" && fail "a DECLARED note carries a 'Merged anyway' line"
++    assert_eq "exactly one nudge" 1 "$(nudge_count)"
++    assert_match "the nudge message" '^ACCEPTANCE DECLARED: gcp-r1' "$(nudge_message 1)"
++    assert_eq "the last stdout line" "acceptance-check: RESULT 0 gcp-r1 DECLARED nudge=testrig/crew.seat" "$(last_line)"
++    end_case
++}
++
++case_record_message_and_note_caps() {
++    new_case record-message-and-note-caps
++    record_rig
++    local tail=' - note on gcp-r1 (refinery, warn: merging)' i
++
++    printf '%s\n' 'AC1 OK — a | f:1' 'AC2 MISSING — b | absent' 'AC3 SUBSTITUTED — c | f:3' 'AC4 DECLARED — d | f:4' >"$T/stdin"
++    run_ac record --work gcp-r1 --verdict MISS --tip "$X"
++    assert_eq "MISS names the missing and substituted items" \
++        "ACCEPTANCE MISS: gcp-r1 AC2,AC3$tail" "$(nudge_message 1)"
++    reset_record
++    printf '%s\n' 'AC1 OK — a | f:1' 'AC2 MISSING — b | absent' 'AC3 SUBSTITUTED — c | f:3' 'AC4 DECLARED — d | f:4' >"$T/stdin"
++    run_ac record --work gcp-r1 --verdict DECLARED --tip "$X"
++    assert_eq "DECLARED names the declared item" \
++        "ACCEPTANCE DECLARED: gcp-r1 AC4$tail" "$(nudge_message 1)"
++
++    reset_record
++    printf '%s\n' 'AC1 OK — a | f:1' >"$T/stdin"
++    run_ac record --work gcp-r1 --verdict MISS --tip "$X"
++    assert_eq "no line with a matching second field" \
++        "ACCEPTANCE MISS: gcp-r1 see note$tail" "$(nudge_message 1)"
++
++    reset_record
++    for i in $(seq 1 40); do printf 'AC%s SUBSTITUTED — item %s | f:%s\n' "$i" "$i" "$i"; done >"$T/stdin"
++    run_ac record --work gcp-r1 --verdict MISS --tip "$X"
++    local message
++    message=$(nudge_message 1)
++    [ "${#message}" -le 200 ] || fail "the message is ${#message} characters, want at most 200"
++    case "$message" in
++        *"$tail") ;;
++        *) fail "the message lost its note pointer: $message" ;;
++    esac
++    assert_match "the id list is what got cut" '^ACCEPTANCE MISS: gcp-r1 AC1,AC2,' "$message"
++
++    reset_record
++    for i in $(seq 1 60); do printf 'AC%s SUBSTITUTED — item %s | f:%s\n' "$i" "$i" "$i"; done >"$T/stdin"
++    run_ac record --work gcp-r1 --verdict MISS --tip "$X"
++    assert_eq "the note holds exactly 40 stdin lines" 40 "$(grep -c '^AC[0-9]* SUBSTITUTED' "$BEADS/gcp-r1.notelog")"
++    grep -q '^AC40 ' "$BEADS/gcp-r1.notelog" || fail "the note lacks the fortieth line"
++    grep -q '^AC41 ' "$BEADS/gcp-r1.notelog" && fail "the note holds a line past the fortieth"
++    [ "$(wc -c <"$BEADS/gcp-r1.notelog" | tr -d ' ')" -le 4000 ] || fail "the note is longer than 4000 characters"
++    end_case
++}
++
++case_record_conforms_and_skip() {
++    new_case record-conforms-and-skip
++    record_rig
++    local verdict
++    for verdict in CONFORMS SKIP; do
++        reset_record
++        run_ac record --work gcp-r1 --verdict "$verdict" --tip "$X"
++        assert_eq "$verdict: exit status" 0 "$RC"
++        assert_eq "$verdict: acceptance_check" "$verdict" "$(bead_meta gcp-r1 acceptance_check)"
++        assert_eq "$verdict: acceptance_check_tip" "$X" "$(bead_meta gcp-r1 acceptance_check_tip)"
++        assert_eq "$verdict: acceptance_check_mode" warn "$(bead_meta gcp-r1 acceptance_check_mode)"
++        assert_eq "$verdict: no acceptance_check_nudge key" "<unset>" "$(bead_meta gcp-r1 acceptance_check_nudge)"
++        assert_eq "$verdict: no note call" 0 "$(calls '^gc bd note ')"
++        assert_eq "$verdict: no label call" 0 "$(calls '--add-label')"
++        assert_eq "$verdict: no nudge call" 0 "$(calls '^gc session nudge ')"
++        assert_eq "$verdict: the last stdout line" "acceptance-check: RESULT 0 gcp-r1 $verdict nudge=none" "$(last_line)"
++    done
++    end_case
++}
++
++case_record_notify_fallback() {
++    new_case record-notify-fallback
++    record_rig
++    # fresh_parent <slung_by|-> <parent assignee|->: the bead, and its parent bead.
++    fresh_parent() {
++        reset_record
++        FAIL_NUDGE=""
++        write_bead gcp-rp
++        if [ "$2" = - ]; then
++            jq 'del(.[0].assignee)' "$BEADS/gcp-rp.json" >"$T/rp.json" && mv -f "$T/rp.json" "$BEADS/gcp-rp.json"
++        else
++            set_field gcp-rp assignee "$2"
++        fi
++        set_field gcp-r1 parent gcp-rp
++        if [ "$1" = - ]; then unset_meta gcp-r1 slung_by; else set_meta gcp-r1 slung_by "$1"; fi
++        printf '%s\n' "$ITEM_MISS" >"$T/stdin"
++    }
++
++    fresh_parent - testrig/crew.other
++    run_ac record --work gcp-r1 --verdict MISS --tip "$X"
++    assert_eq "no slung_by: exit status" 0 "$RC"
++    assert_eq "no slung_by: one nudge" 1 "$(nudge_count)"
++    assert_eq "no slung_by: it goes to the parent's assignee" testrig/crew.other "$(nudge_target 1)"
++    assert_eq "the parent is read through gc bd show" 1 "$(calls '^gc bd show gcp-rp --json$')"
++
++    fresh_parent testrig/crew.seat -
++    FAIL_NUDGE="testrig/crew.seat"
++    run_ac record --work gcp-r1 --verdict MISS --tip "$X"
++    assert_eq "a failed nudge, no parent assignee: exit status" 0 "$RC"
++    assert_eq "the nudges tried" "testrig/crew.seat
++mayor" "$(cut -f1 "$T/nudges")"
++    assert_eq "the outcome" "delivered: mayor" "$(bead_meta gcp-r1 acceptance_check_nudge)"
++    assert_eq "the RESULT line" "acceptance-check: RESULT 0 gcp-r1 MISS nudge=mayor" "$(last_line)"
++
++    fresh_parent testrig/crew.seat testrig/crew.other
++    FAIL_NUDGE="testrig/crew.seat testrig/crew.other mayor"
++    run_ac record --work gcp-r1 --verdict MISS --tip "$X"
++    assert_eq "every nudge failed: exit status" 0 "$RC"
++    assert_eq "every nudge failed: the outcome" "failed: testrig/crew.seat testrig/crew.other mayor" \
++        "$(bead_meta gcp-r1 acceptance_check_nudge)"
++    assert_eq "every nudge failed: the RESULT line" "acceptance-check: RESULT 0 gcp-r1 MISS nudge=failed" "$(last_line)"
++
++    # slung_by is bead data: a value that reads as a flag is never handed to gc.
++    fresh_parent --force testrig/crew.other
++    run_ac record --work gcp-r1 --verdict MISS --tip "$X"
++    assert_eq "a flag-like slung_by: exit status" 0 "$RC"
++    assert_eq "a flag-like slung_by is skipped, the next target is tried" testrig/crew.other \
++        "$(cut -f1 "$T/nudges")"
++    assert_eq "a flag-like slung_by: one attempt" 1 "$(nudge_count)"
++
++    fresh_parent "$AGENT" testrig/crew.other
++    run_ac record --work gcp-r1 --verdict MISS --tip "$X"
++    assert_eq "slung_by is this agent: exit status" 0 "$RC"
++    assert_eq "slung_by is this agent: it is never tried, the next target is" testrig/crew.other \
++        "$(cut -f1 "$T/nudges")"
++    assert_eq "slung_by is this agent: one attempt" 1 "$(nudge_count)"
++    end_case
++}
++
++case_record_usage() {
++    new_case record-usage
++    record_rig
++    # expect_usage <what> <args...>
++    expect_usage() {
++        local what="$1"
++        shift
++        : >"$T/gc.log"
++        run_ac record "$@"
++        assert_eq "$what: exit status" 1 "$RC"
++        grep -q '^usage: acceptance-check.sh' "$T/err" || fail "$what: no stderr line starts 'usage: acceptance-check.sh'"
++        assert_eq "$what: no bead or nudge call" 0 "$(calls '^gc (bd (update|note) |session nudge )')"
++        assert_eq "$what: the last stdout line" "acceptance-check: RESULT 1 - - nudge=none" "$(last_line)"
++    }
++    expect_usage "a verdict outside the four" --work gcp-r1 --verdict MAYBE --tip "$X"
++    expect_usage "a missing --work" --verdict MISS --tip "$X"
++    expect_usage "a missing --tip" --work gcp-r1 --verdict MISS
++    expect_usage "--mode reject" --work gcp-r1 --verdict MISS --tip "$X" --mode reject
++    end_case
++}
++
++case_record_write_failure() {
++    new_case record-write-failure
++    record_rig
++    printf '%s\n' "$ITEM_MISS" >"$T/stdin"
++
++    FAIL_UPDATE=gcp-r1
++    run_ac record --work gcp-r1 --verdict MISS --tip "$X"
++    assert_eq "a failed metadata write: exit status" 2 "$RC"
++    assert_eq "a failed metadata write: no note call" 0 "$(calls '^gc bd note ')"
++    assert_eq "a failed metadata write: no label call" 0 "$(calls '--add-label')"
++    assert_eq "a failed metadata write: no nudge" 0 "$(calls '^gc session nudge ')"
++    assert_eq "a failed metadata write: the last stdout line" \
++        "acceptance-check: RESULT 2 gcp-r1 MISS nudge=none" "$(last_line)"
++
++    reset_record
++    FAIL_UPDATE=""
++    FAIL_NOTE=gcp-r1
++    printf '%s\n' "$ITEM_MISS" >"$T/stdin"
++    run_ac record --work gcp-r1 --verdict MISS --tip "$X"
++    assert_eq "a failed note write: exit status" 2 "$RC"
++    assert_eq "a failed note write: acceptance_check" MISS "$(bead_meta gcp-r1 acceptance_check)"
++    assert_eq "a failed note write: acceptance_check_tip" "$X" "$(bead_meta gcp-r1 acceptance_check_tip)"
++    assert_eq "a failed note write: acceptance_check_mode" warn "$(bead_meta gcp-r1 acceptance_check_mode)"
++    assert_eq "a failed note write: no label call" 0 "$(calls '--add-label')"
++    assert_eq "a failed note write: no nudge" 0 "$(calls '^gc session nudge ')"
++    assert_eq "a failed note write: the last stdout line" \
++        "acceptance-check: RESULT 2 gcp-r1 MISS nudge=none" "$(last_line)"
++
++    reset_record
++    FAIL_NOTE=""
++    FAIL_LABEL=gcp-r1
++    printf '%s\n' "$ITEM_MISS" >"$T/stdin"
++    run_ac record --work gcp-r1 --verdict MISS --tip "$X"
++    assert_eq "a failed label write: exit status" 2 "$RC"
++    assert_eq "a failed label write: acceptance_check" MISS "$(bead_meta gcp-r1 acceptance_check)"
++    assert_eq "a failed label write: the note was written" 1 "$(calls '^gc bd note gcp-r1 ')"
++    assert_eq "a failed label write: no nudge" 0 "$(calls '^gc session nudge ')"
++    assert_eq "a failed label write: the last stdout line" \
++        "acceptance-check: RESULT 2 gcp-r1 MISS nudge=none" "$(last_line)"
++    end_case
++}
++
++# --- cases: the script's text -----------------------------------------------
++
++# text_invariants_ok <file> — the file contains none of the forbidden fragments.
++# Each is an extended regex, so this suite's own text holds none of them verbatim.
++text_invariants_ok() {
++    local pat bad=0
++    for pat in '\{\{' 'drain-ack' 'bd +mol' '--status' '--assignee' 'bd +close' \
++        'rejection_reason' 'gc\.routed_to' 'set +-e' 'set +-u' 'pipefail'; do
++        if grep -Eq -- "$pat" "$1"; then
++            echo "forbidden fragment /$pat/ in $1" >&2
++            bad=1
++        fi
++    done
++    return "$bad"
++}
++
++case_text_invariants() {
++    new_case text-invariants
++    text_invariants_ok "$SCRIPT" || fail "the script carries a forbidden fragment, comments included"
++    cp -f "$SCRIPT" "$T/with-status.sh"
++    printf '%s\n' '# gc bd update x --status=closed' >>"$T/with-status.sh"
++    if text_invariants_ok "$T/with-status.sh" 2>/dev/null; then
++        fail "the invariant check passed a copy with a --status line added"
++    fi
++    grep -q 'MERGE_PUSH_SOURCE_ONLY=1' "$SCRIPT" || fail "the script does not source merge-push.sh in source-only mode"
++    grep -Eq '^resolve_config\(\)' "$SCRIPT" && fail "the script defines resolve_config instead of sourcing it"
++    end_case
++}
++
++# --- run ----------------------------------------------------------------------
++
++[ -f "$SCRIPT" ] || { echo "FAIL: no script at $SCRIPT" >&2; exit 1; }
++[ -f "$(dirname "$SCRIPT")/merge-push.sh" ] || { echo "FAIL: no merge-push.sh beside $SCRIPT" >&2; exit 1; }
++
++case_packet_missing_named_files
++case_packet_setup_substitution
++case_packet_value_substitution
++case_packet_keep_passing_file
++case_packet_suffix_boundary
++case_packet_pattern_table
++case_packet_merge_base_diff
++case_packet_target_default
++case_packet_cap
++case_packet_notes
++case_packet_skips
++case_record_miss
++case_record_declared
++case_record_message_and_note_caps
++case_record_conforms_and_skip
++case_record_notify_fallback
++case_record_usage
++case_record_write_failure
++case_text_invariants
++
++if [ "$PASS_CASES" -ne "$EXPECTED_CASES" ]; then
++    echo "FAIL: $PASS_CASES of $EXPECTED_CASES cases ran" >&2
++    exit 1
++fi
++if [ "$FAILURES" -ne 0 ]; then
++    echo "FAIL: $FAILURES assertion(s) failed across $PASS_CASES cases" >&2
++    exit 1
++fi
++echo "OK: $PASS_CASES cases passed"
+-- 
+2.54.0 (Apple Git-157)
+

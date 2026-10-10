@@ -1,0 +1,319 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sat, 10 Oct 2026 16:32:17 -0400
+Subject: [PATCH 137/148] fix(polecat): take over a dead owner's work bead on
+ resume and check the refinery handoff (gcp-fooz4)
+
+bd >= 1.3.0 (live on the host) refuses a plain --assignee write over
+another actor's in_progress claim unless it carries --if-assignee <current>
+or --force (bd update --help, 1.3.0). The WORK bead is held in_progress
+for the whole run (0060), so whenever it sits under a spelling other than
+this session's actor, submit-and-exit's step-6 handoff to the refinery is
+refused. Two ways in: the live-owner guard's resume arm (0085) lets a new
+session proceed past a dead owner without re-claiming the bead, and the
+gc 1.4.3 -> 1.5.0 identity spelling change. The step-6 write was
+unchecked, so the refusal left the branch pushed, the bead never reached
+the refinery, and steps 7-8 drained the session.
+
+- The resume arm now takes the WORK bead over with a compare-and-set on the
+  owner it just found dead: --assignee=$EXPECTED_ASSIGNEE plus
+  polecat_session, --if-assignee "$GUARD_OWNER". Like workspace-setup's
+  claim it never takes a bead from the refinery target or one routed to
+  human. A refused takeover warns and the resume proceeds.
+- Step 6 checks the handoff write. On refusal it prints HANDOFF_FAILED
+  naming the bead, tells the agent not to run steps 7-8 or drain-ack, and
+  exits 1 before the status read-back.
+
+Tests, red before and green after:
+- test_polecat_live_owner_guard.sh
+  test_dead_owner_resume_takes_the_work_bead_over: red, no takeover call
+  in the stub log; test_refused_takeover_warns_and_still_resumes: red, no
+  WARN. test_resume_never_takes_over_from_the_refinery_or_an_escalation
+  pins the two skips.
+- test_polecat_handoff_stamp.sh test_refused_handoff_fails_loudly: red,
+  "a refused handoff must print a HANDOFF_FAILED line naming the bead".
+Two pack-asset ordering checks now anchor the polecat_session stamp to
+"$WORK_ID", since the takeover in the guard also names this session.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ gastown/agents/polecat/prompt.template.md     | 16 +++++
+ gastown/formulas/mol-polecat-work.toml        | 19 +++++-
+ gastown/tests/test_gastown_pack_assets.sh     | 14 ++--
+ gastown/tests/test_polecat_handoff_stamp.sh   | 42 +++++++++++-
+ .../tests/test_polecat_live_owner_guard.sh    | 66 ++++++++++++++++++-
+ 5 files changed, 147 insertions(+), 10 deletions(-)
+
+diff --git a/gastown/agents/polecat/prompt.template.md b/gastown/agents/polecat/prompt.template.md
+index a1e43894..d2297ca7 100644
+--- a/gastown/agents/polecat/prompt.template.md
++++ b/gastown/agents/polecat/prompt.template.md
+@@ -393,6 +393,22 @@ if [ -n "$STEP_REF" ] && { [ -z "$CLAIM_REASON" ] || [ "$CLAIM_REASON" = "claime
+       exit 0
+     fi
+     echo "WARN work bead $GUARD_WORK_BEAD still names $GUARD_OWNER, but no live session holds that identity — treating this as a resume and proceeding."
++    # Take the work bead over, as workspace-setup's claim would. It is held
++    # in_progress for the whole run, bd >= 1.3.0 refuses a plain --assignee
++    # write over another actor's in_progress claim, and nothing after this
++    # re-claims it: left under the dead owner, submit-and-exit's step-6 handoff
++    # to the refinery is refused with the branch already pushed. --if-assignee
++    # makes it a compare-and-set on the owner just found dead, so a bead that
++    # changed hands since is not stomped. The refinery and an operator
++    # escalation are never taken over; workspace-setup skips the same two.
++    GUARD_ROUTED_TO="$(printf '%s' "$GUARD_WORK_JSON" | jq -r '.[0].metadata."gc.routed_to" // empty' 2>/dev/null)"
++    if [ "$GUARD_OWNER" = "${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}refinery" ] || [ "$GUARD_ROUTED_TO" = "human" ]; then
++      echo "WARN work bead $GUARD_WORK_BEAD is held by the refinery or an operator escalation; leaving its assignee alone."
++    else
++      gc bd update "$GUARD_WORK_BEAD" --assignee="$EXPECTED_ASSIGNEE" \
++        --set-metadata polecat_session="$EXPECTED_ASSIGNEE" --if-assignee "$GUARD_OWNER" \
++        || echo "WARN could not take work bead $GUARD_WORK_BEAD over from $GUARD_OWNER; submit-and-exit cannot hand it to the refinery while another actor holds it — escalate to the witness"
++    fi
+   fi
+ fi
+ # GUARD_END live-owner
+diff --git a/gastown/formulas/mol-polecat-work.toml b/gastown/formulas/mol-polecat-work.toml
+index 74ba04c1..4b83e64f 100644
+--- a/gastown/formulas/mol-polecat-work.toml
++++ b/gastown/formulas/mol-polecat-work.toml
+@@ -1805,8 +1805,19 @@ if [ "$(printf '%s' "$STAMP_JSON" | jq -r '.[0].id // empty' 2>/dev/null)" = "$W
+    [ -z "$(printf '%s' "$STAMP_JSON" | jq -r '.[0].metadata.first_submitted_at // empty' 2>/dev/null)" ]; then
+     HANDOFF_STAMP+=(--set-metadata first_submitted_at="$HANDOFF_AT")
+ fi
+-gc bd update "$WORK_BEAD_ID" --status=open --assignee="$REFINERY_TARGET" --set-metadata gc.routed_to="" \
+-    "${HANDOFF_STAMP[@]}"
++# A refused write is not a handoff. bd >= 1.3.0 refuses an --assignee write over
++# another actor's in_progress claim, which is what this bead is when it is held
++# under any other spelling than this session's actor. Stop before steps 7 and 8:
++# they would drain the session with the branch pushed and the refinery never told.
++if ! gc bd update "$WORK_BEAD_ID" --status=open --assignee="$REFINERY_TARGET" --set-metadata gc.routed_to="" \
++    "${HANDOFF_STAMP[@]}"; then
++    echo "HANDOFF_FAILED $WORK_BEAD_ID was NOT handed to $REFINERY_TARGET: the update was refused."
++    echo "  The branch is pushed and metadata.target is recorded, but the refinery will not see this bead."
++    echo "  Do NOT run steps 7 and 8 and do NOT drain-ack: this session still holds the handoff."
++    echo "  See who holds it (gc bd show $WORK_BEAD_ID --json | jq '.[0] | {status, assignee}'),"
++    echo "  then mail the witness a HELP escalation with that output."
++    exit 1
++fi
+ # --- handoff-stamp:end ---
+ # The handoff is the assignee write; `--status=open` is bookkeeping that has
+ # been observed not to stick (gcp-s14g). Read it back and correct it once, so
+@@ -1834,6 +1845,10 @@ Set `assignee` to the configured refinery named-session identity and clear
+ demand is represented by unassigned work with `gc.routed_to=<target>`, so
+ named-session work should not retain pool-demand metadata.
+ 
++If step 6 prints `HANDOFF_FAILED`, stop there: do not run steps 7 and 8, do not
++drain-ack, and escalate as it says. The write was refused, so the bead is still
++held where it was and the refinery has not been told.
++
+ This write is also the ONE release of the claim `workspace-setup` took on the
+ work bead. The assignee moves this session -> refinery in a single update: it
+ never passes through unassigned, so there is no window in which a bead with a
+diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
+index b59b27a1..953902ff 100755
+--- a/gastown/tests/test_gastown_pack_assets.sh
++++ b/gastown/tests/test_gastown_pack_assets.sh
+@@ -352,10 +352,12 @@ test_claim_refuses_a_pour_onto_a_live_owner() {
+         fail "live-owner guard must probe session liveness, not assume it"
+ 
+     # The guard runs BEFORE the step re-point and the polecat_session stamp:
+-    # both mutate bead state, and a declining polecat must touch nothing.
++    # both mutate bead state, and a declining polecat must touch nothing. The
++    # stamp is the write on the claimed bead; a resume's takeover of the WORK
++    # bead inside the guard also names this session, after the decline paths.
+     local guard_line stamp_line
+     guard_line=$(grep -n '# GUARD_END live-owner' "$prompt" | head -1 | cut -d: -f1)
+-    stamp_line=$(grep -n 'set-metadata polecat_session="\$EXPECTED_ASSIGNEE"' "$prompt" | head -1 | cut -d: -f1)
++    stamp_line=$(grep -n '"\$WORK_ID" --set-metadata polecat_session="\$EXPECTED_ASSIGNEE"' "$prompt" | head -1 | cut -d: -f1)
+     [[ -n "$guard_line" && -n "$stamp_line" && "$guard_line" -lt "$stamp_line" ]] ||
+         fail "live-owner guard must run before the claim block stamps polecat_session"
+ 
+@@ -1282,10 +1284,10 @@ block = text[text.index("bash <<'GC_CLAIM'"): text.index("GC_CLAIM\n```")]
+ if "STEP_REPOINTED" not in block:
+     raise SystemExit(1)
+ # Match the STAMP precisely, not any polecat_session write: the live-owner
+-# guard also writes that key when it restores a step to its owner, and that
+-# write legitimately precedes the re-point (a declining polecat never reaches
+-# it). The stamp is the one that names THIS session.
+-if block.index("STEP_REPOINTED") >= block.index('--set-metadata polecat_session="$EXPECTED_ASSIGNEE"'):
++# guard also writes that key when it restores a step to its owner, and when a
++# resume takes the WORK bead over, and both legitimately precede the re-point.
++# The stamp is the one that names THIS session on the bead being executed.
++if block.index("STEP_REPOINTED") >= block.index('"$WORK_ID" --set-metadata polecat_session="$EXPECTED_ASSIGNEE"'):
+     raise SystemExit(1)
+ PY
+ 
+diff --git a/gastown/tests/test_polecat_handoff_stamp.sh b/gastown/tests/test_polecat_handoff_stamp.sh
+index 10661c49..29197022 100755
+--- a/gastown/tests/test_polecat_handoff_stamp.sh
++++ b/gastown/tests/test_polecat_handoff_stamp.sh
+@@ -62,6 +62,8 @@ PY
+ # The stub answers `show` and `update` from a JSON fixture and logs every call.
+ # `update` really mutates the fixture, and an empty --set-metadata value deletes
+ # the key. GC_STUB_SHOW_FAIL makes `show` fail, as a transient store error does.
++# GC_STUB_UPDATE_FAIL makes `update` refuse and write nothing, as bd >= 1.3.0
++# does to an --assignee write over another actor's in_progress claim.
+ write_gc_stub() {
+     local dir="$1"
+     cat >"$dir/gc" <<'STUB'
+@@ -78,7 +80,13 @@ case "$verb" in
+         [ -z "${GC_STUB_SHOW_FAIL:-}" ] || exit 1
+         exec python3 "$GC_STUB_STORE" show "$GC_STUB_FIXTURE" "$@"
+         ;;
+-    update) exec python3 "$GC_STUB_STORE" update "$GC_STUB_FIXTURE" "$@" ;;
++    update)
++        if [ -n "${GC_STUB_UPDATE_FAIL:-}" ]; then
++            echo "Error: cannot reassign: another actor holds the in_progress claim" >&2
++            exit 1
++        fi
++        exec python3 "$GC_STUB_STORE" update "$GC_STUB_FIXTURE" "$@"
++        ;;
+     *) echo "stub gc: unmodelled beads subcommand: $verb" >&2; exit 64 ;;
+ esac
+ STUB
+@@ -263,6 +271,37 @@ test_unreadable_bead_is_not_stamped_fresh() {
+         fail "last_submitted_at does not depend on the read and must still be written"
+ }
+ 
++test_refused_handoff_fails_loudly() {
++    # The bead is held under another spelling of this polecat (a resume past a
++    # dead owner, or the gc 1.4.3 -> 1.5.0 identity change), so bd refuses the
++    # reassignment. The branch is already pushed. Walking on to steps 7 and 8
++    # would drain the session with the bead never handed to the refinery, so
++    # the block must stop non-zero and say so, and must not ack the drain.
++    seed_bead
++    : >"$TMP/calls.log"
++    local rc=0
++    PATH="$TMP/bin:$PATH" \
++    GC_STUB_FIXTURE="$TMP/fixture.json" \
++    GC_STUB_STORE="$TMP/bin/store.py" \
++    GC_STUB_LOG="$TMP/calls.log" \
++    GC_STUB_UPDATE_FAIL=1 \
++    WORK_BEAD_ID="$BEAD" \
++    REFINERY_TARGET="$REFINERY" \
++        bash -c 'set -uo pipefail; . "$1"' _ "$TMP/stamp.sh" >"$TMP/run.log" 2>&1 || rc=$?
++
++    [[ "$rc" -ne 0 ]] ||
++        fail "a refused handoff exited 0, so the agent walks on to drain: $(cat "$TMP/run.log")"
++    grep -q "^HANDOFF_FAILED $BEAD " "$TMP/run.log" ||
++        fail "a refused handoff must print a HANDOFF_FAILED line naming the bead: $(cat "$TMP/run.log")"
++    ! grep -q 'runtime drain-ack' "$TMP/run.log" ||
++        fail "a refused handoff must not drain"
++    ! grep -q '^stub gc' "$TMP/run.log" ||
++        fail "the failure path made a call the stub does not model: $(cat "$TMP/run.log")"
++    [[ $(update_calls | grep -c .) -eq 1 ]] ||
++        fail "a refused handoff must stop at the refused write, not retry or correct status: $(update_calls)"
++    [[ "$(field assignee)" == "$POLECAT" ]] || fail "the stub's refusal must leave the bead untouched"
++}
++
+ test_auto_push_halt_is_not_stamped() {
+     # auto_push=false halts at branch-ready with no refinery handoff, so nothing
+     # has joined the merge queue and nothing may be stamped. The stamp keys are
+@@ -294,6 +333,7 @@ test_first_handoff_stamps_both_keys_in_the_handoff_write
+ test_resubmit_keeps_first_and_advances_last
+ test_preseeded_first_submitted_at_is_kept
+ test_unreadable_bead_is_not_stamped_fresh
++test_refused_handoff_fails_loudly
+ test_auto_push_halt_is_not_stamped
+ 
+ if [ "$FAILURES" -ne 0 ]; then
+diff --git a/gastown/tests/test_polecat_live_owner_guard.sh b/gastown/tests/test_polecat_live_owner_guard.sh
+index 9ffdf7af..23b9addd 100755
+--- a/gastown/tests/test_polecat_live_owner_guard.sh
++++ b/gastown/tests/test_polecat_live_owner_guard.sh
+@@ -70,6 +70,7 @@ run_guard() {
+     local dir="$1" owner_assignee="$2" me="$3" step_ref="${4-mol-polecat-work.implement}"
+     local root_meta="${5-\"gc.root_bead_id\":\"winnow-5azcp\",}"
+     local claim_reason="${6-claimed}"
++    local work_meta="${7-}"
+ 
+     cat >"$dir/root.json" <<'JSON'
+ [{"id":"winnow-5azcp","status":"in_progress","metadata":{"gc.input_convoy_id":"winnow-0inqp"}}]
+@@ -78,7 +79,7 @@ JSON
+ {"children":[{"id":"winnow-pcpn6","status":"in_progress"}]}
+ JSON
+     cat >"$dir/work.json" <<JSON
+-[{"id":"winnow-pcpn6","status":"in_progress","assignee":"$owner_assignee","metadata":{"gc.session_id":"gc-8a4d"}}]
++[{"id":"winnow-pcpn6","status":"in_progress","assignee":"$owner_assignee","metadata":{${work_meta}"gc.session_id":"gc-8a4d"}}]
+ JSON
+     cat >"$dir/guard-harness.sh" <<HARNESS
+ WORK_ID="winnow-iaroy"
+@@ -165,6 +166,66 @@ JSON
+         fail "resume path wrote the dead owner back onto the step"
+ }
+ 
++# bd >= 1.3.0 refuses a plain --assignee write over another actor's in_progress
++# claim, and the WORK bead is held in_progress for the whole run (0060). A resume
++# that leaves it under the dead owner therefore fails submit-and-exit's step-6
++# handoff to the refinery with the branch already pushed, so the resume takes
++# the bead over, as a compare-and-set on the owner it just found dead.
++takeover_line() {
++    grep -F -- "winnow-pcpn6 --assignee=$1" "$2/calls.log" | grep -F -- "--if-assignee $3" || true
++}
++
++test_dead_owner_resume_takes_the_work_bead_over() {
++    local dir out line
++    dir=$(new_case)
++    cat >"$dir/sessions.json" <<'JSON'
++{"sessions":[{"id":"gc-psfm","name":"winnow/gastown.nux","session_name":"gastown__polecat-gc-psfm","state":"active","closed":false}]}
++JSON
++
++    out=$(run_guard "$dir" "gastown__polecat-gc-8a4d" "gastown__polecat-gc-psfm")
++
++    grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null || fail "the resume did not proceed: $out"
++    line=$(takeover_line gastown__polecat-gc-psfm "$dir" gastown__polecat-gc-8a4d)
++    [[ -n "$line" ]] ||
++        fail "the resume left the work bead under its dead owner, so step 6's handoff will be refused: $(cat "$dir/calls.log")"
++    [[ "$line" == *"--set-metadata polecat_session=gastown__polecat-gc-psfm"* ]] ||
++        fail "the takeover moved the assignee without polecat_session, which must ride along with it: $line"
++}
++
++test_resume_never_takes_over_from_the_refinery_or_an_escalation() {
++    local dir out
++    # The refinery is not running, so it reads as a dead owner. Taking its bead
++    # would pull a handed-off bead out of the merge queue; workspace-setup's
++    # claim skips the same two owners.
++    dir=$(new_case)
++    printf '{"sessions":[]}' >"$dir/sessions.json"
++    out=$(run_guard "$dir" "winnow/{{ .BindingPrefix }}refinery" "gastown__polecat-gc-psfm")
++    grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null || fail "the resume did not proceed: $out"
++    [[ -z "$(takeover_line gastown__polecat-gc-psfm "$dir" "winnow/{{ .BindingPrefix }}refinery")" ]] ||
++        fail "the resume took a work bead over from the refinery"
++
++    dir=$(new_case)
++    printf '{"sessions":[]}' >"$dir/sessions.json"
++    out=$(run_guard "$dir" "winnow/crew.valkyrie" "gastown__polecat-gc-psfm" \
++        "mol-polecat-work.implement" '"gc.root_bead_id":"winnow-5azcp",' "claimed" '"gc.routed_to":"human",')
++    grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null || fail "the resume did not proceed: $out"
++    [[ -z "$(takeover_line gastown__polecat-gc-psfm "$dir" winnow/crew.valkyrie)" ]] ||
++        fail "the resume pulled a gc.routed_to=human bead out of its operator escalation"
++}
++
++test_refused_takeover_warns_and_still_resumes() {
++    local dir out
++    dir=$(new_case)
++    printf '{"sessions":[]}' >"$dir/sessions.json"
++
++    # 13 is bd's stale --if-assignee exit: the bead changed hands since the read.
++    out=$(GC_UPDATE_EXIT=13 run_guard "$dir" "gastown__polecat-gc-8a4d" "gastown__polecat-gc-psfm")
++
++    grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null || fail "a refused takeover stalled the resume: $out"
++    grep -F 'WARN could not take work bead winnow-pcpn6 over from gastown__polecat-gc-8a4d' <<<"$out" >/dev/null ||
++        fail "a refused takeover passed silently: $out"
++}
++
+ test_closed_session_still_listed_is_not_live() {
+     local dir out
+     dir=$(new_case)
+@@ -279,6 +340,9 @@ test_unknown_claim_reason_still_checks() {
+ 
+ test_live_owner_is_declined_and_the_step_restored
+ test_dead_owner_is_a_resume_and_proceeds
++test_dead_owner_resume_takes_the_work_bead_over
++test_resume_never_takes_over_from_the_refinery_or_an_escalation
++test_refused_takeover_warns_and_still_resumes
+ test_closed_session_still_listed_is_not_live
+ test_own_molecule_proceeds_without_probing_liveness
+ test_unreadable_liveness_fails_closed
+-- 
+2.54.0 (Apple Git-157)
+

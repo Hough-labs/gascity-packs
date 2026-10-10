@@ -1,0 +1,218 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sat, 10 Oct 2026 16:39:16 -0400
+Subject: [PATCH 140/148] docs(gastown): make claim-status and role-prompt
+ prose match gc 1.5.0 and the restack (gcp-fooz4)
+
+- approval-fallacy.template.md and the polecat prompt said a claimed step
+  bead "is still stored open". That is gc 1.4.x only: gc 1.5.0's
+  `gc hook --claim` promotes the claim to in_progress (cmd_hook_claim.go:750
+  requires the readback to be in_progress), and a `--claim` update always
+  did. The `open,in_progress` filter is unchanged; the reason is now
+  version-neutral.
+- Both copies also said "a molecule's work bead is never assigned to the
+  polecat session", false since 0060: workspace-setup holds it in_progress
+  for the session from that step on.
+- gastown/README.md "Role prompts point at formulas" forbade restated
+  commands, but the restack restored the crash-recovery copies of
+  `next-iteration` in the witness, deacon, refinery and boot prompts, which
+  upstream also carries and pins (test_witness_wisp_queries_pin_include_infra).
+  Its boot exception ("single-pass watchdog with no formula") has been false
+  since upstream #261 gave boot mol-boot-patrol. The section is now "Role
+  prompts and formula commands": the formula step owns the command, and a
+  prompt either points at it or carries a complete copy naming it.
+- The matching comments in test_gastown_pack_assets.sh and the drift test's
+  docstrings follow.
+
+Prose and test comments only; test_prompt_formula_command_drift.py and
+test_gastown_pack_assets.sh stay green.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ gastown/README.md                             | 29 ++++++++++++++-----
+ gastown/agents/polecat/prompt.template.md     | 11 ++++---
+ .../approval-fallacy.template.md              | 11 ++++---
+ gastown/tests/test_gastown_pack_assets.sh     | 14 +++++----
+ tests/test_prompt_formula_command_drift.py    |  7 +++--
+ 5 files changed, 47 insertions(+), 25 deletions(-)
+
+diff --git a/gastown/README.md b/gastown/README.md
+index 65eb281f..946fcdab 100644
+--- a/gastown/README.md
++++ b/gastown/README.md
+@@ -168,7 +168,7 @@ becomes the start of review instead of the pending-merge handoff, and a refused
+ merge parks the bead (`merge_approval_state=awaiting_review`) for the next
+ patrol iteration rather than closing or escalating it.
+ 
+-## Role prompts point at formulas
++## Role prompts and formula commands
+ 
+ `agents/*/prompt.template.md` is injected into an agent's context at spawn and
+ reads as authoritative operating instructions. A formula step in `formulas/`
+@@ -177,28 +177,41 @@ dangerous: when the formula gains a flag and the prompt's copy does not, the
+ agent runs the lossy copy, it executes cleanly, and the dropped behaviour is
+ simply gone. A partial command in injected context is worse than no command.
+ 
+-**The rule: a prompt template names the formula step; it does not restate the
+-step's command.** A pointer cannot drift; a copy can.
++**The rule: the formula step owns the command.** A prompt template either
++names the step, or carries a *complete* copy that names the step it copies; the
++formula is authoritative wherever the two disagree. A condensed copy is never
++acceptable. Commands an agent runs mid-cycle, such as filing a warrant or
++finding work, point at their step.
+ 
+-Three narrow exceptions, each of which must be *complete*, not condensed:
++Copies exist where a pointer cannot do the job:
+ 
+ - **Cold-start bootstrap.** The first wisp pour has no formula step to read
+   yet. Marked as bootstrap-only in each template, with a pointer to the
+   `next-iteration` step that owns every later pour.
+-- **A role with no formula.** `boot` runs a single-pass watchdog with no
+-  formula, so its warrant command is authoritative there — and therefore
+-  carries the dedup guard that the formula-owned copies carry.
++- **Crash recovery.** A patrol session that exits a cycle without running
++  `next-iteration` has to restore the one-wisp invariant before it can read a
++  step at all, so the witness, deacon, refinery and boot prompts carry a copy
++  of that step. Upstream restates these blocks too and pins their queries in
++  its own tests (`test_witness_wisp_queries_pin_include_infra`), so the fork
++  keeps them rather than replacing them with pointers.
+ - **A flag whose omission fails silently.** The refinery's Rejection Flow
+   quotes the pool-return `gc bd update` verbatim, marked as a copy naming the
+   authoritative step, because a rejection that drops
+   `--set-metadata gc.routed_to=...` orphans the bead with no error, no stall
+   signal, and no wake.
+ 
++Boot is no longer an exception. It used to be a single-pass watchdog with no
++formula, so its prompt carried the warrant command; upstream #261 gave it the
++`mol-boot-patrol` loop, its stuck warrant is now filed by that formula's
++`check-deacon` step, and its prompt points there.
++
+ `tests/test_prompt_formula_command_drift.py` enforces the invariants whose loss
+ was observed in practice: pool-returning updates declare their routing, warrant
+ creation in injected context is deduped, a pool-routed warrant also declares
+ `gc.kind=workflow` so it is a pollable workflow root, and a prompt bail-out path
+-drain-acks.
++drain-acks. They run over every prompt template, copies included. Boot alone
++is exempt from the bail-out check: its always-mode patrol loop must never
++drain-ack, so its crash-recovery copy aborts with a bare `exit 1` on purpose.
+ 
+ ## Dog Pool
+ 
+diff --git a/gastown/agents/polecat/prompt.template.md b/gastown/agents/polecat/prompt.template.md
+index 81ffb607..3eee5aef 100644
+--- a/gastown/agents/polecat/prompt.template.md
++++ b/gastown/agents/polecat/prompt.template.md
+@@ -666,8 +666,10 @@ REFINERY_TARGET="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}refinery"
+ # this guard could not run at all. Recover the convoy from the molecule root of
+ # the step bead this session is holding rather than skipping the check. The
+ # status filter is `open,in_progress`: a claimed step bead carries this
+-# session's assignee but is still stored `open`, so `in_progress` alone matches
+-# nothing and the recovery silently yields no convoy.
++# session's assignee, but its status depends on what claimed it — gc 1.4.x's
++# `gc hook --claim` leaves it `open`, gc 1.5.0's promotes it to `in_progress`,
++# and a `--claim` update always does. Either status alone can match nothing, and
++# then the recovery silently yields no convoy.
+ CONVOY_ID="${GC_BEAD_ID:-}"
+ if [ -z "$CONVOY_ID" ]; then
+   ROOT_BEAD_ID=$(gc bd list --assignee="$EXPECTED_ASSIGNEE" --status=open,in_progress \
+@@ -706,8 +708,9 @@ done
+ # Only POSITIVE evidence counts: the bead is closed, or it is held by the
+ # REFINERY — the one assignee submit-and-exit's handoff actually produces. Every
+ # weaker test has been observed draining a session with the branch unpushed.
+-# "Not in_progress for me" is not evidence: a molecule's work bead is never
+-# assigned to the polecat session in the first place. Nor is a bare "assigned to
++# "Not in_progress for me" is not evidence: workspace-setup holds the work bead
++# in_progress for this session only from that step on, and never takes it from
++# the refinery or an operator escalation. Nor is a bare "assigned to
+ # somebody else", which is equally true of a resumed molecule finding the bead
+ # still held by its own PREVIOUS session (pool restarts mint a new identity) and
+ # of any third party a bead can be parked on — an operator moving it to a crew
+diff --git a/gastown/template-fragments/approval-fallacy.template.md b/gastown/template-fragments/approval-fallacy.template.md
+index 6b7e02bb..6f1f901d 100644
+--- a/gastown/template-fragments/approval-fallacy.template.md
++++ b/gastown/template-fragments/approval-fallacy.template.md
+@@ -41,8 +41,10 @@ REFINERY_TARGET="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}refinery"
+ # this guard could not run at all. Recover the convoy from the molecule root of
+ # the step bead this session is holding rather than skipping the check. The
+ # status filter is `open,in_progress`: a claimed step bead carries this
+-# session's assignee but is still stored `open`, so `in_progress` alone matches
+-# nothing and the recovery silently yields no convoy.
++# session's assignee, but its status depends on what claimed it — gc 1.4.x's
++# `gc hook --claim` leaves it `open`, gc 1.5.0's promotes it to `in_progress`,
++# and a `--claim` update always does. Either status alone can match nothing, and
++# then the recovery silently yields no convoy.
+ CONVOY_ID="${GC_BEAD_ID:-}"
+ if [ -z "$CONVOY_ID" ]; then
+   ROOT_BEAD_ID=$(gc bd list --assignee="$EXPECTED_ASSIGNEE" --status=open,in_progress \
+@@ -81,8 +83,9 @@ done
+ # Only POSITIVE evidence counts: the bead is closed, or it is held by the
+ # REFINERY — the one assignee submit-and-exit's handoff actually produces. Every
+ # weaker test has been observed draining a session with the branch unpushed.
+-# "Not in_progress for me" is not evidence: a molecule's work bead is never
+-# assigned to the polecat session in the first place. Nor is a bare "assigned to
++# "Not in_progress for me" is not evidence: workspace-setup holds the work bead
++# in_progress for this session only from that step on, and never takes it from
++# the refinery or an operator escalation. Nor is a bare "assigned to
+ # somebody else", which is equally true of a resumed molecule finding the bead
+ # still held by its own PREVIOUS session (pool restarts mint a new identity) and
+ # of any third party a bead can be parked on — an operator moving it to a crew
+diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
+index 953902ff..35d2b88e 100755
+--- a/gastown/tests/test_gastown_pack_assets.sh
++++ b/gastown/tests/test_gastown_pack_assets.sh
+@@ -1109,9 +1109,10 @@ PY
+ 
+     # The prompt-side guard could not run at all in the observed session:
+     # $GC_BEAD_ID was empty, so it never resolved a work bead. Both copies must
+-    # recover the convoy, and both must key on POSITIVE evidence — a molecule's
+-    # work bead is never assigned to the polecat session, so "not in_progress
+-    # for me" reports already-submitted on work that was never submitted.
++    # recover the convoy, and both must key on POSITIVE evidence — the work
++    # bead is in_progress for this session only once workspace-setup claims it,
++    # so "not in_progress for me" reports already-submitted on work that was
++    # never submitted.
+     local guard
+     for guard in "$prompt" "$fragment"; do
+         grep -F 'CONVOY_ID="${GC_BEAD_ID:-}"' "$guard" >/dev/null ||
+@@ -1124,9 +1125,10 @@ PY
+         # in-flight, hook-claimed step with in_progress ALONE (adding `open`
+         # there would let it jump to a step whose predecessor has not closed).
+         # The invariant that actually matters is local to this query — the step
+-        # bead it recovers the convoy from is stored `open`, so in_progress
+-        # alone matches nothing and the recovery silently yields no convoy.
+-        python3 - "$guard" <<'PY' || fail "$(basename "$guard") must recover the convoy's held step bead with --status=open,in_progress; a pool-assigned step bead is stored open, so in_progress alone matches nothing"
++        # bead it recovers the convoy from is stored `open` by gc 1.4.x's hook
++        # and `in_progress` by gc 1.5.0's, so either status alone can match
++        # nothing and the recovery silently yields no convoy.
++        python3 - "$guard" <<'PY' || fail "$(basename "$guard") must recover the convoy's held step bead with --status=open,in_progress; a claimed step bead is stored open or in_progress depending on the gc that claimed it"
+ import sys
+ 
+ text = open(sys.argv[1], encoding="utf-8").read()
+diff --git a/tests/test_prompt_formula_command_drift.py b/tests/test_prompt_formula_command_drift.py
+index cf5f8691..98214685 100644
+--- a/tests/test_prompt_formula_command_drift.py
++++ b/tests/test_prompt_formula_command_drift.py
+@@ -15,7 +15,7 @@ indistinguishable by inspection from a healthy one.
+ 
+ These checks encode the invariants that were lost, so the drift cannot silently
+ reappear the next time a formula is edited. The convention the templates follow
+-is documented in ``gastown/README.md`` ("Role prompts point at formulas").
++is documented in ``gastown/README.md`` ("Role prompts and formula commands").
+ """
+ 
+ from __future__ import annotations
+@@ -165,8 +165,9 @@ def warrant_dedup_violations(path: Path, text: str) -> list[str]:
+     the same target — a duplicate spawns a second shutdown dance racing the
+     first. A prompt template that restates the create without the guard hands
+     the agent a command that looks complete and is not. Templates should point
+-    at the owning formula step instead; where a role has no formula to point at
+-    (boot), the inline command has to carry the guard itself.
++    at the owning formula step instead (boot included: since upstream #261 its
++    warrant is filed by mol-boot-patrol's check-deacon step); an inline command
++    that remains has to carry the guard itself.
+     """
+     violations = []
+     guarded = {
+-- 
+2.54.0 (Apple Git-157)
+

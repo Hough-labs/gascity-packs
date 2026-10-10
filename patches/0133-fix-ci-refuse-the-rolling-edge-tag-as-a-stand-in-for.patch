@@ -1,0 +1,105 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sat, 10 Oct 2026 16:39:24 -0400
+Subject: [PATCH 133/148] fix(ci): refuse the rolling edge tag as a stand-in
+ for vcs.revision (gcp-fooz4)
+
+When an archive's gc records no vcs.revision, the release tag stands in
+as GASCITY_SOURCE_REF. For a version tag that is sound, because the tag
+names one commit. `edge`, however, is rebuilt in place several times a
+day (gcp-kinb). Fetching it after the install can name a later build
+than the gc installed, which is the same two-resolution race that
+reading vcs.revision removes. An edge gc with no revision now fails the
+install and exports nothing, instead of warning and exporting `edge`.
+Today's edge archives do record the revision, so this guards a
+regression rather than changing a live path.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .github/scripts/install-gascity-archive.sh   | 10 ++++++++--
+ docs/design/release-compatibility-testing.md | 12 +++++++-----
+ tests/test_install_gascity_archive.py        | 17 +++++++++++++++++
+ 3 files changed, 32 insertions(+), 7 deletions(-)
+
+diff --git a/.github/scripts/install-gascity-archive.sh b/.github/scripts/install-gascity-archive.sh
+index a012ede5..43f3df9f 100755
+--- a/.github/scripts/install-gascity-archive.sh
++++ b/.github/scripts/install-gascity-archive.sh
+@@ -142,8 +142,9 @@ export_source_ref() {
+ # `git fetch` can resolve. A release archive is built from a git checkout, so
+ # its gc records the full commit as vcs.revision in its build info. Only when
+ # that is absent does something else stand in for it: the release tag for an
+-# archive, the module's recorded commit for a go-install build (an empty TAG).
+-# When nothing names the source, fail rather than export a guess.
++# archive -- never `edge`, which can already name a later build -- and the
++# module's recorded commit for a go-install build (an empty TAG). When nothing
++# names the source, fail rather than export a guess.
+ resolve_source_ref() {
+   local binary="$1"
+   local tag="$2"
+@@ -155,6 +156,11 @@ resolve_source_ref() {
+     awk '$1 == "build" && $2 ~ /^vcs\.revision=/ { sub(/^vcs\.revision=/, "", $2); print $2 }' || true)"
+   if [[ -n "$revision" ]]; then
+     printf '%s' "$revision"
++  elif [[ "$tag" == "edge" ]]; then
++    echo "${binary} records no vcs.revision, and edge is a rolling tag: it is rebuilt in place" >&2
++    echo "several times a day, so fetching it now can name a later build than this gc." >&2
++    echo "Refusing to export it as GASCITY_SOURCE_REF; pass a release tag instead." >&2
++    return 1
+   elif [[ -n "$tag" ]]; then
+     echo "WARNING: ${binary} records no vcs.revision; using release tag ${tag} as the gascity source ref." >&2
+     printf '%s' "$tag"
+diff --git a/docs/design/release-compatibility-testing.md b/docs/design/release-compatibility-testing.md
+index 12625b44..466c49e4 100644
+--- a/docs/design/release-compatibility-testing.md
++++ b/docs/design/release-compatibility-testing.md
+@@ -72,11 +72,13 @@ check out that commit as a shallow git tree and export the checkout as
+ `GASCITY_SOURCE_ROOT`. The commit comes from the binary, not from resolving the
+ requested ref a second time, because `main` installs the rolling `edge`
+ pre-release, which can move between the two. A binary that records no revision
+-falls back to its release tag. A ref with no archive (a branch or commit SHA)
+-is built with `go install`, which records no revision either; its commit is the
+-`.Origin.Hash` the module proxy records for the exact module version that build
+-used, as upstream's workflows resolve it. When nothing names the commit, the
+-install fails rather than name a source it cannot vouch for.
++falls back to its release tag, except `edge`: that tag can already name a later
++build, so an `edge` gc with no revision fails the install instead. A ref with no
++archive (a branch or commit SHA) is built with `go install`, which records no
++revision either; its commit is the `.Origin.Hash` the module proxy records for
++the exact module version that build used, as upstream's workflows resolve it.
++When nothing names the commit, the install fails rather than name a source it
++cannot vouch for.
+ 
+ The fixture rig gets a local bare `origin` (next to the rig, as
+ `<rig>-origin.git`) with `origin/HEAD` set, because build formulas base
+diff --git a/tests/test_install_gascity_archive.py b/tests/test_install_gascity_archive.py
+index 0b8091b7..17ea9a99 100644
+--- a/tests/test_install_gascity_archive.py
++++ b/tests/test_install_gascity_archive.py
+@@ -425,6 +425,23 @@ def test_installer_falls_back_to_the_release_tag_when_gc_records_no_revision(tmp
+     assert "release tag v1.5.0" in completed.stderr
+ 
+ 
++def test_installer_refuses_the_rolling_edge_tag_as_a_stand_in(tmp_path):
++    # `edge` is the one tag that cannot vouch for a build: it is rolled forward
++    # in place several times a day, so fetching it later can land on a newer
++    # build than the one installed -- the race reading vcs.revision exists to
++    # rule out. An edge gc with no vcs.revision therefore fails rather than
++    # warning and exporting `edge`, and exports nothing.
++    release = make_release(tmp_path, stamped=False)
++    completed, result = run_installer(tmp_path, release)
++
++    assert completed.returncode == 1
++    assert "records no vcs.revision" in completed.stderr
++    assert "edge is a rolling tag" in completed.stderr
++    assert "using release tag edge" not in completed.stderr
++    assert result["github_env"] == ""
++    assert result["github_path"] == ""
++
++
+ def test_installer_names_the_module_commit_a_go_install_build_was_made_from(tmp_path, release):
+     # A short SHA has no release archive, so gc comes from `go install`, which
+     # builds in module mode and records no vcs.revision. Its build info does
+-- 
+2.54.0 (Apple Git-157)
+

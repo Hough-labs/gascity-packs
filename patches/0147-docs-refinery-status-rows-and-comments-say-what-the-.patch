@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sat, 10 Oct 2026 16:55:48 -0400
+Subject: [PATCH 147/148] docs(refinery): status rows and comments say what the
+ merge lane now does (gcp-fooz4)
+
+No behaviour change.
+
+- Status row 0 says a closed bead whose task-artifact cleanup did not
+  converge is status 2, not 0.
+- Status row 2 names the two other status-2 cases. A closed bead whose
+  cleanup did not converge: find-work's sweep retries a pending state and
+  never retries a blocked one. And mr's --force-with-lease failure: temp is
+  dropped and the next patrol's rebase step re-runs its ancestry decision.
+  It also records the divergence: upstream re-enters the rebase step in the
+  same patrol, and this fork drains the session.
+- The reject-branch-disposition comment no longer says the merged path
+  deletes a branch when delete_merged_branches says to. Since #245 no path
+  deletes a source branch.
+- merge-push.sh's header no longer says the lane suite runs every case
+  "through both this script and the formula". It has been script-only
+  since 0120, started by the step's own invoke block. The header's status-2
+  entry gains the lease case and the blocked-cleanup case.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ gastown/assets/scripts/refinery/merge-push.sh | 14 +++++++++-----
+ gastown/formulas/mol-refinery-patrol.toml     |  9 +++++----
+ 2 files changed, 14 insertions(+), 9 deletions(-)
+
+diff --git a/gastown/assets/scripts/refinery/merge-push.sh b/gastown/assets/scripts/refinery/merge-push.sh
+index 710ebb70..d7e1cdd3 100755
+--- a/gastown/assets/scripts/refinery/merge-push.sh
++++ b/gastown/assets/scripts/refinery/merge-push.sh
+@@ -15,7 +15,9 @@
+ # approval gate is found as this script's sibling; and the lane glue the step's
+ # prose described became lane_direct, lane_mr and lane_local. Messages keep
+ # their wording. gastown/tests/test_refinery_merge_lanes.sh runs every lane
+-# case through both this script and the formula, with identical assertions.
++# case through this script, started by the merge-push step's own invoke block
++# taken from the formula. The formula no longer holds a copy of the lane to run
++# the cases through as well.
+ #
+ # Usage:
+ #   merge-push.sh --work <id> [--rig R] [--target-default B] [--binding-prefix P]
+@@ -61,10 +63,12 @@
+ #       bead is BLOCKED until `gc gastown pr-merge-reconcile` verifies the merge
+ #    1  usage or config error; nothing touched
+ #    2  hard stop; do not mutate bead state. Also returned when a merge landed
+-#       but its task-artifact cleanup did not converge (retryable: find-work's
+-#       sweep picks it up), or when a merge landed but recording it on the bead
+-#       failed: the next patrol's merge-state gate
+-#       closes it as already merged.
++#       but its task-artifact cleanup did not converge (a pending state is
++#       retried by find-work's sweep; a blocked one waits for review), when a
++#       merge landed but recording it on the bead failed (the next patrol's
++#       merge-state gate closes it as already merged), and in mr when
++#       --force-with-lease failed (temp is dropped; the next patrol's rebase step
++#       re-runs its ancestry decision on the moved branch).
+ #    3  the re-rebase onto the moved target conflicted
+ #    4  parked awaiting review (the gate refused, or the approved head no longer
+ #       fast-forwards the target)
+diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
+index c53bcaf6..1e2ede18 100644
+--- a/gastown/formulas/mol-refinery-patrol.toml
++++ b/gastown/formulas/mol-refinery-patrol.toml
+@@ -1345,8 +1345,9 @@ fi
+      # polecat that claims the bead exits on sight until a human clears
+      # metadata.branch by hand. The same-worktree re-claim hides it: that one
+      # still has refs/heads/$BRANCH locally and resumes, which is why the
+-     # symptom reads as intermittent. Only the merged path deletes a branch,
+-     # and only when delete_merged_branches says to.
++     # symptom reads as intermittent. No path deletes a source branch: since
++     # upstream #245 a merged one is kept too, as the task artifact's recovery
++     # copy, and delete_merged_branches deletes nothing.
+      git checkout "$TARGET" && git branch -D temp
+      # --- reject-branch-disposition:end ---
+      ```
+@@ -1687,9 +1688,9 @@ What each status means, and what this step does about it:
+ 
+ | Status | Meaning | This step |
+ |---|---|---|
+-| 0 | Handed off: the work bead is closed and its task artifact cleaned (landed direct, or mr after approval, or closed as already merged), or, for mr with approval off, the pull request is recorded pending and the bead is blocked until `gc gastown pr-merge-reconcile` verifies the merge on a later patrol. | Continue to patrol-summary. The script already ran its cleanup; do not run another. |
++| 0 | Handed off: the work bead is closed and its task-artifact cleanup completed (landed direct, or mr after approval, or closed as already merged), or, for mr with approval off, the pull request is recorded pending and the bead is blocked until `gc gastown pr-merge-reconcile` verifies the merge on a later patrol. A closed bead whose cleanup did not converge is status 2, not 0. | Continue to patrol-summary. The script already ran its cleanup; do not run another. |
+ | 1 | Usage or config error; nothing was touched. | STOP and drain. Read the output above the RESULT line. |
+-| 2 | Hard stop; do not mutate bead state. Also returned when a merge landed but recording it on the bead failed: the next patrol's merge-state gate closes it as already merged. | STOP and drain. |
++| 2 | Hard stop; do not mutate bead state. Also returned when a merge landed but recording it on the bead failed: the next patrol's merge-state gate closes it as already merged. Also returned when the bead closed but its task-artifact cleanup did not converge: its `pending` or `blocked` state stays on the bead, find-work's sweep retries a `pending` one, and a `blocked` one is never retried and waits for review. In mr, also returned when `--force-with-lease` failed because the PR branch moved: the script dropped `temp`, and the next patrol's rebase step re-runs its ancestry decision on the moved branch. Upstream re-enters the rebase step in the same patrol instead; this fork drains the session. | STOP and drain. |
+ | 3 | The re-rebase onto the moved target conflicted. | STOP and drain. |
+ | 4 | Parked awaiting review: the approval gate refused, or the approved head no longer fast-forwards the target. This is not a failure; the bead stays open and assigned to the refinery. | Continue to patrol-summary. |
+ | 5 | The ff-merge was a no-op; nothing landed. | STOP and drain. |
+-- 
+2.54.0 (Apple Git-157)
+

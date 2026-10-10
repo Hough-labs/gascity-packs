@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sat, 10 Oct 2026 16:22:16 -0400
+Subject: [PATCH 126/148] fix(witness): never let a closed row mask a live one
+ in the liveness map (gcp-fooz4)
+
+Under gc v1.5.0 a namepool polecat acts as its alias (rig/gastown.<name>),
+and a closed session keeps that alias, so one alias can sit on a live
+session row and on closed rows of the chair's earlier occupants. The map's
+add() was last-write-wins, so row order decided whether a live holder read
+as closed. Every destructive path re-checks liveness, so this was noise and
+extra rebuilds rather than wrong destruction, but it is still a wrong
+verdict.
+
+A closed value now never overwrites a non-closed one for the same key.
+Harness case: a reused alias with one live and one closed row reads as
+live (red against the previous add()).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ gastown/formulas/mol-witness-patrol.toml           |  8 +++++++-
+ .../test_mol_witness_patrol_orphan_recovery.sh     | 14 ++++++++++++++
+ 2 files changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
+index 8efc2dd5..d3567b06 100644
+--- a/gastown/formulas/mol-witness-patrol.toml
++++ b/gastown/formulas/mol-witness-patrol.toml
+@@ -234,9 +234,15 @@ a NEW session with a different ID — the old one never comes back.
+ 
+      if [ "$MAP_QUERY_RC" -eq 0 ]; then
+        LIVENESS_MAP=$(jq -n --slurpfile sessions "$SESSIONS_FILE" --slurpfile session_beads "$SESSION_BEADS_FILE" '
++         # A key can sit on several rows: under gc v1.5.0 a namepool alias is a
++         # reused chair that closed sessions keep. A closed row must never
++         # overwrite a live one for the same key, or row order decides liveness.
+          def add($m; $key; $state; $closed):
+            if (($key // "") | length) == 0 then $m
+-           else $m + {($key): (if $closed then "closed" else ($state // "") end)}
++           else (if $closed then "closed" else ($state // "") end) as $new
++             | if $new == "closed" and (($m[$key] // "closed") != "closed") then $m
++               else $m + {($key): $new}
++               end
+            end;
+          (reduce ($sessions[0].sessions // [])[] as $s ({};
+              add(.; $s.id;         $s.state; ($s.closed // false))
+diff --git a/gastown/tests/test_mol_witness_patrol_orphan_recovery.sh b/gastown/tests/test_mol_witness_patrol_orphan_recovery.sh
+index c0d14683..dc5d162f 100755
+--- a/gastown/tests/test_mol_witness_patrol_orphan_recovery.sh
++++ b/gastown/tests/test_mol_witness_patrol_orphan_recovery.sh
+@@ -217,6 +217,19 @@ test_empty_session_bead_output_skips() {
+     assert_verdict false "an empty session-bead read that exited 0"
+ }
+ 
++test_reused_alias_with_a_live_holder_is_not_orphaned() {
++    # Under gc v1.5.0 a namepool polecat acts as its alias, and a closed
++    # session keeps that alias, so one alias can sit on a live row AND on
++    # closed rows of earlier occupants. Row order must not decide: if any
++    # row holding the key is live, the key is live.
++    set_roster '{"sessions":[
++      {"id":"s-new","alias":"rig/gastown.nux","state":"active","closed":false},
++      {"id":"s-old","alias":"rig/gastown.nux","state":"closed","closed":true}
++    ]}'
++    run_verdict "rig/gastown.nux" "rig/gastown.nux" OLD
++    assert_verdict false "a reused alias whose current holder is live"
++}
++
+ test_missing_assignee_skips() {
+     set_roster "$ROSTER_LIVE"
+     run_verdict "" "" OLD
+@@ -490,6 +503,7 @@ test_unusable_liveness_map_skips_instead_of_orphaning
+ test_empty_map_with_live_sessions_skips
+ test_empty_roster_output_skips
+ test_empty_session_bead_output_skips
++test_reused_alias_with_a_live_holder_is_not_orphaned
+ test_missing_assignee_skips
+ test_unreadable_bead_skips
+ test_missing_updated_at_skips
+-- 
+2.54.0 (Apple Git-157)
+

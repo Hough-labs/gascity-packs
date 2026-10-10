@@ -1,0 +1,291 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sat, 10 Oct 2026 16:38:42 -0400
+Subject: [PATCH 132/148] fix(ci): name a go-install build's source from its
+ module's .Origin.Hash (gcp-fooz4)
+
+A `go install pkg@REF` build is module mode and records no
+vcs.revision, and the fallback has no release tag. After be578c74 the
+fallback therefore always failed, after its full build. That broke
+branch and SHA dispatch for pack-release-compatibility, which never
+reads the source ref, as well as for the inference gates.
+
+The build info does record the module version REF resolved to: a
+release version, or a pseudo-version for a branch or SHA. The module
+proxy records that exact version's commit as .Origin.Hash, which is how
+upstream's #476 resolved it. The fallback now looks that up with
+`go mod download -json` and exports the full SHA. If the lookup comes up
+empty, the install still fails loud and exports nothing. Checked against
+proxy.golang.org: v1.5.0 gives f66474617d2b..., and the pseudo-version
+for main's 164a7b32acd4 gives the full 164a7b32acd4118c....
+
+The go stub answers `mod download -json` with an Origin only for the
+exact version the fake build recorded. Tests cover a hash present
+(exports it) and a hash absent (fails, naming the version). The doc and
+the inference workflows' gascity_ref descriptions now say a branch or
+SHA is built and named this way, rather than failing.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .github/scripts/install-gascity-archive.sh   | 55 ++++++++++++++----
+ .github/workflows/gascity-pack-inference.yml |  2 +-
+ .github/workflows/supported-pack-nightly.yml |  2 +-
+ docs/design/release-compatibility-testing.md |  6 +-
+ tests/test_install_gascity_archive.py        | 60 ++++++++++++++++----
+ 5 files changed, 101 insertions(+), 24 deletions(-)
+
+diff --git a/.github/scripts/install-gascity-archive.sh b/.github/scripts/install-gascity-archive.sh
+index 4c02935e..a012ede5 100755
+--- a/.github/scripts/install-gascity-archive.sh
++++ b/.github/scripts/install-gascity-archive.sh
+@@ -32,8 +32,8 @@
+ #                   script falls back to `go install` and says so loudly. That
+ #                   path costs the 4.46 GiB above and is never taken by a
+ #                   scheduled run. A `go install` build records no
+-#                   vcs.revision and has no release tag, so the install then
+-#                   fails: see resolve_source_ref below.
++#                   vcs.revision, so its source commit is looked up from the
++#                   module version it was built at: see resolve_source_ref.
+ #
+ # --cache installs under RUNNER_TOOL_CACHE and appends the bin directory to
+ # GITHUB_PATH, as the sibling installers do. Either way the resolved binary path
+@@ -141,12 +141,14 @@ export_source_ref() {
+ # REF the go-install fallback builds (`latest`, a short sha) is nothing a shallow
+ # `git fetch` can resolve. A release archive is built from a git checkout, so
+ # its gc records the full commit as vcs.revision in its build info. Only when
+-# that is absent does the release tag stand in for it, and with neither there is
+-# nothing that names the source: fail rather than export a guess.
++# that is absent does something else stand in for it: the release tag for an
++# archive, the module's recorded commit for a go-install build (an empty TAG).
++# When nothing names the source, fail rather than export a guess.
+ resolve_source_ref() {
+   local binary="$1"
+   local tag="$2"
+   local revision
++  local origin
+   # `|| true`: a binary go cannot read is the absent case below, not a silent
+   # exit under `set -e`; go's own error still reaches the job log.
+   revision="$(go version -m "$binary" |
+@@ -156,15 +158,47 @@ resolve_source_ref() {
+   elif [[ -n "$tag" ]]; then
+     echo "WARNING: ${binary} records no vcs.revision; using release tag ${tag} as the gascity source ref." >&2
+     printf '%s' "$tag"
++  elif origin="$(module_origin_hash "$binary")"; then
++    printf '%s' "$origin"
+   else
+-    echo "${binary} records no vcs.revision and was installed from no release tag, so nothing" >&2
+-    echo "names the gascity commit it was built from. Exporting '${ref}' would point" >&2
+-    echo "GASCITY_SOURCE_REF at a ref a shallow fetch cannot resolve, or at a different" >&2
+-    echo "commit. Pass main, latest or a release tag instead." >&2
++    echo "${binary} records no vcs.revision and its module commit could not be looked up" >&2
++    echo "(above), so nothing names the gascity commit it was built from. Exporting '${ref}'" >&2
++    echo "would point GASCITY_SOURCE_REF at a ref a shallow fetch cannot resolve, or at a" >&2
++    echo "different commit. Pass main, latest or a release tag instead." >&2
+     return 1
+   fi
+ }
+ 
++# The commit a module-mode build was made from. `go install pkg@REF` records no
++# vcs.revision, but its build info records the module version REF resolved to
++# (a release version or a pseudo-version), and the module proxy records that
++# exact version's commit as .Origin.Hash -- upstream's method (#476). Asking for
++# the exact version matters: a query such as @latest comes back without .Origin.
++# Each way the lookup can come up empty says why on stderr and returns 1.
++module_origin_hash() {
++  local binary="$1"
++  local module_path="github.com/${REPO}"
++  local version
++  local module
++  local origin
++  version="$(go version -m "$binary" |
++    awk -v path="$module_path" '$1 == "mod" && $2 == path { print $3 }' || true)"
++  if [[ -z "$version" ]]; then
++    echo "${binary} records no ${module_path} module version to look up." >&2
++    return 1
++  fi
++  if ! module="$(go mod download -json "${module_path}@${version}")"; then
++    echo "$module" >&2
++    return 1
++  fi
++  origin="$(jq -r '.Origin.Hash // empty' <<<"$module" || true)"
++  if [[ -z "$origin" ]]; then
++    echo "The module proxy records no .Origin.Hash for ${module_path}@${version}." >&2
++    return 1
++  fi
++  printf '%s' "$origin"
++}
++
+ # `go install` is the escape hatch for a ref with no published archive. It is
+ # the pre-gcp-m0ei behaviour, disk cost included, so it warns rather than
+ # failing silently into a 4.46 GiB build on a 4Gi budget.
+@@ -177,8 +211,9 @@ install_from_source() {
+   local bin_dir
+   local source_ref
+   bin_dir="$(go env GOPATH)/bin"
+-  # Module mode records no vcs.revision and this path has no release tag, so
+-  # this fails loudly before anything is exported.
++  # No release tag: module mode records no vcs.revision, so the source commit
++  # comes from the module version this build used, or the install fails here,
++  # before anything is exported.
+   source_ref="$(resolve_source_ref "${bin_dir}/gc" "")" || exit 1
+   if [[ -n "${GITHUB_PATH:-}" ]]; then
+     echo "$bin_dir" >> "$GITHUB_PATH"
+diff --git a/.github/workflows/gascity-pack-inference.yml b/.github/workflows/gascity-pack-inference.yml
+index 51800ba2..6637a9db 100644
+--- a/.github/workflows/gascity-pack-inference.yml
++++ b/.github/workflows/gascity-pack-inference.yml
+@@ -4,7 +4,7 @@ on:
+   workflow_dispatch:
+     inputs:
+       gascity_ref:
+-        description: "Gas City release archive to install: latest (newest stable release), main (the rolling edge pre-release built from gascity main), or a release tag such as v1.2.1. A branch or commit SHA has no archive and fails the install: its go install fallback records no commit for the gascity source checkout."
++        description: "Gas City ref to install. latest (newest stable release), main (the rolling edge pre-release built from gascity main) or a release tag such as v1.2.1 installs the published archive. A commit SHA or branch has no archive and is built with go install instead (~4.46 GiB, may evict the runner); go rejects a branch name with a slash, so pass its commit SHA."
+         required: false
+         default: latest
+       gascity_setup_ref:
+diff --git a/.github/workflows/supported-pack-nightly.yml b/.github/workflows/supported-pack-nightly.yml
+index 8720ba17..b52871b1 100644
+--- a/.github/workflows/supported-pack-nightly.yml
++++ b/.github/workflows/supported-pack-nightly.yml
+@@ -6,7 +6,7 @@ on:
+   workflow_dispatch:
+     inputs:
+       gascity_ref:
+-        description: "Gas City release archive to install: latest (newest stable release), main (the rolling edge pre-release built from gascity main), or a release tag such as v1.2.1. A branch or commit SHA has no archive and fails the install: its go install fallback records no commit for the gascity source checkout."
++        description: "Gas City ref to install. latest (newest stable release), main (the rolling edge pre-release built from gascity main) or a release tag such as v1.2.1 installs the published archive. A commit SHA or branch has no archive and is built with go install instead (~4.46 GiB, may evict the runner); go rejects a branch name with a slash, so pass its commit SHA."
+         required: false
+         default: main
+       gascity_setup_ref:
+diff --git a/docs/design/release-compatibility-testing.md b/docs/design/release-compatibility-testing.md
+index b70130a5..12625b44 100644
+--- a/docs/design/release-compatibility-testing.md
++++ b/docs/design/release-compatibility-testing.md
+@@ -73,8 +73,10 @@ check out that commit as a shallow git tree and export the checkout as
+ requested ref a second time, because `main` installs the rolling `edge`
+ pre-release, which can move between the two. A binary that records no revision
+ falls back to its release tag. A ref with no archive (a branch or commit SHA)
+-is built with `go install`, which records neither, so the install fails rather
+-than name a source it cannot vouch for.
++is built with `go install`, which records no revision either; its commit is the
++`.Origin.Hash` the module proxy records for the exact module version that build
++used, as upstream's workflows resolve it. When nothing names the commit, the
++install fails rather than name a source it cannot vouch for.
+ 
+ The fixture rig gets a local bare `origin` (next to the rig, as
+ `<rig>-origin.git`) with `origin/HEAD` set, because build formulas base
+diff --git a/tests/test_install_gascity_archive.py b/tests/test_install_gascity_archive.py
+index 68dd4637..0b8091b7 100644
+--- a/tests/test_install_gascity_archive.py
++++ b/tests/test_install_gascity_archive.py
+@@ -123,13 +123,18 @@ else:
+ '''
+ 
+ 
+-# The stand-in for the Go toolchain, covering the three calls the installer
++# The stand-in for the Go toolchain, covering the four calls the installer
+ # makes. `go version -m` prints the build info of the binary it is given; a
+ # fake gc carries that build info as `# go-build-info<TAB>...` comment lines, so
+ # what is reported is a property of whichever build was actually installed.
+ # `go install pkg@ref` builds in module mode, which is what the real toolchain
+-# does for it: the binary records the module version and no vcs.* settings.
++# does for it: the binary records the module version REF resolved to
++# (FAKE_GO_MODULE_VERSION) and no vcs.* settings. `go mod download -json`
++# answers as the module proxy does: with the version's commit as .Origin.Hash
++# (FAKE_GO_ORIGIN_HASH, when a test sets one), but only when asked for that
++# exact version -- a query such as the REF itself comes back without .Origin.
+ FAKE_GO = '''#!/usr/bin/env python3
++import json
+ import os
+ import sys
+ from pathlib import Path
+@@ -158,11 +163,19 @@ elif args[:1] == ["install"] and len(args) == 2:
+         "#!/bin/sh\\n"
+         "# go-build-info\\tpath\\tgithub.com/gastownhall/gascity/cmd/gc\\n"
+         "# go-build-info\\tmod\\tgithub.com/gastownhall/gascity\\t"
+-        "v1.5.1-0.20261010000000-f66474617d2b\\th1:fake=\\n"
++        + os.environ["FAKE_GO_MODULE_VERSION"]
++        + "\\th1:fake=\\n"
+         "# go-build-info\\tbuild\\t-buildmode=exe\\n"
+         "echo \\"gc version from-source\\"\\n"
+     )
+     gc.chmod(0o755)
++elif args[:3] == ["mod", "download", "-json"] and len(args) == 4:
++    path, _, version = args[3].partition("@")
++    module = {"Path": path, "Version": version}
++    origin = os.environ.get("FAKE_GO_ORIGIN_HASH", "")
++    if origin and version == os.environ["FAKE_GO_MODULE_VERSION"]:
++        module["Origin"] = {"VCS": "git", "URL": f"https://{path}", "Hash": origin}
++    print(json.dumps(module, indent="\\t"))
+ else:
+     sys.stderr.write(f"fake go: unexpected arguments {args!r}\\n")
+     sys.exit(2)
+@@ -182,6 +195,12 @@ def platform_tuple() -> str:
+     return f"{system}_{machine}"
+ 
+ 
++# The pseudo-version `go install ...@f66474617d2b` resolves its REF to, as the
++# fallback's build info records it, and the full commit the proxy records for it.
++MODULE_VERSION = "v1.5.1-0.20261010000000-f66474617d2b"
++MODULE_ORIGIN = "f66474617d2bb7fbe51a3d746da5f3ceab2b8517"
++
++
+ def revision_of(build: int) -> str:
+     """The full commit a build was made from, as vcs.revision records it."""
+     return hashlib.sha1(f"gascity-build-{build}".encode()).hexdigest()
+@@ -263,6 +282,7 @@ def run_installer(tmp_path, release: Path, cache: Path | None = None, ref: str =
+             "GITHUB_ENV": str(github_env),
+             "GITHUB_PATH": str(github_path),
+             "GOPATH": str(tmp_path / "gopath"),
++            "FAKE_GO_MODULE_VERSION": MODULE_VERSION,
+         }
+     )
+     env.update({name: str(value) for name, value in scenario.items()})
+@@ -405,18 +425,38 @@ def test_installer_falls_back_to_the_release_tag_when_gc_records_no_revision(tmp
+     assert "release tag v1.5.0" in completed.stderr
+ 
+ 
+-def test_installer_fails_loudly_when_no_source_revision_can_be_named(tmp_path, release):
++def test_installer_names_the_module_commit_a_go_install_build_was_made_from(tmp_path, release):
+     # A short SHA has no release archive, so gc comes from `go install`, which
+-    # builds in module mode and records no vcs.revision -- and there is no
+-    # release tag to stand in. Exporting the ref as given would hand the
+-    # checkout step a short SHA that a shallow fetch cannot resolve; exporting
+-    # nothing and exiting 0 would push the failure to that step. The install
+-    # fails here instead, and like every failed install it exports nothing.
++    # builds in module mode and records no vcs.revision. Its build info does
++    # record the module version the REF resolved to, and the module proxy
++    # records that exact version's commit as .Origin.Hash (upstream's method,
++    # #476): the full SHA, which a shallow fetch resolves where the short REF
++    # does not.
++    completed, result = run_installer(
++        tmp_path, release, ref="f66474617d2b", FAKE_GO_ORIGIN_HASH=MODULE_ORIGIN
++    )
++
++    assert completed.returncode == 0, completed.stderr
++    assert "falling back to 'go install" in completed.stderr
++    assert "gc version from-source" in completed.stdout
++    gopath_bin = tmp_path / "gopath" / "bin"
++    assert sorted(result["github_env"].splitlines()) == sorted(
++        [f"GC_BIN={gopath_bin}/gc", f"GASCITY_SOURCE_REF={MODULE_ORIGIN}"]
++    )
++    assert result["github_path"] == str(gopath_bin)
++
++
++def test_installer_fails_loudly_when_no_source_revision_can_be_named(tmp_path, release):
++    # The same go-install build, but the proxy has no commit for its version.
++    # Exporting the REF as given would hand the checkout step a short SHA that
++    # a shallow fetch cannot resolve; exporting nothing and exiting 0 would push
++    # the failure to that step. The install fails here instead, naming the
++    # version it looked up, and like every failed install it exports nothing.
+     completed, result = run_installer(tmp_path, release, ref="f66474617d2b")
+ 
+     assert completed.returncode == 1
+     assert "falling back to 'go install" in completed.stderr
+     assert "records no vcs.revision" in completed.stderr
+-    assert "no release tag" in completed.stderr
++    assert f"no .Origin.Hash for github.com/gastownhall/gascity@{MODULE_VERSION}" in completed.stderr
+     assert result["github_env"] == ""
+     assert result["github_path"] == ""
+-- 
+2.54.0 (Apple Git-157)
+

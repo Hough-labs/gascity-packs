@@ -1,0 +1,468 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sat, 10 Oct 2026 16:26:56 -0400
+Subject: [PATCH 129/148] fix(ci): name the gascity source from the installed
+ gc's vcs.revision (gcp-fooz4)
+
+Upstream's #476 checks out the gascity source at the same commit the gc
+binary was built from. The restacked installer instead exported the ref
+it was given: `edge` was resolved once for the archive and again by the
+checkout's fetch, and edge rotates several times a day (gcp-kinb), so
+the two could name different builds. The go-install fallback exported
+its REF literally (`latest`, a short sha), which a shallow
+`git fetch --depth 1` cannot resolve.
+
+GASCITY_SOURCE_REF is now read from the installed binary with
+`go version -m`: the full vcs.revision a release archive's gc records.
+When that is absent, the resolved release tag stands in, with a warning.
+With neither, the install fails and exports nothing. A `go install
+pkg@ref` build is module mode and records no vcs.revision, so the
+go-install fallback now always takes that failure branch.
+
+The checkout steps fetch that full SHA and log the full HEAD. The
+installer tests add a `go` stub that reads build info out of the fake
+gc, so each build carries its own revision. They cover a revision
+present (including after an edge rotation and on a cache hit), an
+absent revision with a tag fallback, and an absent revision with no
+tag (fail).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .github/scripts/install-gascity-archive.sh   |  56 ++++++-
+ .github/workflows/gascity-pack-inference.yml |  10 +-
+ .github/workflows/supported-pack-nightly.yml |  10 +-
+ tests/test_gascity_pack_inference_gate.py    |  15 +-
+ tests/test_install_gascity_archive.py        | 148 +++++++++++++++++--
+ 5 files changed, 204 insertions(+), 35 deletions(-)
+
+diff --git a/.github/scripts/install-gascity-archive.sh b/.github/scripts/install-gascity-archive.sh
+index b19502b7..4c02935e 100755
+--- a/.github/scripts/install-gascity-archive.sh
++++ b/.github/scripts/install-gascity-archive.sh
+@@ -30,16 +30,18 @@
+ #   v1.4.1 | 1.4.1  that exact release tag
+ #   anything else   no archive exists for it (a branch, a commit sha), so the
+ #                   script falls back to `go install` and says so loudly. That
+-#                   path costs the 4.46 GiB above; it exists only so a manual
+-#                   workflow_dispatch against an unreleased gascity ref keeps
+-#                   working, and it is never taken by a scheduled run.
++#                   path costs the 4.46 GiB above and is never taken by a
++#                   scheduled run. A `go install` build records no
++#                   vcs.revision and has no release tag, so the install then
++#                   fails: see resolve_source_ref below.
+ #
+ # --cache installs under RUNNER_TOOL_CACHE and appends the bin directory to
+ # GITHUB_PATH, as the sibling installers do. Either way the resolved binary path
+ # is exported as GC_BIN via GITHUB_ENV so workflow steps can name it without
+-# going through `go env GOPATH`, alongside GASCITY_SOURCE_REF. Both are written
+-# only after a verified install: a failed install exports nothing, so a later
+-# step cannot pick up a ref for a gc that was never installed.
++# going through `go env GOPATH`, alongside GASCITY_SOURCE_REF, the gascity
++# commit that binary was built from. Both are written only after a verified
++# install: a failed install exports nothing, so a later step cannot pick up a
++# ref for a gc that was never installed.
+ 
+ set -euo pipefail
+ 
+@@ -133,6 +135,36 @@ export_source_ref() {
+   fi
+ }
+ 
++# Name that ref from the installed binary, never from the REF this script was
++# given. `edge` rotates several times a day (gcp-kinb), so resolving it a second
++# time for the source can land on a later build than the one installed; and the
++# REF the go-install fallback builds (`latest`, a short sha) is nothing a shallow
++# `git fetch` can resolve. A release archive is built from a git checkout, so
++# its gc records the full commit as vcs.revision in its build info. Only when
++# that is absent does the release tag stand in for it, and with neither there is
++# nothing that names the source: fail rather than export a guess.
++resolve_source_ref() {
++  local binary="$1"
++  local tag="$2"
++  local revision
++  # `|| true`: a binary go cannot read is the absent case below, not a silent
++  # exit under `set -e`; go's own error still reaches the job log.
++  revision="$(go version -m "$binary" |
++    awk '$1 == "build" && $2 ~ /^vcs\.revision=/ { sub(/^vcs\.revision=/, "", $2); print $2 }' || true)"
++  if [[ -n "$revision" ]]; then
++    printf '%s' "$revision"
++  elif [[ -n "$tag" ]]; then
++    echo "WARNING: ${binary} records no vcs.revision; using release tag ${tag} as the gascity source ref." >&2
++    printf '%s' "$tag"
++  else
++    echo "${binary} records no vcs.revision and was installed from no release tag, so nothing" >&2
++    echo "names the gascity commit it was built from. Exporting '${ref}' would point" >&2
++    echo "GASCITY_SOURCE_REF at a ref a shallow fetch cannot resolve, or at a different" >&2
++    echo "commit. Pass main, latest or a release tag instead." >&2
++    return 1
++  fi
++}
++
+ # `go install` is the escape hatch for a ref with no published archive. It is
+ # the pre-gcp-m0ei behaviour, disk cost included, so it warns rather than
+ # failing silently into a 4.46 GiB build on a 4Gi budget.
+@@ -143,12 +175,16 @@ install_from_source() {
+   echo "WARNING: ephemeral storage (GOMODCACHE + GOCACHE + binary) and may evict the runner." >&2
+   go install "github.com/${REPO}/cmd/gc@${ref}"
+   local bin_dir
++  local source_ref
+   bin_dir="$(go env GOPATH)/bin"
++  # Module mode records no vcs.revision and this path has no release tag, so
++  # this fails loudly before anything is exported.
++  source_ref="$(resolve_source_ref "${bin_dir}/gc" "")" || exit 1
+   if [[ -n "${GITHUB_PATH:-}" ]]; then
+     echo "$bin_dir" >> "$GITHUB_PATH"
+   fi
+   export_gc_bin "${bin_dir}/gc"
+-  export_source_ref "$ref"
++  export_source_ref "$source_ref"
+   "${bin_dir}/gc" version
+   exit 0
+ }
+@@ -357,10 +393,14 @@ while true; do
+   break
+ done
+ 
++# Resolved before anything is exported, so a source that cannot be named leaves
++# GITHUB_ENV and GITHUB_PATH as untouched as any other failed install.
++source_ref="$(resolve_source_ref "$target" "$tag")" || exit 1
++
+ if $use_cache && [[ -n "${GITHUB_PATH:-}" ]]; then
+   echo "$bin_dir" >> "$GITHUB_PATH"
+ fi
+ export_gc_bin "$target"
+-export_source_ref "$tag"
++export_source_ref "$source_ref"
+ 
+ "$target" version
+diff --git a/.github/workflows/gascity-pack-inference.yml b/.github/workflows/gascity-pack-inference.yml
+index e201864c..7d99c8cb 100644
+--- a/.github/workflows/gascity-pack-inference.yml
++++ b/.github/workflows/gascity-pack-inference.yml
+@@ -121,9 +121,11 @@ jobs:
+       # The gate imports the builtin core/bd packs from a git checkout of the
+       # SAME gascity revision gc was built from (GASCITY_SOURCE_ROOT): module
+       # zips drop file modes, so pack scripts gc execs would exit 126. The
+-      # archive install exports GASCITY_SOURCE_REF (the release tag, or the ref
+-      # it fell back to building); fetch only that, shallow, so the disk budget
+-      # gcp-m0ei bought back stays bought.
++      # archive install exports GASCITY_SOURCE_REF as the full commit SHA the
++      # installed gc records in its build info (vcs.revision), not a second
++      # resolution of GASCITY_REF: `edge` can rotate between the two. Fetch
++      # only that commit, shallow, so the disk budget gcp-m0ei bought back
++      # stays bought.
+       - name: Check out the matching gascity source
+         run: |
+           gascity_src="${RUNNER_TEMP}/gascity-src"
+@@ -132,7 +134,7 @@ jobs:
+             "${GASCITY_SOURCE_REF:?the install step did not export GASCITY_SOURCE_REF}"
+           git -C "$gascity_src" checkout --quiet --detach FETCH_HEAD
+           echo "GASCITY_SOURCE_ROOT=${gascity_src}" >> "$GITHUB_ENV"
+-          echo "gascity source ${GASCITY_SOURCE_REF} at ${gascity_src} ($(git -C "$gascity_src" rev-parse --short HEAD))"
++          echo "gascity source ${GASCITY_SOURCE_REF} at ${gascity_src} ($(git -C "$gascity_src" rev-parse HEAD))"
+ 
+       # bd must embed the same beads module as gc (the gate refuses a
+       # mismatch), so derive it from the gc just installed instead of pinning it.
+diff --git a/.github/workflows/supported-pack-nightly.yml b/.github/workflows/supported-pack-nightly.yml
+index cd409894..90cff79d 100644
+--- a/.github/workflows/supported-pack-nightly.yml
++++ b/.github/workflows/supported-pack-nightly.yml
+@@ -255,9 +255,11 @@ jobs:
+       # The gate imports the builtin core/bd packs from a git checkout of the
+       # SAME gascity revision gc was built from (GASCITY_SOURCE_ROOT): module
+       # zips drop file modes, so pack scripts gc execs would exit 126. The
+-      # archive install exports GASCITY_SOURCE_REF (the release tag, or the ref
+-      # it fell back to building); fetch only that, shallow, so the disk budget
+-      # gcp-m0ei bought back stays bought.
++      # archive install exports GASCITY_SOURCE_REF as the full commit SHA the
++      # installed gc records in its build info (vcs.revision), not a second
++      # resolution of GASCITY_REF: `edge` can rotate between the two. Fetch
++      # only that commit, shallow, so the disk budget gcp-m0ei bought back
++      # stays bought.
+       - name: Check out the matching gascity source
+         run: |
+           gascity_src="${RUNNER_TEMP}/gascity-src"
+@@ -266,7 +268,7 @@ jobs:
+             "${GASCITY_SOURCE_REF:?the install step did not export GASCITY_SOURCE_REF}"
+           git -C "$gascity_src" checkout --quiet --detach FETCH_HEAD
+           echo "GASCITY_SOURCE_ROOT=${gascity_src}" >> "$GITHUB_ENV"
+-          echo "gascity source ${GASCITY_SOURCE_REF} at ${gascity_src} ($(git -C "$gascity_src" rev-parse --short HEAD))"
++          echo "gascity source ${GASCITY_SOURCE_REF} at ${gascity_src} ($(git -C "$gascity_src" rev-parse HEAD))"
+ 
+       # bd must embed the same beads module as gc (the gate refuses a
+       # mismatch), so derive it from the gc just installed instead of pinning it.
+diff --git a/tests/test_gascity_pack_inference_gate.py b/tests/test_gascity_pack_inference_gate.py
+index 711bbd5f..9db31033 100644
+--- a/tests/test_gascity_pack_inference_gate.py
++++ b/tests/test_gascity_pack_inference_gate.py
+@@ -2507,14 +2507,21 @@ def test_inference_workflows_pin_gascity_source_root_to_installed_gc() -> None:
+     # The gate imports core/bd from a git checkout of the SAME gascity revision
+     # gc was built from. gc is installed from the release archive (gcp-m0ei: a
+     # `go install` needs 4.46 GiB against a 4Gi runner), and the installer
+-    # exports the release tag it resolved (or the ref it fell back to building)
+-    # as GASCITY_SOURCE_REF; the checkout step fetches exactly that ref.
++    # exports the full commit the installed gc records (vcs.revision) as
++    # GASCITY_SOURCE_REF; the checkout step fetches exactly that commit. Its
++    # behaviour is tested in tests/test_install_gascity_archive.py; these pins
++    # keep the workflows wired to it.
+     installer = (gascity_pack_inference_gate.REPO_ROOT / ".github" / "scripts" / "install-gascity-archive.sh").read_text(
+         encoding="utf-8"
+     )
+     assert 'echo "GASCITY_SOURCE_REF=$1" >> "$GITHUB_ENV"' in installer
+-    assert 'export_source_ref "$tag"' in installer
+-    assert 'export_source_ref "$ref"' in installer
++    assert 'go version -m "$binary"' in installer
++    # Both install paths export what resolve_source_ref read from the binary,
++    # never the REF or tag they were given: `edge` resolved twice can name two
++    # builds, and a fallback REF can be a short sha no shallow fetch resolves.
++    assert installer.count('export_source_ref "$source_ref"') == 2
++    assert 'export_source_ref "$tag"' not in installer
++    assert 'export_source_ref "$ref"' not in installer
+     for name in ("supported-pack-nightly.yml", "gascity-pack-inference.yml"):
+         workflow = (gascity_pack_inference_gate.REPO_ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+         install_gc = workflow.index('.github/scripts/install-gascity-archive.sh "${GASCITY_REF}" --cache')
+diff --git a/tests/test_install_gascity_archive.py b/tests/test_install_gascity_archive.py
+index 6450da51..68dd4637 100644
+--- a/tests/test_install_gascity_archive.py
++++ b/tests/test_install_gascity_archive.py
+@@ -11,6 +11,12 @@ Asserting on the script's text cannot tell a rotation apart from a corrupt
+ download, so these tests run the script for real against a scripted stand-in for
+ the release: a `curl` on PATH that serves a release whose asset rotates exactly
+ when a test says it does. Nothing here touches the network.
++
++The same race decides which gascity source the inference gates check out. The
++installer names it (GASCITY_SOURCE_REF) from the build info of the gc it
++installed, so a `go` stand-in reads that build info out of the fake gc itself:
++each build records its own vcs.revision, and a rotation that changes the
++installed build changes the revision with it.
+ """
+ 
+ from __future__ import annotations
+@@ -117,6 +123,52 @@ else:
+ '''
+ 
+ 
++# The stand-in for the Go toolchain, covering the three calls the installer
++# makes. `go version -m` prints the build info of the binary it is given; a
++# fake gc carries that build info as `# go-build-info<TAB>...` comment lines, so
++# what is reported is a property of whichever build was actually installed.
++# `go install pkg@ref` builds in module mode, which is what the real toolchain
++# does for it: the binary records the module version and no vcs.* settings.
++FAKE_GO = '''#!/usr/bin/env python3
++import os
++import sys
++from pathlib import Path
++
++args = sys.argv[1:]
++if args[:2] == ["version", "-m"] and len(args) == 3:
++    binary = Path(args[2])
++    info = [
++        line.split("\\t", 1)[1]
++        for line in binary.read_text().splitlines()
++        if line.startswith("# go-build-info\\t")
++    ]
++    if not info:
++        sys.stderr.write(f"{binary}: could not read Go build info\\n")
++        sys.exit(1)
++    print(f"{binary}: go1.26.5")
++    for line in info:
++        print(f"\\t{line}")
++elif args == ["env", "GOPATH"]:
++    print(os.environ["GOPATH"])
++elif args[:1] == ["install"] and len(args) == 2:
++    bin_dir = Path(os.environ["GOPATH"]) / "bin"
++    bin_dir.mkdir(parents=True, exist_ok=True)
++    gc = bin_dir / "gc"
++    gc.write_text(
++        "#!/bin/sh\\n"
++        "# go-build-info\\tpath\\tgithub.com/gastownhall/gascity/cmd/gc\\n"
++        "# go-build-info\\tmod\\tgithub.com/gastownhall/gascity\\t"
++        "v1.5.1-0.20261010000000-f66474617d2b\\th1:fake=\\n"
++        "# go-build-info\\tbuild\\t-buildmode=exe\\n"
++        "echo \\"gc version from-source\\"\\n"
++    )
++    gc.chmod(0o755)
++else:
++    sys.stderr.write(f"fake go: unexpected arguments {args!r}\\n")
++    sys.exit(2)
++'''
++
++
+ def platform_tuple() -> str:
+     system = {"Darwin": "darwin", "Linux": "linux"}.get(platform.system())
+     machine = {
+@@ -130,9 +182,23 @@ def platform_tuple() -> str:
+     return f"{system}_{machine}"
+ 
+ 
+-def build_archive(build: int) -> bytes:
+-    """A `gascity_edge_<platform>.tar.gz` whose gc identifies its build."""
+-    script = f'#!/bin/sh\necho "gc version build-{build}"\n'.encode()
++def revision_of(build: int) -> str:
++    """The full commit a build was made from, as vcs.revision records it."""
++    return hashlib.sha1(f"gascity-build-{build}".encode()).hexdigest()
++
++
++def build_archive(build: int, *, stamped: bool = True) -> bytes:
++    """A release tarball whose gc identifies its build.
++
++    `stamped` is a goreleaser build from a git checkout, which records the
++    commit as vcs.revision; unstamped is a build that recorded none.
++    """
++    build_info = "# go-build-info\tpath\tgithub.com/gastownhall/gascity/cmd/gc\n"
++    build_info += "# go-build-info\tbuild\t-buildmode=exe\n"
++    if stamped:
++        build_info += "# go-build-info\tbuild\tvcs=git\n"
++        build_info += f"# go-build-info\tbuild\tvcs.revision={revision_of(build)}\n"
++    script = f'#!/bin/sh\n{build_info}echo "gc version build-{build}"\n'.encode()
+     raw = io.BytesIO()
+     with tarfile.open(fileobj=raw, mode="w") as tar:
+         info = tarfile.TarInfo("gc")
+@@ -145,40 +211,47 @@ def build_archive(build: int) -> bytes:
+     return packed.getvalue()
+ 
+ 
+-@pytest.fixture
+-def release(tmp_path):
++def make_release(tmp_path, *, version: str = "edge", stamped: bool = True) -> Path:
+     """A fixture release with enough builds for the worst rotation schedule."""
+     fixture = tmp_path / "release"
+     fixture.mkdir()
+     tuple_ = platform_tuple()
+-    (fixture / "asset").write_text(f"gascity_edge_{tuple_}.tar.gz")
++    (fixture / "asset").write_text(f"gascity_{version}_{tuple_}.tar.gz")
+     (fixture / "current").write_text("0")
+     # Three download attempts, each preceded by a digest request that may also
+     # rotate, cannot consume more than eight builds.
+     for build in range(12):
+-        archive = build_archive(build)
++        archive = build_archive(build, stamped=stamped)
+         (fixture / f"build_{build}.tar.gz").write_bytes(archive)
+         (fixture / f"build_{build}.sha").write_text(hashlib.sha256(archive).hexdigest())
+     return fixture
+ 
+ 
++@pytest.fixture
++def release(tmp_path):
++    return make_release(tmp_path)
++
++
+ def sha_of(release: Path, build: int) -> str:
+     return (release / f"build_{build}.sha").read_text().strip()
+ 
+ 
+-def run_installer(tmp_path, release: Path, cache: Path | None = None, **scenario):
++def run_installer(tmp_path, release: Path, cache: Path | None = None, ref: str = "edge", **scenario):
+     bin_stub = tmp_path / "stub-bin"
+     bin_stub.mkdir(exist_ok=True)
+-    curl = bin_stub / "curl"
+-    curl.write_text(FAKE_CURL)
+-    curl.chmod(0o755)
++    for name, body in (("curl", FAKE_CURL), ("go", FAKE_GO)):
++        stub = bin_stub / name
++        stub.write_text(body)
++        stub.chmod(0o755)
+ 
+     cache = cache if cache is not None else tmp_path / "tool-cache"
+     cache.mkdir(exist_ok=True)
+     github_env = tmp_path / "github-env"
+     github_path = tmp_path / "github-path"
+-    github_env.touch()
+-    github_path.touch()
++    # Emptied per run, as each Actions step starts with fresh files, so a run
++    # is judged on what it wrote and not on an earlier run's exports.
++    github_env.write_text("")
++    github_path.write_text("")
+ 
+     env = dict(os.environ)
+     env.pop("GITHUB_TOKEN", None)
+@@ -189,12 +262,13 @@ def run_installer(tmp_path, release: Path, cache: Path | None = None, **scenario
+             "RUNNER_TOOL_CACHE": str(cache),
+             "GITHUB_ENV": str(github_env),
+             "GITHUB_PATH": str(github_path),
++            "GOPATH": str(tmp_path / "gopath"),
+         }
+     )
+     env.update({name: str(value) for name, value in scenario.items()})
+ 
+     completed = subprocess.run(
+-        [str(INSTALLER), "edge", "--cache"],
++        [str(INSTALLER), ref, "--cache"],
+         env=env,
+         capture_output=True,
+         text=True,
+@@ -225,8 +299,11 @@ def test_installer_verifies_and_installs_the_published_archive(tmp_path, release
+     # this entry.
+     assert sha_of(release, 0)[:16] in result["github_env"]
+     # Order-free, but sorted rather than a set so a doubled export still fails.
++    # The source ref is the full commit the installed gc records, never the
++    # rolling tag: resolving `edge` again can name a later build, and a
++    # shallow `git fetch` resolves a full SHA where it cannot resolve a short one.
+     assert sorted(result["github_env"].splitlines()) == sorted(
+-        [f"GC_BIN={result['github_path']}/gc", "GASCITY_SOURCE_REF=edge"]
++        [f"GC_BIN={result['github_path']}/gc", f"GASCITY_SOURCE_REF={revision_of(0)}"]
+     )
+     assert Path(result["github_path"], "gc").is_file()
+ 
+@@ -245,6 +322,8 @@ def test_installer_reuses_the_cache_entry_for_an_already_verified_checksum(tmp_p
+     assert result["archive_requests"] == []
+     assert "Reusing cached Gas City edge" in second.stdout
+     assert "gc version build-0" in second.stdout
++    # Read from the cached binary, so a cache hit names the build it serves.
++    assert f"GASCITY_SOURCE_REF={revision_of(0)}" in result["github_env"].splitlines()
+ 
+ 
+ def test_installer_absorbs_an_edge_rotation_between_checksum_and_download(tmp_path, release):
+@@ -268,6 +347,12 @@ def test_installer_absorbs_an_edge_rotation_between_checksum_and_download(tmp_pa
+     # never on the checksum that was resolved first.
+     assert sha_of(release, 1)[:16] in result["github_env"]
+     assert sha_of(release, 0)[:16] not in result["github_env"]
++    # And the source ref names build 1 too. Resolving `edge` once for the
++    # archive and again for the source is the race this rules out: the two
++    # resolutions can land on different builds, the one checked out matching
++    # neither the gc installed nor the other.
++    assert f"GASCITY_SOURCE_REF={revision_of(1)}" in result["github_env"].splitlines()
++    assert revision_of(0) not in result["github_env"]
+ 
+ 
+ def test_installer_bounds_its_retries_when_edge_will_not_hold_still(tmp_path, release):
+@@ -302,3 +387,36 @@ def test_installer_still_fails_loudly_on_a_real_checksum_mismatch(tmp_path, rele
+     assert len(result["archive_requests"]) == 1
+     assert result["github_env"] == ""
+     assert list(result["cache"].rglob("gc")) == []
++
++
++def test_installer_falls_back_to_the_release_tag_when_gc_records_no_revision(tmp_path):
++    # A build with no vcs.revision in its build info. A version tag names one
++    # commit, so it is the one ref that can still stand in -- loudly, because
++    # the revision is then taken on the tag's word rather than read from gc.
++    release = make_release(tmp_path, version="1.5.0", stamped=False)
++    completed, result = run_installer(tmp_path, release, ref="v1.5.0")
++
++    assert completed.returncode == 0, completed.stderr
++    assert "gc version build-0" in completed.stdout
++    assert sorted(result["github_env"].splitlines()) == sorted(
++        [f"GC_BIN={result['github_path']}/gc", "GASCITY_SOURCE_REF=v1.5.0"]
++    )
++    assert "records no vcs.revision" in completed.stderr
++    assert "release tag v1.5.0" in completed.stderr
++
++
++def test_installer_fails_loudly_when_no_source_revision_can_be_named(tmp_path, release):
++    # A short SHA has no release archive, so gc comes from `go install`, which
++    # builds in module mode and records no vcs.revision -- and there is no
++    # release tag to stand in. Exporting the ref as given would hand the
++    # checkout step a short SHA that a shallow fetch cannot resolve; exporting
++    # nothing and exiting 0 would push the failure to that step. The install
++    # fails here instead, and like every failed install it exports nothing.
++    completed, result = run_installer(tmp_path, release, ref="f66474617d2b")
++
++    assert completed.returncode == 1
++    assert "falling back to 'go install" in completed.stderr
++    assert "records no vcs.revision" in completed.stderr
++    assert "no release tag" in completed.stderr
++    assert result["github_env"] == ""
++    assert result["github_path"] == ""
+-- 
+2.54.0 (Apple Git-157)
+

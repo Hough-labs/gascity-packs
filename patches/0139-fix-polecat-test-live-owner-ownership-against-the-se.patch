@@ -1,0 +1,274 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sat, 10 Oct 2026 16:35:48 -0400
+Subject: [PATCH 139/148] fix(polecat): test live-owner ownership against the
+ session's identity set (gcp-fooz4)
+
+0085 decided "the work bead is someone else's" with one string compare,
+GUARD_OWNER != EXPECTED_ASSIGNEE. One session answers to several
+spellings: gc 1.4.3 recorded claims under the runtime session_name, and a
+gc 1.5.0 namepool polecat acts under its alias (BEADS_ACTOR =
+session.AssigneeIdentifier). A molecule that straddles the upgrade finds
+its own work bead under the old spelling, the liveness probe finds that
+spelling's live row, which is this session, and the guard declines its own
+molecule.
+
+The guard now treats the owner as this session when it equals any of
+BEADS_ACTOR, GC_ALIAS, GC_SESSION_ID, GC_SESSION_NAME or GC_AGENT. That is
+upstream #360's identity-set fix for the claim (9f98ea4e,
+claim_assignee_is_ours in gascity/commands/claim/run.sh), carried here as
+the same function. A self match skips the liveness probe and goes to the
+takeover from the previous commit, which moves the bead to the spelling
+bd checks writes against, so step 6's handoff is not refused either.
+
+Test: test_polecat_live_owner_guard.sh
+test_own_molecule_under_another_spelling_is_not_declined (owner
+gastown__polecat-gc-psfm, EXPECTED_ASSIGNEE winnow/gastown.nux, both this
+session). Red before: "CLAIM_DECLINED_LIVE_OWNER ... that owner is live
+(session gc-psfm)". Green after. The harness now resets BEADS_ACTOR and the
+GC_* identity variables so the runner's own session cannot leak in.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ gastown/agents/polecat/prompt.template.md     | 143 ++++++++++--------
+ .../tests/test_polecat_live_owner_guard.sh    |  38 ++++-
+ 2 files changed, 120 insertions(+), 61 deletions(-)
+
+diff --git a/gastown/agents/polecat/prompt.template.md b/gastown/agents/polecat/prompt.template.md
+index 5df47064..81ffb607 100644
+--- a/gastown/agents/polecat/prompt.template.md
++++ b/gastown/agents/polecat/prompt.template.md
+@@ -314,6 +314,21 @@ STEP_REF="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].metadata."gc.step_ref" // emp
+ # The WORK bead carries no `gc.routed_to`, so it is not a release candidate and
+ # its assignee survives as the durable record of who owns this molecule. Ask it.
+ #
++# "Is the owner us?" is a test against the session's whole identity SET, not
++# the one spelling EXPECTED_ASSIGNEE picks: the same session is its alias, its
++# bead id and its runtime session name, and which one a claim was recorded
++# under depends on the gc that wrote it. Upstream #360 (9f98ea4e) made this
++# exact correction to the gascity pack's claim (claim_assignee_is_ours,
++# gascity/commands/claim/run.sh); this is that function.
++claim_assignee_is_ours() {
++  for _own in "${BEADS_ACTOR:-}" "${GC_ALIAS:-}" "${GC_SESSION_ID:-}" "${GC_SESSION_NAME:-}" "${GC_AGENT:-}"; do
++    if [ -n "$_own" ] && [ "$1" = "$_own" ]; then
++      return 0
++    fi
++  done
++  return 1
++}
++
+ # Only a `claimed` reason can be a duplicate pour. `existing_assignment` and
+ # `ready_assignment` mean the bead already carried this session's identity
+ # before the hook ran, and the release clears the assignee — so a released bead
+@@ -342,70 +357,78 @@ if [ -n "$STEP_REF" ] && { [ -z "$CLAIM_REASON" ] || [ "$CLAIM_REASON" = "claime
+     # Proceed exactly as this block did before the guard existed.
+     echo "WARN live-owner guard could not resolve an owner for this molecule; proceeding unguarded"
+   elif [ "$GUARD_OWNER" != "$EXPECTED_ASSIGNEE" ]; then
+-    # Someone else's name is on the molecule. Only a LIVE someone blocks: a pool
+-    # restart mints a fresh session identity, so a DEAD prior owner on the work
+-    # bead is the ordinary resume case and must not stall the engine. `gc
+-    # session list` omits closed sessions by default, so a hit there is the
+-    # liveness answer. asleep and draining count as alive — both still own their
+-    # work and get woken back onto it.
+-    GUARD_ALIVE=""
+-    GUARD_OWNER_SN=""
+-    GUARD_LIST_OK=0
+-    GUARD_TRY=0
+-    while [ "$GUARD_TRY" -lt 3 ]; do
+-      GUARD_TRY=$((GUARD_TRY + 1))
+-      GUARD_LIST="$(gc session list --json 2>/dev/null)"
+-      if printf '%s' "$GUARD_LIST" | jq -e 'has("sessions")' >/dev/null 2>&1; then
+-        GUARD_LIST_OK=1
+-        GUARD_ROW="$(printf '%s' "$GUARD_LIST" | jq -c --arg o "$GUARD_OWNER" \
+-          '[.sessions[] | select(.closed != true)
+-            | select(.session_name == $o or .id == $o or .name == $o or .alias == $o)]
+-           | .[0] // empty' 2>/dev/null)"
+-        GUARD_ALIVE="$(printf '%s' "$GUARD_ROW" | jq -r '.id // empty' 2>/dev/null)"
+-        GUARD_OWNER_SN="$(printf '%s' "$GUARD_ROW" | jq -r '.session_name // empty' 2>/dev/null)"
+-        break
+-      fi
+-      sleep "$GUARD_TRY"
+-    done
+-    if [ "$GUARD_LIST_OK" -ne 1 ] || [ -n "$GUARD_ALIVE" ]; then
+-      # Alive, or liveness unreadable. Unreadable is NOT evidence the owner is
+-      # gone, and the two mistakes are not symmetric: declining costs one pool
+-      # slot and the bead stays claimable, proceeding stomps a live worktree and
+-      # corrupts whatever the owner is mid-write on. Fail closed.
+-      echo "CLAIM_DECLINED_LIVE_OWNER $WORK_ID"
+-      echo "  work bead $GUARD_WORK_BEAD is held by $GUARD_OWNER, and this session is $EXPECTED_ASSIGNEE."
+-      if [ "$GUARD_LIST_OK" -ne 1 ]; then
+-        echo "  session liveness was UNREADABLE after retries — declining rather than assuming the owner is gone."
+-      else
+-        echo "  that owner is live (session $GUARD_ALIVE). This is a duplicate pour onto an in-flight molecule."
++    if claim_assignee_is_ours "$GUARD_OWNER"; then
++      # Another spelling of THIS session: gc 1.4.3 claimed under the runtime
++      # session_name, a gc 1.5.0 namepool polecat acts under its alias. Its
++      # live row is us, so probing liveness would decline our own molecule.
++      echo "WARN work bead $GUARD_WORK_BEAD names $GUARD_OWNER, another identity of this session ($EXPECTED_ASSIGNEE); it is ours."
++    else
++      # Someone else's name is on the molecule. Only a LIVE someone blocks: a
++      # pool restart mints a fresh session identity, so a DEAD prior owner on
++      # the work bead is the ordinary resume case and must not stall the engine.
++      # `gc session list` omits closed sessions by default, so a hit there is
++      # the liveness answer. asleep and draining count as alive — both still own
++      # their work and get woken back onto it.
++      GUARD_ALIVE=""
++      GUARD_OWNER_SN=""
++      GUARD_LIST_OK=0
++      GUARD_TRY=0
++      while [ "$GUARD_TRY" -lt 3 ]; do
++        GUARD_TRY=$((GUARD_TRY + 1))
++        GUARD_LIST="$(gc session list --json 2>/dev/null)"
++        if printf '%s' "$GUARD_LIST" | jq -e 'has("sessions")' >/dev/null 2>&1; then
++          GUARD_LIST_OK=1
++          GUARD_ROW="$(printf '%s' "$GUARD_LIST" | jq -c --arg o "$GUARD_OWNER" \
++            '[.sessions[] | select(.closed != true)
++              | select(.session_name == $o or .id == $o or .name == $o or .alias == $o)]
++             | .[0] // empty' 2>/dev/null)"
++          GUARD_ALIVE="$(printf '%s' "$GUARD_ROW" | jq -r '.id // empty' 2>/dev/null)"
++          GUARD_OWNER_SN="$(printf '%s' "$GUARD_ROW" | jq -r '.session_name // empty' 2>/dev/null)"
++          break
++        fi
++        sleep "$GUARD_TRY"
++      done
++      if [ "$GUARD_LIST_OK" -ne 1 ] || [ -n "$GUARD_ALIVE" ]; then
++        # Alive, or liveness unreadable. Unreadable is NOT evidence the owner is
++        # gone, and the two mistakes are not symmetric: declining costs one pool
++        # slot and the bead stays claimable, proceeding stomps a live worktree
++        # and corrupts whatever the owner is mid-write on. Fail closed.
++        echo "CLAIM_DECLINED_LIVE_OWNER $WORK_ID"
++        echo "  work bead $GUARD_WORK_BEAD is held by $GUARD_OWNER, and this session is $EXPECTED_ASSIGNEE."
++        if [ "$GUARD_LIST_OK" -ne 1 ]; then
++          echo "  session liveness was UNREADABLE after retries — declining rather than assuming the owner is gone."
++        else
++          echo "  that owner is live (session $GUARD_ALIVE). This is a duplicate pour onto an in-flight molecule."
++        fi
++        echo "  Restoring the step to its owner and draining. No code, branch, or worktree touched."
++        # The hook stamped OUR gc.session_id/gc.session_name onto the step
++        # during the claim. Put the owner's back. The session name is the live
++        # row's: GUARD_OWNER is an assignee, which under gc 1.5.0 is an alias or
++        # a session bead id, not the runtime session name gc reads from this
++        # key. When either value cannot be read, clear the key rather than leave
++        # ours standing — a wrong binding is worse than an absent one, and the
++        # owner's next write restores it.
++        gc bd update "$WORK_ID" --assignee="$GUARD_OWNER" \
++          --set-metadata gc.session_name="$GUARD_OWNER_SN" \
++          --set-metadata polecat_session="$GUARD_OWNER" \
++          --set-metadata gc.session_id="$GUARD_OWNER_SID" \
++          || echo "WARN could not restore $WORK_ID to $GUARD_OWNER — the step is left claimed by a session that will not run it; escalate to the witness"
++        gc session nudge "${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}witness" \
++          "DUPLICATE_POUR declined: step $WORK_ID poured onto $EXPECTED_ASSIGNEE while work bead $GUARD_WORK_BEAD is held by $GUARD_OWNER. Step restored to its owner." \
++          >/dev/null 2>&1 || true
++        gc runtime drain-ack
++        exit 0
+       fi
+-      echo "  Restoring the step to its owner and draining. No code, branch, or worktree touched."
+-      # The hook stamped OUR gc.session_id/gc.session_name onto the step during
+-      # the claim. Put the owner's back. The session name is the live row's:
+-      # GUARD_OWNER is an assignee, which under gc 1.5.0 is an alias or a
+-      # session bead id, not the runtime session name gc reads from this key.
+-      # When either value cannot be read, clear the key rather than leave ours
+-      # standing — a wrong binding is worse than an absent one, and the owner's
+-      # next write restores it.
+-      gc bd update "$WORK_ID" --assignee="$GUARD_OWNER" \
+-        --set-metadata gc.session_name="$GUARD_OWNER_SN" \
+-        --set-metadata polecat_session="$GUARD_OWNER" \
+-        --set-metadata gc.session_id="$GUARD_OWNER_SID" \
+-        || echo "WARN could not restore $WORK_ID to $GUARD_OWNER — the step is left claimed by a session that will not run it; escalate to the witness"
+-      gc session nudge "${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}witness" \
+-        "DUPLICATE_POUR declined: step $WORK_ID poured onto $EXPECTED_ASSIGNEE while work bead $GUARD_WORK_BEAD is held by $GUARD_OWNER. Step restored to its owner." \
+-        >/dev/null 2>&1 || true
+-      gc runtime drain-ack
+-      exit 0
++      echo "WARN work bead $GUARD_WORK_BEAD still names $GUARD_OWNER, but no live session holds that identity — treating this as a resume and proceeding."
+     fi
+-    echo "WARN work bead $GUARD_WORK_BEAD still names $GUARD_OWNER, but no live session holds that identity — treating this as a resume and proceeding."
+     # Take the work bead over, as workspace-setup's claim would. It is held
+     # in_progress for the whole run, bd >= 1.3.0 refuses a plain --assignee
+-    # write over another actor's in_progress claim, and nothing after this
+-    # re-claims it: left under the dead owner, submit-and-exit's step-6 handoff
+-    # to the refinery is refused with the branch already pushed. --if-assignee
+-    # makes it a compare-and-set on the owner just found dead, so a bead that
+-    # changed hands since is not stomped. The refinery and an operator
++    # write over another actor's in_progress claim (and compares spellings, so
++    # an old spelling of this session counts as another actor), and nothing
++    # after this re-claims it: left where it is, submit-and-exit's step-6
++    # handoff to the refinery is refused with the branch already pushed.
++    # --if-assignee makes it a compare-and-set on the holder just read, so a
++    # bead that changed hands since is not stomped. The refinery and an operator
+     # escalation are never taken over; workspace-setup skips the same two.
+     GUARD_ROUTED_TO="$(printf '%s' "$GUARD_WORK_JSON" | jq -r '.[0].metadata."gc.routed_to" // empty' 2>/dev/null)"
+     if [ "$GUARD_OWNER" = "${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}refinery" ] || [ "$GUARD_ROUTED_TO" = "human" ]; then
+diff --git a/gastown/tests/test_polecat_live_owner_guard.sh b/gastown/tests/test_polecat_live_owner_guard.sh
+index dcfa4472..beade27f 100755
+--- a/gastown/tests/test_polecat_live_owner_guard.sh
++++ b/gastown/tests/test_polecat_live_owner_guard.sh
+@@ -65,7 +65,10 @@ SH
+ 
+ # run_guard executes the guard with the claim block's inputs already bound, then
+ # echoes GUARD_PROCEEDED. A decline exits before that marker, so its absence is
+-# the assertion that the polecat never reached the work.
++# the assertion that the polecat never reached the work. The session's identity
++# variables are reset so the test runner's own cannot leak in: BEADS_ACTOR is
++# the session under test, and SELF_IDS may add its other spellings as
++# assignments (GC_SESSION_NAME=... GC_SESSION_ID=...).
+ run_guard() {
+     local dir="$1" owner_assignee="$2" me="$3" step_ref="${4-mol-polecat-work.implement}"
+     local root_meta="${5-\"gc.root_bead_id\":\"winnow-5azcp\",}"
+@@ -82,6 +85,9 @@ JSON
+ [{"id":"winnow-pcpn6","status":"in_progress","assignee":"$owner_assignee","metadata":{${work_meta}"gc.session_id":"gc-8a4d"}}]
+ JSON
+     cat >"$dir/guard-harness.sh" <<HARNESS
++unset BEADS_ACTOR GC_ALIAS GC_SESSION_ID GC_SESSION_NAME GC_AGENT
++BEADS_ACTOR="$me"
++${SELF_IDS:-}
+ WORK_ID="winnow-iaroy"
+ EXPECTED_ASSIGNEE="$me"
+ STEP_REF="$step_ref"
+@@ -176,6 +182,35 @@ test_restore_takes_the_session_name_from_the_live_row() {
+         fail "with no live row the restore must clear gc.session_name: $(cat "$dir/calls.log")"
+ }
+ 
++# One session, two spellings. gc 1.4.3 claimed under the runtime session_name;
++# a gc 1.5.0 namepool polecat's BEADS_ACTOR is its alias. A molecule straddling
++# the upgrade finds its own work bead under the old spelling, and the live row
++# for that spelling is THIS session, so a one-string test declines the
++# session's own molecule. Upstream #360 (9f98ea4e) settled this for the claim:
++# any of BEADS_ACTOR, GC_ALIAS, GC_SESSION_ID, GC_SESSION_NAME, GC_AGENT is us.
++test_own_molecule_under_another_spelling_is_not_declined() {
++    local dir out line
++    dir=$(new_case)
++    live_sessions "$dir"
++
++    out=$(SELF_IDS="GC_ALIAS=winnow/gastown.nux GC_SESSION_ID=gc-psfm GC_SESSION_NAME=gastown__polecat-gc-psfm GC_AGENT=winnow/gastown.nux" \
++        run_guard "$dir" "gastown__polecat-gc-psfm" "winnow/gastown.nux")
++
++    ! grep -F 'CLAIM_DECLINED_LIVE_OWNER' <<<"$out" >/dev/null ||
++        fail "the guard declined this session's own molecule held under its session_name: $out"
++    grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null ||
++        fail "the guard did not proceed on this session's own molecule: $out"
++    ! grep -F 'session list' "$dir/calls.log" >/dev/null ||
++        fail "the guard probed liveness for an owner that is one of this session's own identities"
++    ! grep -F -- '--assignee=gastown__polecat-gc-psfm' "$dir/calls.log" >/dev/null ||
++        fail "the guard restored the step as if to another owner"
++    # bd checks writes against BEADS_ACTOR, so the bead moves to the spelling
++    # this session acts under, or step 6's handoff is refused.
++    line=$(takeover_line winnow/gastown.nux "$dir" gastown__polecat-gc-psfm)
++    [[ -n "$line" ]] ||
++        fail "the work bead was left under the old spelling of this session: $(cat "$dir/calls.log")"
++}
++
+ test_dead_owner_is_a_resume_and_proceeds() {
+     local dir out
+     dir=$(new_case)
+@@ -371,6 +406,7 @@ test_unknown_claim_reason_still_checks() {
+ test_live_owner_is_declined_and_the_step_restored
+ test_restore_takes_the_session_name_from_the_live_row
+ test_dead_owner_is_a_resume_and_proceeds
++test_own_molecule_under_another_spelling_is_not_declined
+ test_dead_owner_resume_takes_the_work_bead_over
+ test_resume_never_takes_over_from_the_refinery_or_an_escalation
+ test_refused_takeover_warns_and_still_resumes
+-- 
+2.54.0 (Apple Git-157)
+

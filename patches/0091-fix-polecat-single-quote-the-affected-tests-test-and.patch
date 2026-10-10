@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sun, 27 Sep 2026 20:32:47 -0400
+Subject: [PATCH 091/148] fix(polecat): single-quote the affected-tests test
+ and flag unmapped go re-runs (gcp-oczc)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Self-review touch-ups to cb786ad4.
+
+The `[ -n "{{affected_tests_command}}" ]` test double-quoted the rendered
+command, so a command carrying $(...) was expanded (run) just to test that
+it is non-empty, and a path with spaces could split it. It now uses the
+same single quotes as the gate_run call beside it.
+
+The base re-run in self-review §3 exits 0 when `go test -run` matches no
+test at all ("[no tests to run]"), which would read as "green on base". It
+errs toward "yours", the safe side, but the prose now says to fall back to
+the whole phase command in that case. Exercised by hand on this rig's
+module-root id go:..TestGastownEmbedsPackContent: it maps to
+`go test ./. -run ^TestGastownEmbedsPackContent$` and runs that one test.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ gastown/formulas/mol-polecat-work.toml | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/gastown/formulas/mol-polecat-work.toml b/gastown/formulas/mol-polecat-work.toml
+index 1e5fe6b6..5df06e09 100644
+--- a/gastown/formulas/mol-polecat-work.toml
++++ b/gastown/formulas/mol-polecat-work.toml
+@@ -989,7 +989,7 @@ gate_run setup '{{setup_command}}'
+ gate_run typecheck '{{typecheck_command}}'
+ gate_run lint '{{lint_command}}'
+ gate_run build '{{build_command}}'
+-if [ -n "{{affected_tests_command}}" ]; then
++if [ -n '{{affected_tests_command}}' ]; then
+     # Rig has an affected-tests detector. Run only the tests our diff
+     # touches — same logic the rig's CI uses to dispatch test workflows.
+     # The command must read `git diff --name-only $BASE_REF...HEAD`
+@@ -1000,6 +1000,8 @@ if [ -n "{{affected_tests_command}}" ]; then
+     # below never fires. It must also fail closed: a pipe-style detector
+     # without `set -o pipefail` swallows a failed diff, runs zero tests,
+     # exits 0, and pushes untested work.
++    # The test above is single-quoted like gate_run's argument, so testing it
++    # never expands or runs any of it.
+     gate_run affected-tests '{{affected_tests_command}}'
+ else
+     # No affected detector — run test_command as the rig configured it.
+@@ -1062,8 +1064,10 @@ echo "re-run on base exit $? for $ID"
+ git worktree remove --force "$T"
+ ```
+   Exit 0 means **green on base: the red is yours.** Fix it and re-run
+-  self-review from §2. Non-zero means red on base; read the output to confirm
+-  it is the same failure and not a re-run that could not start. Once every
++  self-review from §2. A go re-run that printed `[no tests to run]` did not
++  map the id: re-run the whole phase through `PHASE_CMD` instead. Non-zero
++  means red on base; read the output to confirm it is the same failure and not
++  a re-run that could not start. Once every
+   NEW id that remains is red on base too, record them, then proceed:
+ ```bash
+ KR='<the known-red path the §2 block printed>'
+-- 
+2.54.0 (Apple Git-157)
+

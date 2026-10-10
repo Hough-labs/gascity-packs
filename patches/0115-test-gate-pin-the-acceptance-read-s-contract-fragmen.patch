@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Mon, 5 Oct 2026 23:35:50 -0400
+Subject: [PATCH 115/148] test(gate): pin the acceptance read's contract
+ fragments (gcp-s7j4.2)
+
+The inference gate validates that mol-refinery-patrol still calls the scripts
+that hold its lanes. Add the acceptance read: the step must call
+acceptance-check.sh for a packet and record a SKIP for a bead with nothing to
+read, and the script must keep the three lines that make its guarantees real
+(the polecat's own diff, the recorded tip, the queryable label).
+
+Two reject tests cover a refinery step that stops calling the script and a pack
+without it; each fails when its pin is removed from the gate.
+
+Validation: tests/test_gascity_pack_inference_gate.py, 83 passed.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ scripts/gascity_pack_inference_gate.py    | 17 ++++++++++
+ tests/test_gascity_pack_inference_gate.py | 39 +++++++++++++++++++++++
+ 2 files changed, 56 insertions(+)
+
+diff --git a/scripts/gascity_pack_inference_gate.py b/scripts/gascity_pack_inference_gate.py
+index 968197be..64e04651 100644
+--- a/scripts/gascity_pack_inference_gate.py
++++ b/scripts/gascity_pack_inference_gate.py
+@@ -160,6 +160,13 @@ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
+         'land --head "$WORK"',
+         'stack --head "$WORK"',
+         'serial --head "$WORK"',
++        # The acceptance read (gcp-s7j4.2): the step calls acceptance-check.sh for
++        # a packet per bead and records a SKIP for a bead with nothing to read,
++        # and keeps no acceptance logic of its own. A step that stops calling it
++        # is a rig that sets acceptance_check=warn and silently gets no read.
++        "acceptance-check.sh",
++        'packet --work "$ACK_ID"',
++        'record --work "$ACK_ID" --verdict SKIP',
+     ),
+     "mol-witness-patrol": (
+         "LIVENESS_MAP=$(jq -n",
+@@ -355,6 +362,16 @@ GASTOWN_SCRIPT_CONTRACTS = {
+         'branch_has_real_change "origin/$SB_TARGET" "$SB_ENTRY"',
+         '(.commits | type == "number" and . >= 1 and . == floor)',
+     ),
++    # The acceptance read's mechanics (gcp-s7j4.1). Each fragment is the line that
++    # makes one guarantee real: the packet diffs the polecat's own work, not the
++    # drift the target gained since the fork; a record carries the tip it judged,
++    # so a later read can tell a judged branch from a moved one; and the label is
++    # what makes a hit queryable.
++    "assets/scripts/refinery/acceptance-check.sh": (
++        'pk_base=$(ac_git merge-base "$pk_target_tip" "$pk_tip" 2>/dev/null)',
++        '--set-metadata "acceptance_check_tip=$rec_tip" \\',
++        'if ! gc bd update "$rec_work" --add-label "$rec_label" >/dev/null; then',
++    ),
+ }
+ METHODOLOGY_FLOW_CONTRACTS = {
+     "superpowers": {
+diff --git a/tests/test_gascity_pack_inference_gate.py b/tests/test_gascity_pack_inference_gate.py
+index 64c08f63..df39aa05 100644
+--- a/tests/test_gascity_pack_inference_gate.py
++++ b/tests/test_gascity_pack_inference_gate.py
+@@ -1822,6 +1822,33 @@ def test_validate_gastown_orchestration_contract_rejects_a_pack_without_the_merg
+         gascity_pack_inference_gate.validate_gastown_orchestration_contract(pack)
+ 
+ 
++def test_validate_gastown_orchestration_contract_accepts_the_fixture_pack_with_acceptance_check(tmp_path) -> None:
++    pack = write_gastown_contract_pack(tmp_path)
++
++    assert (pack / "assets" / "scripts" / "refinery" / "acceptance-check.sh").is_file()
++    gascity_pack_inference_gate.validate_gastown_orchestration_contract(pack)
++
++
++def test_validate_gastown_orchestration_contract_rejects_a_refinery_step_that_stops_calling_acceptance_check(tmp_path) -> None:
++    pack = write_gastown_contract_pack(
++        tmp_path,
++        formula_edit=lambda name, text: (
++            text.replace("acceptance-check.sh", "") if name == "mol-refinery-patrol" else text
++        ),
++    )
++
++    with pytest.raises(gascity_pack_inference_gate.GateError, match="mol-refinery-patrol"):
++        gascity_pack_inference_gate.validate_gastown_orchestration_contract(pack)
++
++
++def test_validate_gastown_orchestration_contract_rejects_a_pack_without_the_acceptance_check_script(tmp_path) -> None:
++    pack = write_gastown_contract_pack(tmp_path)
++    (pack / "assets" / "scripts" / "refinery" / "acceptance-check.sh").unlink()
++
++    with pytest.raises(gascity_pack_inference_gate.GateError, match="missing script file"):
++        gascity_pack_inference_gate.validate_gastown_orchestration_contract(pack)
++
++
+ def test_validate_methodology_flow_contracts_accept_current_packs() -> None:
+     for pack_name in gascity_pack_inference_gate.METHODOLOGY_PACKS:
+         gascity_pack_inference_gate.validate_methodology_flow_contract(
+@@ -1959,6 +1986,18 @@ def test_gastown_build_workflow_contract_covers_orchestration_roles() -> None:
+         'branch_has_real_change "origin/$SB_TARGET" "$SB_ENTRY"',
+         '(.commits | type == "number" and . >= 1 and . == floor)',
+     }
++    # The acceptance read (gcp-s7j4.2): the step calls the script, the script's
++    # own fragments live there.
++    for fragment in ("acceptance-check.sh", 'packet --work "$ACK_ID"', 'record --work "$ACK_ID" --verdict SKIP'):
++        assert fragment in contracts["mol-refinery-patrol"]
++    acceptance_contracts = gascity_pack_inference_gate.GASTOWN_SCRIPT_CONTRACTS[
++        "assets/scripts/refinery/acceptance-check.sh"
++    ]
++    assert set(acceptance_contracts) == {
++        'pk_base=$(ac_git merge-base "$pk_target_tip" "$pk_tip" 2>/dev/null)',
++        '--set-metadata "acceptance_check_tip=$rec_tip" \\',
++        'if ! gc bd update "$rec_work" --add-label "$rec_label" >/dev/null; then',
++    }
+     assert not {"branch_has_real_change", "branch_already_landed"} & set(contracts["mol-refinery-patrol"])
+     assert "FAIL-SAFE: empty liveness map" in contracts["mol-witness-patrol"]
+     assert "gc bd create --type=task --labels=warrant" in contracts["mol-deacon-patrol"]
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sat, 10 Oct 2026 16:23:30 -0400
+Subject: [PATCH 142/148] fix(refinery): clear handoff_stage when reject mode
+ returns a MISS to the pool (gcp-fooz4)
+
+Upstream #322 (b43abe63) requires every rejection to unset handoff_stage: the
+polecat's completed submit no longer stands, and a stale marker lets the
+witness's Step 3a hand the rejected tip straight back to the refinery. The
+rebase step's conflict rejection and handle-failures both carry it; the
+acceptance check's reject mode (rec_return_to_pool) did not.
+
+test_refinery_acceptance_check.sh's reject case now starts from a bead with
+handoff_stage=target_recorded and pins the pool-return write and the cleared
+field. Red before this change (the write lacked --unset-metadata handoff_stage
+and the field survived), green after.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ gastown/assets/scripts/refinery/acceptance-check.sh |  7 +++++--
+ gastown/tests/test_refinery_acceptance_check.sh     | 11 ++++++++++-
+ 2 files changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/gastown/assets/scripts/refinery/acceptance-check.sh b/gastown/assets/scripts/refinery/acceptance-check.sh
+index c1c96709..d7d8155a 100755
+--- a/gastown/assets/scripts/refinery/acceptance-check.sh
++++ b/gastown/assets/scripts/refinery/acceptance-check.sh
+@@ -593,7 +593,10 @@ rec_run() {
+ # cleaned up and the source reopened, then the bead is put back with its reason and
+ # its routing. Each write runs only after the one before it succeeded. CFG_RIG and
+ # CFG_BINDING_PREFIX are resolve_config's twins of the rebase step's
+-# ${GC_RIG:+$GC_RIG/}<binding prefix>polecat. Returns 1 when a write failed.
++# ${GC_RIG:+$GC_RIG/}<binding prefix>polecat. handoff_stage is cleared as on every
++# rejection (upstream #322): the polecat's completed submit no longer stands, and a
++# stale marker would let the witness's Step 3a hand this tip straight back here.
++# Returns 1 when a write failed.
+ rec_return_to_pool() {
+   rp_ids=$(ac_nudge_ids MISS "$2")
+   rp_reason="acceptance: ${rp_ids:+$rp_ids - }see note"
+@@ -605,7 +608,7 @@ rec_return_to_pool() {
+     ac_warn "gc workflow reopen-source for $1 failed; the bead stays with the refinery"
+     return 1
+   fi
+-  if ! gc bd update "$1" --status=open --assignee= \
++  if ! gc bd update "$1" --status=open --assignee= --unset-metadata handoff_stage \
+     --set-metadata "rejection_reason=$rp_reason" \
+     --set-metadata "gc.routed_to=${CFG_RIG:+$CFG_RIG/}${CFG_BINDING_PREFIX}polecat" >/dev/null; then
+     ac_warn "the pool return of $1 failed; the bead stays with the refinery"
+diff --git a/gastown/tests/test_refinery_acceptance_check.sh b/gastown/tests/test_refinery_acceptance_check.sh
+index 40d7623c..ca2c3340 100755
+--- a/gastown/tests/test_refinery_acceptance_check.sh
++++ b/gastown/tests/test_refinery_acceptance_check.sh
+@@ -146,6 +146,10 @@ bd)
+                 edit_bead "$file" --arg k "${2%%=*}" --arg v "${2#*=}" '.[0].metadata[$k] = $v'
+                 shift
+                 ;;
++            --unset-metadata)
++                edit_bead "$file" --arg k "$2" 'del(.[0].metadata[$k])'
++                shift
++                ;;
+             --add-label)
+                 edit_bead "$file" --arg v "$2" '.[0].labels = (((.[0].labels // []) + [$v]) | unique)'
+                 shift
+@@ -1086,6 +1090,10 @@ write_calls() { grep -E '^gc (bd (update|note) |session nudge |workflow )' "$T/g
+ case_record_reject_miss() {
+     new_case record-reject-miss
+     record_rig
++    # The polecat's completed-submit marker. Every rejection clears it (upstream
++    # #322): left set, the witness's Step 3a would hand this rejected tip straight
++    # back to the refinery as a finished handoff.
++    set_meta gcp-r1 handoff_stage target_recorded
+     printf '%s\n' 'AC1 OK — a | b' 'AC2 MISSING — c | absent' 'AC4 SUBSTITUTED — d | e' >"$T/stdin"
+ 
+     run_ac record --work gcp-r1 --verdict MISS --tip "$X" --mode reject
+@@ -1098,9 +1106,10 @@ gc session nudge testrig/crew.seat ACCEPTANCE MISS: gcp-r1 AC2,AC4 - note on gcp
+ gc bd update gcp-r1 --set-metadata acceptance_check_nudge=delivered: testrig/crew.seat
+ gc workflow delete-source gcp-r1 --apply
+ gc workflow reopen-source gcp-r1
+-gc bd update gcp-r1 --status=open --assignee= --set-metadata rejection_reason=acceptance: AC2,AC4 - see note --set-metadata gc.routed_to=testrig/gastown.polecat" \
++gc bd update gcp-r1 --status=open --assignee= --unset-metadata handoff_stage --set-metadata rejection_reason=acceptance: AC2,AC4 - see note --set-metadata gc.routed_to=testrig/gastown.polecat" \
+         "$(write_calls)"
+     assert_eq "status" open "$(bead_field gcp-r1 status)"
++    assert_eq "handoff_stage" "<unset>" "$(bead_meta gcp-r1 handoff_stage)"
+     assert_eq "assignee" "" "$(bead_field gcp-r1 assignee)"
+     assert_eq "rejection_reason" "acceptance: AC2,AC4 - see note" "$(bead_meta gcp-r1 rejection_reason)"
+     assert_eq "gc.routed_to" testrig/gastown.polecat "$(bead_meta gcp-r1 gc.routed_to)"
+-- 
+2.54.0 (Apple Git-157)
+
