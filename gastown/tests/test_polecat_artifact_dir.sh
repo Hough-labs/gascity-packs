@@ -15,6 +15,28 @@ fail() {
     exit 1
 }
 
+# mktemp -d returns /var/folders/... on macOS, where /var is a symlink to
+# /private/var. The production callers resolve the city and rig roots with
+# pwd -P before they reach the validator, whose rig-namespace guard rejects any
+# path that differs from its physical form, so the fixtures must start physical
+# too. Hand them an unresolved root and a valid worktree is rejected.
+physical_mktemp_dir() {
+    local dir
+    dir=$(mktemp -d) || return 1
+    (cd "$dir" && pwd -P)
+}
+
+# Step 1 of workspace-setup claims the work bead before it reads the artifact
+# metadata, and stamps the session identity it finds in the environment. The
+# workspace tests pin that identity so the expected call does not vary with
+# whichever session runs the suite.
+WORKSPACE_TEST_ACTOR=ac-test-polecat
+
+workspace_claim_call() {
+    printf '%s update ac-safe1 --status=in_progress --assignee=%s --set-metadata polecat_session=%s' \
+        "$1" "$WORKSPACE_TEST_ACTOR" "$WORKSPACE_TEST_ACTOR"
+}
+
 extract_validator() {
     local output=$1
     python3 - "$POLECAT_FORMULA" "$output" <<'PY'
@@ -92,9 +114,12 @@ with formula_path.open("rb") as handle:
     formula = tomllib.load(handle)
 workspace = next(step for step in formula["steps"] if step["id"] == "workspace-setup")
 blocks = re.findall(r"```bash\n(.*?)```", workspace["description"], re.DOTALL)
-if len(blocks) < 5:
-    raise SystemExit(f"workspace-setup has {len(blocks)} bash blocks; expected at least 5")
-script = "\n".join(blocks[:5])
+# Everything up to and including the block that adds the worktree. Counting
+# blocks goes stale each time the step gains one (the work-bead claim did).
+creation = next((i for i, block in enumerate(blocks) if "worktree add" in block), None)
+if creation is None:
+    raise SystemExit(f"workspace-setup has no worktree-creation block among {len(blocks)} bash blocks")
+script = "\n".join(blocks[: creation + 1])
 script = script.replace("{{convoy_id}}", "convoy-test")
 script = script.replace("{{base_branch}}", "main")
 script = script.replace("{{binding_prefix}}", "gastown.")
@@ -115,8 +140,8 @@ init_repo() {
 }
 
 test_workspace_creation_uses_canonical_sibling() {
-    local tmp rig remote city provider canonical setup calls bd_subcommand
-    tmp=$(mktemp -d)
+    local tmp rig remote city provider canonical setup calls bd_subcommand claim_call
+    tmp=$(physical_mktemp_dir)
     trap 'rm -rf "$tmp"' RETURN
     rig="$tmp/rig"
     remote="$tmp/remote.git"
@@ -126,6 +151,7 @@ test_workspace_creation_uses_canonical_sibling() {
     setup="$tmp/workspace-create.sh"
     calls="$tmp/gc-calls"
     bd_subcommand=$(printf '%s%s' b d)
+    claim_call=$(workspace_claim_call "$bd_subcommand")
 
     init_repo "$rig"
     git -C "$rig" branch -M main
@@ -145,13 +171,14 @@ test_workspace_creation_uses_canonical_sibling() {
                     printf '%s\n' '{"children":[{"id":"ac-safe1"}]}'
                     ;;
                 "$bd_subcommand show ac-safe1 --json")
-                    printf '%s\n' '[{"metadata":{}}]'
+                    printf '%s\n' '[{"status":"in_progress","assignee":"'"$WORKSPACE_TEST_ACTOR"'","metadata":{}}]'
                     ;;
                 "$bd_subcommand update ac-safe1 --set-metadata artifact_dir="*)
                     return 0
                     ;;
                 "$bd_subcommand update ac-safe1 --unset-metadata handoff_stage" | \
-                "$bd_subcommand update ac-safe1 --set-metadata base_ref="*)
+                "$bd_subcommand update ac-safe1 --set-metadata base_ref="* | \
+                "$claim_call")
                     return 0
                     ;;
                 "runtime drain-ack")
@@ -162,6 +189,7 @@ test_workspace_creation_uses_canonical_sibling() {
                     ;;
             esac
         }
+        export BEADS_ACTOR="$WORKSPACE_TEST_ACTOR"
         export GC_CITY_PATH="$city"
         export GC_RIG=demo
         export GC_RIG_ROOT="$rig"
@@ -189,7 +217,7 @@ test_workspace_creation_uses_canonical_sibling() {
 test_worktree_setup_ignores_gc_without_mutating_tracked_or_global_ignores() {
     local tmp rig city provider global_config global_ignore exclude
     local tracked_before config_before global_before status
-    tmp=$(mktemp -d)
+    tmp=$(physical_mktemp_dir)
     trap 'rm -rf "$tmp"' RETURN
     rig="$tmp/rig"
     city="$tmp/city"
@@ -235,7 +263,10 @@ test_worktree_setup_ignores_gc_without_mutating_tracked_or_global_ignores() {
 
     # Existing worktrees take the idempotent fast path. That path must still
     # repair an installation created before .gc/ became a runtime exclude.
-    sed -i '\|^\.gc/$|d' "$exclude"
+    # No `sed -i`: GNU and BSD sed disagree on its argument, and BSD sed takes
+    # the script as a backup suffix.
+    sed '\|^\.gc/$|d' "$exclude" >"$exclude.new"
+    mv -f "$exclude.new" "$exclude"
     GIT_CONFIG_GLOBAL="$global_config" \
         "$WORKTREE_SETUP" "$rig" "$provider" gastown.nux
     [[ "$(grep -cxF '.gc/' "$exclude")" -eq 1 ]] ||
@@ -244,7 +275,7 @@ test_worktree_setup_ignores_gc_without_mutating_tracked_or_global_ignores() {
 
 test_worktree_sync_ignores_codex_skills_but_rejects_unrelated_dirt() {
     local tmp rig remote city provider skill_root exclude head_before status stderr
-    tmp=$(mktemp -d)
+    tmp=$(physical_mktemp_dir)
     trap 'rm -rf "$tmp"' RETURN
     rig="$tmp/rig"
     remote="$tmp/remote.git"
@@ -305,7 +336,7 @@ test_worktree_sync_ignores_codex_skills_but_rejects_unrelated_dirt() {
 test_worktree_sync_preserves_task_state_and_only_fast_forwards_stable_branch() {
     local tmp rig remote city provider stable hash task_sha detached_sha
     local stable_sha foreign foreign_head foreign_exclude_before status
-    tmp=$(mktemp -d)
+    tmp=$(physical_mktemp_dir)
     trap 'rm -rf "$tmp"' RETURN
     rig="$tmp/rig"
     remote="$tmp/remote.git"
@@ -438,7 +469,7 @@ test_worktree_sync_preserves_task_state_and_only_fast_forwards_stable_branch() {
 
 test_shutdown_probe_scopes_rig_and_fails_closed() {
     local tmp probe calls output bd_subcommand
-    tmp=$(mktemp -d)
+    tmp=$(physical_mktemp_dir)
     trap 'rm -rf "$tmp"' RETURN
     probe="$tmp/probe.sh"
     calls="$tmp/calls"
@@ -499,7 +530,7 @@ test_shutdown_probe_scopes_rig_and_fails_closed() {
 test_validator_rejects_provider_and_unrelated_paths() {
     local tmp validator rig city_a city_b provider bead valid got plain
     local alias_root foreign foreign_wt cross_city other_rig wrong_namespace
-    tmp=$(mktemp -d)
+    tmp=$(physical_mktemp_dir)
     trap 'rm -rf "$tmp"' RETURN
     validator="$tmp/validator.sh"
     extract_validator "$validator"
@@ -588,10 +619,11 @@ test_validator_rejects_provider_and_unrelated_paths() {
 }
 
 test_workspace_metadata_reads_fail_closed_without_pipefail() {
-    local mode tmp rig remote city provider canonical setup calls bd_subcommand
+    local mode tmp rig remote city provider canonical setup calls bd_subcommand claim_call
     bd_subcommand=$(printf '%s%s' b d)
+    claim_call=$(workspace_claim_call "$bd_subcommand")
     for mode in command-failure malformed empty ambiguous; do
-        tmp=$(mktemp -d)
+        tmp=$(physical_mktemp_dir)
         rig="$tmp/rig"
         remote="$tmp/remote.git"
         city="$tmp/city"
@@ -631,11 +663,12 @@ test_workspace_metadata_reads_fail_closed_without_pipefail() {
                     "runtime drain-ack")
                         return 0
                         ;;
-                    # Step 1's stage-marker clear and base_ref record run
-                    # before the artifact metadata read by design; neither
-                    # names an artifact path.
+                    # Step 1's stage-marker clear, base_ref record and work-bead
+                    # claim run before the artifact metadata read by design;
+                    # none names an artifact path.
                     "$bd_subcommand update ac-safe1 --unset-metadata handoff_stage" | \
-                    "$bd_subcommand update ac-safe1 --set-metadata base_ref=refs/remotes/origin/main")
+                    "$bd_subcommand update ac-safe1 --set-metadata base_ref=refs/remotes/origin/main" | \
+                    "$claim_call")
                         return 0
                         ;;
                     "$bd_subcommand update "*)
@@ -646,6 +679,7 @@ test_workspace_metadata_reads_fail_closed_without_pipefail() {
                         ;;
                 esac
             }
+            export BEADS_ACTOR="$WORKSPACE_TEST_ACTOR"
             export GC_CITY_PATH="$city"
             export GC_RIG=demo
             export GC_RIG_ROOT="$rig"
@@ -660,7 +694,8 @@ test_workspace_metadata_reads_fail_closed_without_pipefail() {
             fail "metadata read mode $mode created a replacement artifact"
         if grep "^${bd_subcommand} update " "$calls" |
             grep -v -x -e "${bd_subcommand} update ac-safe1 --unset-metadata handoff_stage" \
-                -e "${bd_subcommand} update ac-safe1 --set-metadata base_ref=refs/remotes/origin/main" |
+                -e "${bd_subcommand} update ac-safe1 --set-metadata base_ref=refs/remotes/origin/main" \
+                -e "$claim_call" |
             grep -q .; then
             fail "metadata read mode $mode mutated work bead metadata"
         fi
@@ -669,8 +704,8 @@ test_workspace_metadata_reads_fail_closed_without_pipefail() {
 }
 
 test_workspace_collision_fails_closed_without_alternate() {
-    local tmp rig remote city provider canonical setup calls bd_subcommand
-    tmp=$(mktemp -d)
+    local tmp rig remote city provider canonical setup calls bd_subcommand claim_call
+    tmp=$(physical_mktemp_dir)
     trap 'rm -rf "$tmp"' RETURN
     rig="$tmp/rig"
     remote="$tmp/remote.git"
@@ -680,6 +715,7 @@ test_workspace_collision_fails_closed_without_alternate() {
     setup="$tmp/workspace-create.sh"
     calls="$tmp/gc-calls"
     bd_subcommand=$(printf '%s%s' b d)
+    claim_call=$(workspace_claim_call "$bd_subcommand")
 
     init_repo "$rig"
     git -C "$rig" branch -M main
@@ -703,9 +739,16 @@ test_workspace_collision_fails_closed_without_alternate() {
                     printf '%s\n' '{"children":[{"id":"ac-safe1"}]}'
                     ;;
                 "$bd_subcommand show ac-safe1 --json")
-                    printf '%s\n' '[{"metadata":{}}]'
+                    printf '%s\n' '[{"status":"in_progress","assignee":"'"$WORKSPACE_TEST_ACTOR"'","metadata":{}}]'
                     ;;
                 "runtime drain-ack")
+                    return 0
+                    ;;
+                # Step 1's stage-marker clear, base_ref record and work-bead
+                # claim run before the artifact is touched, by design.
+                "$bd_subcommand update ac-safe1 --unset-metadata handoff_stage" | \
+                "$bd_subcommand update ac-safe1 --set-metadata base_ref=refs/remotes/origin/main" | \
+                "$claim_call")
                     return 0
                     ;;
                 "$bd_subcommand update "*)
@@ -716,6 +759,7 @@ test_workspace_collision_fails_closed_without_alternate() {
                     ;;
             esac
         }
+        export BEADS_ACTOR="$WORKSPACE_TEST_ACTOR"
         export GC_CITY_PATH="$city"
         export GC_RIG=demo
         export GC_RIG_ROOT="$rig"
@@ -735,8 +779,8 @@ test_workspace_collision_fails_closed_without_alternate() {
 }
 
 test_workspace_rejects_redirected_artifact_root_before_creation() {
-    local tmp rig remote city provider redirected setup calls bd_subcommand
-    tmp=$(mktemp -d)
+    local tmp rig remote city provider redirected setup calls bd_subcommand claim_call
+    tmp=$(physical_mktemp_dir)
     trap 'rm -rf "$tmp"' RETURN
     rig="$tmp/rig"
     remote="$tmp/remote.git"
@@ -746,6 +790,7 @@ test_workspace_rejects_redirected_artifact_root_before_creation() {
     setup="$tmp/workspace-create.sh"
     calls="$tmp/gc-calls"
     bd_subcommand=$(printf '%s%s' b d)
+    claim_call=$(workspace_claim_call "$bd_subcommand")
 
     init_repo "$rig"
     git -C "$rig" branch -M main
@@ -769,9 +814,16 @@ test_workspace_rejects_redirected_artifact_root_before_creation() {
                     printf '%s\n' '{"children":[{"id":"ac-safe1"}]}'
                     ;;
                 "$bd_subcommand show ac-safe1 --json")
-                    printf '%s\n' '[{"metadata":{}}]'
+                    printf '%s\n' '[{"status":"in_progress","assignee":"'"$WORKSPACE_TEST_ACTOR"'","metadata":{}}]'
                     ;;
                 "runtime drain-ack")
+                    return 0
+                    ;;
+                # Step 1's stage-marker clear, base_ref record and work-bead
+                # claim run before the artifact is touched, by design.
+                "$bd_subcommand update ac-safe1 --unset-metadata handoff_stage" | \
+                "$bd_subcommand update ac-safe1 --set-metadata base_ref=refs/remotes/origin/main" | \
+                "$claim_call")
                     return 0
                     ;;
                 "$bd_subcommand update "*)
@@ -782,6 +834,7 @@ test_workspace_rejects_redirected_artifact_root_before_creation() {
                     ;;
             esac
         }
+        export BEADS_ACTOR="$WORKSPACE_TEST_ACTOR"
         export GC_CITY_PATH="$city"
         export GC_RIG=demo
         export GC_RIG_ROOT="$rig"
@@ -896,7 +949,7 @@ write_cleanup_bead_json() {
 test_cleanup_command_is_idempotent_and_mr_retryable() {
     local tmp rig remote city canonical sweep_artifact nonterminal_artifact
     local bin bead_json calls sha nonterminal_sha result output
-    tmp=$(mktemp -d)
+    tmp=$(physical_mktemp_dir)
     trap 'rm -rf "$tmp"' RETURN
     rig="$tmp/rig"
     remote="$tmp/remote.git"
@@ -1021,7 +1074,7 @@ test_cleanup_command_rejects_cross_city_and_dirty_artifacts() {
     local tmp rig city_a city_b cross_city cross_rig wrong_namespace wrong_bead
     local symlink_path symlink_target foreign dirty provider legacy
     local remote bin bead_json calls sha status
-    tmp=$(mktemp -d)
+    tmp=$(physical_mktemp_dir)
     trap 'rm -rf "$tmp"' RETURN
     rig="$tmp/rig"
     remote="$tmp/remote.git"
@@ -1124,7 +1177,7 @@ test_cleanup_command_rejects_cross_city_and_dirty_artifacts() {
 test_cleanup_requires_live_remote_evidence_and_stable_state() {
     local tmp rig remote city bin bead_json second_json calls show_count
     local artifact source_sha delivered_sha target_sha remote_record status
-    tmp=$(mktemp -d)
+    tmp=$(physical_mktemp_dir)
     trap 'rm -rf "$tmp"' RETURN
     rig="$tmp/rig"
     remote="$tmp/remote.git"
@@ -1349,7 +1402,7 @@ test_git_status_failures_preserve_artifacts_and_provider_state() {
     local tmp rig remote city provider artifact bin bead_json calls
     local fail_on source_sha stable_head stable_branch status real_git
     local status_count
-    tmp=$(mktemp -d)
+    tmp=$(physical_mktemp_dir)
     trap 'rm -rf "$tmp"' RETURN
     rig="$tmp/rig"
     remote="$tmp/remote.git"
@@ -1422,7 +1475,7 @@ test_git_status_failures_preserve_artifacts_and_provider_state() {
 test_witness_status_failure_blocks_artifact_removal() {
     local tmp rig remote city artifact gate bin real_git source_sha
     local status_count output
-    tmp=$(mktemp -d)
+    tmp=$(physical_mktemp_dir)
     trap 'rm -rf "$tmp"' RETURN
     rig="$tmp/rig"
     remote="$tmp/remote.git"
@@ -1493,7 +1546,9 @@ test_metadata_migration_and_consumers_are_canonical_first() {
         "$SHUTDOWN_FORMULA" \
         "$REFINERY_FORMULA" \
         "$GASTOWN/agents/polecat/prompt.template.md" \
-        "$GASTOWN/agents/witness/prompt.template.md" <<'PY'
+        "$GASTOWN/agents/witness/prompt.template.md" \
+        "$GASTOWN/assets/scripts/refinery/merge-push.sh" \
+        "$ARTIFACT_CLEANUP" <<'PY'
 import pathlib
 import sys
 import tomllib
@@ -1505,6 +1560,8 @@ import tomllib
     refinery_path,
     polecat_prompt_path,
     witness_prompt_path,
+    merge_push_path,
+    cleanup_script_path,
 ) = (
     pathlib.Path(arg) for arg in sys.argv[1:]
 )
@@ -1649,25 +1706,46 @@ if find_work.index("gc gastown pr-merge-reconcile") > find_work.index(
     "gc gastown task-artifact-cleanup"
 ):
     raise SystemExit("refinery does not reconcile PR state before bounded cleanup retry")
+# The merge lane lives in merge-push.sh; the merge-push step only invokes it.
+# The cleanup ordering is therefore asserted against the script, which is what
+# the refinery runs.
+mp = merge_push_path.read_text(encoding="utf-8")
+cleanup = cleanup_script_path.read_text(encoding="utf-8")
 for fragment in (
-    "**Successful task-artifact cleanup (direct only on this path):**",
-    'if [ "$MERGE_STRATEGY" = "direct" ]; then',
-    'gc gastown task-artifact-cleanup "$WORK"',
-    '"$WORK" "$PR_URL" "$PR_NUMBER" "$TARGET" "$PR_HEAD_SHA"',
-    'if [ "$PR_HEAD_SHA" != "$EXPECTED_PR_HEAD" ]',
-    "artifact_cleanup_state=pending",
-    "artifact_cleanup_state=complete",
-    "Do not invoke task-artifact cleanup on this publication path",
-    "merge_result=mr_merged",
-    "MR reconciliation MUST record",
-    "and only then run",
-    "retains that source ref after local cleanup",
+    "Do NOT re-type the lane, run any of its commands yourself, or run a second\ncleanup",
 ):
     if fragment not in merge:
-        raise SystemExit(f"refinery artifact cleanup contract missing: {fragment}")
-if 'delete_merged_branches = "true": `git push origin --delete $BRANCH`' in merge:
+        raise SystemExit(f"refinery merge-push step no longer hands the lane to the script: {fragment}")
+for fragment in (
+    "direct_cleanup() {",
+    'gc gastown task-artifact-cleanup "$WORK"',
+    '0) direct_cleanup || return $? ;;',
+    'gc gastown pr-merge-reconcile record "$WORK" "$PR_URL" "$PR_NUMBER" "$TARGET" "$PR_HEAD_SHA"',
+    'if [ "$PR_HEAD_SHA" != "$EXPECTED_PR_HEAD" ]',
+    "merge_result=mr_merged",
+    "origin/$BRANCH is deliberately kept",
+    "deletes nothing",
+):
+    if fragment not in mp:
+        raise SystemExit(f"refinery artifact cleanup contract missing from merge-push.sh: {fragment}")
+if "--set-metadata artifact_cleanup_state=complete" not in cleanup:
+    raise SystemExit("task-artifact cleanup does not record artifact_cleanup_state=complete")
+# The publication path (approval off) records the pending PR and must not run
+# cleanup: reconciliation does that after the verified close.
+publication = mp[
+    mp.index('if [ "$APPROVAL_REQUIRED" -eq 0 ]; then'):mp.index("# 4b. Breadcrumbs first")
+]
+if "task-artifact-cleanup" in publication or "direct_cleanup" in publication:
+    raise SystemExit("refinery runs task-artifact cleanup on the PR publication path")
+# MR reconciliation records its merge evidence, and only then runs cleanup.
+if mp.index("merge_result=mr_merged") > mp.index('gc bd close "$WORK" --reason "Merged to'):
+    raise SystemExit("refinery closes an MR-merged bead before recording its merge evidence")
+mr_land = mp.index("direct_close mr\nLAND_STATUS=$?")
+if "0) direct_cleanup || return $? ;;" not in mp[mr_land:]:
+    raise SystemExit("refinery does not run task-artifact cleanup after landing the MR head")
+if "git push origin --delete" in mp:
     raise SystemExit("successful direct cleanup can still delete its recovery source ref")
-if "leak the merged branch" in merge:
+if "leak the merged branch" in merge or "leak the merged branch" in mp:
     raise SystemExit("refinery still describes an intentionally retained source ref as leaked")
 polecat_prompt = polecat_prompt_path.read_text(encoding="utf-8")
 witness_prompt = witness_prompt_path.read_text(encoding="utf-8")
