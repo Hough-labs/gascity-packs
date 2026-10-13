@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sat, 10 Oct 2026 16:22:16 -0400
-Subject: [PATCH 126/148] fix(witness): never let a closed row mask a live one
+Subject: [PATCH 126/149] fix(witness): never let a closed row mask a live one
  in the liveness map (gcp-fooz4)
 
 Under gc v1.5.0 a namepool polecat acts as its alias (rig/gastown.<name>),

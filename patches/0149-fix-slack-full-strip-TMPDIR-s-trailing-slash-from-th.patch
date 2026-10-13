@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Tue, 13 Oct 2026 15:01:29 -0400
+Subject: [PATCH 149/149] fix(slack-full): strip TMPDIR's trailing slash from
+ the home-less build dirs (gcp-3hkjw)
+
+private_build_dir() joined \${TMPDIR:-/tmp} to the leaf name verbatim. macOS
+sets TMPDIR with a trailing slash (/var/folders/.../T/), so GOCACHE and
+GOPATH came out as .../T//gc-slack-adapter-<kind>-<uid>. The kernel treats
+the doubled slash as one, so the adapter still built; but
+test_gopath_is_defaulted_whenever_home_is_unset expects a single slash and
+failed both parametrized cases on darwin. GitHub CI runs Linux with TMPDIR
+unset, so nothing caught it.
+
+Strip exactly one trailing slash with \${base%/} inside private_build_dir(),
+which fixes both callers (GOCACHE and GOPATH) in one place. The script is
+fixed rather than the test: the existing assertion already states the
+intended shape and is left untouched.
+
+Add test_home_less_build_strips_a_trailing_slash_from_tmpdir, which sets the
+trailing slash itself so Linux CI exercises the case too. Red-checked: it
+fails against the unmodified run.sh with the "//" path in the assertion
+diff, and passes with the fix. Whole file: 24 passed, 2 skipped with the
+host TMPDIR and with TMPDIR unset.
+
+Origin is upstream 8e95b894 (#500, in BASELINE 520e95cb); carried as a fork
+commit so a later baseline sync can drop it once upstream has the fix.
+---
+ slack-full/adapter/run.sh               |  7 +++++--
+ slack-full/tests/test_adapter_run_sh.py | 18 ++++++++++++++++++
+ 2 files changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/slack-full/adapter/run.sh b/slack-full/adapter/run.sh
+index 4112acaf..616f4ed5 100755
+--- a/slack-full/adapter/run.sh
++++ b/slack-full/adapter/run.sh
+@@ -181,9 +181,12 @@ fi
+ # located". Fill only that gap: when Go can find a cache on its own,
+ # leave it alone so rebuilds keep sharing the normal one.
+ private_build_dir() {
+-  local uid dir
++  local uid base dir
+   uid="$(id -u)" || return 1
+-  dir="${TMPDIR:-/tmp}/$1-$uid"
++  # macOS sets TMPDIR with a trailing slash; strip it so the join below
++  # does not produce a doubled one.
++  base="${TMPDIR:-/tmp}"
++  dir="${base%/}/$1-$uid"
+   mkdir -p -m 700 "$dir" 2>/dev/null || true
+   if [[ -L "$dir" || ! -d "$dir" || ! -O "$dir" ]] || ! chmod 700 "$dir"; then
+     log "ERROR: $dir is not a private directory owned by this user; refusing to build with it"
+diff --git a/slack-full/tests/test_adapter_run_sh.py b/slack-full/tests/test_adapter_run_sh.py
+index 64b42157..15b6f90f 100644
+--- a/slack-full/tests/test_adapter_run_sh.py
++++ b/slack-full/tests/test_adapter_run_sh.py
+@@ -278,6 +278,24 @@ def test_self_heal_builds_when_home_is_unset(harness, tmp_path):
+     assert (adapter / "gc-slack-adapter").exists()
+ 
+ 
++def test_home_less_build_strips_a_trailing_slash_from_tmpdir(harness, tmp_path):
++    """macOS sets TMPDIR with a trailing slash (/var/folders/.../T/).
++    Joining it verbatim yields .../T//gc-slack-adapter-..., which is
++    harmless to the kernel but is not the path the adapter means to
++    hand the build. Set the slash here rather than inheriting it, so
++    Linux CI — where TMPDIR is unset — exercises the same case."""
++    adapter, run, go_invocations, build_environments = harness
++    tmp = tmp_path / "tmpdir"
++    tmp.mkdir()
++    proc = run(extra_env={"TMPDIR": str(tmp) + "/"}, drop_env=BARE_SUPERVISOR_ENV)
++    assert proc.returncode == 0, proc.stderr
++    uid = os.getuid()
++    assert build_environments() == [
++        f"buildenv GOCACHE={tmp}/gc-slack-adapter-gocache-{uid}"
++        f" GOPATH={tmp}/gc-slack-adapter-gopath-{uid}"
++    ], build_environments()
++
++
+ @pytest.mark.parametrize("kind", ["gocache", "gopath"])
+ def test_home_less_build_refuses_a_symlinked_build_dir(harness, tmp_path, kind):
+     adapter, run, go_invocations, _ = harness
+-- 
+2.54.0 (Apple Git-157)
+

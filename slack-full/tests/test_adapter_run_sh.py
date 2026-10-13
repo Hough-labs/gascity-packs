@@ -278,6 +278,24 @@ def test_self_heal_builds_when_home_is_unset(harness, tmp_path):
     assert (adapter / "gc-slack-adapter").exists()
 
 
+def test_home_less_build_strips_a_trailing_slash_from_tmpdir(harness, tmp_path):
+    """macOS sets TMPDIR with a trailing slash (/var/folders/.../T/).
+    Joining it verbatim yields .../T//gc-slack-adapter-..., which is
+    harmless to the kernel but is not the path the adapter means to
+    hand the build. Set the slash here rather than inheriting it, so
+    Linux CI — where TMPDIR is unset — exercises the same case."""
+    adapter, run, go_invocations, build_environments = harness
+    tmp = tmp_path / "tmpdir"
+    tmp.mkdir()
+    proc = run(extra_env={"TMPDIR": str(tmp) + "/"}, drop_env=BARE_SUPERVISOR_ENV)
+    assert proc.returncode == 0, proc.stderr
+    uid = os.getuid()
+    assert build_environments() == [
+        f"buildenv GOCACHE={tmp}/gc-slack-adapter-gocache-{uid}"
+        f" GOPATH={tmp}/gc-slack-adapter-gopath-{uid}"
+    ], build_environments()
+
+
 @pytest.mark.parametrize("kind", ["gocache", "gopath"])
 def test_home_less_build_refuses_a_symlinked_build_dir(harness, tmp_path, kind):
     adapter, run, go_invocations, _ = harness

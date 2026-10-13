@@ -181,9 +181,12 @@ fi
 # located". Fill only that gap: when Go can find a cache on its own,
 # leave it alone so rebuilds keep sharing the normal one.
 private_build_dir() {
-  local uid dir
+  local uid base dir
   uid="$(id -u)" || return 1
-  dir="${TMPDIR:-/tmp}/$1-$uid"
+  # macOS sets TMPDIR with a trailing slash; strip it so the join below
+  # does not produce a doubled one.
+  base="${TMPDIR:-/tmp}"
+  dir="${base%/}/$1-$uid"
   mkdir -p -m 700 "$dir" 2>/dev/null || true
   if [[ -L "$dir" || ! -d "$dir" || ! -O "$dir" ]] || ! chmod 700 "$dir"; then
     log "ERROR: $dir is not a private directory owned by this user; refusing to build with it"
