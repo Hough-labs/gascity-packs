@@ -181,6 +181,11 @@ GC_BD_ARGV_TAIL_ALLOWLIST: dict[Path, set[str]] = {
         " # gc-bd-argv-tail: case label matching the fake gc's argv tail",
         "restore_call='bd update winnow-iaroy --assignee=gastown__polecat-gc-8a4d'"
         " # gc-bd-argv-tail: expected argv tail, not an invocation",
+        "! grep -F 'bd update winnow-iaroy' \"$dir/calls.log\" >/dev/null ||"
+        " # gc-bd-argv-tail: stub call log, not an invocation",
+        "grep -F 'bd update winnow-iaroy"
+        " --assignee=winnow/{{ .BindingPrefix }}refinery' \"$dir/calls.log\" >/dev/null ||"
+        " # gc-bd-argv-tail: stub call log, not an invocation",
     },
     Path("gastown/tests/test_polecat_work_bead_claim_guard.sh"): {
         '"bd show") # gc-bd-argv-tail: case label matching the fake gc\'s argv tail',

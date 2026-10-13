@@ -422,7 +422,7 @@ test_live_crew_owner_is_the_slinger_and_proceeds() {
         fail "a live crew owner was declined as a duplicate pour: $out"
     grep -F 'a live winnow/specialists.spec session: that is the slinger, not a worker; proceeding.' <<<"$out" >/dev/null ||
         fail "proceeding past a live crew owner was not announced: $out"
-    ! grep -F 'bd update winnow-iaroy' "$dir/calls.log" >/dev/null ||
+    ! grep -F 'bd update winnow-iaroy' "$dir/calls.log" >/dev/null || # gc-bd-argv-tail: stub call log, not an invocation
         fail "the step was handed to the crew seat: $(cat "$dir/calls.log")"
     ! grep -F 'session nudge' "$dir/calls.log" >/dev/null ||
         fail "the guard nudged the witness about a crew slinger"
@@ -444,7 +444,7 @@ test_live_refinery_owner_is_still_declined() {
         fail "a live refinery owner was not declined: $out"
     ! grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null ||
         fail "guard declined but still fell through to the work"
-    grep -F 'bd update winnow-iaroy --assignee=winnow/{{ .BindingPrefix }}refinery' "$dir/calls.log" >/dev/null ||
+    grep -F 'bd update winnow-iaroy --assignee=winnow/{{ .BindingPrefix }}refinery' "$dir/calls.log" >/dev/null || # gc-bd-argv-tail: stub call log, not an invocation
         fail "the step was not restored to the refinery: $(cat "$dir/calls.log")"
 }
 

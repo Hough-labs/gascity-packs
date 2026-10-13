@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Tue, 13 Oct 2026 18:20:46 -0400
+Subject: [PATCH 153/153] test(gastown): mark live-owner guard call-log greps
+ as argv-tail data (gcp-4eb7j, gcp-qjkp)
+
+gcp-qjkp (a328f60f) added two assertions to test_polecat_live_owner_guard.sh
+that grep the fake gc's call log for 'bd update winnow-iaroy'. They name a bd
+subcommand as DATA, not as an invocation, but carry neither the
+gc-bd-argv-tail marker nor an allowlist entry, so
+test_shipped_pack_assets_route_beads_commands_through_gc flagged them as bare
+bd calls and went red on integration.
+
+Follow the guard's existing triple-lock convention: append the marker comment
+to the two lines (lines 425 and 447, after the trailing ||) and add the two
+stripped lines to GC_BD_ARGV_TAIL_ALLOWLIST for that exact path. No assertion
+is weakened and the guard logic is untouched; editing either line again
+re-fires the guard, as intended.
+
+Validation: pytest tests/test_no_bare_bd_commands.py goes from 1 failed,
+1 passed to 2 passed; bash -n and the live-owner guard script both exit 0.
+patches/ export regenerated in this commit (make patches).
+---
+ gastown/tests/test_polecat_live_owner_guard.sh | 4 ++--
+ tests/test_no_bare_bd_commands.py              | 5 +++++
+ 2 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/gastown/tests/test_polecat_live_owner_guard.sh b/gastown/tests/test_polecat_live_owner_guard.sh
+index 63e1c2bd..a043fa65 100755
+--- a/gastown/tests/test_polecat_live_owner_guard.sh
++++ b/gastown/tests/test_polecat_live_owner_guard.sh
+@@ -422,7 +422,7 @@ test_live_crew_owner_is_the_slinger_and_proceeds() {
+         fail "a live crew owner was declined as a duplicate pour: $out"
+     grep -F 'a live winnow/specialists.spec session: that is the slinger, not a worker; proceeding.' <<<"$out" >/dev/null ||
+         fail "proceeding past a live crew owner was not announced: $out"
+-    ! grep -F 'bd update winnow-iaroy' "$dir/calls.log" >/dev/null ||
++    ! grep -F 'bd update winnow-iaroy' "$dir/calls.log" >/dev/null || # gc-bd-argv-tail: stub call log, not an invocation
+         fail "the step was handed to the crew seat: $(cat "$dir/calls.log")"
+     ! grep -F 'session nudge' "$dir/calls.log" >/dev/null ||
+         fail "the guard nudged the witness about a crew slinger"
+@@ -444,7 +444,7 @@ test_live_refinery_owner_is_still_declined() {
+         fail "a live refinery owner was not declined: $out"
+     ! grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null ||
+         fail "guard declined but still fell through to the work"
+-    grep -F 'bd update winnow-iaroy --assignee=winnow/{{ .BindingPrefix }}refinery' "$dir/calls.log" >/dev/null ||
++    grep -F 'bd update winnow-iaroy --assignee=winnow/{{ .BindingPrefix }}refinery' "$dir/calls.log" >/dev/null || # gc-bd-argv-tail: stub call log, not an invocation
+         fail "the step was not restored to the refinery: $(cat "$dir/calls.log")"
+ }
+ 
+diff --git a/tests/test_no_bare_bd_commands.py b/tests/test_no_bare_bd_commands.py
+index 25889fad..b3c73f8e 100644
+--- a/tests/test_no_bare_bd_commands.py
++++ b/tests/test_no_bare_bd_commands.py
+@@ -181,6 +181,11 @@ GC_BD_ARGV_TAIL_ALLOWLIST: dict[Path, set[str]] = {
+         " # gc-bd-argv-tail: case label matching the fake gc's argv tail",
+         "restore_call='bd update winnow-iaroy --assignee=gastown__polecat-gc-8a4d'"
+         " # gc-bd-argv-tail: expected argv tail, not an invocation",
++        "! grep -F 'bd update winnow-iaroy' \"$dir/calls.log\" >/dev/null ||"
++        " # gc-bd-argv-tail: stub call log, not an invocation",
++        "grep -F 'bd update winnow-iaroy"
++        " --assignee=winnow/{{ .BindingPrefix }}refinery' \"$dir/calls.log\" >/dev/null ||"
++        " # gc-bd-argv-tail: stub call log, not an invocation",
+     },
+     Path("gastown/tests/test_polecat_work_bead_claim_guard.sh"): {
+         '"bd show") # gc-bd-argv-tail: case label matching the fake gc\'s argv tail',
+-- 
+2.54.0 (Apple Git-157)
+
