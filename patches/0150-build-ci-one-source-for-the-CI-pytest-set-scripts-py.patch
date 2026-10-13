@@ -1,0 +1,150 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Tue, 13 Oct 2026 15:33:16 -0400
+Subject: [PATCH 150/150] build(ci): one source for the CI pytest set,
+ scripts/pytest-ci.sh (gcp-juuft)
+
+The Python pack test list existed only inline in ci.yml's "Run Python pack
+tests" step. gc-ch43y adds that set to the rig's local gates (preflight and
+refinery), and a second inline copy in city.toml would drift the first time a
+pack's tests dir is added -- the fork already did this to the line once
+(gauntlet-tdd/tests was added after the baseline).
+
+scripts/pytest-ci.sh now holds the list and runs it. It cds to the repo root
+itself, so it runs from any directory, and passes extra args through to pytest
+("$@"). ci.yml calls it as `bash scripts/pytest-ci.sh` (bash rather than ./ so
+the step does not depend on the checkout keeping the exec bit). The directory
+list and order are unchanged from ci.yml:39, so the collected set is identical
+(2045 tests either way).
+
+test_python_pack_tests_run_through_one_script pins ci.yml to the script: the
+step's only active line is the script call, no workflow step re-inlines the
+list, and the script holds it. It fails against the old ci.yml.
+
+Two consumers of the old inline list are updated to follow it, both outside
+the bead's named file list because the change makes them wrong:
+test_repository_consumers_use_scoped_pack_path asserted the scoped pack path
+appears in ci.yml (it now reads scripts/pytest-ci.sh), and gauntlet-tdd/README
+said ci.yml names gauntlet-tdd/tests.
+
+Validation: pytest tests/test_ci_workflow.py, the full script run from the
+repo root and from gastown/, shellcheck, and the red check above.
+---
+ .github/workflows/ci.yml               |  2 +-
+ gauntlet-tdd/README.md                 |  6 ++--
+ scripts/pytest-ci.sh                   | 12 ++++++++
+ tests/test_ci_workflow.py              | 42 ++++++++++++++++++++++++++
+ tests/test_contributing_pack_rename.py |  4 ++-
+ 5 files changed, 61 insertions(+), 5 deletions(-)
+ create mode 100755 scripts/pytest-ci.sh
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 2cd90354..523de4f5 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -36,7 +36,7 @@ jobs:
+         run: python3 validate_registry.py --require-git
+ 
+       - name: Run Python pack tests
+-        run: python3 -m pytest tests contributing-to-gascity/tests gascity/tests discord/tests github/tests oversight-rig/tests slack-full/tests slack-channel/tests pr-pipeline/tests profiler/tests gauntlet-tdd/tests -q
++        run: bash scripts/pytest-ci.sh
+ 
+       # Installed once, from the published release archive, and reused by every
+       # step below that needs gc. `go install` of cmd/gc costs 4.46 GiB of
+diff --git a/gauntlet-tdd/README.md b/gauntlet-tdd/README.md
+index ae254e69..f33f067e 100644
+--- a/gauntlet-tdd/README.md
++++ b/gauntlet-tdd/README.md
+@@ -216,6 +216,6 @@ python3 -m pytest gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py -q
+ The suite is pack-local, mirroring `pr-pipeline/tests/`. It asserts the
+ formulas parse, declare their required vars, name only documented step
+ targets, keep the red gate on `gauntlet lint`, keep the lane pinned to bats,
+-and write run state with `--append-notes` rather than `--notes`. `.github/workflows/ci.yml` names `gauntlet-tdd/tests` in its pytest path
+-list — that list is explicit, not a glob, so a new pack's suite is invisible
+-to CI until it is added there.
++and write run state with `--append-notes` rather than `--notes`. `scripts/pytest-ci.sh` (the script CI's "Run Python pack tests" step calls)
++names `gauntlet-tdd/tests` in its pytest path list — that list is explicit, not
++a glob, so a new pack's suite is invisible to CI until it is added there.
+diff --git a/scripts/pytest-ci.sh b/scripts/pytest-ci.sh
+new file mode 100755
+index 00000000..18907c33
+--- /dev/null
++++ b/scripts/pytest-ci.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++# scripts/pytest-ci.sh — the Python pack test set, in one place.
++#
++# This is the set CI runs (.github/workflows/ci.yml, "Run Python pack tests")
++# and the rig gate runs. The directory list lives only here, so the two cannot
++# drift (gc-ch43y): add a pack's tests dir to this list and both pick it up.
++#
++# Usage: scripts/pytest-ci.sh [pytest args...]
++#        Extra arguments pass through to pytest, e.g. --collect-only.
++set -euo pipefail
++cd "$(dirname "$0")/.."
++exec python3 -m pytest tests contributing-to-gascity/tests gascity/tests discord/tests github/tests oversight-rig/tests slack-full/tests slack-channel/tests pr-pipeline/tests profiler/tests gauntlet-tdd/tests -q "$@"
+diff --git a/tests/test_ci_workflow.py b/tests/test_ci_workflow.py
+index 5400d9a3..3a318228 100644
+--- a/tests/test_ci_workflow.py
++++ b/tests/test_ci_workflow.py
+@@ -41,3 +41,45 @@ def test_order_scope_regression_runs_with_installed_gc() -> None:
+         "the order-scope regression is short-circuited, so a failure cannot "
+         f"fail the job: {running}"
+     )
++
++
++def test_python_pack_tests_run_through_one_script() -> None:
++    # The Python pack test set lives in scripts/pytest-ci.sh so CI and the rig
++    # gate run one list. A second copy inlined in a workflow would drift.
++    workflows = REPO_ROOT.joinpath(".github", "workflows")
++    ci = yaml.safe_load(workflows.joinpath("ci.yml").read_text(encoding="utf-8"))
++    steps = ci["jobs"]["check"]["steps"]
++    step_name = "Run Python pack tests"
++    matching = [step for step in steps if step.get("name") == step_name]
++    assert matching, (
++        f"no step named {step_name!r} in CI job 'check'; "
++        f"found: {[step.get('name') for step in steps]}"
++    )
++
++    active = [
++        line.strip()
++        for line in matching[0]["run"].splitlines()
++        if line.strip() and not line.strip().startswith("#")
++    ]
++    assert active == ["bash scripts/pytest-ci.sh"], (
++        f"{step_name!r} in ci.yml must run exactly `bash scripts/pytest-ci.sh`; "
++        f"active lines: {active}"
++    )
++
++    inline_prefix = "pytest tests contributing-to-gascity/tests"
++    for workflow_file in sorted(workflows.glob("*.yml")):
++        workflow = yaml.safe_load(workflow_file.read_text(encoding="utf-8"))
++        for job_name, job in (workflow.get("jobs") or {}).items():
++            for step in job.get("steps") or []:
++                run = step.get("run") or ""
++                assert inline_prefix not in run, (
++                    f"step {step.get('name')!r} of job {job_name!r} in "
++                    f"{workflow_file.name} re-inlines the pytest list; "
++                    "call scripts/pytest-ci.sh instead"
++                )
++
++    script = REPO_ROOT.joinpath("scripts", "pytest-ci.sh")
++    assert script.is_file(), "scripts/pytest-ci.sh is missing"
++    assert "python3 -m pytest tests contributing-to-gascity/tests" in script.read_text(
++        encoding="utf-8"
++    ), "scripts/pytest-ci.sh no longer holds the pytest list"
+diff --git a/tests/test_contributing_pack_rename.py b/tests/test_contributing_pack_rename.py
+index 898c59e5..54c4add9 100644
+--- a/tests/test_contributing_pack_rename.py
++++ b/tests/test_contributing_pack_rename.py
+@@ -36,4 +36,6 @@ def test_repository_consumers_use_scoped_pack_path() -> None:
+         assert "tree/main/contributing\"" not in text
+         assert "./contributing)" not in text
+ 
+-    assert expected_path in consumers[0].read_text(encoding="utf-8")
++    # The CI pytest list lives in scripts/pytest-ci.sh; ci.yml only calls it.
++    pytest_list = REPO_ROOT / "scripts/pytest-ci.sh"
++    assert expected_path in pytest_list.read_text(encoding="utf-8")
+-- 
+2.54.0 (Apple Git-157)
+

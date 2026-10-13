@@ -36,4 +36,6 @@ def test_repository_consumers_use_scoped_pack_path() -> None:
         assert "tree/main/contributing\"" not in text
         assert "./contributing)" not in text
 
-    assert expected_path in consumers[0].read_text(encoding="utf-8")
+    # The CI pytest list lives in scripts/pytest-ci.sh; ci.yml only calls it.
+    pytest_list = REPO_ROOT / "scripts/pytest-ci.sh"
+    assert expected_path in pytest_list.read_text(encoding="utf-8")

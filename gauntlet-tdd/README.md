@@ -216,6 +216,6 @@ python3 -m pytest gauntlet-tdd/tests/test_gauntlet_tdd_formulas.py -q
 The suite is pack-local, mirroring `pr-pipeline/tests/`. It asserts the
 formulas parse, declare their required vars, name only documented step
 targets, keep the red gate on `gauntlet lint`, keep the lane pinned to bats,
-and write run state with `--append-notes` rather than `--notes`. `.github/workflows/ci.yml` names `gauntlet-tdd/tests` in its pytest path
-list — that list is explicit, not a glob, so a new pack's suite is invisible
-to CI until it is added there.
+and write run state with `--append-notes` rather than `--notes`. `scripts/pytest-ci.sh` (the script CI's "Run Python pack tests" step calls)
+names `gauntlet-tdd/tests` in its pytest path list — that list is explicit, not
+a glob, so a new pack's suite is invisible to CI until it is added there.
