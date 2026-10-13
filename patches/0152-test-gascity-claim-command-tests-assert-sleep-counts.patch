@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Tue, 13 Oct 2026 17:17:11 -0400
+Subject: [PATCH 152/152] test(gascity): claim-command tests assert sleep
+ counts, not a 2s wall clock (gcp-tzai, gcp-dy0qj)
+
+Two claim-command tests ran gascity/commands/claim/run.sh under
+subprocess.run(timeout=2) and flaked under host load (gcp-tzai; the base-red
+bead gcp-dy0qj tracks the same flake). run.sh spawns one python3 per
+json_pick field, 12 to 16 spawns per run, which measured 0.9 to 1.3s at load
+14 and blew the 2s budget at load 95+.
+
+The 2s budget was standing in for an assertion that the PATH sleep shim
+replaced the real sleep (run.sh sleeps 2s between hook attempts and 1s between
+verify attempts). The retry count is already asserted by call count. So:
+
+- one module constant, CLAIM_COMMAND_HANG_GUARD_SECONDS = 30, replaces the
+  three timeout=2 sites (the termination-signal test changes timeout only);
+- in the bounds and unreadable-claim tests the fake sleep now logs
+  "sleep <arg>" to its own GC_TEST_SLEEPS file and returns without sleeping.
+  A separate file keeps the existing GC_TEST_CALLS line-count assertions
+  unchanged;
+- new assertions pin the sleeps: ["sleep 2", "sleep 2"] for the hook loop and
+  ["sleep 1", "sleep 1"] for the verify loop, i.e. the shim ran and the loop
+  slept exactly between its 3 attempts.
+
+Validation: mutating run.sh:184 sleep 2 -> 3 fails the bounds test on the
+new sleep assertion, and run.sh:241 sleep 1 -> 3 fails the unreadable test
+(both reverted). Out of scope: run.sh's per-field python3 spawns, an upstream
+performance change rather than a test fix.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ gascity/tests/test_formula_assets.py | 50 +++++++++++++++++++++++++---
+ 1 file changed, 45 insertions(+), 5 deletions(-)
+
+diff --git a/gascity/tests/test_formula_assets.py b/gascity/tests/test_formula_assets.py
+index 8fee9382..8fc66c82 100755
+--- a/gascity/tests/test_formula_assets.py
++++ b/gascity/tests/test_formula_assets.py
+@@ -9,6 +9,10 @@ import tempfile
+ import tomllib
+ import unittest
+ 
++# Hang guard only: the claim-command tests assert retry and sleep counts, not
++# elapsed time, so this never bounds how fast run.sh must finish under load.
++CLAIM_COMMAND_HANG_GUARD_SECONDS = 30
++
+ 
+ FORMULAS = {
+     "build-base",
+@@ -1086,7 +1090,11 @@ class FormulaAssetTests(unittest.TestCase):
+             )
+             fake_gc.chmod(0o755)
+             fake_sleep = bin_dir / "sleep"
+-            fake_sleep.write_text("#!/bin/sh\n/bin/sleep 0.05\n", encoding="utf-8")
++            fake_sleep.write_text(
++                "#!/bin/sh\n"
++                "printf 'sleep %s\\n' \"$*\" >>\"$GC_TEST_SLEEPS\"\n",
++                encoding="utf-8",
++            )
+             fake_sleep.chmod(0o755)
+             env = {
+                 **os.environ,
+@@ -1095,18 +1103,30 @@ class FormulaAssetTests(unittest.TestCase):
+                 "GC_PACK_DIR": str(root),
+                 "GC_PACK_NAME": "gc",
+                 "GC_TEST_CALLS": str(calls),
++                "GC_TEST_SLEEPS": str(tmp_path / "sleeps"),
+                 "PATH": f"{bin_dir}:/usr/bin:/bin",
+             }
+             result = subprocess.run(
+-                [str(command)], capture_output=True, env=env, text=True, timeout=2
++                [str(command)],
++                capture_output=True,
++                env=env,
++                text=True,
++                timeout=CLAIM_COMMAND_HANG_GUARD_SECONDS,
+             )
+             call_lines = calls.read_text(encoding="utf-8").splitlines()
++            sleeps = tmp_path / "sleeps"
++            sleep_lines = (
++                sleeps.read_text(encoding="utf-8").splitlines()
++                if sleeps.exists()
++                else []
++            )
+ 
+         self.assertEqual(result.returncode, 1)
+         self.assertIn("permanent hook failure", result.stderr)
+         self.assertIn("after 3 attempts", result.stderr)
+         self.assertEqual(call_lines.count("hook --claim --drain-ack --json"), 3)
+         self.assertNotIn("runtime drain-ack", call_lines)
++        self.assertEqual(sleep_lines, ["sleep 2", "sleep 2"])
+ 
+     def test_city_claim_command_drain_acks_missing_assignee_configuration(self) -> None:
+         root = pathlib.Path(__file__).resolve().parents[1]
+@@ -1241,7 +1261,11 @@ class FormulaAssetTests(unittest.TestCase):
+                 "PATH": f"{bin_dir}:/usr/bin:/bin",
+             }
+             result = subprocess.run(
+-                [str(command)], capture_output=True, env=env, text=True, timeout=2
++                [str(command)],
++                capture_output=True,
++                env=env,
++                text=True,
++                timeout=CLAIM_COMMAND_HANG_GUARD_SECONDS,
+             )
+             call_lines = calls.read_text(encoding="utf-8").splitlines()
+ 
+@@ -1335,7 +1359,11 @@ class FormulaAssetTests(unittest.TestCase):
+             )
+             fake_gc.chmod(0o755)
+             fake_sleep = bin_dir / "sleep"
+-            fake_sleep.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
++            fake_sleep.write_text(
++                "#!/bin/sh\n"
++                "printf 'sleep %s\\n' \"$*\" >>\"$GC_TEST_SLEEPS\"\n",
++                encoding="utf-8",
++            )
+             fake_sleep.chmod(0o755)
+             env = {
+                 **os.environ,
+@@ -1344,12 +1372,23 @@ class FormulaAssetTests(unittest.TestCase):
+                 "GC_PACK_DIR": str(root),
+                 "GC_PACK_NAME": "gc",
+                 "GC_TEST_CALLS": str(calls),
++                "GC_TEST_SLEEPS": str(tmp_path / "sleeps"),
+                 "PATH": f"{bin_dir}:/usr/bin:/bin",
+             }
+             result = subprocess.run(
+-                [str(command)], capture_output=True, env=env, text=True, timeout=2
++                [str(command)],
++                capture_output=True,
++                env=env,
++                text=True,
++                timeout=CLAIM_COMMAND_HANG_GUARD_SECONDS,
+             )
+             call_lines = calls.read_text(encoding="utf-8").splitlines()
++            sleeps = tmp_path / "sleeps"
++            sleep_lines = (
++                sleeps.read_text(encoding="utf-8").splitlines()
++                if sleeps.exists()
++                else []
++            )
+ 
+         self.assertEqual(result.returncode, 1, result.stderr)
+         self.assertIn("incomplete bead record", result.stderr)
+@@ -1357,6 +1396,7 @@ class FormulaAssetTests(unittest.TestCase):
+         show_call = " ".join(("b" + "d", "show", "bd-123", "--json"))
+         self.assertEqual(call_lines.count(show_call), 3)
+         self.assertEqual(len(call_lines), 4)
++        self.assertEqual(sleep_lines, ["sleep 1", "sleep 1"])
+ 
+ 
+     def test_third_party_agents_include_work_claim_protocol(self) -> None:
+-- 
+2.54.0 (Apple Git-157)
+
