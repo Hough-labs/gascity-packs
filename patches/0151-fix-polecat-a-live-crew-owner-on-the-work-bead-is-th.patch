@@ -1,0 +1,213 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Tue, 13 Oct 2026 16:11:16 -0400
+Subject: [PATCH 151/151] fix(polecat): a live crew owner on the work bead is
+ the slinger, not a worker (gcp-qjkp)
+
+The live-owner guard (gcp-mjjg, e739a413) declined on ANY live assignee of the
+work bead and restored the step to that assignee. A crew, specialist or mayor
+seat is always live and never runs polecat steps, so a bead slung while its
+author still held the assignee was refused and its step handed to a seat that
+would never run it. The molecule stranded silently (winnow-lqft1, winnow-94p5e,
+feryn-c0fo).
+
+The liveness loop now also reads the live row's template. A live owner is a
+worker only when its template is exactly the polecat or the refinery, or when
+it has no template (an unclassifiable row keeps the old fail-closed decline).
+A live non-worker prints a WARN naming the seat as the slinger and falls
+through to the existing takeover arm, which moves the work bead with
+--if-assignee. Unreadable liveness still declines, and the decline body is
+unchanged. The CLAIM_DECLINED_LIVE_OWNER prose now says the same.
+
+Tests: the live_sessions fixture gains the template and a crew and a refinery
+row; three new cases cover the crew owner proceeding, the refinery still
+declining, and a template-less row failing closed. Each of the first two was
+seen to fail with the decision mutated (every live owner declines; refinery
+dropped from the worker set) and passes on the real change.
+
+Out of scope: the unreadable-liveness path still restores the step to whatever
+owner is named, crew included (pre-fix behaviour, fails closed on purpose).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ gastown/agents/polecat/prompt.template.md     | 38 ++++++++--
+ .../tests/test_polecat_live_owner_guard.sh    | 69 ++++++++++++++++++-
+ 2 files changed, 100 insertions(+), 7 deletions(-)
+
+diff --git a/gastown/agents/polecat/prompt.template.md b/gastown/agents/polecat/prompt.template.md
+index 8f16470d..94d293f1 100644
+--- a/gastown/agents/polecat/prompt.template.md
++++ b/gastown/agents/polecat/prompt.template.md
+@@ -372,6 +372,7 @@ if [ -n "$STEP_REF" ] && { [ -z "$CLAIM_REASON" ] || [ "$CLAIM_REASON" = "claime
+       # their work and get woken back onto it.
+       GUARD_ALIVE=""
+       GUARD_OWNER_SN=""
++      GUARD_OWNER_TPL=""
+       GUARD_LIST_OK=0
+       GUARD_TRY=0
+       while [ "$GUARD_TRY" -lt 3 ]; do
+@@ -385,12 +386,29 @@ if [ -n "$STEP_REF" ] && { [ -z "$CLAIM_REASON" ] || [ "$CLAIM_REASON" = "claime
+              | .[0] // empty' 2>/dev/null)"
+           GUARD_ALIVE="$(printf '%s' "$GUARD_ROW" | jq -r '.id // empty' 2>/dev/null)"
+           GUARD_OWNER_SN="$(printf '%s' "$GUARD_ROW" | jq -r '.session_name // empty' 2>/dev/null)"
++          GUARD_OWNER_TPL="$(printf '%s' "$GUARD_ROW" | jq -r '.template // empty' 2>/dev/null)"
+           break
+         fi
+         sleep "$GUARD_TRY"
+       done
+-      if [ "$GUARD_LIST_OK" -ne 1 ] || [ -n "$GUARD_ALIVE" ]; then
+-        # Alive, or liveness unreadable. Unreadable is NOT evidence the owner is
++      # Only a live WORKER blocks. A crew, specialist or mayor seat is always
++      # live and never runs polecat steps: when one is the work bead's assignee
++      # it is the slinger, and declining would hand the step to a seat that will
++      # not run it and strand the molecule (gcp-qjkp). A worker is a live row
++      # whose template is EXACTLY the polecat or the refinery. A row with no
++      # template cannot be classified, so it is treated like a worker: that is
++      # the fail-closed behaviour from before the template check existed.
++      GUARD_DECLINE=0
++      if [ "$GUARD_LIST_OK" -ne 1 ]; then
++        GUARD_DECLINE=1
++      elif [ -n "$GUARD_ALIVE" ]; then
++        case "$GUARD_OWNER_TPL" in
++          ""|"${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat"|"${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}refinery")
++            GUARD_DECLINE=1 ;;
++        esac
++      fi
++      if [ "$GUARD_DECLINE" -eq 1 ]; then
++        # A live worker, or liveness unreadable. Unreadable is NOT evidence the owner is
+         # gone, and the two mistakes are not symmetric: declining costs one pool
+         # slot and the bead stays claimable, proceeding stomps a live worktree
+         # and corrupts whatever the owner is mid-write on. Fail closed.
+@@ -420,7 +438,11 @@ if [ -n "$STEP_REF" ] && { [ -z "$CLAIM_REASON" ] || [ "$CLAIM_REASON" = "claime
+         gc runtime drain-ack
+         exit 0
+       fi
+-      echo "WARN work bead $GUARD_WORK_BEAD still names $GUARD_OWNER, but no live session holds that identity — treating this as a resume and proceeding."
++      if [ -n "$GUARD_ALIVE" ]; then
++        echo "WARN work bead $GUARD_WORK_BEAD is held by $GUARD_OWNER, a live $GUARD_OWNER_TPL session: that is the slinger, not a worker; proceeding."
++      else
++        echo "WARN work bead $GUARD_WORK_BEAD still names $GUARD_OWNER, but no live session holds that identity — treating this as a resume and proceeding."
++      fi
+     fi
+     # Take the work bead over, as workspace-setup's claim would. It is held
+     # in_progress for the whole run, bd >= 1.3.0 refuses a plain --assignee
+@@ -509,8 +531,9 @@ falls through to unassigned pool work routed to
+ 
+ `CLAIM_DECLINED_LIVE_OWNER` means the claim itself was clean — the step bead was
+ genuinely open and unassigned when you took it — but the molecule's WORK bead is
+-still held by a DIFFERENT session that is still alive. That is a duplicate pour,
+-not a handoff, and a clean claim cannot distinguish the two on its own: a step
++still held by another POLECAT or by the REFINERY that is still alive (or session
++liveness could not be read). That is a duplicate pour, not a handoff, and a clean
++claim cannot distinguish the two on its own: a step
+ bead released out from under a live owner is byte-identical to one that was
+ never claimed. The work bead is the tiebreaker because it is never routed to the
+ pool and so is never released. Declining costs one pool slot; proceeding stomps
+@@ -518,6 +541,11 @@ a live worktree, so the guard also declines when session liveness is unreadable.
+ Do NOT re-run the claim to get a different answer, and do NOT work the bead
+ anyway — the block has already restored the step to its owner and drained.
+ 
++A live crew, specialist or mayor seat on the work bead does not decline. That seat
++is the slinger, not a worker: it never runs polecat steps, so handing it the step
++would strand the molecule. The guard prints a `WARN` naming the seat, proceeds,
++and takes the work bead over from it.
++
+ `STEP_REPOINTED` is not a bail-out and never drain-acks. It means the assigned
+ tier handed back this session's own in-flight WORK bead — which
+ `mol-polecat-work` holds `in_progress` for the whole run, so a second sling
+diff --git a/gastown/tests/test_polecat_live_owner_guard.sh b/gastown/tests/test_polecat_live_owner_guard.sh
+index beade27f..63e1c2bd 100755
+--- a/gastown/tests/test_polecat_live_owner_guard.sh
++++ b/gastown/tests/test_polecat_live_owner_guard.sh
+@@ -118,8 +118,10 @@ new_case() {
+ live_sessions() {
+     cat >"$1/sessions.json" <<'JSON'
+ {"sessions":[
+-  {"id":"gc-8a4d","name":"winnow/gastown.furiosa","session_name":"gastown__polecat-gc-8a4d","alias":"winnow/gastown.furiosa","state":"active","closed":false},
+-  {"id":"gc-psfm","name":"winnow/gastown.nux","session_name":"gastown__polecat-gc-psfm","alias":"winnow/gastown.nux","state":"active","closed":false}
++  {"id":"gc-8a4d","name":"winnow/gastown.furiosa","session_name":"gastown__polecat-gc-8a4d","alias":"winnow/gastown.furiosa","template":"winnow/{{ .BindingPrefix }}polecat","state":"active","closed":false},
++  {"id":"gc-psfm","name":"winnow/gastown.nux","session_name":"gastown__polecat-gc-psfm","alias":"winnow/gastown.nux","template":"winnow/{{ .BindingPrefix }}polecat","state":"active","closed":false},
++  {"id":"gc-crw1","name":"winnow/specialists.thomas","session_name":"winnow--specialists__thomas","alias":"winnow/specialists.thomas","template":"winnow/specialists.spec","state":"active","closed":false},
++  {"id":"gc-ref1","name":"winnow/{{ .BindingPrefix }}refinery","session_name":"winnow--gastown__refinery","alias":"winnow/{{ .BindingPrefix }}refinery","template":"winnow/{{ .BindingPrefix }}refinery","state":"active","closed":false}
+ ]}
+ JSON
+ }
+@@ -403,6 +405,66 @@ test_unknown_claim_reason_still_checks() {
+         fail "an unknown claim reason skipped the guard instead of checking: $out"
+ }
+ 
++# gcp-qjkp: a crew, specialist or mayor seat is always live and never runs
++# polecat steps. When one is still the work bead's assignee it is the slinger,
++# not a worker, and declining would hand the step to a seat that will not run
++# it. Only a live POLECAT or REFINERY owner is a worker.
++test_live_crew_owner_is_the_slinger_and_proceeds() {
++    local dir out line
++    dir=$(new_case)
++    live_sessions "$dir"
++
++    out=$(run_guard "$dir" "winnow/specialists.thomas" "winnow/gastown.nux")
++
++    grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null ||
++        fail "a live crew owner stalled the molecule: $out"
++    ! grep -F 'CLAIM_DECLINED_LIVE_OWNER' <<<"$out" >/dev/null ||
++        fail "a live crew owner was declined as a duplicate pour: $out"
++    grep -F 'a live winnow/specialists.spec session: that is the slinger, not a worker; proceeding.' <<<"$out" >/dev/null ||
++        fail "proceeding past a live crew owner was not announced: $out"
++    ! grep -F 'bd update winnow-iaroy' "$dir/calls.log" >/dev/null ||
++        fail "the step was handed to the crew seat: $(cat "$dir/calls.log")"
++    ! grep -F 'session nudge' "$dir/calls.log" >/dev/null ||
++        fail "the guard nudged the witness about a crew slinger"
++    ! grep -F 'runtime drain-ack' "$dir/calls.log" >/dev/null ||
++        fail "the guard drained on a crew slinger"
++    line=$(takeover_line winnow/gastown.nux "$dir" winnow/specialists.thomas)
++    [[ -n "$line" ]] ||
++        fail "the work bead was not taken over from the crew seat: $(cat "$dir/calls.log")"
++}
++
++test_live_refinery_owner_is_still_declined() {
++    local dir out
++    dir=$(new_case)
++    live_sessions "$dir"
++
++    out=$(run_guard "$dir" "winnow/{{ .BindingPrefix }}refinery" "winnow/gastown.nux")
++
++    grep -F 'CLAIM_DECLINED_LIVE_OWNER winnow-iaroy' <<<"$out" >/dev/null ||
++        fail "a live refinery owner was not declined: $out"
++    ! grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null ||
++        fail "guard declined but still fell through to the work"
++    grep -F 'bd update winnow-iaroy --assignee=winnow/{{ .BindingPrefix }}refinery' "$dir/calls.log" >/dev/null ||
++        fail "the step was not restored to the refinery: $(cat "$dir/calls.log")"
++}
++
++# A live row with no template cannot be classified. It is treated like a worker,
++# which is how every live owner was treated before the template check.
++test_live_owner_without_a_template_fails_closed() {
++    local dir out
++    dir=$(new_case)
++    cat >"$dir/sessions.json" <<'JSON'
++{"sessions":[{"id":"gc-8a4d","name":"winnow/gastown.furiosa","session_name":"gastown__polecat-gc-8a4d","state":"active","closed":false}]}
++JSON
++
++    out=$(run_guard "$dir" "gastown__polecat-gc-8a4d" "gastown__polecat-gc-psfm")
++
++    grep -F 'CLAIM_DECLINED_LIVE_OWNER' <<<"$out" >/dev/null ||
++        fail "a live owner with no template was not declined: $out"
++    ! grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null ||
++        fail "guard fell through on a live owner it could not classify"
++}
++
+ test_live_owner_is_declined_and_the_step_restored
+ test_restore_takes_the_session_name_from_the_live_row
+ test_dead_owner_is_a_resume_and_proceeds
+@@ -417,5 +479,8 @@ test_unresolvable_molecule_proceeds_unguarded
+ test_work_bead_claim_skips_the_guard
+ test_preassigned_step_skips_the_walk_entirely
+ test_unknown_claim_reason_still_checks
++test_live_crew_owner_is_the_slinger_and_proceeds
++test_live_refinery_owner_is_still_declined
++test_live_owner_without_a_template_fails_closed
+ 
+ echo "polecat live-owner guard tests passed"
+-- 
+2.54.0 (Apple Git-157)
+

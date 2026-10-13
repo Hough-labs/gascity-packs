@@ -118,8 +118,10 @@ new_case() {
 live_sessions() {
     cat >"$1/sessions.json" <<'JSON'
 {"sessions":[
-  {"id":"gc-8a4d","name":"winnow/gastown.furiosa","session_name":"gastown__polecat-gc-8a4d","alias":"winnow/gastown.furiosa","state":"active","closed":false},
-  {"id":"gc-psfm","name":"winnow/gastown.nux","session_name":"gastown__polecat-gc-psfm","alias":"winnow/gastown.nux","state":"active","closed":false}
+  {"id":"gc-8a4d","name":"winnow/gastown.furiosa","session_name":"gastown__polecat-gc-8a4d","alias":"winnow/gastown.furiosa","template":"winnow/{{ .BindingPrefix }}polecat","state":"active","closed":false},
+  {"id":"gc-psfm","name":"winnow/gastown.nux","session_name":"gastown__polecat-gc-psfm","alias":"winnow/gastown.nux","template":"winnow/{{ .BindingPrefix }}polecat","state":"active","closed":false},
+  {"id":"gc-crw1","name":"winnow/specialists.thomas","session_name":"winnow--specialists__thomas","alias":"winnow/specialists.thomas","template":"winnow/specialists.spec","state":"active","closed":false},
+  {"id":"gc-ref1","name":"winnow/{{ .BindingPrefix }}refinery","session_name":"winnow--gastown__refinery","alias":"winnow/{{ .BindingPrefix }}refinery","template":"winnow/{{ .BindingPrefix }}refinery","state":"active","closed":false}
 ]}
 JSON
 }
@@ -403,6 +405,66 @@ test_unknown_claim_reason_still_checks() {
         fail "an unknown claim reason skipped the guard instead of checking: $out"
 }
 
+# gcp-qjkp: a crew, specialist or mayor seat is always live and never runs
+# polecat steps. When one is still the work bead's assignee it is the slinger,
+# not a worker, and declining would hand the step to a seat that will not run
+# it. Only a live POLECAT or REFINERY owner is a worker.
+test_live_crew_owner_is_the_slinger_and_proceeds() {
+    local dir out line
+    dir=$(new_case)
+    live_sessions "$dir"
+
+    out=$(run_guard "$dir" "winnow/specialists.thomas" "winnow/gastown.nux")
+
+    grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null ||
+        fail "a live crew owner stalled the molecule: $out"
+    ! grep -F 'CLAIM_DECLINED_LIVE_OWNER' <<<"$out" >/dev/null ||
+        fail "a live crew owner was declined as a duplicate pour: $out"
+    grep -F 'a live winnow/specialists.spec session: that is the slinger, not a worker; proceeding.' <<<"$out" >/dev/null ||
+        fail "proceeding past a live crew owner was not announced: $out"
+    ! grep -F 'bd update winnow-iaroy' "$dir/calls.log" >/dev/null ||
+        fail "the step was handed to the crew seat: $(cat "$dir/calls.log")"
+    ! grep -F 'session nudge' "$dir/calls.log" >/dev/null ||
+        fail "the guard nudged the witness about a crew slinger"
+    ! grep -F 'runtime drain-ack' "$dir/calls.log" >/dev/null ||
+        fail "the guard drained on a crew slinger"
+    line=$(takeover_line winnow/gastown.nux "$dir" winnow/specialists.thomas)
+    [[ -n "$line" ]] ||
+        fail "the work bead was not taken over from the crew seat: $(cat "$dir/calls.log")"
+}
+
+test_live_refinery_owner_is_still_declined() {
+    local dir out
+    dir=$(new_case)
+    live_sessions "$dir"
+
+    out=$(run_guard "$dir" "winnow/{{ .BindingPrefix }}refinery" "winnow/gastown.nux")
+
+    grep -F 'CLAIM_DECLINED_LIVE_OWNER winnow-iaroy' <<<"$out" >/dev/null ||
+        fail "a live refinery owner was not declined: $out"
+    ! grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null ||
+        fail "guard declined but still fell through to the work"
+    grep -F 'bd update winnow-iaroy --assignee=winnow/{{ .BindingPrefix }}refinery' "$dir/calls.log" >/dev/null ||
+        fail "the step was not restored to the refinery: $(cat "$dir/calls.log")"
+}
+
+# A live row with no template cannot be classified. It is treated like a worker,
+# which is how every live owner was treated before the template check.
+test_live_owner_without_a_template_fails_closed() {
+    local dir out
+    dir=$(new_case)
+    cat >"$dir/sessions.json" <<'JSON'
+{"sessions":[{"id":"gc-8a4d","name":"winnow/gastown.furiosa","session_name":"gastown__polecat-gc-8a4d","state":"active","closed":false}]}
+JSON
+
+    out=$(run_guard "$dir" "gastown__polecat-gc-8a4d" "gastown__polecat-gc-psfm")
+
+    grep -F 'CLAIM_DECLINED_LIVE_OWNER' <<<"$out" >/dev/null ||
+        fail "a live owner with no template was not declined: $out"
+    ! grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null ||
+        fail "guard fell through on a live owner it could not classify"
+}
+
 test_live_owner_is_declined_and_the_step_restored
 test_restore_takes_the_session_name_from_the_live_row
 test_dead_owner_is_a_resume_and_proceeds
@@ -417,5 +479,8 @@ test_unresolvable_molecule_proceeds_unguarded
 test_work_bead_claim_skips_the_guard
 test_preassigned_step_skips_the_walk_entirely
 test_unknown_claim_reason_still_checks
+test_live_crew_owner_is_the_slinger_and_proceeds
+test_live_refinery_owner_is_still_declined
+test_live_owner_without_a_template_fails_closed
 
 echo "polecat live-owner guard tests passed"

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sat, 10 Oct 2026 16:39:16 -0400
-Subject: [PATCH 140/150] docs(gastown): make claim-status and role-prompt
+Subject: [PATCH 140/151] docs(gastown): make claim-status and role-prompt
  prose match gc 1.5.0 and the restack (gcp-fooz4)
 
 - approval-fallacy.template.md and the polecat prompt said a claimed step

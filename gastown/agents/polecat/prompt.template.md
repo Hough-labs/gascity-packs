@@ -372,6 +372,7 @@ if [ -n "$STEP_REF" ] && { [ -z "$CLAIM_REASON" ] || [ "$CLAIM_REASON" = "claime
       # their work and get woken back onto it.
       GUARD_ALIVE=""
       GUARD_OWNER_SN=""
+      GUARD_OWNER_TPL=""
       GUARD_LIST_OK=0
       GUARD_TRY=0
       while [ "$GUARD_TRY" -lt 3 ]; do
@@ -385,12 +386,29 @@ if [ -n "$STEP_REF" ] && { [ -z "$CLAIM_REASON" ] || [ "$CLAIM_REASON" = "claime
              | .[0] // empty' 2>/dev/null)"
           GUARD_ALIVE="$(printf '%s' "$GUARD_ROW" | jq -r '.id // empty' 2>/dev/null)"
           GUARD_OWNER_SN="$(printf '%s' "$GUARD_ROW" | jq -r '.session_name // empty' 2>/dev/null)"
+          GUARD_OWNER_TPL="$(printf '%s' "$GUARD_ROW" | jq -r '.template // empty' 2>/dev/null)"
           break
         fi
         sleep "$GUARD_TRY"
       done
-      if [ "$GUARD_LIST_OK" -ne 1 ] || [ -n "$GUARD_ALIVE" ]; then
-        # Alive, or liveness unreadable. Unreadable is NOT evidence the owner is
+      # Only a live WORKER blocks. A crew, specialist or mayor seat is always
+      # live and never runs polecat steps: when one is the work bead's assignee
+      # it is the slinger, and declining would hand the step to a seat that will
+      # not run it and strand the molecule (gcp-qjkp). A worker is a live row
+      # whose template is EXACTLY the polecat or the refinery. A row with no
+      # template cannot be classified, so it is treated like a worker: that is
+      # the fail-closed behaviour from before the template check existed.
+      GUARD_DECLINE=0
+      if [ "$GUARD_LIST_OK" -ne 1 ]; then
+        GUARD_DECLINE=1
+      elif [ -n "$GUARD_ALIVE" ]; then
+        case "$GUARD_OWNER_TPL" in
+          ""|"${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat"|"${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}refinery")
+            GUARD_DECLINE=1 ;;
+        esac
+      fi
+      if [ "$GUARD_DECLINE" -eq 1 ]; then
+        # A live worker, or liveness unreadable. Unreadable is NOT evidence the owner is
         # gone, and the two mistakes are not symmetric: declining costs one pool
         # slot and the bead stays claimable, proceeding stomps a live worktree
         # and corrupts whatever the owner is mid-write on. Fail closed.
@@ -420,7 +438,11 @@ if [ -n "$STEP_REF" ] && { [ -z "$CLAIM_REASON" ] || [ "$CLAIM_REASON" = "claime
         gc runtime drain-ack
         exit 0
       fi
-      echo "WARN work bead $GUARD_WORK_BEAD still names $GUARD_OWNER, but no live session holds that identity — treating this as a resume and proceeding."
+      if [ -n "$GUARD_ALIVE" ]; then
+        echo "WARN work bead $GUARD_WORK_BEAD is held by $GUARD_OWNER, a live $GUARD_OWNER_TPL session: that is the slinger, not a worker; proceeding."
+      else
+        echo "WARN work bead $GUARD_WORK_BEAD still names $GUARD_OWNER, but no live session holds that identity — treating this as a resume and proceeding."
+      fi
     fi
     # Take the work bead over, as workspace-setup's claim would. It is held
     # in_progress for the whole run, bd >= 1.3.0 refuses a plain --assignee
@@ -509,14 +531,20 @@ falls through to unassigned pool work routed to
 
 `CLAIM_DECLINED_LIVE_OWNER` means the claim itself was clean — the step bead was
 genuinely open and unassigned when you took it — but the molecule's WORK bead is
-still held by a DIFFERENT session that is still alive. That is a duplicate pour,
-not a handoff, and a clean claim cannot distinguish the two on its own: a step
+still held by another POLECAT or by the REFINERY that is still alive (or session
+liveness could not be read). That is a duplicate pour, not a handoff, and a clean
+claim cannot distinguish the two on its own: a step
 bead released out from under a live owner is byte-identical to one that was
 never claimed. The work bead is the tiebreaker because it is never routed to the
 pool and so is never released. Declining costs one pool slot; proceeding stomps
 a live worktree, so the guard also declines when session liveness is unreadable.
 Do NOT re-run the claim to get a different answer, and do NOT work the bead
 anyway — the block has already restored the step to its owner and drained.
+
+A live crew, specialist or mayor seat on the work bead does not decline. That seat
+is the slinger, not a worker: it never runs polecat steps, so handing it the step
+would strand the molecule. The guard prints a `WARN` naming the seat, proceeds,
+and takes the work bead over from it.
 
 `STEP_REPOINTED` is not a bail-out and never drain-acks. It means the assigned
 tier handed back this session's own in-flight WORK bead — which
