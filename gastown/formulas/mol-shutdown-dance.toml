@@ -438,7 +438,13 @@ if [ -n "$target_bead" ] && [ -n "${bead_json:-}" ]; then
 
   echo "target_bead=$target_bead updated_at=$bead_updated artifact_dir=$artifact_dir"
   # Bead moved within the 7-minute interrogation window (60s+120s+240s = 420s)?
-  bead_epoch="$(date -u -d "$bead_updated" +%s 2>/dev/null)" || {
+  # GNU `date -d` first, BSD `date -j -f` second: the fleet includes macOS,
+  # where -d is not a date. BSD cannot parse fractional seconds or a bare Z,
+  # so strip the one and spell the other +0000. The sed program has no
+  # backslash on purpose: this is a TOML basic string.
+  bead_norm="$(printf '%s' "$bead_updated" | sed -E 's/[.][0-9]+//; s/Z$/+0000/')"
+  bead_epoch="$(date -u -d "$bead_updated" +%s 2>/dev/null)" ||
+  bead_epoch="$(date -u -j -f '%Y-%m-%dT%H:%M:%S%z' "$bead_norm" +%s 2>/dev/null)" || {
     bead_epoch=0
     progress=unknown
   }

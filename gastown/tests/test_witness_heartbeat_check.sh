@@ -42,10 +42,15 @@ run_check() {
     ERR=$(cat "$ERRFILE")
 }
 
+# Epoch seconds -> RFC3339 UTC. GNU `date -d @N` first, BSD `date -r N` second,
+# so the fixtures build on both hosts the script under test runs on.
+epoch_to_rfc3339() {
+    date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null ||
+        date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ
+}
+
 ts_ago() {
-    # Seconds ago -> RFC3339 UTC. GNU date here; the script under test is what
-    # needs BSD portability, not this Linux-only CI test.
-    date -u -d "@$(( $(date -u +%s) - $1 ))" +%Y-%m-%dT%H:%M:%SZ
+    epoch_to_rfc3339 "$(( $(date -u +%s) - $1 ))"
 }
 
 tmp=$(mktemp -d)
@@ -119,7 +124,7 @@ test_fractional_seconds_parse() {
 }
 
 test_future_heartbeat_is_clock_skew_not_stale() {
-    run_check "$(printf '{"sessions":[{"id":"s1","name":"alpha/witness","rig":"alpha","state":"asleep","last_active":"%s","closed":false}]}' "$(date -u -d "@$(( $(date -u +%s) + 3600 ))" +%Y-%m-%dT%H:%M:%SZ)")"
+    run_check "$(printf '{"sessions":[{"id":"s1","name":"alpha/witness","rig":"alpha","state":"asleep","last_active":"%s","closed":false}]}' "$(epoch_to_rfc3339 "$(( $(date -u +%s) + 3600 ))")")"
     [ "$RC" -eq 0 ] || fail "a future heartbeat is skew, not staleness, got $RC ($OUT)"
     printf '%s' "$OUT" | grep -q '^fresh	alpha	alpha/witness	asleep	0	' ||
         fail "a future heartbeat should clamp to age 0, got: $OUT"
@@ -256,8 +261,24 @@ test_uses_no_bash4_only_constructs() {
 test_formula_dispatches_via_pack_command_without_agent_pack_env() {
     grep -Fqx 'GASTOWN_WITNESS_STALE_MIN={{witness_stale_min}} gc gastown witness-heartbeat-check' "$FORMULA" ||
         fail "health-scan must invoke the heartbeat check through the gastown command namespace"
-    ! grep -Fq 'GC_PACK_DIR' "$FORMULA" ||
-        fail "agent formulas must not assume managed sessions receive GC_PACK_DIR"
+    # Scoped to the step that runs the heartbeat check. The formula's
+    # dolt-push-divergence step legitimately keeps GC_PACK_DIR as a fallback
+    # behind the formula-source lookup (gcp-oo0v); the rule this pins is that
+    # the heartbeat dispatch never depends on it.
+    python3 - "$FORMULA" <<'PY' ||
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as handle:
+    formula = tomllib.load(handle)
+steps = [s for s in formula["steps"] if "witness-heartbeat-check" in s.get("description", "")]
+if not steps:
+    raise SystemExit("no step runs witness-heartbeat-check")
+for step in steps:
+    if "GC_PACK_DIR" in step["description"]:
+        raise SystemExit(f"step {step['id']} depends on GC_PACK_DIR")
+PY
+        fail "the heartbeat step must not assume managed sessions receive GC_PACK_DIR"
     [ -x "$COMMAND" ] ||
         fail "the witness-heartbeat-check pack command must be executable"
 

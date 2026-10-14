@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sat, 10 Oct 2026 16:28:18 -0400
-Subject: [PATCH 131/154] docs(ci): describe the archive install, not the
+Subject: [PATCH 131/155] docs(ci): describe the archive install, not the
  go-module flow (gcp-fooz4)
 
 The release-compatibility design doc said the inference workflows
