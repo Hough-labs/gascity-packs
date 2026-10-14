@@ -151,6 +151,12 @@ bd)
             shift
         done
         ;;
+    note)
+        # `note <work> --stdin`: the body arrives on stdin and is appended to the
+        # notes file (lane-wedge.sh mark notes the bead it parks).
+        { [ "$#" -eq 4 ] && [ "$3" = "$GC_STUB_WORK" ] && [ "$4" = --stdin ]; } || unexpected
+        cat >>"$GC_STUB_NOTES"
+        ;;
     close)
         { [ "$#" -eq 5 ] && [ "$3" = "$GC_STUB_WORK" ] && [ "$4" = --reason ]; } || unexpected
         edit_bead --arg r "$5" '.[0].status = "closed" | .[0].close_reason = $r'
@@ -520,6 +526,7 @@ run_process() {
             GC_BEAD_ID="$WISP_ID" GC_AGENT="$REFINERY_AGENT" GC_RIG=testrig \
             GC_PACK_DIR="$PACK_DIR" WORK="$WORK_ID" \
             GC_STUB_LOG="$T/gc.log" GC_STUB_BEAD="$BEAD" GC_STUB_WORK="$WORK_ID" \
+            GC_STUB_NOTES="$T/notes" \
             GC_STUB_NEXT_WISP="$NEXT_WISP_ID" GC_STUB_FORMULA_SOURCE= \
             GH_STUB_LOG="$T/gh.log" STUB_PR="$T/pr.json" STUB_ORIGIN_DIR="$ORIGIN" \
             STUB_BODY_CAPTURE="$T/pr-body.md" STUB_GH_MISSING="$STUB_GH_MISSING" \
@@ -795,6 +802,7 @@ HOOK
 }
 
 test_lane_direct_push_veto_status_7() {
+    local marker
     new_case direct_push_veto_status_7
     build_rig unmerged
     write_bead
@@ -811,8 +819,24 @@ HOOK
     expect "push attempts" "$(wc -l <"$T/push-attempts" | tr -d ' ')" 1
     expect_no_merge_metadata
     expect_not_closed
-    expect_drained
-    expect_status 1
+    # The lane parks (gcp-ubv2): the step continues on with the marker written,
+    # one escalation sent and the bead kept, never drained.
+    expect_not_drained
+    expect_status 0
+    output_has 'merge-push: status 7: the lane is wedged; continue to patrol-summary' ||
+        fail "the output does not say the lane is wedged"
+    marker="$(git -C "$REFINERY" rev-parse --absolute-git-dir)/refinery-lane-wedged.json"
+    [ -f "$marker" ] || fail "no lane-wedge marker at $marker"
+    expect "marker target" "$(jq -r '.target' "$marker")" "$TARGET_NAME"
+    expect "marker target_sha" "$(jq -r '.target_sha' "$marker")" "$TARGET_BEFORE"
+    expect "marker heads" "$(jq -c '.heads' "$marker")" "[\"$WORK_ID\"]"
+    expect "marker escalation" "$(jq -r '.escalation' "$marker")" sent
+    expect "ESCALATION mails" \
+        "$(grep -cF "gc mail send mayor/ --notify -s ESCALATION: merge lane wedged on testrig/$TARGET_NAME at ${TARGET_BEFORE:0:12} [HIGH] -m " "$T/gc.log")" 1
+    grep -qF "stays assigned to the refinery and is not rejected" "$T/notes" ||
+        fail "the bead was not noted as kept; notes: $(cat "$T/notes" 2>/dev/null)"
+    expect "assignee" "$(bead assignee)" "$REFINERY_AGENT"
+    expect "status" "$(bead status)" in_progress
     expect_target_unchanged
     end_case
 }
@@ -1266,6 +1290,9 @@ if [ "$SCRIPT" != "$PACK_DIR/assets/scripts/refinery/merge-push.sh" ]; then
     mkdir -p "$HARNESS/pack/assets/scripts/refinery"
     cp -f "$SCRIPT" "$HARNESS/pack/assets/scripts/refinery/merge-push.sh"
     chmod +x "$HARNESS/pack/assets/scripts/refinery/merge-push.sh"
+    # The 7) arm resolves lane-wedge.sh beside merge-push.sh.
+    cp -f "$PACK_DIR/assets/scripts/refinery/lane-wedge.sh" "$HARNESS/pack/assets/scripts/refinery/lane-wedge.sh"
+    chmod +x "$HARNESS/pack/assets/scripts/refinery/lane-wedge.sh"
     PACK_DIR="$HARNESS/pack"
 fi
 

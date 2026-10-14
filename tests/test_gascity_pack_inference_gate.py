@@ -1853,6 +1853,14 @@ def test_validate_gastown_orchestration_contract_rejects_a_pack_without_the_merg
         gascity_pack_inference_gate.validate_gastown_orchestration_contract(pack)
 
 
+def test_validate_gastown_orchestration_contract_rejects_a_pack_without_the_lane_wedge_script(tmp_path) -> None:
+    pack = write_gastown_contract_pack(tmp_path)
+    (pack / "assets" / "scripts" / "refinery" / "lane-wedge.sh").unlink()
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="missing script file"):
+        gascity_pack_inference_gate.validate_gastown_orchestration_contract(pack)
+
+
 def test_validate_gastown_orchestration_contract_accepts_the_fixture_pack_with_acceptance_check(tmp_path) -> None:
     pack = write_gastown_contract_pack(tmp_path)
 

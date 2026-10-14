@@ -31,7 +31,7 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 FORMULA="${FORMULA:-$ROOT/gastown/formulas/mol-refinery-patrol.toml}"
 BATCH_SCRIPT="${BATCH_SCRIPT:-$ROOT/gastown/assets/scripts/refinery/merge-batch.sh}"
-EXPECTED_CASES=9
+EXPECTED_CASES=10
 
 REFINERY_AGENT=testrig/gastown.refinery
 HEAD_ID=wb-head
@@ -335,6 +335,20 @@ case_find_work_truncates() {
     end_case
 }
 
+case_find_work_wedged_lane_does_not_batch() {
+    new_case find_work_wedged_lane_does_not_batch
+    # LANE_WEDGE_ONLY is what the lane-wedge block, which sits above the extracted
+    # fence, leaves behind while the lane is parked (gcp-ubv2).
+    run_find_work 3 GC_STUB_ASSIGNED="$ASSIGNED_TWO" STUB_SELECT_OUT="$HEAD_ID\n$SECOND_ID" \
+        LANE_WEDGE_ONLY=base-red
+    assert_eq "merge-batch.sh argv log" "" "$(batch_calls)"
+    assert_no_manifest "a wedged lane"
+    grep -qx 'INFO: the lane is wedged; batching off.' "$T/out" ||
+        fail "stdout has no 'INFO: the lane is wedged; batching off.' line"
+    grep -q -- '--label=base-red' "$T/gc.log" || fail "the scan did not carry --label=base-red"
+    end_case
+}
+
 # --- rebase ---------------------------------------------------------------------------
 
 case_rebase_stack() {
@@ -433,6 +447,18 @@ case_merge_push_lanes() {
     assert_eq "merge-push.sh argv log, land 2" "" "$(push_calls)"
     grep -q '^gc runtime drain-ack' "$T/gc.log" || fail "land 2 did not drain-ack"
 
+    # Status 7 parks the lane through lane-wedge.sh. None is staged beside the
+    # stub, so the marker cannot be written and the block must STOP and drain
+    # rather than continue with nothing recorded.
+    : >"$T/batch.log"
+    : >"$T/gc.log"
+    run_block "$T/invoke.sh" WORK="$HEAD_ID" STUB_LAND_STATUS=7
+    assert_eq "block status, land 7 with no lane-wedge.sh" 1 "$?"
+    assert_eq "merge-batch.sh argv log, land 7" "land --head $HEAD_ID" "$(batch_calls)"
+    grep -q '^gc runtime drain-ack' "$T/gc.log" || fail "land 7 with no lane-wedge.sh did not drain-ack"
+    grep -q 'the lane-wedge marker was not written' "$T/out" ||
+        fail "stdout does not say the lane-wedge marker was not written"
+
     : >"$T/batch.log"
     : >"$T/gc.log"
     chmod -x "$BATCH_STUB"
@@ -508,6 +534,7 @@ case_find_work_rendered
 case_find_work_select_one
 case_find_work_routed
 case_find_work_truncates
+case_find_work_wedged_lane_does_not_batch
 case_rebase_stack
 case_batch_red
 case_merge_push_lanes

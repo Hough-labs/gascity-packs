@@ -167,6 +167,15 @@ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
         "acceptance-check.sh",
         'packet --work "$ACK_ID"',
         'record --work "$ACK_ID" --verdict SKIP',
+        # The lane wedge (gcp-ubv2): a push refused while the target stood still
+        # parks the lane through lane-wedge.sh instead of draining with the bead
+        # still assigned, and find-work reads the same script to filter its scan.
+        # A step that stops calling it is a refinery that re-selects a refused
+        # head every session until the restart circuit breaker opens.
+        "lane-wedge.sh",
+        'mark --work "$WORK" --log "$MP_LOG"',
+        '"$LANE_WEDGE" check',
+        '${LANE_WEDGE_ONLY:+--label="$LANE_WEDGE_ONLY"}',
     ),
     "mol-witness-patrol": (
         "LIVENESS_MAP=$(jq -n",
@@ -377,6 +386,13 @@ GASTOWN_SCRIPT_CONTRACTS = {
         'pk_base=$(ac_git merge-base "$pk_target_tip" "$pk_tip" 2>/dev/null)',
         '--set-metadata "acceptance_check_tip=$rec_tip" \\',
         'if ! gc bd update "$rec_work" --add-label "$rec_label" >/dev/null; then',
+    ),
+    # The lane wedge's marker and escalation (gcp-ubv2): the marker file is the
+    # one thing find-work and the mayor's release both name, and the mail is the
+    # only signal a human gets that the lane is parked.
+    "assets/scripts/refinery/lane-wedge.sh": (
+        "refinery-lane-wedged.json",
+        "gc mail send mayor/ --notify",
     ),
 }
 METHODOLOGY_FLOW_CONTRACTS = {

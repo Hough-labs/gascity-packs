@@ -316,19 +316,55 @@ fi
 
 Search for work beads assigned to you — unclaimed, or already claimed by you —
 then for work merely routed to you, then decide whether this iteration batches.
-Run the whole fence in ONE shell: the batch block reads `WORK` and `ROUTED`
-from the query above it.
+Run the whole fence in ONE shell: the query reads `LANE_WEDGE_ONLY` and
+`LANE_WEDGE_SKIP` from the lane-wedge block above it, and the batch block reads
+`WORK` and `ROUTED` from the query.
 ```bash
+# --- find-work-lane-wedge:begin ---
+# A lane parked by merge-push's status 7 (gcp-ubv2) limits the scan below to
+# base-red beads and skips every head the remote already refused.
+LANE_WEDGE_ONLY=""
+LANE_WEDGE_SKIP=""
+LW_CITY="${GC_CITY:-${GC_CITY_PATH:-}}"
+if [ -n "$LW_CITY" ]; then
+  LW_FORMULA_JSON=$(gc formula list --city "$LW_CITY" --json 2>/dev/null)
+else
+  LW_FORMULA_JSON=$(gc formula list --json 2>/dev/null)
+fi
+LW_FORMULA_SRC=$(printf '%s' "$LW_FORMULA_JSON" \\
+  | jq -r '.formulas[]? | select(.name == "mol-refinery-patrol") | .source // empty' 2>/dev/null \\
+  | head -1)
+LANE_WEDGE=""
+if [ -n "$LW_FORMULA_SRC" ]; then
+  LANE_WEDGE="$(dirname "$(dirname "$LW_FORMULA_SRC")")/assets/scripts/refinery/lane-wedge.sh"
+fi
+if [ ! -x "$LANE_WEDGE" ] && [ -n "${GC_PACK_DIR:-}" ]; then
+  LANE_WEDGE="$GC_PACK_DIR/assets/scripts/refinery/lane-wedge.sh"
+fi
+if [ ! -x "$LANE_WEDGE" ]; then
+  echo "WARN: lane-wedge.sh not runnable (resolved '$LANE_WEDGE'); no wedge filter applied."
+else
+  LW_OUT=$("$LANE_WEDGE" check)
+  LW_RC=$?
+  echo "$LW_OUT"
+  if [ "$LW_RC" -eq 3 ]; then
+    LANE_WEDGE_ONLY=base-red
+    LANE_WEDGE_SKIP=$(echo "$LW_OUT" | sed -n 's/^LANE-WEDGE holds .* skip=//p' | tail -n 1)
+  elif [ "$LW_RC" -ne 0 ]; then
+    echo "WARN: lane-wedge.sh check exited $LW_RC; no wedge filter applied."
+  fi
+fi
+# --- find-work-lane-wedge:end ---
 # --- find-work-query:begin ---
 REFINERY_SELF="${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery"
 WORK=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee=$GC_AGENT --status=open,in_progress \
-  --exclude-type=epic --has-metadata-key=branch --limit=0 --json |
-  jq -r 'sort_by(.priority, (.metadata.first_submitted_at // .created_at)) | .[0].id // empty')
+  --exclude-type=epic --has-metadata-key=branch ${LANE_WEDGE_ONLY:+--label="$LANE_WEDGE_ONLY"} --limit=0 --json |
+  jq -r --arg skip "${LANE_WEDGE_SKIP:-}" '($skip | split(",")) as $sk | map(select(.id as $i | ($sk | any(.[]; . == $i)) | not)) | sort_by(.priority, (.metadata.first_submitted_at // .created_at)) | .[0].id // empty')
 if [ -z "$WORK" ]; then
   ROUTED=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --no-assignee --status=open,in_progress \
-    --exclude-type=epic --has-metadata-key=branch \
+    --exclude-type=epic --has-metadata-key=branch ${LANE_WEDGE_ONLY:+--label="$LANE_WEDGE_ONLY"} \
     --metadata-field gc.routed_to="$REFINERY_SELF" --limit=0 --json |
-    jq -r 'sort_by(.priority, (.metadata.first_submitted_at // .created_at)) | .[0].id // empty')
+    jq -r --arg skip "${LANE_WEDGE_SKIP:-}" '($skip | split(",")) as $sk | map(select(.id as $i | ($sk | any(.[]; . == $i)) | not)) | sort_by(.priority, (.metadata.first_submitted_at // .created_at)) | .[0].id // empty')
   if [ -n "$ROUTED" ]; then
     gc bd update "$ROUTED" --assignee="$GC_AGENT" --status=in_progress \
       --set-metadata gc.routed_to=""
@@ -360,6 +396,8 @@ if [ -n "$WORK" ] && [ "$BATCH_MAX" -gt 1 ]; then
     echo "INFO: no git dir to hold the batch manifest; batching off."
   elif [ "$WORK" = "${ROUTED:-}" ]; then
     echo "INFO: $WORK came from the routed claim; batching off."
+  elif [ -n "${LANE_WEDGE_ONLY:-}" ]; then
+    echo "INFO: the lane is wedged; batching off."
   else
     BATCH_CITY="${GC_CITY:-${GC_CITY_PATH:-}}"
     if [ -n "$BATCH_CITY" ]; then
@@ -396,6 +434,13 @@ if [ -n "$WORK" ] && [ "$BATCH_MAX" -gt 1 ]; then
 fi
 # --- find-work-batch:end ---
 ```
+
+**A wedged lane (gcp-ubv2).** When `lane-wedge.sh check` holds, the lane is
+parked: a push to the target was refused while it stood still, and nothing can
+land until it moves. The scan then takes only beads labelled `base-red`, none of
+the `skip=` ids (heads the remote already refused at this sha), and nothing
+batches. Every other bead stays assigned and waits. An empty WORK takes the IDLE
+path below, with no drain-ack. The marker clears when `origin/<target>` moves.
 
 **The batch (merge_batch_max = {{merge_batch_max}}).** With the default of 1, or
 a placeholder left unrendered, the block batches nothing and prints at most an
@@ -1573,6 +1618,19 @@ case "$MP_STATUS" in
   0)
     echo "merge-push: status $MP_STATUS: continue to patrol-summary."
     ;;
+  7)
+    # The remote refused the push while the target stood still. Park the lane
+    # (gcp-ubv2): a drain with this bead still assigned re-selects it in the next
+    # session, is refused again, and walks the restart circuit breaker open.
+    LANE_WEDGE="$(dirname "$MERGE_PUSH")/lane-wedge.sh"
+    if [ -x "$LANE_WEDGE" ] && "$LANE_WEDGE" mark --work "$WORK" --log "$MP_LOG"; then
+      echo "merge-push: status 7: the lane is wedged; continue to patrol-summary. Do NOT drain."
+    else
+      echo "merge-push: status 7 and the lane-wedge marker was not written. STOP. Read the RESULT line above."
+      gc runtime drain-ack
+      exit 1
+    fi
+    ;;
   9)
     # The script blocked an invalid existing_pr and mailed the mayor; it never
     # pours or burns a wisp, so this step does. The next wisp carries the values
@@ -1664,7 +1722,7 @@ What each status means, and what this step does about it:
 | 3 | The re-rebase onto the moved target conflicted. | STOP and drain. |
 | 5 | The ff-merge was a no-op; nothing landed. | STOP and drain. |
 | 6 | Retries exhausted; the target moved under every attempt. | STOP and drain. |
-| 7 | The remote refused the push while the target stood still. | STOP and drain; see below. |
+| 7 | The remote refused the push while the target stood still. | Continue to patrol-summary; if the marker was not written, STOP and drain. See below. |
 | 8 | False completion halted: the bead is blocked and the mayor and witness were nudged. | STOP and drain. |
 | 9 | Invalid `existing_pr` blocked: the bead is blocked and the mayor was mailed. | The block above pours the next wisp, assigns it, burns this one and drains. |
 | 11 | `merge_strategy=local` is unsupported: the mayor was mailed. | STOP. Do NOT close the bead, delete the branch or burn the wisp, until a human decides how to proceed. |
@@ -1687,14 +1745,27 @@ head. `land` removes the manifest after a landing, and once its manifest
 checks pass it drops `temp` on every exit, as the single-bead script does.
 
 Status 7 is the one that most invites a wrong next move: the remote refused the
-push while `$TARGET` stood still. Re-running the merge immediately just re-runs
-the pre-push gate, so if the gate is saturated the retry is what keeps it
-saturated. Read the push output for the refusal reason (a busy push-gate lane,
-a receive hook, permissions) and clear it if you can. Do not push by hand: `temp`
-is already gone, and the step drains. The next patrol re-selects the bead,
-rebuilds `temp` in the rebase step and runs the tests again before it pushes, so
-a gate that is still refusing refuses that push too. Raise
-`REFINERY_PUSH_GATE_MAX_WAIT_SECONDS` if the refinery is losing slots to a
+push while `$TARGET` stood still (a red pre-push gate, a busy slot after the
+wait, a receive hook, or permissions). Retrying cannot clear it, and draining
+with the bead still assigned only has the next session re-select the same head,
+be refused again and drain again. On 2026-10-01 that loop restarted feryn's
+refinery six times in an hour and tripped the session circuit breaker, which
+kept the lane down for 80 minutes (gcp-ubv2). So this step parks the lane
+instead of draining:
+
+- `lane-wedge.sh mark` writes the marker `refinery-lane-wedged.json` in this
+  clone's git dir, with the target, the sha it stood at and the refused heads.
+- It mails the mayor ONCE per target and sha, with the push output and the
+  release, and puts a `LANE-WEDGED` note on the bead.
+- The bead is KEPT: still assigned to you, not rejected and not released.
+  Releasing it would make a polecat redo a good branch.
+- Until `origin/$TARGET` moves, find-work takes only beads labelled `base-red`,
+  never a refused head, and an empty WORK takes the IDLE path with no drain-ack.
+  The marker clears itself the first time find-work sees the target move.
+- Never push by hand: `temp` is already gone. If the marker was not written,
+  STOP and drain.
+
+Raise `REFINERY_PUSH_GATE_MAX_WAIT_SECONDS` if the refinery is losing slots to a
 genuinely busy gate rather than to a veto."""
 
 [[steps]]
@@ -1714,6 +1785,7 @@ Include:
 - Bugs filed (IDs, if any pre-existing failures were tracked)
 - Rejections (if the branch was rejected back to pool)
 - Any escalations sent
+- Lane wedge: the LANE-WEDGE NEW/KNOWN line, if merge-push returned 7.
 
 If the cycle ended early (conflict rejection, no work found), note
 why and what state was left.

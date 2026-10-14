@@ -105,7 +105,8 @@ PY
 # Stub `gc` implementing just enough of the beads CLI to answer the shipped
 # query: a list filter, the claiming write, and the read-back. It models
 # assignee equality, --no-assignee, a comma-separated status filter,
-# --has-metadata-key, --metadata-field, --exclude-type and --limit. Anything
+# --has-metadata-key, --metadata-field, --exclude-type, --label (a bead must
+# carry every label given) and --limit. Anything
 # else is an error, so a query that grows a flag this stub does not model fails
 # loudly instead of passing vacuously.
 #
@@ -184,6 +185,7 @@ if verb == "list":
     metadata_key = None
     metadata_fields = {}
     excluded_types = set()
+    labels = []
     limit = None
     for name, value in flags(args):
         if name in ("--json", None):
@@ -203,6 +205,8 @@ if verb == "list":
             metadata_fields[key] = expected
         elif name == "--exclude-type":
             excluded_types.update(value.split(","))
+        elif name == "--label":
+            labels.append(value)
         elif name == "--limit":
             limit = int(value)
         else:
@@ -223,6 +227,7 @@ if verb == "list":
             for key, expected in metadata_fields.items()
         )
         and bead.get("issue_type") not in excluded_types
+        and all(label in (bead.get("labels") or []) for label in labels)
     ]
     # Two stable passes give (priority asc, created_at desc). A bead with no
     # priority is P2, the store's default.
@@ -332,6 +337,8 @@ run_find_work() {
         GC_STUB_CLAIM_HIJACK="$hijack" \
         GC_AGENT="$agent" \
         GC_RIG="$rig" \
+        LANE_WEDGE_ONLY="${FW_WEDGE_ONLY:-}" \
+        LANE_WEDGE_SKIP="${FW_WEDGE_SKIP:-}" \
             bash -c 'set -uo pipefail; . "$1" >"$2" 2>&1; printf "%s" "$WORK"' \
                 _ "$script" "$TMP/run.log"
     ) || {
@@ -362,8 +369,8 @@ fixture() {
 }
 
 queued() {
-    # queued <id> <priority> <created_at> <first_submitted_at> <assignee> [routed_to]
-    # A merge candidate with the fields the store orders on. An empty
+    # queued <id> <priority> <created_at> <first_submitted_at> <assignee> [routed_to] [labels]
+    # labels is a comma-separated list. A merge candidate with the fields the store orders on. An empty
     # first_submitted_at leaves the key off, as on a bead handed over before
     # the handoff stamp existed.
     python3 - "$@" <<'PY'
@@ -372,6 +379,7 @@ import sys
 
 bead_id, priority, created_at, first_submitted_at, assignee = sys.argv[1:6]
 routed_to = sys.argv[6] if len(sys.argv) > 6 else ""
+labels = [label for label in (sys.argv[7] if len(sys.argv) > 7 else "").split(",") if label]
 metadata = {"branch": f"polecat/{bead_id}"}
 if first_submitted_at:
     metadata["first_submitted_at"] = first_submitted_at
@@ -384,6 +392,7 @@ print(json.dumps({
     "issue_type": "task",
     "priority": int(priority),
     "created_at": created_at,
+    "labels": labels,
     "metadata": metadata,
 }))
 PY
@@ -731,6 +740,68 @@ test_routed_scan_is_served_oldest_first() {
         fail "the routed scan must leave the newer bead unclaimed this pass"
 }
 
+# ── gcp-ubv2: a wedged lane takes only base-red beads ─────────────────────────
+# lane-wedge.sh check holds while a push to the target is refused and the target
+# stands still. The block above the query turns that into LANE_WEDGE_ONLY and
+# LANE_WEDGE_SKIP, which these cases hand the extracted query directly.
+
+test_wedge_offers_only_base_red_beads() {
+    local got
+    got=$(FW_WEDGE_ONLY=base-red run_find_work \
+        "$(fixture \
+            "$(queued wb-old 2 2026-09-01T06:00:00Z 2026-09-01T07:00:00Z "$REFINERY")" \
+            "$(queued wb-red 2 2026-09-10T06:00:00Z 2026-09-10T07:00:00Z "$REFINERY" "" base-red)")" \
+        "$REFINERY" winnow "$BOUND_ONLY")
+    [[ "$got" == "wb-red" ]] ||
+        fail "a wedged lane must take the base-red bead over an older unlabelled one, got '$got'"
+    grep -q -- '--label=base-red' "$TMP/stub.log" ||
+        fail "the wedged scan did not filter on --label=base-red; calls: $(tr '\n' ';' <"$TMP/stub.log")"
+}
+
+test_wedge_without_a_base_red_bead_yields_no_work() {
+    local got
+    got=$(FW_WEDGE_ONLY=base-red run_find_work \
+        "$(fixture "$(queued wb-old 2 2026-09-01T06:00:00Z 2026-09-01T07:00:00Z "$REFINERY")")" \
+        "$REFINERY" winnow "$BOUND_ONLY")
+    [[ -z "$got" ]] ||
+        fail "a wedged lane with no base-red bead must find no work, got '$got'"
+}
+
+test_wedge_skips_a_refused_base_red_head() {
+    local got
+    got=$(FW_WEDGE_ONLY=base-red FW_WEDGE_SKIP=wb-red run_find_work \
+        "$(fixture \
+            "$(queued wb-red 2 2026-09-01T06:00:00Z 2026-09-01T07:00:00Z "$REFINERY" "" base-red)" \
+            "$(queued wb-red2 2 2026-09-10T06:00:00Z 2026-09-10T07:00:00Z "$REFINERY" "" base-red)")" \
+        "$REFINERY" winnow "$BOUND_ONLY")
+    [[ "$got" == "wb-red2" ]] ||
+        fail "a base-red head the remote already refused must be skipped, got '$got'"
+}
+
+test_wedge_filters_the_routed_scan() {
+    local got
+    got=$(FW_WEDGE_ONLY=base-red run_find_work \
+        "$(fixture "$(queued wb-routed 2 2026-09-01T06:00:00Z 2026-09-01T07:00:00Z "" "$REFINERY")")" \
+        "$REFINERY" winnow "$BOUND_ONLY")
+    [[ -z "$got" ]] ||
+        fail "a wedged lane must not claim an unlabelled routed bead, got '$got'"
+    [[ -z "$(claimed_assignee wb-routed)" ]] ||
+        fail "the unlabelled routed bead was claimed"
+}
+
+test_no_wedge_leaves_the_scan_unlabelled() {
+    local got
+    got=$(run_find_work \
+        "$(fixture \
+            "$(queued wb-old 2 2026-09-01T06:00:00Z 2026-09-01T07:00:00Z "$REFINERY")" \
+            "$(queued wb-red 2 2026-09-10T06:00:00Z 2026-09-10T07:00:00Z "$REFINERY" "" base-red)")" \
+        "$REFINERY" winnow "$BOUND_ONLY")
+    [[ "$got" == "wb-old" ]] ||
+        fail "with no wedge the oldest bead is served, got '$got'"
+    ! grep -q -- '--label' "$TMP/stub.log" ||
+        fail "an unwedged scan must carry no --label; calls: $(tr '\n' ';' <"$TMP/stub.log")"
+}
+
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/gastown-find-work.XXXXXX") || exit 1
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/bin"
@@ -766,6 +837,11 @@ test_routed_scan_is_served_oldest_first
 test_open_only_scans_are_not_reintroduced
 test_prompt_points_at_the_step_instead_of_restating_it
 test_polecat_handoff_verifies_the_status_it_writes
+test_wedge_offers_only_base_red_beads
+test_wedge_without_a_base_red_bead_yields_no_work
+test_wedge_skips_a_refused_base_red_head
+test_wedge_filters_the_routed_scan
+test_no_wedge_leaves_the_scan_unlabelled
 
 if [ "$FAILURES" -ne 0 ]; then
     echo "$FAILURES test(s) failed" >&2

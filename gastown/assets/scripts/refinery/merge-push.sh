@@ -67,7 +67,9 @@
 #    3  the re-rebase onto the moved target conflicted
 #    5  the ff-merge was a no-op; nothing landed
 #    6  retries exhausted; the target moved under every attempt
-#    7  the remote refused the push while the target stood still
+#    7  the remote refused the push while the target stood still; the line
+#       `merge-ff-push: REFUSED target=<T> sha=<S>` names the target and the
+#       tip it stood at, and lane-wedge.sh mark reads it to park the lane
 #    8  false completion halted: the bead is blocked and mayor + witness nudged
 #    9  invalid existing_pr blocked: the bead is blocked and the mayor mailed
 #   11  merge_strategy=local is unsupported: the mayor was mailed
@@ -504,6 +506,8 @@ lookup_pr_info() {
 #       under every attempt)
 #   7 = the remote REFUSED the push while $TARGET stood still — a push-gate
 #       veto, a receive hook, or permissions. Not a race; retrying cannot help.
+#       Prints `merge-ff-push: REFUSED target=$TARGET sha=$BEFORE_SHA` just
+#       before returning, the line lane-wedge.sh mark parses (gcp-ubv2).
 merge_ff_push_cleanup_wt() {
   if [ -n "${mfp_wt:-}" ]; then
     git worktree remove --force "$mfp_wt" >/dev/null 2>&1 || true
@@ -628,6 +632,7 @@ merge_ff_push() {
       fi
       if [ "$mfp_reject_sha" = "$BEFORE_SHA" ]; then
         echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status) and origin/$TARGET is STILL $BEFORE_SHA — the target did not move, so the remote refused this push (push-gate veto, receive hook, or permissions). This is not a race; retrying re-runs the pre-push gate and cannot succeed. STOP. Do not mutate bead state."
+        echo "merge-ff-push: REFUSED target=$TARGET sha=$BEFORE_SHA"
         return 7
       fi
       echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status); origin/$TARGET moved $BEFORE_SHA -> $mfp_reject_sha, so the target really did advance between the fetch and the push."

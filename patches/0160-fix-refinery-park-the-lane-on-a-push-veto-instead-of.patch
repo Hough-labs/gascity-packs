@@ -1,0 +1,1230 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Tue, 13 Oct 2026 23:35:06 -0400
+Subject: [PATCH 160/160] fix(refinery): park the lane on a push veto instead
+ of draining with assigned work (gcp-ubv2)
+
+When the target branch is red, the rig's pre-push gate refuses every merge's
+push and merge-push returns status 7. The patrol drained with the bead still
+assigned, so the next fresh session re-selected the same head, was refused
+again and drained again. On 2026-10-01 that walked feryn's refinery through six
+restarts in an hour into the session circuit breaker and cost the lane 80
+minutes, with the fix bead stuck behind it.
+
+Status 7 now parks the lane (MAYOR RULING 4, option 1 scoped to status 7):
+
+- merge-push.sh prints `merge-ff-push: REFUSED target=<T> sha=<S>` just before
+  returning 7, naming the tip the target still stood at. merge-batch inherits it.
+- New lane-wedge.sh. `mark` records the refused head in a marker in the clone's
+  git dir, mails the mayor once per (target, sha) with the release (`rm <marker>`)
+  and puts a note on the bead. The bead is kept: assignee and status unchanged,
+  because releasing it would make a polecat redo a good branch. `check` holds
+  while the target stands at the marked sha and clears the marker once it moves.
+- The patrol's invoke block gains a 7) arm that runs `mark` and continues to
+  patrol-summary, and STOPs and drains only if the marker was not written.
+- find-work runs `check` and, while it holds, scans only beads labelled base-red
+  and skips every head already refused, so a fix for the red target can land and
+  nothing batches. An empty WORK takes the existing IDLE path.
+- Registered lane-wedge.sh in the inference gate like merge-batch.sh.
+
+Out of scope: run-tests reds, the pre-push gate reading known-red, and breaker
+config.
+
+Validation: test_refinery_lane_wedge.sh (new, 12 tests), merge_lanes (status 7
+case flipped from drain to park), find_work (+5 wedge cases), batch_wiring (+1
+case, 10 total) and the inference-gate pytest all pass.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ gastown/assets/scripts/refinery/lane-wedge.sh | 196 ++++++++
+ gastown/assets/scripts/refinery/merge-push.sh |   7 +-
+ gastown/formulas/mol-refinery-patrol.toml     | 102 +++-
+ gastown/tests/test_refinery_batch_wiring.sh   |  29 +-
+ gastown/tests/test_refinery_find_work.sh      |  82 +++-
+ gastown/tests/test_refinery_lane_wedge.sh     | 434 ++++++++++++++++++
+ gastown/tests/test_refinery_merge_lanes.sh    |  31 +-
+ scripts/gascity_pack_inference_gate.py        |  16 +
+ tests/test_gascity_pack_inference_gate.py     |   8 +
+ 9 files changed, 883 insertions(+), 22 deletions(-)
+ create mode 100755 gastown/assets/scripts/refinery/lane-wedge.sh
+ create mode 100755 gastown/tests/test_refinery_lane_wedge.sh
+
+diff --git a/gastown/assets/scripts/refinery/lane-wedge.sh b/gastown/assets/scripts/refinery/lane-wedge.sh
+new file mode 100755
+index 00000000..add56300
+--- /dev/null
++++ b/gastown/assets/scripts/refinery/lane-wedge.sh
+@@ -0,0 +1,196 @@
++#!/usr/bin/env bash
++# lane-wedge.sh — park the refinery's merge lane when the remote refuses a push
++# while the target stands still (gcp-ubv2).
++#
++# merge-push.sh returns status 7 when a push is refused and origin/<target> is
++# still where the merge started: a red pre-push gate, a busy slot after the
++# wait, a receive hook, or permissions. Nothing the refinery can do clears that,
++# and a session that quits with the bead still assigned only has its successor
++# re-select the same head, be refused again and quit again. On 2026-10-01 that
++# loop restarted feryn's refinery six times in an hour, tripped the session
++# circuit breaker, and kept the lane down for 80 minutes.
++#
++# So the lane is parked instead: a marker records the target and the sha the
++# push was refused at, and find-work reads it. While the target stands at that
++# sha, find-work takes only beads labelled base-red (a fix for the red target)
++# and skips every head already refused. The marker clears when origin/<target>
++# moves. The work bead is KEPT: its assignee and status are unchanged, and it
++# only gets a note.
++#
++# Usage (run inside the refinery's clone):
++#   lane-wedge.sh mark --work <id> --log <file>
++#   lane-wedge.sh check
++#
++# The marker is $(git rev-parse --absolute-git-dir)/refinery-lane-wedged.json:
++#   {"target", "target_sha", "since", "heads": [<id>, ...], "escalation": "sent"|"failed"}
++#
++# mark   Read the LAST `merge-ff-push: REFUSED target=<T> sha=<S>` line of <file>
++#        (the merge-push output). With none, exit 2 and touch nothing. The same
++#        target and sha as the marker adds <id> to heads; anything else starts a
++#        new marker. Unless the marker already records a sent escalation, mail the
++#        mayor ONCE, then note the bead. A failed mail is recorded as
++#        escalation=failed and sent again by the next mark at the same sha.
++#        Exit 0 once the marker is written, 2 when it cannot be.
++#
++# check  Print one line and exit:
++#          LANE-WEDGE none                                  0  no marker
++#          WARN lane-wedge: unreadable marker <M> removed.  0  marker removed
++#          LANE-WEDGE cleared <T> <S12> -> <C12>            0  target moved; removed
++#          LANE-WEDGE holds <T> <S12> skip=<a,b>            3  target unmoved
++#          LANE-WEDGE holds <T> <S12> fetch-failed skip=..  3  fetch failed; kept
++#        skip= lists the heads the remote already refused at this sha.
++#
++# Exit 1 is a usage error. The script never drains the session and never pours
++# or burns a patrol wisp: the formula owns the patrol loop.
++#
++# No `set -e`, `set -u` or `set -o pipefail`: every command that matters is
++# checked on its own exit status.
++
++usage() {
++  echo "usage: lane-wedge.sh mark --work <id> --log <file> | lane-wedge.sh check" >&2
++  return 1
++}
++
++# marker_path prints the marker's absolute path, or fails outside a git clone.
++marker_path() {
++  local gd
++  gd=$(git rev-parse --absolute-git-dir 2>/dev/null) || return 1
++  printf '%s/refinery-lane-wedged.json\n' "$gd"
++}
++
++# marker_valid <file> succeeds when <file> parses as a marker.
++marker_valid() {
++  jq -e '(.target | type == "string") and (.target_sha | type == "string")
++         and (.heads | type == "array")' "$1" >/dev/null 2>&1
++}
++
++cmd_mark() {
++  local work="" log="" m line t s s12 same stored_esc since heads esc
++  local tmp body note heads_csv
++  while [ "$#" -gt 0 ]; do
++    case "$1" in
++      --work) work="${2:-}"; shift 2 || return 1 ;;
++      --log) log="${2:-}"; shift 2 || return 1 ;;
++      *) usage; return 1 ;;
++    esac
++  done
++  if [ -z "$work" ] || [ -z "$log" ]; then
++    usage
++    return 1
++  fi
++  m=$(marker_path) || { echo "lane-wedge: not inside a git clone." >&2; return 1; }
++
++  line=$(grep -E '^merge-ff-push: REFUSED target=[^ ]+ sha=[0-9a-f]+$' "$log" 2>/dev/null | tail -n 1)
++  if [ -z "$line" ]; then
++    echo "lane-wedge: no 'merge-ff-push: REFUSED' line in $log; marker not written." >&2
++    return 2
++  fi
++  t=${line#*target=}
++  t=${t%% *}
++  s=${line##* sha=}
++  s12=${s:0:12}
++
++  same=0
++  stored_esc=""
++  since=""
++  heads="[]"
++  if [ -f "$m" ] && marker_valid "$m" \
++    && [ "$(jq -r '.target' "$m")" = "$t" ] && [ "$(jq -r '.target_sha' "$m")" = "$s" ]; then
++    same=1
++    stored_esc=$(jq -r '.escalation // empty' "$m")
++    since=$(jq -r '.since // empty' "$m")
++    heads=$(jq -c '.heads' "$m")
++  fi
++  if [ "$same" -eq 1 ]; then
++    heads=$(printf '%s' "$heads" | jq -c --arg w "$work" 'if index($w) then . else . + [$w] end')
++  else
++    heads=$(jq -nc --arg w "$work" '[$w]')
++    since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
++  fi
++  esc="$stored_esc"
++
++  if [ "$stored_esc" != "sent" ]; then
++    body=$(printf '%s\n' \
++      "The refinery's push to $t was refused while origin/$t stood still at $s." \
++      "Bead: $work" \
++      "Target: $t at $s" \
++      "The lane is parked: only base-red beads until origin/$t moves." \
++      "" \
++      "Release: rm $m" \
++      "A fix bead that is not labelled base-red lands only after that rm." \
++      "" \
++      "Push output (last 30 lines):")
++    body="$body
++$(tail -n 30 "$log")"
++    if gc mail send mayor/ --notify \
++      -s "ESCALATION: merge lane wedged on ${GC_RIG:+$GC_RIG/}$t at ${s12} [HIGH]" \
++      -m "$body"; then
++      esc="sent"
++    else
++      esc="failed"
++      echo "WARN lane-wedge: the escalation mail failed; the next mark at $s sends it again." >&2
++    fi
++  fi
++
++  note="LANE-WEDGED: push to $t refused while origin/$t stood at $s (merge-push status 7). This bead stays assigned to the refinery and is not rejected. It merges on the first patrol after origin/$t moves; until then find-work takes only base-red beads."
++  if ! printf '%s\n' "$note" | gc bd note "$work" --stdin; then
++    echo "WARN lane-wedge: could not note $work; carrying on." >&2
++  fi
++
++  tmp=$(mktemp "$m.XXXXXX") || return 2
++  if ! jq -n --arg t "$t" --arg s "$s" --arg since "$since" --argjson heads "$heads" --arg esc "$esc" \
++    '{target: $t, target_sha: $s, since: $since, heads: $heads, escalation: $esc}' >"$tmp" \
++    || ! mv -f "$tmp" "$m"; then
++    rm -f "$tmp"
++    echo "lane-wedge: could not write $m." >&2
++    return 2
++  fi
++
++  heads_csv=$(jq -r '.heads | join(",")' "$m")
++  if [ "$same" -eq 1 ]; then
++    echo "LANE-WEDGE KNOWN $t $s12 heads=$heads_csv escalation=$esc"
++  else
++    echo "LANE-WEDGE NEW $t $s12 head=$work escalation=$esc"
++  fi
++  return 0
++}
++
++cmd_check() {
++  local m t s s12 skip cur
++  [ "$#" -eq 0 ] || { usage; return 1; }
++  m=$(marker_path) || { echo "lane-wedge: not inside a git clone." >&2; return 1; }
++  if [ ! -f "$m" ]; then
++    echo "LANE-WEDGE none"
++    return 0
++  fi
++  if ! marker_valid "$m"; then
++    rm -f "$m"
++    echo "WARN lane-wedge: unreadable marker $m removed."
++    return 0
++  fi
++  t=$(jq -r '.target' "$m")
++  s=$(jq -r '.target_sha' "$m")
++  s12=${s:0:12}
++  skip=$(jq -r '.heads | join(",")' "$m")
++  if ! git fetch origin "+refs/heads/${t}:refs/remotes/origin/${t}" >/dev/null 2>&1 \
++    || ! cur=$(git rev-parse "refs/remotes/origin/$t" 2>/dev/null); then
++    echo "LANE-WEDGE holds $t $s12 fetch-failed skip=$skip"
++    return 3
++  fi
++  if [ "$cur" != "$s" ]; then
++    rm -f "$m"
++    echo "LANE-WEDGE cleared $t $s12 -> ${cur:0:12}"
++    return 0
++  fi
++  echo "LANE-WEDGE holds $t $s12 skip=$skip"
++  return 3
++}
++
++sub="${1:-}"
++[ "$#" -gt 0 ] && shift
++case "$sub" in
++  mark) cmd_mark "$@" ;;
++  check) cmd_check "$@" ;;
++  *) usage ;;
++esac
++exit $?
+diff --git a/gastown/assets/scripts/refinery/merge-push.sh b/gastown/assets/scripts/refinery/merge-push.sh
+index 910938cb..b952ba60 100755
+--- a/gastown/assets/scripts/refinery/merge-push.sh
++++ b/gastown/assets/scripts/refinery/merge-push.sh
+@@ -67,7 +67,9 @@
+ #    3  the re-rebase onto the moved target conflicted
+ #    5  the ff-merge was a no-op; nothing landed
+ #    6  retries exhausted; the target moved under every attempt
+-#    7  the remote refused the push while the target stood still
++#    7  the remote refused the push while the target stood still; the line
++#       `merge-ff-push: REFUSED target=<T> sha=<S>` names the target and the
++#       tip it stood at, and lane-wedge.sh mark reads it to park the lane
+ #    8  false completion halted: the bead is blocked and mayor + witness nudged
+ #    9  invalid existing_pr blocked: the bead is blocked and the mayor mailed
+ #   11  merge_strategy=local is unsupported: the mayor was mailed
+@@ -504,6 +506,8 @@ lookup_pr_info() {
+ #       under every attempt)
+ #   7 = the remote REFUSED the push while $TARGET stood still — a push-gate
+ #       veto, a receive hook, or permissions. Not a race; retrying cannot help.
++#       Prints `merge-ff-push: REFUSED target=$TARGET sha=$BEFORE_SHA` just
++#       before returning, the line lane-wedge.sh mark parses (gcp-ubv2).
+ merge_ff_push_cleanup_wt() {
+   if [ -n "${mfp_wt:-}" ]; then
+     git worktree remove --force "$mfp_wt" >/dev/null 2>&1 || true
+@@ -628,6 +632,7 @@ merge_ff_push() {
+       fi
+       if [ "$mfp_reject_sha" = "$BEFORE_SHA" ]; then
+         echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status) and origin/$TARGET is STILL $BEFORE_SHA — the target did not move, so the remote refused this push (push-gate veto, receive hook, or permissions). This is not a race; retrying re-runs the pre-push gate and cannot succeed. STOP. Do not mutate bead state."
++        echo "merge-ff-push: REFUSED target=$TARGET sha=$BEFORE_SHA"
+         return 7
+       fi
+       echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status); origin/$TARGET moved $BEFORE_SHA -> $mfp_reject_sha, so the target really did advance between the fetch and the push."
+diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
+index 9b45d78f..1a907ed4 100644
+--- a/gastown/formulas/mol-refinery-patrol.toml
++++ b/gastown/formulas/mol-refinery-patrol.toml
+@@ -316,19 +316,55 @@ fi
+ 
+ Search for work beads assigned to you — unclaimed, or already claimed by you —
+ then for work merely routed to you, then decide whether this iteration batches.
+-Run the whole fence in ONE shell: the batch block reads `WORK` and `ROUTED`
+-from the query above it.
++Run the whole fence in ONE shell: the query reads `LANE_WEDGE_ONLY` and
++`LANE_WEDGE_SKIP` from the lane-wedge block above it, and the batch block reads
++`WORK` and `ROUTED` from the query.
+ ```bash
++# --- find-work-lane-wedge:begin ---
++# A lane parked by merge-push's status 7 (gcp-ubv2) limits the scan below to
++# base-red beads and skips every head the remote already refused.
++LANE_WEDGE_ONLY=""
++LANE_WEDGE_SKIP=""
++LW_CITY="${GC_CITY:-${GC_CITY_PATH:-}}"
++if [ -n "$LW_CITY" ]; then
++  LW_FORMULA_JSON=$(gc formula list --city "$LW_CITY" --json 2>/dev/null)
++else
++  LW_FORMULA_JSON=$(gc formula list --json 2>/dev/null)
++fi
++LW_FORMULA_SRC=$(printf '%s' "$LW_FORMULA_JSON" \\
++  | jq -r '.formulas[]? | select(.name == "mol-refinery-patrol") | .source // empty' 2>/dev/null \\
++  | head -1)
++LANE_WEDGE=""
++if [ -n "$LW_FORMULA_SRC" ]; then
++  LANE_WEDGE="$(dirname "$(dirname "$LW_FORMULA_SRC")")/assets/scripts/refinery/lane-wedge.sh"
++fi
++if [ ! -x "$LANE_WEDGE" ] && [ -n "${GC_PACK_DIR:-}" ]; then
++  LANE_WEDGE="$GC_PACK_DIR/assets/scripts/refinery/lane-wedge.sh"
++fi
++if [ ! -x "$LANE_WEDGE" ]; then
++  echo "WARN: lane-wedge.sh not runnable (resolved '$LANE_WEDGE'); no wedge filter applied."
++else
++  LW_OUT=$("$LANE_WEDGE" check)
++  LW_RC=$?
++  echo "$LW_OUT"
++  if [ "$LW_RC" -eq 3 ]; then
++    LANE_WEDGE_ONLY=base-red
++    LANE_WEDGE_SKIP=$(echo "$LW_OUT" | sed -n 's/^LANE-WEDGE holds .* skip=//p' | tail -n 1)
++  elif [ "$LW_RC" -ne 0 ]; then
++    echo "WARN: lane-wedge.sh check exited $LW_RC; no wedge filter applied."
++  fi
++fi
++# --- find-work-lane-wedge:end ---
+ # --- find-work-query:begin ---
+ REFINERY_SELF="${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery"
+ WORK=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee=$GC_AGENT --status=open,in_progress \
+-  --exclude-type=epic --has-metadata-key=branch --limit=0 --json |
+-  jq -r 'sort_by(.priority, (.metadata.first_submitted_at // .created_at)) | .[0].id // empty')
++  --exclude-type=epic --has-metadata-key=branch ${LANE_WEDGE_ONLY:+--label="$LANE_WEDGE_ONLY"} --limit=0 --json |
++  jq -r --arg skip "${LANE_WEDGE_SKIP:-}" '($skip | split(",")) as $sk | map(select(.id as $i | ($sk | any(.[]; . == $i)) | not)) | sort_by(.priority, (.metadata.first_submitted_at // .created_at)) | .[0].id // empty')
+ if [ -z "$WORK" ]; then
+   ROUTED=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --no-assignee --status=open,in_progress \
+-    --exclude-type=epic --has-metadata-key=branch \
++    --exclude-type=epic --has-metadata-key=branch ${LANE_WEDGE_ONLY:+--label="$LANE_WEDGE_ONLY"} \
+     --metadata-field gc.routed_to="$REFINERY_SELF" --limit=0 --json |
+-    jq -r 'sort_by(.priority, (.metadata.first_submitted_at // .created_at)) | .[0].id // empty')
++    jq -r --arg skip "${LANE_WEDGE_SKIP:-}" '($skip | split(",")) as $sk | map(select(.id as $i | ($sk | any(.[]; . == $i)) | not)) | sort_by(.priority, (.metadata.first_submitted_at // .created_at)) | .[0].id // empty')
+   if [ -n "$ROUTED" ]; then
+     gc bd update "$ROUTED" --assignee="$GC_AGENT" --status=in_progress \
+       --set-metadata gc.routed_to=""
+@@ -360,6 +396,8 @@ if [ -n "$WORK" ] && [ "$BATCH_MAX" -gt 1 ]; then
+     echo "INFO: no git dir to hold the batch manifest; batching off."
+   elif [ "$WORK" = "${ROUTED:-}" ]; then
+     echo "INFO: $WORK came from the routed claim; batching off."
++  elif [ -n "${LANE_WEDGE_ONLY:-}" ]; then
++    echo "INFO: the lane is wedged; batching off."
+   else
+     BATCH_CITY="${GC_CITY:-${GC_CITY_PATH:-}}"
+     if [ -n "$BATCH_CITY" ]; then
+@@ -397,6 +435,13 @@ fi
+ # --- find-work-batch:end ---
+ ```
+ 
++**A wedged lane (gcp-ubv2).** When `lane-wedge.sh check` holds, the lane is
++parked: a push to the target was refused while it stood still, and nothing can
++land until it moves. The scan then takes only beads labelled `base-red`, none of
++the `skip=` ids (heads the remote already refused at this sha), and nothing
++batches. Every other bead stays assigned and waits. An empty WORK takes the IDLE
++path below, with no drain-ack. The marker clears when `origin/<target>` moves.
++
+ **The batch (merge_batch_max = {{merge_batch_max}}).** With the default of 1, or
+ a placeholder left unrendered, the block batches nothing and prints at most an
+ INFO line: this is the single-bead lane, unchanged. With a larger value, and a
+@@ -1573,6 +1618,19 @@ case "$MP_STATUS" in
+   0)
+     echo "merge-push: status $MP_STATUS: continue to patrol-summary."
+     ;;
++  7)
++    # The remote refused the push while the target stood still. Park the lane
++    # (gcp-ubv2): a drain with this bead still assigned re-selects it in the next
++    # session, is refused again, and walks the restart circuit breaker open.
++    LANE_WEDGE="$(dirname "$MERGE_PUSH")/lane-wedge.sh"
++    if [ -x "$LANE_WEDGE" ] && "$LANE_WEDGE" mark --work "$WORK" --log "$MP_LOG"; then
++      echo "merge-push: status 7: the lane is wedged; continue to patrol-summary. Do NOT drain."
++    else
++      echo "merge-push: status 7 and the lane-wedge marker was not written. STOP. Read the RESULT line above."
++      gc runtime drain-ack
++      exit 1
++    fi
++    ;;
+   9)
+     # The script blocked an invalid existing_pr and mailed the mayor; it never
+     # pours or burns a wisp, so this step does. The next wisp carries the values
+@@ -1664,7 +1722,7 @@ What each status means, and what this step does about it:
+ | 3 | The re-rebase onto the moved target conflicted. | STOP and drain. |
+ | 5 | The ff-merge was a no-op; nothing landed. | STOP and drain. |
+ | 6 | Retries exhausted; the target moved under every attempt. | STOP and drain. |
+-| 7 | The remote refused the push while the target stood still. | STOP and drain; see below. |
++| 7 | The remote refused the push while the target stood still. | Continue to patrol-summary; if the marker was not written, STOP and drain. See below. |
+ | 8 | False completion halted: the bead is blocked and the mayor and witness were nudged. | STOP and drain. |
+ | 9 | Invalid `existing_pr` blocked: the bead is blocked and the mayor was mailed. | The block above pours the next wisp, assigns it, burns this one and drains. |
+ | 11 | `merge_strategy=local` is unsupported: the mayor was mailed. | STOP. Do NOT close the bead, delete the branch or burn the wisp, until a human decides how to proceed. |
+@@ -1687,14 +1745,27 @@ head. `land` removes the manifest after a landing, and once its manifest
+ checks pass it drops `temp` on every exit, as the single-bead script does.
+ 
+ Status 7 is the one that most invites a wrong next move: the remote refused the
+-push while `$TARGET` stood still. Re-running the merge immediately just re-runs
+-the pre-push gate, so if the gate is saturated the retry is what keeps it
+-saturated. Read the push output for the refusal reason (a busy push-gate lane,
+-a receive hook, permissions) and clear it if you can. Do not push by hand: `temp`
+-is already gone, and the step drains. The next patrol re-selects the bead,
+-rebuilds `temp` in the rebase step and runs the tests again before it pushes, so
+-a gate that is still refusing refuses that push too. Raise
+-`REFINERY_PUSH_GATE_MAX_WAIT_SECONDS` if the refinery is losing slots to a
++push while `$TARGET` stood still (a red pre-push gate, a busy slot after the
++wait, a receive hook, or permissions). Retrying cannot clear it, and draining
++with the bead still assigned only has the next session re-select the same head,
++be refused again and drain again. On 2026-10-01 that loop restarted feryn's
++refinery six times in an hour and tripped the session circuit breaker, which
++kept the lane down for 80 minutes (gcp-ubv2). So this step parks the lane
++instead of draining:
++
++- `lane-wedge.sh mark` writes the marker `refinery-lane-wedged.json` in this
++  clone's git dir, with the target, the sha it stood at and the refused heads.
++- It mails the mayor ONCE per target and sha, with the push output and the
++  release, and puts a `LANE-WEDGED` note on the bead.
++- The bead is KEPT: still assigned to you, not rejected and not released.
++  Releasing it would make a polecat redo a good branch.
++- Until `origin/$TARGET` moves, find-work takes only beads labelled `base-red`,
++  never a refused head, and an empty WORK takes the IDLE path with no drain-ack.
++  The marker clears itself the first time find-work sees the target move.
++- Never push by hand: `temp` is already gone. If the marker was not written,
++  STOP and drain.
++
++Raise `REFINERY_PUSH_GATE_MAX_WAIT_SECONDS` if the refinery is losing slots to a
+ genuinely busy gate rather than to a veto."""
+ 
+ [[steps]]
+@@ -1714,6 +1785,7 @@ Include:
+ - Bugs filed (IDs, if any pre-existing failures were tracked)
+ - Rejections (if the branch was rejected back to pool)
+ - Any escalations sent
++- Lane wedge: the LANE-WEDGE NEW/KNOWN line, if merge-push returned 7.
+ 
+ If the cycle ended early (conflict rejection, no work found), note
+ why and what state was left.
+diff --git a/gastown/tests/test_refinery_batch_wiring.sh b/gastown/tests/test_refinery_batch_wiring.sh
+index b118b0dc..b89452c0 100755
+--- a/gastown/tests/test_refinery_batch_wiring.sh
++++ b/gastown/tests/test_refinery_batch_wiring.sh
+@@ -31,7 +31,7 @@ set -uo pipefail
+ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+ FORMULA="${FORMULA:-$ROOT/gastown/formulas/mol-refinery-patrol.toml}"
+ BATCH_SCRIPT="${BATCH_SCRIPT:-$ROOT/gastown/assets/scripts/refinery/merge-batch.sh}"
+-EXPECTED_CASES=9
++EXPECTED_CASES=10
+ 
+ REFINERY_AGENT=testrig/gastown.refinery
+ HEAD_ID=wb-head
+@@ -335,6 +335,20 @@ case_find_work_truncates() {
+     end_case
+ }
+ 
++case_find_work_wedged_lane_does_not_batch() {
++    new_case find_work_wedged_lane_does_not_batch
++    # LANE_WEDGE_ONLY is what the lane-wedge block, which sits above the extracted
++    # fence, leaves behind while the lane is parked (gcp-ubv2).
++    run_find_work 3 GC_STUB_ASSIGNED="$ASSIGNED_TWO" STUB_SELECT_OUT="$HEAD_ID\n$SECOND_ID" \
++        LANE_WEDGE_ONLY=base-red
++    assert_eq "merge-batch.sh argv log" "" "$(batch_calls)"
++    assert_no_manifest "a wedged lane"
++    grep -qx 'INFO: the lane is wedged; batching off.' "$T/out" ||
++        fail "stdout has no 'INFO: the lane is wedged; batching off.' line"
++    grep -q -- '--label=base-red' "$T/gc.log" || fail "the scan did not carry --label=base-red"
++    end_case
++}
++
+ # --- rebase ---------------------------------------------------------------------------
+ 
+ case_rebase_stack() {
+@@ -433,6 +447,18 @@ case_merge_push_lanes() {
+     assert_eq "merge-push.sh argv log, land 2" "" "$(push_calls)"
+     grep -q '^gc runtime drain-ack' "$T/gc.log" || fail "land 2 did not drain-ack"
+ 
++    # Status 7 parks the lane through lane-wedge.sh. None is staged beside the
++    # stub, so the marker cannot be written and the block must STOP and drain
++    # rather than continue with nothing recorded.
++    : >"$T/batch.log"
++    : >"$T/gc.log"
++    run_block "$T/invoke.sh" WORK="$HEAD_ID" STUB_LAND_STATUS=7
++    assert_eq "block status, land 7 with no lane-wedge.sh" 1 "$?"
++    assert_eq "merge-batch.sh argv log, land 7" "land --head $HEAD_ID" "$(batch_calls)"
++    grep -q '^gc runtime drain-ack' "$T/gc.log" || fail "land 7 with no lane-wedge.sh did not drain-ack"
++    grep -q 'the lane-wedge marker was not written' "$T/out" ||
++        fail "stdout does not say the lane-wedge marker was not written"
++
+     : >"$T/batch.log"
+     : >"$T/gc.log"
+     chmod -x "$BATCH_STUB"
+@@ -508,6 +534,7 @@ case_find_work_rendered
+ case_find_work_select_one
+ case_find_work_routed
+ case_find_work_truncates
++case_find_work_wedged_lane_does_not_batch
+ case_rebase_stack
+ case_batch_red
+ case_merge_push_lanes
+diff --git a/gastown/tests/test_refinery_find_work.sh b/gastown/tests/test_refinery_find_work.sh
+index 88fad546..c73d57a0 100755
+--- a/gastown/tests/test_refinery_find_work.sh
++++ b/gastown/tests/test_refinery_find_work.sh
+@@ -105,7 +105,8 @@ PY
+ # Stub `gc` implementing just enough of the beads CLI to answer the shipped
+ # query: a list filter, the claiming write, and the read-back. It models
+ # assignee equality, --no-assignee, a comma-separated status filter,
+-# --has-metadata-key, --metadata-field, --exclude-type and --limit. Anything
++# --has-metadata-key, --metadata-field, --exclude-type, --label (a bead must
++# carry every label given) and --limit. Anything
+ # else is an error, so a query that grows a flag this stub does not model fails
+ # loudly instead of passing vacuously.
+ #
+@@ -184,6 +185,7 @@ if verb == "list":
+     metadata_key = None
+     metadata_fields = {}
+     excluded_types = set()
++    labels = []
+     limit = None
+     for name, value in flags(args):
+         if name in ("--json", None):
+@@ -203,6 +205,8 @@ if verb == "list":
+             metadata_fields[key] = expected
+         elif name == "--exclude-type":
+             excluded_types.update(value.split(","))
++        elif name == "--label":
++            labels.append(value)
+         elif name == "--limit":
+             limit = int(value)
+         else:
+@@ -223,6 +227,7 @@ if verb == "list":
+             for key, expected in metadata_fields.items()
+         )
+         and bead.get("issue_type") not in excluded_types
++        and all(label in (bead.get("labels") or []) for label in labels)
+     ]
+     # Two stable passes give (priority asc, created_at desc). A bead with no
+     # priority is P2, the store's default.
+@@ -332,6 +337,8 @@ run_find_work() {
+         GC_STUB_CLAIM_HIJACK="$hijack" \
+         GC_AGENT="$agent" \
+         GC_RIG="$rig" \
++        LANE_WEDGE_ONLY="${FW_WEDGE_ONLY:-}" \
++        LANE_WEDGE_SKIP="${FW_WEDGE_SKIP:-}" \
+             bash -c 'set -uo pipefail; . "$1" >"$2" 2>&1; printf "%s" "$WORK"' \
+                 _ "$script" "$TMP/run.log"
+     ) || {
+@@ -362,8 +369,8 @@ fixture() {
+ }
+ 
+ queued() {
+-    # queued <id> <priority> <created_at> <first_submitted_at> <assignee> [routed_to]
+-    # A merge candidate with the fields the store orders on. An empty
++    # queued <id> <priority> <created_at> <first_submitted_at> <assignee> [routed_to] [labels]
++    # labels is a comma-separated list. A merge candidate with the fields the store orders on. An empty
+     # first_submitted_at leaves the key off, as on a bead handed over before
+     # the handoff stamp existed.
+     python3 - "$@" <<'PY'
+@@ -372,6 +379,7 @@ import sys
+ 
+ bead_id, priority, created_at, first_submitted_at, assignee = sys.argv[1:6]
+ routed_to = sys.argv[6] if len(sys.argv) > 6 else ""
++labels = [label for label in (sys.argv[7] if len(sys.argv) > 7 else "").split(",") if label]
+ metadata = {"branch": f"polecat/{bead_id}"}
+ if first_submitted_at:
+     metadata["first_submitted_at"] = first_submitted_at
+@@ -384,6 +392,7 @@ print(json.dumps({
+     "issue_type": "task",
+     "priority": int(priority),
+     "created_at": created_at,
++    "labels": labels,
+     "metadata": metadata,
+ }))
+ PY
+@@ -731,6 +740,68 @@ test_routed_scan_is_served_oldest_first() {
+         fail "the routed scan must leave the newer bead unclaimed this pass"
+ }
+ 
++# ── gcp-ubv2: a wedged lane takes only base-red beads ─────────────────────────
++# lane-wedge.sh check holds while a push to the target is refused and the target
++# stands still. The block above the query turns that into LANE_WEDGE_ONLY and
++# LANE_WEDGE_SKIP, which these cases hand the extracted query directly.
++
++test_wedge_offers_only_base_red_beads() {
++    local got
++    got=$(FW_WEDGE_ONLY=base-red run_find_work \
++        "$(fixture \
++            "$(queued wb-old 2 2026-09-01T06:00:00Z 2026-09-01T07:00:00Z "$REFINERY")" \
++            "$(queued wb-red 2 2026-09-10T06:00:00Z 2026-09-10T07:00:00Z "$REFINERY" "" base-red)")" \
++        "$REFINERY" winnow "$BOUND_ONLY")
++    [[ "$got" == "wb-red" ]] ||
++        fail "a wedged lane must take the base-red bead over an older unlabelled one, got '$got'"
++    grep -q -- '--label=base-red' "$TMP/stub.log" ||
++        fail "the wedged scan did not filter on --label=base-red; calls: $(tr '\n' ';' <"$TMP/stub.log")"
++}
++
++test_wedge_without_a_base_red_bead_yields_no_work() {
++    local got
++    got=$(FW_WEDGE_ONLY=base-red run_find_work \
++        "$(fixture "$(queued wb-old 2 2026-09-01T06:00:00Z 2026-09-01T07:00:00Z "$REFINERY")")" \
++        "$REFINERY" winnow "$BOUND_ONLY")
++    [[ -z "$got" ]] ||
++        fail "a wedged lane with no base-red bead must find no work, got '$got'"
++}
++
++test_wedge_skips_a_refused_base_red_head() {
++    local got
++    got=$(FW_WEDGE_ONLY=base-red FW_WEDGE_SKIP=wb-red run_find_work \
++        "$(fixture \
++            "$(queued wb-red 2 2026-09-01T06:00:00Z 2026-09-01T07:00:00Z "$REFINERY" "" base-red)" \
++            "$(queued wb-red2 2 2026-09-10T06:00:00Z 2026-09-10T07:00:00Z "$REFINERY" "" base-red)")" \
++        "$REFINERY" winnow "$BOUND_ONLY")
++    [[ "$got" == "wb-red2" ]] ||
++        fail "a base-red head the remote already refused must be skipped, got '$got'"
++}
++
++test_wedge_filters_the_routed_scan() {
++    local got
++    got=$(FW_WEDGE_ONLY=base-red run_find_work \
++        "$(fixture "$(queued wb-routed 2 2026-09-01T06:00:00Z 2026-09-01T07:00:00Z "" "$REFINERY")")" \
++        "$REFINERY" winnow "$BOUND_ONLY")
++    [[ -z "$got" ]] ||
++        fail "a wedged lane must not claim an unlabelled routed bead, got '$got'"
++    [[ -z "$(claimed_assignee wb-routed)" ]] ||
++        fail "the unlabelled routed bead was claimed"
++}
++
++test_no_wedge_leaves_the_scan_unlabelled() {
++    local got
++    got=$(run_find_work \
++        "$(fixture \
++            "$(queued wb-old 2 2026-09-01T06:00:00Z 2026-09-01T07:00:00Z "$REFINERY")" \
++            "$(queued wb-red 2 2026-09-10T06:00:00Z 2026-09-10T07:00:00Z "$REFINERY" "" base-red)")" \
++        "$REFINERY" winnow "$BOUND_ONLY")
++    [[ "$got" == "wb-old" ]] ||
++        fail "with no wedge the oldest bead is served, got '$got'"
++    ! grep -q -- '--label' "$TMP/stub.log" ||
++        fail "an unwedged scan must carry no --label; calls: $(tr '\n' ';' <"$TMP/stub.log")"
++}
++
+ TMP=$(mktemp -d "${TMPDIR:-/tmp}/gastown-find-work.XXXXXX") || exit 1
+ trap 'rm -rf "$TMP"' EXIT
+ mkdir -p "$TMP/bin"
+@@ -766,6 +837,11 @@ test_routed_scan_is_served_oldest_first
+ test_open_only_scans_are_not_reintroduced
+ test_prompt_points_at_the_step_instead_of_restating_it
+ test_polecat_handoff_verifies_the_status_it_writes
++test_wedge_offers_only_base_red_beads
++test_wedge_without_a_base_red_bead_yields_no_work
++test_wedge_skips_a_refused_base_red_head
++test_wedge_filters_the_routed_scan
++test_no_wedge_leaves_the_scan_unlabelled
+ 
+ if [ "$FAILURES" -ne 0 ]; then
+     echo "$FAILURES test(s) failed" >&2
+diff --git a/gastown/tests/test_refinery_lane_wedge.sh b/gastown/tests/test_refinery_lane_wedge.sh
+new file mode 100755
+index 00000000..96a226b9
+--- /dev/null
++++ b/gastown/tests/test_refinery_lane_wedge.sh
+@@ -0,0 +1,434 @@
++#!/usr/bin/env bash
++# Contract tests for lane-wedge.sh and the find-work block that reads it (gcp-ubv2).
++#
++# When the target branch itself is red, the rig's pre-push gate refuses every
++# merge's push and merge-push.sh returns status 7. The refinery used to drain
++# with the bead still assigned, so the next fresh session re-selected the same
++# head, was refused again, and drained again until the restart circuit breaker
++# opened and kept the lane down for 80 minutes (feryn, 2026-10-01).
++#
++# lane-wedge.sh parks the lane instead. `mark` records the refused head and the
++# sha the target stood at, mails the mayor once per (target, sha) and notes the
++# bead. `check` holds while the target stands at that sha and clears the marker
++# once it moves. The script runs here for real, under a PATH holding only the
++# tools the refinery's merge lanes are given, against a bare origin and a clone,
++# with a journalling gc stub. The shipped find-work-lane-wedge block is
++# extracted from the formula and executed, not transcribed.
++#
++# The suite fails unless EXPECTED_TESTS tests ran. Point SCRIPT at another copy
++# of the script to run the same cases against it.
++set -uo pipefail
++
++ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
++SCRIPT="${SCRIPT:-$ROOT/gastown/assets/scripts/refinery/lane-wedge.sh}"
++FORMULA="$ROOT/gastown/formulas/mol-refinery-patrol.toml"
++EXPECTED_TESTS=12
++
++FAILURES=0
++PASS_TESTS=0
++CASE=""
++CASE_START_FAILURES=0
++T=""
++
++fail() {
++    echo "FAIL[$CASE]: $*" >&2
++    FAILURES=$((FAILURES + 1))
++}
++
++expect() {
++    [ "$2" = "$3" ] || fail "$1 is '$2', want '$3'"
++}
++
++# --- stubs and fixture ------------------------------------------------------
++
++# The fake gc. Every call is journalled one per line as `gc <argv>` (a mail
++# body spans several lines). Dispatch is on the argv words one at a time. Any
++# call it does not model exits 64, so a script that grows a gc call fails here.
++write_gc_stub() {
++    cat >"$1/gc" <<'STUB'
++#!/usr/bin/env bash
++ARGS=("$@")
++printf 'gc %s\n' "$*" >>"$GC_STUB_LOG"
++unexpected() {
++    echo "stub gc: unexpected invocation: gc ${ARGS[*]}" >&2
++    exit 64
++}
++case "${1:-}" in
++mail)
++    [ "${2:-}" = send ] || unexpected
++    [ "${GC_STUB_MAIL_FAIL:-}" != 1 ] || exit 1
++    ;;
++bd)
++    case "${2:-}" in
++    note)
++        cat >>"$GC_STUB_NOTES"
++        ;;
++    *) unexpected ;;
++    esac
++    ;;
++formula)
++    [ "${2:-}" = list ] || unexpected
++    echo '{"formulas":[]}'
++    ;;
++*) unexpected ;;
++esac
++exit 0
++STUB
++    chmod +x "$1/gc"
++}
++
++# make_bin <dir> — a PATH holding only the tools the merge lanes are given
++# (test_refinery_merge_lanes.sh), plus git, and the gc stub.
++make_bin() {
++    local bin="$1" tool path
++    mkdir -p "$bin"
++    for tool in bash sh env cat cp mv rm rmdir mkdir mktemp ls ln chmod touch \
++        cut dirname basename grep sed awk tr head tail wc sort uniq jq sleep date \
++        find xargs expr git; do
++        path=$(command -v "$tool") || continue
++        ln -sf "$path" "$bin/$tool"
++    done
++    write_gc_stub "$bin"
++}
++
++git_q() { git "$@" >/dev/null 2>&1; }
++
++# new_case <name> — a bare origin with integration, a seed clone that pushes to
++# it, the refinery clone, the stubs and the logs.
++new_case() {
++    CASE="$1"
++    CASE_START_FAILURES=$FAILURES
++    T=$(mktemp -d)
++    ORIGIN="$T/origin.git"
++    SEED="$T/seed"
++    REFINERY="$T/refinery"
++    BIN="$T/bin"
++    mkdir -p "$T/home" "$T/tmp"
++    git_q init --bare -b integration "$ORIGIN"
++    git_q init -b integration "$SEED"
++    git -C "$SEED" config user.name seed
++    git -C "$SEED" config user.email seed@example.invalid
++    git -C "$SEED" config commit.gpgsign false
++    echo one >"$SEED/file"
++    git_q -C "$SEED" add file
++    git_q -C "$SEED" commit -m one
++    git_q -C "$SEED" remote add origin "$ORIGIN"
++    git_q -C "$SEED" push origin integration
++    git_q clone "$ORIGIN" "$REFINERY"
++    make_bin "$BIN"
++    : >"$T/gc.log"
++    : >"$T/notes"
++    : >"$T/refused.log"
++    MARKER="$(git -C "$REFINERY" rev-parse --absolute-git-dir)/refinery-lane-wedged.json"
++}
++
++end_case() {
++    if [ "$FAILURES" -ne "$CASE_START_FAILURES" ]; then
++        {
++            echo "--- $CASE: last run output ---"
++            cat "$T/out" 2>/dev/null
++            echo "--- $CASE: gc calls ---"
++            cat "$T/gc.log"
++        } >&2
++    fi
++    trash "$T" 2>/dev/null || rm -rf "$T"
++    PASS_TESTS=$((PASS_TESTS + 1))
++}
++
++origin_tip() { git --git-dir="$ORIGIN" rev-parse refs/heads/integration; }
++
++# advance_origin — land one more commit on the origin's integration.
++advance_origin() {
++    echo "$RANDOM" >>"$SEED/file"
++    git_q -C "$SEED" commit -am advance
++    git_q -C "$SEED" push origin integration
++}
++
++# write_refused_log <sha> — merge-push output that ends in the REFUSED line.
++write_refused_log() {
++    {
++        echo "remote: pre-push gate: lint is red"
++        echo "merge-ff-push: push to integration was rejected (status 1); origin/integration is STILL $1."
++        echo "merge-ff-push: REFUSED target=integration sha=$1"
++    } >"$T/refused.log"
++}
++
++# run_script <args...> — run lane-wedge.sh inside the refinery clone under the
++# restricted PATH. Sets RC and leaves the output in $T/out.
++run_script() {
++    (
++        cd "$REFINERY" || exit 90
++        env -i PATH="$BIN" HOME="$T/home" TMPDIR="$T/tmp" \
++            GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GC_RIG=testrig \
++            GC_STUB_LOG="$T/gc.log" GC_STUB_NOTES="$T/notes" \
++            GC_STUB_MAIL_FAIL="${MAIL_FAIL:-}" \
++            "$BIN/bash" "$SCRIPT" "$@"
++    ) >"$T/out" 2>&1
++    RC=$?
++}
++
++# mark_head <id> [sha] — mark <id> against a log refused at [sha] (the origin tip).
++mark_head() {
++    local sha="${2:-$(origin_tip)}"
++    write_refused_log "$sha"
++    run_script mark --work "$1" --log "$T/refused.log"
++}
++
++mail_count() { grep -cF "gc mail send mayor/ --notify -s ESCALATION: merge lane wedged on testrig/integration at " "$T/gc.log"; }
++marker_field() { jq -r "$@" "$MARKER"; }
++output_has() { grep -qE -- "$1" "$T/out"; }
++
++# --- mark -------------------------------------------------------------------
++
++test_mark_new_wedge_records_escalates_and_notes() {
++    local sha
++    new_case mark_new_wedge
++    sha=$(origin_tip)
++    mark_head gcp-a
++    expect "exit status" "$RC" 0
++    output_has "^LANE-WEDGE NEW integration ${sha:0:12} head=gcp-a escalation=sent\$" ||
++        fail "no 'LANE-WEDGE NEW' line; output: $(cat "$T/out")"
++    [ -f "$MARKER" ] || fail "no marker at $MARKER"
++    expect "marker target" "$(marker_field .target)" integration
++    expect "marker target_sha" "$(marker_field .target_sha)" "$sha"
++    expect "marker heads" "$(marker_field -c .heads)" '["gcp-a"]'
++    expect "marker escalation" "$(marker_field .escalation)" sent
++    [ -n "$(marker_field .since)" ] || fail "marker has no since"
++    expect "mails" "$(mail_count)" 1
++    grep -qF "gc mail send mayor/ --notify -s ESCALATION: merge lane wedged on testrig/integration at ${sha:0:12} [HIGH] -m " "$T/gc.log" ||
++        fail "the mail subject is not the escalation subject; calls: $(head -n 1 "$T/gc.log")"
++    # The release is the marker's removal, and the mail says so on its own line,
++    # followed by the line about a fix bead that is not labelled base-red.
++    grep -qxF "Release: rm $MARKER" "$T/gc.log" || fail "the mail has no 'Release: rm $MARKER' line"
++    grep -A1 -xF "Release: rm $MARKER" "$T/gc.log" | tail -n 1 |
++        grep -qxF "A fix bead that is not labelled base-red lands only after that rm." ||
++        fail "the line after the release is not the base-red caveat"
++    grep -qF "push to integration refused while origin/integration stood at $sha" "$T/notes" ||
++        fail "the bead was not noted; notes: $(cat "$T/notes")"
++    grep -qF "stays assigned to the refinery and is not rejected" "$T/notes" ||
++        fail "the note does not say the bead is kept"
++    end_case
++}
++
++test_mark_same_sha_escalates_once() {
++    new_case mark_same_sha
++    mark_head gcp-a
++    expect "first exit status" "$RC" 0
++    mark_head gcp-b
++    expect "second exit status" "$RC" 0
++    output_has '^LANE-WEDGE KNOWN integration [0-9a-f]{12} heads=gcp-a,gcp-b escalation=sent$' ||
++        fail "no 'LANE-WEDGE KNOWN' line; output: $(cat "$T/out")"
++    expect "mails" "$(mail_count)" 1
++    expect "marker heads" "$(marker_field -c .heads)" '["gcp-a","gcp-b"]'
++    end_case
++}
++
++test_mark_new_sha_escalates_again() {
++    local second
++    new_case mark_new_sha
++    mark_head gcp-a
++    advance_origin
++    second=$(origin_tip)
++    mark_head gcp-b
++    expect "exit status" "$RC" 0
++    output_has "^LANE-WEDGE NEW integration ${second:0:12} head=gcp-b escalation=sent\$" ||
++        fail "no 'LANE-WEDGE NEW' line for the second sha; output: $(cat "$T/out")"
++    expect "mails" "$(mail_count)" 2
++    expect "marker target_sha" "$(marker_field .target_sha)" "$second"
++    expect "marker heads" "$(marker_field -c .heads)" '["gcp-b"]'
++    end_case
++}
++
++test_mark_retries_a_failed_escalation() {
++    new_case mark_retry
++    MAIL_FAIL=1 mark_head gcp-a
++    expect "first exit status" "$RC" 0
++    expect "first marker escalation" "$(marker_field .escalation)" failed
++    output_has '^WARN lane-wedge: the escalation mail failed' ||
++        fail "the failed mail printed no WARN; output: $(cat "$T/out")"
++    mark_head gcp-a
++    expect "second exit status" "$RC" 0
++    expect "second marker escalation" "$(marker_field .escalation)" sent
++    expect "mails" "$(mail_count)" 2
++    expect "marker heads" "$(marker_field -c .heads)" '["gcp-a"]'
++    end_case
++}
++
++test_mark_without_a_refused_line_writes_nothing() {
++    new_case mark_without_refused_line
++    echo "merge-ff-push: push to integration was rejected (status 1)" >"$T/refused.log"
++    run_script mark --work gcp-a --log "$T/refused.log"
++    expect "exit status" "$RC" 2
++    [ ! -e "$MARKER" ] || fail "a marker was written without a REFUSED line"
++    [ ! -s "$T/gc.log" ] || fail "gc was called without a REFUSED line: $(cat "$T/gc.log")"
++    end_case
++}
++
++# --- check ------------------------------------------------------------------
++
++test_check_without_marker_is_none() {
++    new_case check_without_marker
++    run_script check
++    expect "exit status" "$RC" 0
++    expect "output" "$(cat "$T/out")" "LANE-WEDGE none"
++    end_case
++}
++
++test_check_holds_while_target_stands() {
++    local sha
++    new_case check_holds
++    sha=$(origin_tip)
++    mark_head gcp-a
++    run_script check
++    expect "exit status" "$RC" 3
++    expect "output" "$(cat "$T/out")" "LANE-WEDGE holds integration ${sha:0:12} skip=gcp-a"
++    [ -f "$MARKER" ] || fail "check removed the marker while the target stood still"
++    end_case
++}
++
++test_check_clears_when_target_moves() {
++    local before after
++    new_case check_clears
++    before=$(origin_tip)
++    mark_head gcp-a
++    advance_origin
++    after=$(origin_tip)
++    run_script check
++    expect "exit status" "$RC" 0
++    expect "output" "$(cat "$T/out")" "LANE-WEDGE cleared integration ${before:0:12} -> ${after:0:12}"
++    [ ! -e "$MARKER" ] || fail "the marker survived the target moving"
++    end_case
++}
++
++test_check_holds_when_fetch_fails() {
++    local sha
++    new_case check_fetch_fails
++    sha=$(origin_tip)
++    mark_head gcp-a
++    git_q -C "$REFINERY" remote set-url origin "$T/missing.git"
++    run_script check
++    expect "exit status" "$RC" 3
++    expect "output" "$(cat "$T/out")" "LANE-WEDGE holds integration ${sha:0:12} fetch-failed skip=gcp-a"
++    [ -f "$MARKER" ] || fail "check removed the marker when it could not fetch"
++    end_case
++}
++
++test_check_removes_an_unreadable_marker() {
++    new_case check_unreadable
++    echo "this is not json" >"$MARKER"
++    run_script check
++    expect "exit status" "$RC" 0
++    output_has '^WARN lane-wedge: unreadable marker .* removed\.$' ||
++        fail "no unreadable-marker WARN; output: $(cat "$T/out")"
++    [ ! -e "$MARKER" ] || fail "the unreadable marker was kept"
++    end_case
++}
++
++# --- the formula's block and the script's shape -----------------------------
++
++# extract_lane_wedge_block <outfile> — the shipped find-work-lane-wedge block,
++# read out of the formula with tomllib.
++extract_lane_wedge_block() {
++    python3 - "$FORMULA" "$1" <<'PY'
++import re
++import sys
++import tomllib
++
++formula, out = sys.argv[1:3]
++begin = "# --- find-work-lane-wedge:begin ---"
++end = "# --- find-work-lane-wedge:end ---"
++with open(formula, "rb") as handle:
++    doc = tomllib.load(handle)
++blocks = [
++    text.split(begin, 1)[1].split(end, 1)[0]
++    for text in (step.get("description", "") for step in doc["steps"])
++    if begin in text and end in text
++]
++if len(blocks) != 1:
++    sys.exit(f"expected exactly one find-work-lane-wedge block, found {len(blocks)}")
++if re.search(r"\{\{[^}]*\}\}", blocks[0]):
++    sys.exit("the find-work-lane-wedge block carries a template placeholder")
++with open(out, "w") as handle:
++    handle.write(blocks[0])
++PY
++}
++
++test_find_work_block_sets_the_filter() {
++    local last
++    new_case find_work_block
++    extract_lane_wedge_block "$T/block.sh" || { fail "could not extract the block"; end_case; return; }
++    cat >"$T/run-block.sh" <<'RUNNER'
++. "$1"
++printf '%s|%s\n' "$LANE_WEDGE_ONLY" "$LANE_WEDGE_SKIP"
++RUNNER
++    # The block finds the script the way merge-batch.sh is found: by the
++    # formula's source, else GC_PACK_DIR. The stub lists no formula.
++    mkdir -p "$T/pack/assets/scripts/refinery"
++    cp -f "$SCRIPT" "$T/pack/assets/scripts/refinery/lane-wedge.sh"
++    chmod +x "$T/pack/assets/scripts/refinery/lane-wedge.sh"
++
++    mark_head gcp-a
++    (
++        cd "$REFINERY" || exit 90
++        env -i PATH="$BIN" HOME="$T/home" TMPDIR="$T/tmp" \
++            GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GC_RIG=testrig \
++            GC_PACK_DIR="$T/pack" GC_STUB_LOG="$T/gc.log" GC_STUB_NOTES="$T/notes" \
++            "$BIN/bash" "$T/run-block.sh" "$T/block.sh"
++    ) >"$T/out" 2>&1
++    last=$(tail -n 1 "$T/out")
++    expect "a held wedge's filter" "$last" "base-red|gcp-a"
++
++    rm -f "$MARKER"
++    (
++        cd "$REFINERY" || exit 90
++        env -i PATH="$BIN" HOME="$T/home" TMPDIR="$T/tmp" \
++            GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GC_RIG=testrig \
++            GC_PACK_DIR="$T/pack" GC_STUB_LOG="$T/gc.log" GC_STUB_NOTES="$T/notes" \
++            "$BIN/bash" "$T/run-block.sh" "$T/block.sh"
++    ) >"$T/out" 2>&1
++    last=$(tail -n 1 "$T/out")
++    expect "no marker's filter" "$last" "|"
++    end_case
++}
++
++test_script_has_no_patrol_control() {
++    new_case script_shape
++    [ -x "$SCRIPT" ] || fail "$SCRIPT is not executable"
++    expect "template placeholders in the script" "$(grep -c '{{' "$SCRIPT")" 0
++    expect "patrol-loop control in the script" "$(grep -cE 'drain-ack|gc bd mol (wisp|burn)' "$SCRIPT")" 0
++    end_case
++}
++
++# --- runner -----------------------------------------------------------------
++
++test_mark_new_wedge_records_escalates_and_notes
++test_mark_same_sha_escalates_once
++test_mark_new_sha_escalates_again
++test_mark_retries_a_failed_escalation
++test_mark_without_a_refused_line_writes_nothing
++test_check_without_marker_is_none
++test_check_holds_while_target_stands
++test_check_clears_when_target_moves
++test_check_holds_when_fetch_fails
++test_check_removes_an_unreadable_marker
++test_find_work_block_sets_the_filter
++test_script_has_no_patrol_control
++
++# A test defined but never called would pass vacuously: every definition needs
++# exactly one call line.
++while read -r defined; do
++    [ "$(grep -cx "$defined" "${BASH_SOURCE[0]}")" = 1 ] || {
++        CASE=runner
++        fail "$defined is not called exactly once"
++    }
++done < <(sed -n 's/^\(test_[a-z_]*\)() {$/\1/p' "${BASH_SOURCE[0]}")
++
++if [ "$PASS_TESTS" -ne "$EXPECTED_TESTS" ]; then
++    echo "FAIL: $PASS_TESTS of $EXPECTED_TESTS tests ran" >&2
++    exit 1
++fi
++if [ "$FAILURES" -ne 0 ]; then
++    echo "$FAILURES failure(s)" >&2
++    exit 1
++fi
++echo "OK: $PASS_TESTS tests passed"
+diff --git a/gastown/tests/test_refinery_merge_lanes.sh b/gastown/tests/test_refinery_merge_lanes.sh
+index 500d0fae..6004347b 100644
+--- a/gastown/tests/test_refinery_merge_lanes.sh
++++ b/gastown/tests/test_refinery_merge_lanes.sh
+@@ -151,6 +151,12 @@ bd)
+             shift
+         done
+         ;;
++    note)
++        # `note <work> --stdin`: the body arrives on stdin and is appended to the
++        # notes file (lane-wedge.sh mark notes the bead it parks).
++        { [ "$#" -eq 4 ] && [ "$3" = "$GC_STUB_WORK" ] && [ "$4" = --stdin ]; } || unexpected
++        cat >>"$GC_STUB_NOTES"
++        ;;
+     close)
+         { [ "$#" -eq 5 ] && [ "$3" = "$GC_STUB_WORK" ] && [ "$4" = --reason ]; } || unexpected
+         edit_bead --arg r "$5" '.[0].status = "closed" | .[0].close_reason = $r'
+@@ -520,6 +526,7 @@ run_process() {
+             GC_BEAD_ID="$WISP_ID" GC_AGENT="$REFINERY_AGENT" GC_RIG=testrig \
+             GC_PACK_DIR="$PACK_DIR" WORK="$WORK_ID" \
+             GC_STUB_LOG="$T/gc.log" GC_STUB_BEAD="$BEAD" GC_STUB_WORK="$WORK_ID" \
++            GC_STUB_NOTES="$T/notes" \
+             GC_STUB_NEXT_WISP="$NEXT_WISP_ID" GC_STUB_FORMULA_SOURCE= \
+             GH_STUB_LOG="$T/gh.log" STUB_PR="$T/pr.json" STUB_ORIGIN_DIR="$ORIGIN" \
+             STUB_BODY_CAPTURE="$T/pr-body.md" STUB_GH_MISSING="$STUB_GH_MISSING" \
+@@ -795,6 +802,7 @@ HOOK
+ }
+ 
+ test_lane_direct_push_veto_status_7() {
++    local marker
+     new_case direct_push_veto_status_7
+     build_rig unmerged
+     write_bead
+@@ -811,8 +819,24 @@ HOOK
+     expect "push attempts" "$(wc -l <"$T/push-attempts" | tr -d ' ')" 1
+     expect_no_merge_metadata
+     expect_not_closed
+-    expect_drained
+-    expect_status 1
++    # The lane parks (gcp-ubv2): the step continues on with the marker written,
++    # one escalation sent and the bead kept, never drained.
++    expect_not_drained
++    expect_status 0
++    output_has 'merge-push: status 7: the lane is wedged; continue to patrol-summary' ||
++        fail "the output does not say the lane is wedged"
++    marker="$(git -C "$REFINERY" rev-parse --absolute-git-dir)/refinery-lane-wedged.json"
++    [ -f "$marker" ] || fail "no lane-wedge marker at $marker"
++    expect "marker target" "$(jq -r '.target' "$marker")" "$TARGET_NAME"
++    expect "marker target_sha" "$(jq -r '.target_sha' "$marker")" "$TARGET_BEFORE"
++    expect "marker heads" "$(jq -c '.heads' "$marker")" "[\"$WORK_ID\"]"
++    expect "marker escalation" "$(jq -r '.escalation' "$marker")" sent
++    expect "ESCALATION mails" \
++        "$(grep -cF "gc mail send mayor/ --notify -s ESCALATION: merge lane wedged on testrig/$TARGET_NAME at ${TARGET_BEFORE:0:12} [HIGH] -m " "$T/gc.log")" 1
++    grep -qF "stays assigned to the refinery and is not rejected" "$T/notes" ||
++        fail "the bead was not noted as kept; notes: $(cat "$T/notes" 2>/dev/null)"
++    expect "assignee" "$(bead assignee)" "$REFINERY_AGENT"
++    expect "status" "$(bead status)" in_progress
+     expect_target_unchanged
+     end_case
+ }
+@@ -1266,6 +1290,9 @@ if [ "$SCRIPT" != "$PACK_DIR/assets/scripts/refinery/merge-push.sh" ]; then
+     mkdir -p "$HARNESS/pack/assets/scripts/refinery"
+     cp -f "$SCRIPT" "$HARNESS/pack/assets/scripts/refinery/merge-push.sh"
+     chmod +x "$HARNESS/pack/assets/scripts/refinery/merge-push.sh"
++    # The 7) arm resolves lane-wedge.sh beside merge-push.sh.
++    cp -f "$PACK_DIR/assets/scripts/refinery/lane-wedge.sh" "$HARNESS/pack/assets/scripts/refinery/lane-wedge.sh"
++    chmod +x "$HARNESS/pack/assets/scripts/refinery/lane-wedge.sh"
+     PACK_DIR="$HARNESS/pack"
+ fi
+ 
+diff --git a/scripts/gascity_pack_inference_gate.py b/scripts/gascity_pack_inference_gate.py
+index c802136f..27196807 100644
+--- a/scripts/gascity_pack_inference_gate.py
++++ b/scripts/gascity_pack_inference_gate.py
+@@ -167,6 +167,15 @@ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
+         "acceptance-check.sh",
+         'packet --work "$ACK_ID"',
+         'record --work "$ACK_ID" --verdict SKIP',
++        # The lane wedge (gcp-ubv2): a push refused while the target stood still
++        # parks the lane through lane-wedge.sh instead of draining with the bead
++        # still assigned, and find-work reads the same script to filter its scan.
++        # A step that stops calling it is a refinery that re-selects a refused
++        # head every session until the restart circuit breaker opens.
++        "lane-wedge.sh",
++        'mark --work "$WORK" --log "$MP_LOG"',
++        '"$LANE_WEDGE" check',
++        '${LANE_WEDGE_ONLY:+--label="$LANE_WEDGE_ONLY"}',
+     ),
+     "mol-witness-patrol": (
+         "LIVENESS_MAP=$(jq -n",
+@@ -378,6 +387,13 @@ GASTOWN_SCRIPT_CONTRACTS = {
+         '--set-metadata "acceptance_check_tip=$rec_tip" \\',
+         'if ! gc bd update "$rec_work" --add-label "$rec_label" >/dev/null; then',
+     ),
++    # The lane wedge's marker and escalation (gcp-ubv2): the marker file is the
++    # one thing find-work and the mayor's release both name, and the mail is the
++    # only signal a human gets that the lane is parked.
++    "assets/scripts/refinery/lane-wedge.sh": (
++        "refinery-lane-wedged.json",
++        "gc mail send mayor/ --notify",
++    ),
+ }
+ METHODOLOGY_FLOW_CONTRACTS = {
+     "superpowers": {
+diff --git a/tests/test_gascity_pack_inference_gate.py b/tests/test_gascity_pack_inference_gate.py
+index fc1b6b91..5cabeaed 100644
+--- a/tests/test_gascity_pack_inference_gate.py
++++ b/tests/test_gascity_pack_inference_gate.py
+@@ -1853,6 +1853,14 @@ def test_validate_gastown_orchestration_contract_rejects_a_pack_without_the_merg
+         gascity_pack_inference_gate.validate_gastown_orchestration_contract(pack)
+ 
+ 
++def test_validate_gastown_orchestration_contract_rejects_a_pack_without_the_lane_wedge_script(tmp_path) -> None:
++    pack = write_gastown_contract_pack(tmp_path)
++    (pack / "assets" / "scripts" / "refinery" / "lane-wedge.sh").unlink()
++
++    with pytest.raises(gascity_pack_inference_gate.GateError, match="missing script file"):
++        gascity_pack_inference_gate.validate_gastown_orchestration_contract(pack)
++
++
+ def test_validate_gastown_orchestration_contract_accepts_the_fixture_pack_with_acceptance_check(tmp_path) -> None:
+     pack = write_gastown_contract_pack(tmp_path)
+ 
+-- 
+2.54.0 (Apple Git-157)
+
