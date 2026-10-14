@@ -405,7 +405,13 @@ if [ -n "$target_bead" ] && [ -n "${bead_json:-}" ]; then
     [ "$rig_namespace_real" = "$rig_namespace" ] || return 1
     provider_parent=$(dirname -- "$provider_real")
     provider_name=$(basename -- "$provider_real")
-    [ "$provider_parent" = "$rig_namespace_real/polecats" ] || return 1
+    # A provider home is <rig_ns>/<lane>/<agent>: polecats, or a specialists
+    # lane such as views or infra. Key on that shape, not on the lane's name;
+    # "artifacts" is the task-artifact root, never a lane of agent homes.
+    [ "$(dirname -- "$provider_parent")" = "$rig_namespace_real" ] || return 1
+    case "$(basename -- "$provider_parent")" in
+      ""|"."|".."|artifacts|*[!A-Za-z0-9._-]*) return 1 ;;
+    esac
     case "$provider_name" in
       ""|"."|".."|*[!A-Za-z0-9._-]*) return 1 ;;
     esac
