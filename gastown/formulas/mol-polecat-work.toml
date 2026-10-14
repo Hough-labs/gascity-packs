@@ -570,7 +570,10 @@ is cited, not re-diagnosed and not re-filed (gc-cgxps).
 
 **Config: typecheck_command = {{typecheck_command}}**
 **Config: lint_command = {{lint_command}}**
-**Config: test_command = {{test_command}}**
+
+Tests do not run here. A test red on base is attributed at self-review, which
+re-runs every NEW failing test id on a detached worktree of the base (§3), so
+a full test sweep of the unchanged base would repeat that work (gcp-zhbyb).
 
 **Skip this step if resuming a rejected branch** — pre-flights were
 already verified on the prior attempt. Close this step and proceed.
@@ -580,10 +583,10 @@ in ONE shell. §2 and §3 need the functions and variables it sets, so they sit
 at its end instead of in blocks of their own.
 
 A phase that an open base-red bead already covers is not re-run on base: all
-that run could do is confirm a red the ledger already holds. A NEW red in that
-phase is still caught at self-review, which runs every phase and re-runs each
-new failure on base. The skip fails closed: when `known-red list` errors or its
-answer does not parse, the phase runs.
+that run could do is confirm a red the ledger already holds. A NEW typecheck
+or lint red in that phase is still caught at self-review, which runs every
+phase and re-runs each new failure on base. The skip fails closed: when
+`known-red list` errors or its answer does not parse, the phase runs.
 
 A phase is named after the formula var that holds its command: `setup`,
 `typecheck`, `lint`, `build`, `test`, `affected-tests`. A configured command's
@@ -679,7 +682,6 @@ preflight_phase() {
 }
 preflight_phase typecheck '{{typecheck_command}}'
 preflight_phase lint '{{lint_command}}'
-preflight_phase test '{{test_command}}'
 # --- preflight-phases:end ---
 # --- preflight-red:begin ---
 if ! grep -q '^gate([A-Za-z0-9_-]*): FAIL' "$GATE_LOG"; then

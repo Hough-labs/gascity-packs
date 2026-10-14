@@ -1,0 +1,196 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Wed, 14 Oct 2026 18:40:36 -0400
+Subject: [PATCH 164/164] fix(gastown): stop polecat preflight running the full
+ test suite on the unchanged base (gcp-zhbyb)
+
+preflight-tests re-ran the rig's whole test command on the unchanged base
+before every bead. On winnow that was 0 of 46 test preflights answered from
+receipts, about 20 sweep-hours, and a median 43 min wall since GATE_ALL; four
+concurrent sweeps also livelock the pool under the gc stall backstop. The sweep
+buys no attribution self-review lacks: self-review section 3 re-runs every NEW
+red test id on a detached worktree of the base and decides "green on base: the
+red is yours" vs "red on base too". Preflight's test phase only found a base
+red earlier. Hunter's ruling 2026-10-14 supersedes gcp-xlf5.
+
+The preflight loop drops `preflight_phase test`; typecheck and lint stay (cheap,
+receipt-answered). The description swaps the test_command config line for a
+paragraph saying why tests do not run here, and the known-red skip paragraph no
+longer implies a test phase runs. Self-review, the refinery, mol-polecat-base
+and every rig's test_command are untouched.
+
+test_known_red_wiring.sh: (e) now covers lint (seed gcp-bt1:lint:open) and
+asserts typecheck runs, lint does not, and the log names gcp-bt1; test is
+pinned never-invoked with and without known-red, and the formula must contain
+zero `preflight_phase test`. The three preflight red-branch cases inject their
+red through PREFLIGHT_LINT instead of the removed test phase (the known-red case
+seeds typecheck as its covered phase so the lint red is not skipped); the filed
+bead now carries phase=lint. Those edits are the design's step-5 scope growth.
+
+Validation: new pins FAIL against the unchanged formula (3 FAIL lines) and
+the test passes after; restoring only the test-phase line fails it again.
+
+Risk accepted by the ruling: a polecat may implement on a base whose tests are
+red and learn it at self-review, which already classifies that correctly.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ gastown/formulas/mol-polecat-work.toml | 14 ++++----
+ gastown/tests/test_known_red_wiring.sh | 47 +++++++++++++++++---------
+ 2 files changed, 39 insertions(+), 22 deletions(-)
+
+diff --git a/gastown/formulas/mol-polecat-work.toml b/gastown/formulas/mol-polecat-work.toml
+index 453bafa7..30fb1093 100644
+--- a/gastown/formulas/mol-polecat-work.toml
++++ b/gastown/formulas/mol-polecat-work.toml
+@@ -570,7 +570,10 @@ is cited, not re-diagnosed and not re-filed (gc-cgxps).
+ 
+ **Config: typecheck_command = {{typecheck_command}}**
+ **Config: lint_command = {{lint_command}}**
+-**Config: test_command = {{test_command}}**
++
++Tests do not run here. A test red on base is attributed at self-review, which
++re-runs every NEW failing test id on a detached worktree of the base (§3), so
++a full test sweep of the unchanged base would repeat that work (gcp-zhbyb).
+ 
+ **Skip this step if resuming a rejected branch** — pre-flights were
+ already verified on the prior attempt. Close this step and proceed.
+@@ -580,10 +583,10 @@ in ONE shell. §2 and §3 need the functions and variables it sets, so they sit
+ at its end instead of in blocks of their own.
+ 
+ A phase that an open base-red bead already covers is not re-run on base: all
+-that run could do is confirm a red the ledger already holds. A NEW red in that
+-phase is still caught at self-review, which runs every phase and re-runs each
+-new failure on base. The skip fails closed: when `known-red list` errors or its
+-answer does not parse, the phase runs.
++that run could do is confirm a red the ledger already holds. A NEW typecheck
++or lint red in that phase is still caught at self-review, which runs every
++phase and re-runs each new failure on base. The skip fails closed: when
++`known-red list` errors or its answer does not parse, the phase runs.
+ 
+ A phase is named after the formula var that holds its command: `setup`,
+ `typecheck`, `lint`, `build`, `test`, `affected-tests`. A configured command's
+@@ -679,7 +682,6 @@ preflight_phase() {
+ }
+ preflight_phase typecheck '{{typecheck_command}}'
+ preflight_phase lint '{{lint_command}}'
+-preflight_phase test '{{test_command}}'
+ # --- preflight-phases:end ---
+ # --- preflight-red:begin ---
+ if ! grep -q '^gate([A-Za-z0-9_-]*): FAIL' "$GATE_LOG"; then
+diff --git a/gastown/tests/test_known_red_wiring.sh b/gastown/tests/test_known_red_wiring.sh
+index 9c0be5b1..6533d819 100644
+--- a/gastown/tests/test_known_red_wiring.sh
++++ b/gastown/tests/test_known_red_wiring.sh
+@@ -387,56 +387,71 @@ test_d_phase_covered() {
+ 
+ # preflight <env...> — the preflight §1 block rendered with stub phase
+ # commands that record their invocation, then the §2/§3 block. typecheck uses
+-# winnow's quoting shape.
++# winnow's quoting shape. Preflight runs typecheck and lint only (gcp-zhbyb), so
++# a red is injected through PREFLIGHT_LINT. test_command stays a recording stub
++# so a test phase that comes back shows up in $INVOKED.
+ preflight() {
+     : >"$TMP/invoked"
+     printf '#!/usr/bin/env bash\necho "$1" >>"$INVOKED"\n' >"$TMP/repo/stub-gate.sh"
+     extract_block "$FORMULA" preflight-tests preflight-phases "$TMP/phases.sh" \
+         typecheck_command='bash "$(pwd)/stub-gate.sh" typecheck' \
+-        lint_command='echo lint >>"$INVOKED"' \
+-        test_command="${PREFLIGHT_TEST:-echo test >>\"\$INVOKED\"}" || return 1
++        lint_command="${PREFLIGHT_LINT:-echo lint >>\"\$INVOKED\"}" \
++        test_command='echo test >>"$INVOKED"' || return 1
+     extract_block "$FORMULA" preflight-tests preflight-red "$TMP/red.sh" base_branch=integration convoy_id=gcp-convoy binding_prefix=gastown. || return 1
+     run_blocks "$TMP/resolve.sh" "$TMP/gate.sh" "$TMP/skip.sh" "$TMP/phases.sh" "$TMP/red.sh" -- \
+         GC_STUB_FORMULAS="$TMP/formulas.json" INVOKED="$TMP/invoked" "$@"
+ }
+ 
+ # (e) the preflight loop skips a phase an open base-red covers, and only it.
++# lint is the covered phase: test no longer runs in preflight at all (gcp-zhbyb).
+ test_e_preflight_skips_only_the_covered_phase() {
+     make_pack "$TMP/pack-a" yes
+     formulas_json "$TMP/pack-a"
+-    seed_ledger gcp-bt1:test:open
++    seed_ledger gcp-bt1:lint:open
+     preflight || { fail "(e) could not render the preflight blocks"; return; }
+     local log
+     log="$(git -C "$TMP/repo" rev-parse --absolute-git-dir)/preflight-gate.log"
+     [ "$RUN_CODE" -eq 0 ] || fail "(e) the preflight blocks exited $RUN_CODE: $(cat "$TMP/run.log")"
+     grep -qx 'typecheck' "$TMP/invoked" || fail "(e) typecheck must run, invoked: $(cat "$TMP/invoked")"
+-    grep -qx 'lint' "$TMP/invoked" || fail "(e) lint must run, invoked: $(cat "$TMP/invoked")"
+-    ! grep -qx 'test' "$TMP/invoked" || fail "(e) test must NOT run on base while gcp-bt1 covers it"
+-    grep -qx 'phase test not re-run on base: known red gcp-bt1' "$log" ||
+-        fail "(e) the log must say why test was skipped, got: $(cat "$log")"
++    ! grep -qx 'lint' "$TMP/invoked" || fail "(e) lint must NOT run on base while gcp-bt1 covers it"
++    grep -qx 'phase lint not re-run on base: known red gcp-bt1' "$log" ||
++        fail "(e) the log must say why lint was skipped, got: $(cat "$log")"
+     grep -q '^PRE-FLIGHTS GREEN' "$TMP/run.log" || fail "(e) a skipped phase is not a failure, got: $(cat "$TMP/run.log")"
+     [ ! -s "$TMP/calls.log" ] || fail "(e) a green preflight must not note or mail, got: $(cat "$TMP/calls.log")"
+ 
+-    # Without known-red every phase runs.
++    # (gcp-zhbyb) The test phase never runs in preflight, covered or not: a
++    # test red on base is attributed at self-review, which re-runs every NEW
++    # failing test id on a detached worktree of the base.
++    ! grep -qx 'test' "$TMP/invoked" ||
++        fail "(e) gcp-zhbyb: preflight must never run the test phase on base, invoked: $(cat "$TMP/invoked")"
++
++    # Without known-red every remaining phase runs, and test still does not.
+     formulas_json "$TMP/pack-empty"
+     make_pack "$TMP/pack-empty"
+     preflight || return
+-    grep -qx 'test' "$TMP/invoked" || fail "(e) without known-red the test phase must run, invoked: $(cat "$TMP/invoked")"
++    grep -qx 'typecheck' "$TMP/invoked" && grep -qx 'lint' "$TMP/invoked" ||
++        fail "(e) without known-red typecheck and lint must run, invoked: $(cat "$TMP/invoked")"
++    ! grep -qx 'test' "$TMP/invoked" ||
++        fail "(e) gcp-zhbyb: preflight must never run the test phase on base, invoked: $(cat "$TMP/invoked")"
+     grep -q '^WARN known-red not found' "$TMP/run.log" || fail "(e) a missing known-red must WARN, got: $(cat "$TMP/run.log")"
++
++    # gcp-zhbyb: the formula carries no test phase in its preflight loop.
++    [ "$(grep -c 'preflight_phase test' "$FORMULA")" = "0" ] ||
++        fail "(e) gcp-zhbyb: $FORMULA must not contain 'preflight_phase test', found $(grep -c 'preflight_phase test' "$FORMULA")"
+ }
+ 
+ # The preflight red branch acts on known-red's exit code.
+ test_preflight_red_known_notes_and_files_nothing() {
+     make_pack "$TMP/pack-a" yes
+     formulas_json "$TMP/pack-a"
+-    seed_ledger gcp-lt1:lint:open
++    seed_ledger gcp-lt1:typecheck:open
+     python3 - "$TMP/ledger.json" <<'PY'
+ import json, sys
+ db = json.load(open(sys.argv[1]))
+ db["beads"]["gcp-lt1"]["metadata"]["base_red_sigs"] = "go:internal/x.TestKnown"
+ json.dump(db, open(sys.argv[1], "w"))
+ PY
+-    PREFLIGHT_TEST='printf "%s\n" "--- FAIL: TestKnown (0.00s)" "FAIL	example.com/org/repo/internal/x	0.1s"; exit 1' preflight
++    PREFLIGHT_LINT='printf "%s\n" "--- FAIL: TestKnown (0.00s)" "FAIL	example.com/org/repo/internal/x	0.1s"; exit 1' preflight
+     grep -q '^PRE-FLIGHTS RED, all KNOWN: gcp-lt1' "$TMP/run.log" ||
+         fail "an all-KNOWN red must be cited, got: $(cat "$TMP/run.log")"
+     { grep -q "^note $WORK_BEAD: " "$TMP/calls.log" && grep -qx 'KNOWN: gcp-lt1' "$TMP/calls.log"; } ||
+@@ -449,12 +464,12 @@ test_preflight_red_new_is_filed_and_mailed() {
+     make_pack "$TMP/pack-a" yes
+     formulas_json "$TMP/pack-a"
+     seed_ledger
+-    PREFLIGHT_TEST='printf "%s\n" "--- FAIL: TestNew (0.00s)" "FAIL	example.com/org/repo/internal/y	0.1s"; exit 1' preflight
++    PREFLIGHT_LINT='printf "%s\n" "--- FAIL: TestNew (0.00s)" "FAIL	example.com/org/repo/internal/y	0.1s"; exit 1' preflight
+     local filed
+     filed=$(python3 -c 'import json,sys; print(" ".join(sorted(json.load(open(sys.argv[1]))["beads"])))' "$TMP/ledger.json")
+     [ "$filed" = "gcp-fk1" ] || fail "a NEW red must be filed through known-red, ledger holds: $filed"
+-    [ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["beads"]["gcp-fk1"]["metadata"]["base_red_phase"])' "$TMP/ledger.json" 2>/dev/null)" = "test" ] ||
+-        fail "the filed bead must carry phase=test, the name of the var that holds the command"
++    [ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["beads"]["gcp-fk1"]["metadata"]["base_red_phase"])' "$TMP/ledger.json" 2>/dev/null)" = "lint" ] ||
++        fail "the filed bead must carry phase=lint, the name of the var that holds the command"
+     grep -q "^mail gastown.witness -s NOTICE: integration has failing pre-flights -m Filed: gcp-fk1" "$TMP/calls.log" ||
+         fail "the witness NOTICE must name the filed bead, got: $(cat "$TMP/calls.log")"
+ }
+@@ -463,7 +478,7 @@ test_preflight_red_lookup_failure_files_nothing() {
+     make_pack "$TMP/pack-a" yes
+     formulas_json "$TMP/pack-a"
+     seed_ledger
+-    PREFLIGHT_TEST='printf "%s\n" "--- FAIL: TestNew (0.00s)" "FAIL	example.com/org/repo/internal/y	0.1s"; exit 1' preflight FAKE_GC_FAIL=1
++    PREFLIGHT_LINT='printf "%s\n" "--- FAIL: TestNew (0.00s)" "FAIL	example.com/org/repo/internal/y	0.1s"; exit 1' preflight FAKE_GC_FAIL=1
+     grep -q 'known-red lookup failed; not filed' "$TMP/calls.log" ||
+         fail "a failed lookup must say so to the witness, got: $(cat "$TMP/calls.log")"
+     ! grep -q '"create"' "$TMP/fake_gc.log" || fail "a failed lookup must file nothing"
+-- 
+2.54.0 (Apple Git-157)
+

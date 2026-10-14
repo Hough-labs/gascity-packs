@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Tue, 13 Oct 2026 15:33:16 -0400
-Subject: [PATCH 150/163] build(ci): one source for the CI pytest set,
+Subject: [PATCH 150/164] build(ci): one source for the CI pytest set,
  scripts/pytest-ci.sh (gcp-juuft)
 
 The Python pack test list existed only inline in ci.yml's "Run Python pack

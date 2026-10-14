@@ -387,56 +387,71 @@ test_d_phase_covered() {
 
 # preflight <env...> — the preflight §1 block rendered with stub phase
 # commands that record their invocation, then the §2/§3 block. typecheck uses
-# winnow's quoting shape.
+# winnow's quoting shape. Preflight runs typecheck and lint only (gcp-zhbyb), so
+# a red is injected through PREFLIGHT_LINT. test_command stays a recording stub
+# so a test phase that comes back shows up in $INVOKED.
 preflight() {
     : >"$TMP/invoked"
     printf '#!/usr/bin/env bash\necho "$1" >>"$INVOKED"\n' >"$TMP/repo/stub-gate.sh"
     extract_block "$FORMULA" preflight-tests preflight-phases "$TMP/phases.sh" \
         typecheck_command='bash "$(pwd)/stub-gate.sh" typecheck' \
-        lint_command='echo lint >>"$INVOKED"' \
-        test_command="${PREFLIGHT_TEST:-echo test >>\"\$INVOKED\"}" || return 1
+        lint_command="${PREFLIGHT_LINT:-echo lint >>\"\$INVOKED\"}" \
+        test_command='echo test >>"$INVOKED"' || return 1
     extract_block "$FORMULA" preflight-tests preflight-red "$TMP/red.sh" base_branch=integration convoy_id=gcp-convoy binding_prefix=gastown. || return 1
     run_blocks "$TMP/resolve.sh" "$TMP/gate.sh" "$TMP/skip.sh" "$TMP/phases.sh" "$TMP/red.sh" -- \
         GC_STUB_FORMULAS="$TMP/formulas.json" INVOKED="$TMP/invoked" "$@"
 }
 
 # (e) the preflight loop skips a phase an open base-red covers, and only it.
+# lint is the covered phase: test no longer runs in preflight at all (gcp-zhbyb).
 test_e_preflight_skips_only_the_covered_phase() {
     make_pack "$TMP/pack-a" yes
     formulas_json "$TMP/pack-a"
-    seed_ledger gcp-bt1:test:open
+    seed_ledger gcp-bt1:lint:open
     preflight || { fail "(e) could not render the preflight blocks"; return; }
     local log
     log="$(git -C "$TMP/repo" rev-parse --absolute-git-dir)/preflight-gate.log"
     [ "$RUN_CODE" -eq 0 ] || fail "(e) the preflight blocks exited $RUN_CODE: $(cat "$TMP/run.log")"
     grep -qx 'typecheck' "$TMP/invoked" || fail "(e) typecheck must run, invoked: $(cat "$TMP/invoked")"
-    grep -qx 'lint' "$TMP/invoked" || fail "(e) lint must run, invoked: $(cat "$TMP/invoked")"
-    ! grep -qx 'test' "$TMP/invoked" || fail "(e) test must NOT run on base while gcp-bt1 covers it"
-    grep -qx 'phase test not re-run on base: known red gcp-bt1' "$log" ||
-        fail "(e) the log must say why test was skipped, got: $(cat "$log")"
+    ! grep -qx 'lint' "$TMP/invoked" || fail "(e) lint must NOT run on base while gcp-bt1 covers it"
+    grep -qx 'phase lint not re-run on base: known red gcp-bt1' "$log" ||
+        fail "(e) the log must say why lint was skipped, got: $(cat "$log")"
     grep -q '^PRE-FLIGHTS GREEN' "$TMP/run.log" || fail "(e) a skipped phase is not a failure, got: $(cat "$TMP/run.log")"
     [ ! -s "$TMP/calls.log" ] || fail "(e) a green preflight must not note or mail, got: $(cat "$TMP/calls.log")"
 
-    # Without known-red every phase runs.
+    # (gcp-zhbyb) The test phase never runs in preflight, covered or not: a
+    # test red on base is attributed at self-review, which re-runs every NEW
+    # failing test id on a detached worktree of the base.
+    ! grep -qx 'test' "$TMP/invoked" ||
+        fail "(e) gcp-zhbyb: preflight must never run the test phase on base, invoked: $(cat "$TMP/invoked")"
+
+    # Without known-red every remaining phase runs, and test still does not.
     formulas_json "$TMP/pack-empty"
     make_pack "$TMP/pack-empty"
     preflight || return
-    grep -qx 'test' "$TMP/invoked" || fail "(e) without known-red the test phase must run, invoked: $(cat "$TMP/invoked")"
+    grep -qx 'typecheck' "$TMP/invoked" && grep -qx 'lint' "$TMP/invoked" ||
+        fail "(e) without known-red typecheck and lint must run, invoked: $(cat "$TMP/invoked")"
+    ! grep -qx 'test' "$TMP/invoked" ||
+        fail "(e) gcp-zhbyb: preflight must never run the test phase on base, invoked: $(cat "$TMP/invoked")"
     grep -q '^WARN known-red not found' "$TMP/run.log" || fail "(e) a missing known-red must WARN, got: $(cat "$TMP/run.log")"
+
+    # gcp-zhbyb: the formula carries no test phase in its preflight loop.
+    [ "$(grep -c 'preflight_phase test' "$FORMULA")" = "0" ] ||
+        fail "(e) gcp-zhbyb: $FORMULA must not contain 'preflight_phase test', found $(grep -c 'preflight_phase test' "$FORMULA")"
 }
 
 # The preflight red branch acts on known-red's exit code.
 test_preflight_red_known_notes_and_files_nothing() {
     make_pack "$TMP/pack-a" yes
     formulas_json "$TMP/pack-a"
-    seed_ledger gcp-lt1:lint:open
+    seed_ledger gcp-lt1:typecheck:open
     python3 - "$TMP/ledger.json" <<'PY'
 import json, sys
 db = json.load(open(sys.argv[1]))
 db["beads"]["gcp-lt1"]["metadata"]["base_red_sigs"] = "go:internal/x.TestKnown"
 json.dump(db, open(sys.argv[1], "w"))
 PY
-    PREFLIGHT_TEST='printf "%s\n" "--- FAIL: TestKnown (0.00s)" "FAIL	example.com/org/repo/internal/x	0.1s"; exit 1' preflight
+    PREFLIGHT_LINT='printf "%s\n" "--- FAIL: TestKnown (0.00s)" "FAIL	example.com/org/repo/internal/x	0.1s"; exit 1' preflight
     grep -q '^PRE-FLIGHTS RED, all KNOWN: gcp-lt1' "$TMP/run.log" ||
         fail "an all-KNOWN red must be cited, got: $(cat "$TMP/run.log")"
     { grep -q "^note $WORK_BEAD: " "$TMP/calls.log" && grep -qx 'KNOWN: gcp-lt1' "$TMP/calls.log"; } ||
@@ -449,12 +464,12 @@ test_preflight_red_new_is_filed_and_mailed() {
     make_pack "$TMP/pack-a" yes
     formulas_json "$TMP/pack-a"
     seed_ledger
-    PREFLIGHT_TEST='printf "%s\n" "--- FAIL: TestNew (0.00s)" "FAIL	example.com/org/repo/internal/y	0.1s"; exit 1' preflight
+    PREFLIGHT_LINT='printf "%s\n" "--- FAIL: TestNew (0.00s)" "FAIL	example.com/org/repo/internal/y	0.1s"; exit 1' preflight
     local filed
     filed=$(python3 -c 'import json,sys; print(" ".join(sorted(json.load(open(sys.argv[1]))["beads"])))' "$TMP/ledger.json")
     [ "$filed" = "gcp-fk1" ] || fail "a NEW red must be filed through known-red, ledger holds: $filed"
-    [ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["beads"]["gcp-fk1"]["metadata"]["base_red_phase"])' "$TMP/ledger.json" 2>/dev/null)" = "test" ] ||
-        fail "the filed bead must carry phase=test, the name of the var that holds the command"
+    [ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["beads"]["gcp-fk1"]["metadata"]["base_red_phase"])' "$TMP/ledger.json" 2>/dev/null)" = "lint" ] ||
+        fail "the filed bead must carry phase=lint, the name of the var that holds the command"
     grep -q "^mail gastown.witness -s NOTICE: integration has failing pre-flights -m Filed: gcp-fk1" "$TMP/calls.log" ||
         fail "the witness NOTICE must name the filed bead, got: $(cat "$TMP/calls.log")"
 }
@@ -463,7 +478,7 @@ test_preflight_red_lookup_failure_files_nothing() {
     make_pack "$TMP/pack-a" yes
     formulas_json "$TMP/pack-a"
     seed_ledger
-    PREFLIGHT_TEST='printf "%s\n" "--- FAIL: TestNew (0.00s)" "FAIL	example.com/org/repo/internal/y	0.1s"; exit 1' preflight FAKE_GC_FAIL=1
+    PREFLIGHT_LINT='printf "%s\n" "--- FAIL: TestNew (0.00s)" "FAIL	example.com/org/repo/internal/y	0.1s"; exit 1' preflight FAKE_GC_FAIL=1
     grep -q 'known-red lookup failed; not filed' "$TMP/calls.log" ||
         fail "a failed lookup must say so to the witness, got: $(cat "$TMP/calls.log")"
     ! grep -q '"create"' "$TMP/fake_gc.log" || fail "a failed lookup must file nothing"
