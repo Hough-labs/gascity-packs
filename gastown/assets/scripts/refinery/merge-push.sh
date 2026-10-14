@@ -11,9 +11,9 @@
 # The helpers and lane text are the merge-push step's blocks taken through
 # tomllib, the renderer's own un-escape, with only these edits: every template
 # variable became its resolved CFG_* value; every gh call goes through "$GH";
-# every place that ended the agent's shell returns a status instead; the
-# approval gate is found as this script's sibling; and the lane glue the step's
-# prose described became lane_direct, lane_mr and lane_local. Messages keep
+# every place that ended the agent's shell returns a status instead; and the
+# lane glue the step's prose described became lane_direct, lane_mr and
+# lane_local. Messages keep
 # their wording. gastown/tests/test_refinery_merge_lanes.sh runs every lane
 # case through this script, started by the merge-push step's own invoke block
 # taken from the formula. The formula no longer holds a copy of the lane to run
@@ -21,7 +21,6 @@
 #
 # Usage:
 #   merge-push.sh --work <id> [--rig R] [--target-default B] [--binding-prefix P]
-#                 [--require-approval V] [--review-agent A]
 #                 [--delete-merged-branches V] [--gh BIN]
 #
 # Run it inside the refinery's clone, with `temp` rebased onto the target, as
@@ -32,8 +31,6 @@
 # Config, highest precedence first: the flag; the rig's FormulaVars (a key that
 # is PRESENT wins even when empty); a value derived from the session; the
 # embedded default.
-#   require_merge_approval  --require-approval        default false
-#   review_agent            --review-agent            default ""
 #   delete_merged_branches  --delete-merged-branches  default true; deprecated,
 #                           deletes nothing: a verified merge keeps its source
 #                           branch as the task artifact's recovery copy
@@ -46,9 +43,7 @@
 # FormulaVars come from `gc config show --json`, or from the file named by
 # MERGE_PUSH_CONFIG_JSON (a test seam; unset in production). They are never
 # read from `gc bd formula show ... .vars`, which reports formula DEFAULTS
-# whatever the rig sets, so it would silently disarm a re-armed approval gate.
-# If the config cannot be read, or has no entry for the rig, require_merge_approval
-# resolves ON (fail closed): an unreadable switch is not permission to skip review.
+# whatever the rig sets.
 #
 # GH="${REFINERY_GH:-gh}", overridden by --gh.
 #
@@ -58,9 +53,9 @@
 # Exit status. The merge-push step owns patrol-loop control for every status;
 # this script never ends the agent's session and never pours or burns a wisp.
 #    0  handed off: the work bead is closed and its task artifact cleaned
-#       (landed direct, or mr after approval, or closed as already merged), or,
-#       for mr with approval off, the pull request is recorded pending and the
-#       bead is BLOCKED until `gc gastown pr-merge-reconcile` verifies the merge
+#       (landed direct, or closed as already merged), or, for mr, the pull
+#       request is recorded pending and the bead is BLOCKED until
+#       `gc gastown pr-merge-reconcile` verifies the merge
 #    1  usage or config error; nothing touched
 #    2  hard stop; do not mutate bead state. Also returned when a merge landed
 #       but its task-artifact cleanup did not converge (a pending state is
@@ -70,8 +65,6 @@
 #       --force-with-lease failed (temp is dropped; the next patrol's rebase step
 #       re-runs its ancestry decision on the moved branch).
 #    3  the re-rebase onto the moved target conflicted
-#    4  parked awaiting review (the gate refused, or the approved head no longer
-#       fast-forwards the target)
 #    5  the ff-merge was a no-op; nothing landed
 #    6  retries exhausted; the target moved under every attempt
 #    7  the remote refused the push while the target stood still
@@ -86,20 +79,14 @@
 # characterized under, a plain bash shell, and every command that matters is
 # checked on its own exit status.
 
-# Canonicalized now, before anything changes directory, so the sibling gate
-# path below stays right wherever the lane runs.
-MERGE_PUSH_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 GH="${REFINERY_GH:-gh}"
 
 # Must equal mol-refinery-patrol.toml's [vars.<name>].default; the lane suite
 # pins that.
-MERGE_PUSH_DEFAULT_REQUIRE_MERGE_APPROVAL=false
-MERGE_PUSH_DEFAULT_REVIEW_AGENT=""
 MERGE_PUSH_DEFAULT_DELETE_MERGED_BRANCHES=true
 
 usage() {
   echo "usage: merge-push.sh --work <id> [--rig R] [--target-default B] [--binding-prefix P]"
-  echo "                     [--require-approval V] [--review-agent A]"
   echo "                     [--delete-merged-branches V] [--gh BIN]"
 }
 
@@ -119,12 +106,10 @@ resolve_config() {
   rc_rig="" rc_rig_set=0
   rc_target="" rc_target_set=0
   rc_prefix="" rc_prefix_set=0
-  rc_approval="" rc_approval_set=0
-  rc_review="" rc_review_set=0
   rc_delete="" rc_delete_set=0
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      --work|--rig|--target-default|--binding-prefix|--require-approval|--review-agent|--delete-merged-branches|--gh)
+      --work|--rig|--target-default|--binding-prefix|--delete-merged-branches|--gh)
         if [ "$#" -lt 2 ]; then
           echo "merge-push: $1 needs a value." >&2
           usage >&2
@@ -135,8 +120,6 @@ resolve_config() {
           --rig) rc_rig="$2" rc_rig_set=1 ;;
           --target-default) rc_target="$2" rc_target_set=1 ;;
           --binding-prefix) rc_prefix="$2" rc_prefix_set=1 ;;
-          --require-approval) rc_approval="$2" rc_approval_set=1 ;;
-          --review-agent) rc_review="$2" rc_review_set=1 ;;
           --delete-merged-branches) rc_delete="$2" rc_delete_set=1 ;;
           --gh) GH="$2" ;;
         esac
@@ -183,25 +166,6 @@ resolve_config() {
     fi
   fi
 
-  if [ "$rc_approval_set" -eq 1 ]; then
-    CFG_REQUIRE_MERGE_APPROVAL="$rc_approval"
-  elif rc_value=$(rc_formula_var require_merge_approval); then
-    CFG_REQUIRE_MERGE_APPROVAL="$rc_value"
-  elif [ "$rc_config_ok" -ne 1 ]; then
-    CFG_REQUIRE_MERGE_APPROVAL=true
-    echo "merge-push: cannot read rig config for $CFG_RIG ($rc_config_why); require_merge_approval resolves ON (fail closed). An unreadable switch is not permission to skip review."
-  else
-    CFG_REQUIRE_MERGE_APPROVAL="$MERGE_PUSH_DEFAULT_REQUIRE_MERGE_APPROVAL"
-  fi
-
-  if [ "$rc_review_set" -eq 1 ]; then
-    CFG_REVIEW_AGENT="$rc_review"
-  elif rc_value=$(rc_formula_var review_agent); then
-    CFG_REVIEW_AGENT="$rc_value"
-  else
-    CFG_REVIEW_AGENT="$MERGE_PUSH_DEFAULT_REVIEW_AGENT"
-  fi
-
   if [ "$rc_delete_set" -eq 1 ]; then
     CFG_DELETE_MERGED_BRANCHES="$rc_delete"
   elif rc_value=$(rc_formula_var delete_merged_branches); then
@@ -240,7 +204,7 @@ resolve_config() {
     esac
   fi
 
-  echo "merge-push: config rig=$CFG_RIG target_default=${CFG_TARGET_DEFAULT:-<none>} require_merge_approval=$CFG_REQUIRE_MERGE_APPROVAL review_agent=$CFG_REVIEW_AGENT delete_merged_branches=$CFG_DELETE_MERGED_BRANCHES binding_prefix=$CFG_BINDING_PREFIX gh=$GH"
+  echo "merge-push: config rig=$CFG_RIG target_default=${CFG_TARGET_DEFAULT:-<none>} delete_merged_branches=$CFG_DELETE_MERGED_BRANCHES binding_prefix=$CFG_BINDING_PREFIX gh=$GH"
   return 0
 }
 
@@ -250,7 +214,6 @@ result_summary() {
     1) echo "usage or config error; nothing touched" ;;
     2) echo "hard stop; do not mutate bead state" ;;
     3) echo "re-rebase onto the moved target conflicted" ;;
-    4) echo "parked awaiting review" ;;
     5) echo "ff-merge was a no-op; nothing landed" ;;
     6) echo "retries exhausted; the target moved under every attempt" ;;
     7) echo "push refused while the target stood still" ;;
@@ -261,109 +224,6 @@ result_summary() {
   esac
 }
 
-# --- approval gate ----------------------------------------------------------
-
-# merge-approval-gate.sh ships beside this script in the same pack tree
-# (assets/scripts/checks/ next to assets/scripts/refinery/). The sibling path is
-# therefore present whenever this script is, and version-coherent with it by
-# construction: a script from pin X can never reach a gate from pin Y. That is
-# what the formula's `gc formula list` lookup existed to guarantee (gcp-amo);
-# the sibling path gets it without a gc call.
-resolve_approval_gate() {
-  rag_dir=$(cd "$MERGE_PUSH_DIR/../checks" 2>/dev/null && pwd) || return 1
-  if [ -f "$rag_dir/merge-approval-gate.sh" ]; then
-    printf '%s\n' "$rag_dir/merge-approval-gate.sh"
-    return 0
-  fi
-  return 1
-}
-
-run_approval_gate() {
-  # $1 = the commit the refinery is about to land. Passing it closes the gap
-  # where the local rebased tip has drifted from the reviewed PR head.
-  ag_sha="${1:-}"
-  set -- --bead "$WORK" --required "$CFG_REQUIRE_MERGE_APPROVAL"
-  if [ -n "$ag_sha" ]; then
-    set -- "$@" --merge-sha "$ag_sha"
-  fi
-  bash "$APPROVAL_GATE" "$@"
-}
-
-# Reviewer addressing. review_agent is written unqualified in the rig's
-# formula_vars (`specialists.iris`, `gastown.mayor`) and the rig prefix used to
-# be pasted on unconditionally. That is right for a rig-scoped reviewer and
-# wrong for a town-level one: gascity-packs names `gastown.mayor`, whose only
-# session address is the bare name, so every park nudged
-# `gascity-packs/gastown.mayor`, got "session not found", and — fire-and-forget,
-# with no retry and no marker — never told the reviewer anything. On a rig whose
-# whole point is a review gate, that turns "reviewed merges" into "merges that
-# wait forever" (gcp-a22).
-#
-# So resolve rather than assume. A bare name is tried rig-scoped first and then
-# town-level: the rig attempt stays first so a rig-local reviewer is never
-# shadowed by a town agent that happens to share its name. An address the
-# operator already qualified (`otherrig/agent`) is taken verbatim, and a leading
-# `/` forces town-level and skips the rig attempt.
-nudge_review_agent() {
-  # $1 = message. Echoes the address that accepted it, or — on return 1 — a
-  # flattened diagnostic naming every scope that refused.
-  nra_msg="$1"
-  nra_addr="$CFG_REVIEW_AGENT"
-  case "$nra_addr" in
-    /*) set -- "${nra_addr#/}" ;;
-    */*) set -- "$nra_addr" ;;
-    *)
-      if [ -n "${GC_RIG:-}" ]; then
-        set -- "$GC_RIG/$nra_addr" "$nra_addr"
-      else
-        set -- "$nra_addr"
-      fi
-      ;;
-  esac
-  nra_errors=""
-  for nra_try in "$@"; do
-    if nra_out=$(gc session nudge "$nra_try" "$nra_msg" 2>&1); then
-      printf '%s' "$nra_try"
-      return 0
-    fi
-    nra_errors="${nra_errors:+$nra_errors; }$nra_try: $(printf '%s' "$nra_out" | tr '
-' ' ')"
-  done
-  printf '%s' "$nra_errors"
-  return 1
-}
-
-park_awaiting_review() {
-  # A refused merge is not a failure and not an incident: the branch is fine,
-  # the reviewer simply has not approved THIS commit. Leave the bead open and
-  # assigned to the refinery with the refusal recorded, nudge the reviewer if
-  # the rig named one, and let the next patrol iteration re-check. Never
-  # close, never escalate, never retry the merge in this iteration.
-  # The gate reports on stderr and can emit more than one line; metadata is a
-  # single-line store, so flatten before writing.
-  ag_reason=$(printf '%s' "$1" | tr '
-' ' ')
-  if ! gc bd update "$WORK" --set-metadata merge_approval_state=awaiting_review --set-metadata merge_approval_gate_reason="$ag_reason"; then
-    echo "WARN could not record the gate refusal on $WORK; the bead stays open and unmerged regardless."
-  fi
-  if [ -n "$CFG_REVIEW_AGENT" ]; then
-    # The nudge is the only thing that tells the reviewer this bead is waiting,
-    # so its outcome goes into durable state either way — a failure visible only
-    # in a patrol transcript is exactly how gcp-a22 stayed invisible. One field,
-    # rewritten on every park, so a later delivery cannot leave a stale failure
-    # standing behind it.
-    if ag_nudge=$(nudge_review_agent "REVIEW NEEDED: $WORK — ${PR_URL:-$BRANCH} awaiting merge approval. Record a verdict with record-merge-approval.sh (--pr + --sha of the live head)."); then
-      gc bd update "$WORK" --set-metadata merge_approval_nudge="delivered: $ag_nudge" ||
-        echo "WARN could not record the review nudge delivery on $WORK."
-    else
-      echo "WARN review nudge for $WORK reached no reviewer session: $ag_nudge"
-      gc bd update "$WORK" --set-metadata merge_approval_nudge="failed: $ag_nudge" ||
-        echo "WARN could not record the review nudge failure on $WORK; it is visible only in this transcript."
-    fi
-  fi
-  echo "APPROVAL GATE REFUSED: $WORK — $1"
-  echo "Bead left open and assigned to the refinery; skip the merge and run patrol-summary + next-iteration."
-}
 # --- existing_pr escalation -------------------------------------------------
 
 block_existing_pr() {
@@ -632,14 +492,13 @@ lookup_pr_info() {
 
 # --- merge_ff_push ----------------------------------------------------------
 
-# Land `temp` on $TARGET and prove it landed. Reads BRANCH, TARGET,
-# APPROVAL_REQUIRED; sets TEMP_SHA, MERGED_SHA, MERGED_SHORT on success.
+# Land `temp` on $TARGET and prove it landed. Reads BRANCH, TARGET; sets
+# TEMP_SHA, MERGED_SHA, MERGED_SHORT on success.
 #
 # Exit status:
 #   0 = landed and verified (MERGED_SHA is $TEMP_SHA, reachable on the target)
 #   2 = hard stop; do not mutate bead state
 #   3 = the re-rebase onto the new tip conflicted
-#   4 = approval-gated and the branch must move; park awaiting review
 #   5 = no-op: origin/$TARGET already contains temp; nothing to land here
 #   6 = retries exhausted while losing the race (measured: the target moved
 #       under every attempt)
@@ -711,10 +570,6 @@ merge_ff_push() {
     if [ "$mfp_merge_status" -ne 0 ]; then
       merge_ff_push_cleanup_wt
       echo "merge-ff-push: ff-merge of $TEMP_SHA onto $BEFORE_SHA failed (status $mfp_merge_status) — origin/$TARGET moved under this patrol."
-      if [ "${APPROVAL_REQUIRED:-0}" -eq 1 ]; then
-        echo "merge-ff-push: approval is keyed to the current head; refusing to re-rebase it. Park for review."
-        return 4
-      fi
       if [ "$mfp_attempt" -ge "$mfp_max" ]; then
         break
       fi
@@ -776,10 +631,6 @@ merge_ff_push() {
         return 7
       fi
       echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status); origin/$TARGET moved $BEFORE_SHA -> $mfp_reject_sha, so the target really did advance between the fetch and the push."
-      if [ "${APPROVAL_REQUIRED:-0}" -eq 1 ]; then
-        echo "merge-ff-push: approval is keyed to the current head; refusing to re-rebase it. Park for review."
-        return 4
-      fi
       if [ "$mfp_attempt" -ge "$mfp_max" ]; then
         break
       fi
@@ -824,31 +675,18 @@ merge_ff_push() {
 # bodies, printf formats) whose content indentation would change.
 
 # "1. Merge, push, verify, and close work bead": land `temp` and close the
-# bead. Shared by the direct lane and 4b (approved); 4b passes `mr` and closes
-# with the verified-PR evidence its cleanup needs (see lane_mr). Cleanup is the
-# caller's.
+# bead. Cleanup is the caller's.
 direct_close() {
-dc_lane="${1:-direct}"
 merge_ff_push
 MERGE_LAND_STATUS=$?
 case "$MERGE_LAND_STATUS" in
   0)
-    if [ "$dc_lane" = mr ]; then
-      gc bd update "$WORK" --set-metadata merge_result=mr_merged --set-metadata merged_sha="$MERGED_SHA" --set-metadata merged_target="$TARGET" --set-metadata pr_head_sha="$PR_HEAD_SHA" --set-metadata pr_number="$PR_NUMBER" --unset-metadata rejection_reason
-    else
-      gc bd update "$WORK" --set-metadata merge_result=merged --set-metadata merged_sha="$MERGED_SHA" --set-metadata merged_target="$TARGET" --unset-metadata rejection_reason
-    fi
-    DC_RECORDED=$?
-    if [ "$DC_RECORDED" -eq 0 ] && gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT"; then
+    if gc bd update "$WORK" --set-metadata merge_result=merged --set-metadata merged_sha="$MERGED_SHA" --set-metadata merged_target="$TARGET" --unset-metadata rejection_reason && gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT"; then
       MP_SUMMARY="merged to $TARGET at $MERGED_SHORT"
       return 0
     fi
     echo "merge-ff-push landed $BRANCH on $TARGET at $MERGED_SHORT, but recording the merge on $WORK failed; the bead is still open. STOP. The next patrol's merge-state gate closes it as already merged."
     return 2
-    ;;
-  4)
-    park_awaiting_review "the approved head no longer fast-forwards $TARGET; the branch must be re-rebased and re-reviewed before it can land"
-    return 4
     ;;
   *)
     echo "merge-ff-push did not land $BRANCH on $TARGET (status $MERGE_LAND_STATUS). STOP. Do not mutate bead state."
@@ -1009,13 +847,12 @@ direct_close
 LAND_STATUS=$?
 case "$LAND_STATUS" in
   0) direct_cleanup || return $? ;;
-  4) cleanup_temp ;;
 esac
 return "$LAND_STATUS"
 }
 
 # MERGE_STRATEGY = mr: refuse a 0-diff branch, push it, publish and verify the
-# pull request, record it, then hand off (4a) or gate the merge (4b).
+# pull request, record it, then hand off (4a).
 lane_mr() {
 branch_has_real_change "origin/$TARGET" temp
 BHRC_STATUS=$?
@@ -1227,59 +1064,23 @@ if [ -z "$PR_URL" ] || [ "$PR_URL" = null ] || [ -z "$PR_NUMBER" ] || [ "$PR_NUM
   return 2
 fi
 
-if [ "$APPROVAL_REQUIRED" -eq 0 ]; then
-  # 4a. Approval gate off: record the pending PR WITHOUT closing the work bead
-  # (upstream #245). The bead moves to blocked, so its dependents stay blocked,
-  # until `gc gastown pr-merge-reconcile` verifies the merge on a later patrol.
-  # No task-artifact cleanup here: reconciliation runs it after the verified
-  # close.
-  if ! gc gastown pr-merge-reconcile record "$WORK" "$PR_URL" "$PR_NUMBER" "$TARGET" "$PR_HEAD_SHA"; then
-    echo "Failed to record pending PR state. STOP. Do not close $WORK."
-    return 2
-  fi
-  if ! gc mail send mayor/ -s "PR ready for review: $WORK" -m "Work bead: $WORK
+# 4a. Record the pending PR WITHOUT closing the work bead (upstream #245). The
+# bead moves to blocked, so its dependents stay blocked, until
+# `gc gastown pr-merge-reconcile` verifies the merge on a later patrol.
+# No task-artifact cleanup here: reconciliation runs it after the verified
+# close.
+if ! gc gastown pr-merge-reconcile record "$WORK" "$PR_URL" "$PR_NUMBER" "$TARGET" "$PR_HEAD_SHA"; then
+  echo "Failed to record pending PR state. STOP. Do not close $WORK."
+  return 2
+fi
+if ! gc mail send mayor/ -s "PR ready for review: $WORK" -m "Work bead: $WORK
 Pull request: $PR_URL
  The bead and its dependents remain blocked until a refinery patrol verifies the merge."; then
-    echo "Pending PR state is safe, but mayor notification failed; report the delivery failure."
-  fi
-  MP_SUMMARY="pull request pending merge: $PR_URL"
-  cleanup_temp
-  return 0
+  echo "Pending PR state is safe, but mayor notification failed; report the delivery failure."
 fi
-
-# 4b. Breadcrumbs first: the approval gate reads pr_number back to check the
-# reviewer approved THIS pull request.
-gc bd update $WORK --set-metadata pr_url="$PR_URL" --set-metadata pr_number="$PR_NUMBER" --set-metadata merged_target="$TARGET" --unset-metadata rejection_reason
-
-# 4b. Approval gate on: refused parks the bead; approved lands it with the
-# direct path's merge.
-APPROVAL_GATE_OUTPUT=$(run_approval_gate "$(git rev-parse temp)" 2>&1)
-APPROVAL_GATE_STATUS=$?
-echo "$APPROVAL_GATE_OUTPUT"
-if [ "$APPROVAL_GATE_STATUS" -ne 0 ]; then
-  park_awaiting_review "$APPROVAL_GATE_OUTPUT"
-  cleanup_temp
-  return 4
-fi
-gc bd update "$WORK" --set-metadata merge_approval_state=approved --unset-metadata merge_approval_gate_reason
-# The close records the verified-PR evidence (merge_result=mr_merged,
-# pr_head_sha, pr_number, merged_sha), not the direct lane's merged. The push
-# above moved origin/$BRANCH to the validated head, so cleanup's direct-merge arm,
-# which needs origin/$BRANCH still at the PRE-rebase artifact_source_sha, blocks
-# whenever the rebase rewrote the branch, and a real merge then exited 2. What
-# this lane can prove is the verified-PR arm's evidence: origin/$BRANCH (or
-# refs/pull/<n>/head) at pr_head_sha, the head GitHub reported and the gate
-# approved, and merged_sha on the target. They are one commit: with approval on,
-# merge_ff_push never re-rebases temp. GitHub's pr_state and pr_merged_at are
-# not written: the refinery landed the head itself, and those fields belong to
-# pr-merge-reconcile, which only scans beads carrying pr_reconcile_pending.
-direct_close mr
-LAND_STATUS=$?
-case "$LAND_STATUS" in
-  0) direct_cleanup || return $? ;;
-  4) cleanup_temp ;;
-esac
-return "$LAND_STATUS"
+MP_SUMMARY="pull request pending merge: $PR_URL"
+cleanup_temp
+return 0
 }
 
 # MERGE_STRATEGY = local: unsupported. Escalate and leave everything as it is.
@@ -1292,11 +1093,11 @@ return 11
 }
 
 # resolve_merge_strategy <bead-id> — print the strategy the lane would run for
-# the bead before the approval gate is considered: its metadata.merge_strategy
-# (default direct), with pr read as mr, and an existing_pr forcing mr. The
-# forcing notice goes to stderr so stdout is the strategy alone. merge-batch.sh
-# calls this for each batch candidate, so a member is eligible by the lane's own
-# rule and the two cannot drift (gcp-l8td.8).
+# the bead: its metadata.merge_strategy (default direct), with pr read as mr,
+# and an existing_pr forcing mr. The forcing notice goes to stderr so stdout is
+# the strategy alone. merge-batch.sh calls this for each batch candidate, so a
+# member is eligible by the lane's own rule and the two cannot drift
+# (gcp-l8td.8).
 resolve_merge_strategy() {
   rms_json=$(gc bd show "$1" --json) || return 1
   rms_strategy=$(printf '%s' "$rms_json" | jq -r '.[0].metadata.merge_strategy // "direct"')
@@ -1309,18 +1110,6 @@ resolve_merge_strategy() {
     rms_strategy="mr"
   fi
   printf '%s\n' "$rms_strategy"
-}
-
-# resolve_approval_required — set APPROVAL_REQUIRED (0 or 1) from
-# CFG_REQUIRE_MERGE_APPROVAL. Approval gate opt-in: only the recognized off
-# values disable it; anything unrecognized (a typo in the rig's formula_vars)
-# turns it ON, because the failure mode of a mis-read switch must be "review
-# required", never "review silently skipped".
-resolve_approval_required() {
-  case "$(printf '%s' "$CFG_REQUIRE_MERGE_APPROVAL" | tr '[:upper:]' '[:lower:]')" in
-    ''|false|0|no|off) APPROVAL_REQUIRED=0 ;;
-    *) APPROVAL_REQUIRED=1 ;;
-  esac
 }
 
 main() {
@@ -1339,14 +1128,6 @@ MP_TEMP_CONSUMED=1
 
 resolve_origin_repo
 MERGE_STRATEGY=$(resolve_merge_strategy "$WORK")
-resolve_approval_required
-if [ "$APPROVAL_REQUIRED" -eq 1 ] && [ "$MERGE_STRATEGY" = "direct" ]; then
-  # A reviewed merge needs something to review. Without this promotion the
-  # gate would refuse every direct-mode bead forever (fail-closed, but
-  # permanently deadlocked) because no PR would ever exist to approve.
-  echo "require_merge_approval is on; a reviewed merge needs a pull request — using merge_strategy=mr."
-  MERGE_STRATEGY="mr"
-fi
 case "$MERGE_STRATEGY" in
   direct|mr|local) echo "merge-push: LANE $MERGE_STRATEGY" ;;
   *)
@@ -1355,15 +1136,6 @@ case "$MERGE_STRATEGY" in
     ;;
 esac
 
-APPROVAL_GATE=""
-if [ "$APPROVAL_REQUIRED" -eq 1 ]; then
-  APPROVAL_GATE=$(resolve_approval_gate)
-  if [ -z "$APPROVAL_GATE" ]; then
-    echo "require_merge_approval is on but merge-approval-gate.sh was not found. STOP. Do not mutate bead state."
-    echo "An unreadable gate is not an approval."
-    return 2
-  fi
-fi
 if [ "$MERGE_STRATEGY" = "mr" ] && [ -n "$EXISTING_PR" ]; then
   if [ -z "$BRANCH" ] || [ "$BRANCH" = "null" ]; then
     block_existing_pr "metadata.existing_pr is set but metadata.branch is missing."

@@ -1,0 +1,3251 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Tue, 13 Oct 2026 22:12:40 -0400
+Subject: [PATCH 158/158] refactor(refinery): retire the merge approval gate
+ and keep the origin-scoped PR repo (gcp-648nn)
+
+Hunter ruled to retire the fork's gc-native merge approval gate (option A,
+keep the origin repo scoping). It is fork-only, has been disarmed in every
+rig since 2026-09-08, partly duplicates upstream #245's PR-review lane, and
+re-conflicts with the mr lane on every baseline upgrade.
+
+With no gate, the refinery's mr lane is upstream #245's: open or reuse the
+PR, `pr-merge-reconcile record`, and the bead stays blocked until reconcile
+closes it on a verified GitHub merge. The origin-repo scoping of the PR
+lookup (resolve_origin_repo and --repo "$ORIGIN_REPO") stays, since upstream's
+`gh repo view` resolves to the fork's parent repo.
+
+Retired, by subject and bead id (this is one forward commit, not a history
+rewrite):
+- gcp-dc8: the approval signal (record-merge-approval.sh), the fail-closed
+  merge-approval-gate.sh, the patrol gate, and the flatten/guard of the
+  refusal metadata write
+- gcp-amo: resolving the gate from the formula's own pack tree
+- gcp-3ty: scoping the gate's PR lookup to origin
+- gcp-a22: resolving the review nudge across both agent scopes
+- "an approved mr landing closes with verified-PR evidence (gcp-fooz4)":
+  the 4b lane and its direct_close mr arm
+
+Removed: the three gate files, merge-push.sh's approval resolution, park and
+4b code (direct_close is back to its single-lane form, exit 4 is gone),
+merge-batch.sh's gate guards (including the unreadable-config fail-closed,
+whose only rationale was the approval switch), the formula's vars and prose
+and exit-4 row, the README section, and their tests and pins. A city that
+still sets require_merge_approval or review_agent in [rigs.formula_vars]
+carries dead config, not an error.
+
+Validation: test_refinery_merge_lanes (22 cases), test_refinery_merge_batch
+(22 cases), test_refinery_merge_push and test_polecat_artifact_dir pass; the
+AC1 grep prints only the two historical gcp-amo comments in the deacon and
+witness patrols.
+
+Fold at the next baseline upgrade: drop those patches and fix up this commit's remaining hunks into their introducing patches; the replayed tree must equal the pre-fold tree (gcp-k6301).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ embed_test.go                                 |    2 -
+ gastown/README.md                             |   69 -
+ .../scripts/checks/merge-approval-gate.sh     |  298 -----
+ .../assets/scripts/record-merge-approval.sh   |  123 --
+ .../scripts/refinery/acceptance-check.sh      |    2 +-
+ .../assets/scripts/refinery/merge-batch.sh    |   39 +-
+ gastown/assets/scripts/refinery/merge-push.sh |  294 +----
+ gastown/formulas/mol-polecat-work.toml        |   16 +-
+ gastown/formulas/mol-refinery-patrol.toml     |   48 +-
+ gastown/tests/test_gastown_pack_assets.sh     |    4 +-
+ gastown/tests/test_merge_approval_gate.sh     | 1139 -----------------
+ gastown/tests/test_polecat_artifact_dir.sh    |   13 +-
+ gastown/tests/test_refinery_merge_batch.sh    |   68 +-
+ gastown/tests/test_refinery_merge_lanes.sh    |  195 +--
+ gastown/tests/test_refinery_merge_push.sh     |   46 +-
+ scripts/gascity_pack_inference_gate.py        |    2 +-
+ tests/test_no_bare_bd_commands.py             |    6 -
+ 17 files changed, 99 insertions(+), 2265 deletions(-)
+ delete mode 100755 gastown/assets/scripts/checks/merge-approval-gate.sh
+ delete mode 100755 gastown/assets/scripts/record-merge-approval.sh
+ delete mode 100755 gastown/tests/test_merge_approval_gate.sh
+
+diff --git a/embed_test.go b/embed_test.go
+index bafd6ce8..4a048b0c 100644
+--- a/embed_test.go
++++ b/embed_test.go
+@@ -12,8 +12,6 @@ func TestGastownEmbedsPackContent(t *testing.T) {
+ 		"agents/dog/agent.toml",
+ 		"agents/dog/prompt.template.md",
+ 		"formulas/mol-shutdown-dance.toml",
+-		"assets/scripts/record-merge-approval.sh",
+-		"assets/scripts/checks/merge-approval-gate.sh",
+ 		"template-fragments/propulsion.template.md",
+ 		"overlay/per-provider/codex/.codex/hooks.json",
+ 	} {
+diff --git a/gastown/README.md b/gastown/README.md
+index 946fcdab..6a28a982 100644
+--- a/gastown/README.md
++++ b/gastown/README.md
+@@ -98,75 +98,6 @@ Per sling, an explicit choice still short-circuits ahead of the default:
+ instead (`--formula` is a boolean that reinterprets the positional argument), and
+ `--on <formula>` attaches one to an existing bead. `[agent_defaults]` is the one
+ knob that cannot override the agent's own value.
+-## Merge Approval Gate
+-
+-`mol-refinery-patrol` can require a reviewed merge. The gate is **opt-in per
+-rig** and off by default, so rigs that do not require review are unaffected:
+-
+-```toml
+-[rigs.formula_vars]
+-require_merge_approval = "true"
+-review_agent = "specialists.iris"   # optional: nudged when a bead parks
+-```
+-
+-`review_agent` is resolved, not assumed. A bare name is nudged at rig scope
+-first (`<rig>/specialists.iris`) and then town-level (`gastown.mayor`), so a
+-rig-local reviewer and a town agent are both reachable without the operator
+-having to know which scope owns the session; the rig attempt stays first so a
+-rig-local reviewer is never shadowed by a town agent of the same name. Write
+-`otherrig/agent` to pin another rig, or a leading `/` (`/gastown.mayor`) to go
+-straight to town level. Whichever way it resolves, the outcome is written to the
+-work bead as `merge_approval_nudge`: either `delivered:` and the address that
+-took it, or `failed:` and every scope that refused. The nudge is fire-and-forget
+-and a failed one never blocks the park, so without that marker an unreachable
+-reviewer is a silent failure — the bead parks correctly and nobody is ever told.
+-
+-gc cannot emit a formal GitHub review event, so the approval signal is
+-gc-native: it lives in the work bead's own metadata, keyed to the PR number
+-and the exact head SHA the reviewer read.
+-
+-| Metadata key | Meaning |
+-|---|---|
+-| `merge_approval.verdict` | `approved` or `changes_requested` |
+-| `merge_approval.pr_number` | PR the verdict applies to |
+-| `merge_approval.head_sha` | Full 40-hex commit the reviewer read |
+-| `merge_approval.reviewer` | Approving reviewer identity |
+-| `merge_approval.recorded_at` | UTC timestamp |
+-| `merge_approval_state` | `awaiting_review` while the gate has the bead parked |
+-| `merge_approval_gate_reason` | Why the gate refused this commit |
+-| `merge_approval_nudge` | Whether the reviewer was actually reached |
+-
+-A reviewer agent produces the signal:
+-
+-```bash
+-assets/scripts/record-merge-approval.sh \
+-    --bead <work-bead> --pr <number|url> --sha <live-head-sha> --verdict approved
+-```
+-
+-The refinery consumes it through
+-`assets/scripts/checks/merge-approval-gate.sh`, which re-reads the live PR head
+-from GitHub and permits the merge only when the approved SHA is still the head.
+-An approval therefore authorizes one commit, not a branch — pushing after review
+-invalidates it. Every other outcome refuses, including the ones the gate cannot
+-explain (unreadable bead, PR lookup failure, unresolvable head SHA): a tool
+-error is a suspect, not a licence to merge.
+-
+-The patrol formula locates that script through its own resolved source path —
+-`gc formula list --json` reports where gc loaded `mol-refinery-patrol.toml`
+-from, and the gate sits beside it in the same pack tree. That anchor is the
+-only one that holds in the context the formula actually runs in (the agent's
+-own shell, where `GC_PACK_DIR` is unset — gc exports it for pack *commands*
+-only) and it is version-coherent by construction: a formula from one pin can
+-never reach a gate from another. `$GC_CITY/.gc/scripts/checks/` and
+-`GC_PACK_DIR` remain fallbacks for cities that stage checks themselves. If none
+-resolve, patrol stops without touching bead state — an unreadable gate is not
+-an approval.
+-
+-Turning the gate on implies the pull-request lane. `merge_strategy=direct` is
+-promoted to `mr`, because a reviewed merge needs a PR to review; PR publication
+-becomes the start of review instead of the pending-merge handoff, and a refused
+-merge parks the bead (`merge_approval_state=awaiting_review`) for the next
+-patrol iteration rather than closing or escalating it.
+ 
+ ## Role prompts and formula commands
+ 
+diff --git a/gastown/assets/scripts/checks/merge-approval-gate.sh b/gastown/assets/scripts/checks/merge-approval-gate.sh
+deleted file mode 100755
+index 19c6d685..00000000
+--- a/gastown/assets/scripts/checks/merge-approval-gate.sh
++++ /dev/null
+@@ -1,298 +0,0 @@
+-#!/usr/bin/env bash
+-# Consumer for the gc-native merge approval signal — the refinery's merge gate.
+-#
+-# Reads the signal that record-merge-approval.sh wrote on the work bead and
+-# decides whether the refinery may land the branch. The signal names a PR number
+-# and a head SHA; this script re-reads the LIVE PR head from GitHub and permits
+-# the merge only when the approved SHA is still the head. New commits after
+-# approval therefore invalidate it — an approval authorizes one commit, not a
+-# branch.
+-#
+-# FAIL CLOSED. Every path that is not a positive, current, matching approval
+-# refuses the merge, including the paths where the gate cannot tell: a bead it
+-# cannot read, a PR it cannot resolve, a head SHA GitHub will not return. A
+-# tool error is a suspect, not a licence to merge.
+-#
+-# Usage:
+-#   merge-approval-gate.sh --bead <id> [--required <true|false>] [--merge-sha <sha>]
+-#
+-#   --required   Opt-in switch, normally the rig's require_merge_approval
+-#                formula var. Unset/empty/false/0/no/off = gate disabled (exit 0).
+-#                ANY other value enables it, so a typo enables the gate rather
+-#                than silently disabling it. Falls back to
+-#                $GC_REQUIRE_MERGE_APPROVAL.
+-#   --merge-sha  The commit the refinery is about to merge (`git rev-parse temp`).
+-#                When given it must equal the approved SHA, which closes the gap
+-#                where the local branch tip has drifted from the reviewed PR head.
+-#
+-# Exit codes:
+-#   0  merge permitted (approved and current), or gate not enabled
+-#   1  REFUSE — missing, incomplete, non-approving, mismatched, or stale signal
+-#   2  REFUSE — cannot evaluate (unreadable bead, unresolvable origin repo, PR
+-#      lookup failure, no token)
+-
+-set -uo pipefail
+-
+-SELF=$(basename "$0")
+-
+-usage() {
+-    echo "usage: $SELF --bead <id> [--required <true|false>] [--merge-sha <sha>]" >&2
+-}
+-
+-# A refusal the gate can explain: the signal was read and found wanting.
+-refuse() {
+-    echo "GATE: refused reason=$1" >&2
+-    exit 1
+-}
+-
+-# A refusal the gate cannot explain: it never got to a verdict. Same outcome,
+-# different exit code so the caller can tell "reviewer said no" from "the gate
+-# is broken" without the two ever collapsing into a merge.
+-undecidable() {
+-    echo "GATE: undecidable reason=$1" >&2
+-    exit 2
+-}
+-
+-die_usage() {
+-    echo "ERROR: $*" >&2
+-    usage
+-    exit 2
+-}
+-
+-BEAD=""
+-REQUIRED=""
+-REQUIRED_SET=0
+-MERGE_SHA=""
+-
+-need_value() {
+-    [ "$1" -ge 2 ] || die_usage "$2 requires a value"
+-}
+-
+-while [ "$#" -gt 0 ]; do
+-    case "$1" in
+-        --bead) need_value "$#" --bead; BEAD="$2"; shift 2 ;;
+-        --bead=*) BEAD="${1#*=}"; shift ;;
+-        --required) need_value "$#" --required; REQUIRED="$2"; REQUIRED_SET=1; shift 2 ;;
+-        --required=*) REQUIRED="${1#*=}"; REQUIRED_SET=1; shift ;;
+-        --merge-sha) need_value "$#" --merge-sha; MERGE_SHA="$2"; shift 2 ;;
+-        --merge-sha=*) MERGE_SHA="${1#*=}"; shift ;;
+-        -h|--help) usage; exit 0 ;;
+-        *) die_usage "unknown argument: $1" ;;
+-    esac
+-done
+-
+-if [ "$REQUIRED_SET" -eq 0 ]; then
+-    REQUIRED="${GC_REQUIRE_MERGE_APPROVAL:-}"
+-fi
+-
+-# Opt-in: rigs that do not require review are unaffected. Only the recognized
+-# off values disable the gate; anything unrecognized turns it ON.
+-case "$(printf '%s' "$REQUIRED" | tr '[:upper:]' '[:lower:]')" in
+-    ''|false|0|no|off)
+-        echo "GATE: not-required"
+-        exit 0
+-        ;;
+-esac
+-
+-[ -n "$BEAD" ] || die_usage "--bead is required"
+-
+-# json_payload strips any non-JSON prefix line (bd emits a
+-# `warning: beads.role not configured` diagnostic on stdout ahead of the real
+-# payload). Same guard the sibling review check scripts use.
+-json_payload() {
+-    awk 'found || /^[[:space:]]*[[{]/{ found=1; print }'
+-}
+-
+-read_bead() {
+-    local attempt=0 output=""
+-    while [ "$attempt" -lt 5 ]; do
+-        output=$(gc bd show "$BEAD" --json 2>/dev/null | json_payload)
+-        if [ -n "$output" ] && printf '%s' "$output" | jq -e 'type == "array" or type == "object"' >/dev/null 2>&1; then
+-            printf '%s' "$output"
+-            return 0
+-        fi
+-        attempt=$((attempt + 1))
+-        sleep 0.2
+-    done
+-    return 1
+-}
+-
+-BEAD_JSON=$(read_bead) || undecidable "bead_unreadable bead=$BEAD"
+-
+-meta() {
+-    printf '%s' "$BEAD_JSON" |
+-        jq -r --arg key "$1" '
+-            (if type == "array" then .[0] else . end)
+-            | (.metadata[$key] // "")
+-            | tostring
+-        ' 2>/dev/null
+-}
+-
+-SIG_VERDICT=$(meta merge_approval.verdict)
+-SIG_PR=$(meta merge_approval.pr_number)
+-SIG_SHA=$(printf '%s' "$(meta merge_approval.head_sha)" | tr '[:upper:]' '[:lower:]')
+-SIG_REVIEWER=$(meta merge_approval.reviewer)
+-SIG_AT=$(meta merge_approval.recorded_at)
+-BEAD_BRANCH=$(meta branch)
+-BEAD_PR=$(meta pr_number)
+-if [ -z "$BEAD_PR" ]; then
+-    BEAD_PR=$(printf '%s\n' "$(meta pr_url)" |
+-        sed -nE 's|^[Hh][Tt][Tt][Pp][Ss]?://[^/]+/[^/]+/[^/]+/pull/([0-9]+)/?$|\1|p' | head -n 1)
+-fi
+-
+-if [ -z "$SIG_VERDICT" ] && [ -z "$SIG_PR" ] && [ -z "$SIG_SHA" ]; then
+-    refuse "no_approval_signal bead=$BEAD"
+-fi
+-# A partially written signal is not a weaker approval, it is no approval.
+-if [ -z "$SIG_VERDICT" ] || [ -z "$SIG_PR" ] || [ -z "$SIG_SHA" ] ||
+-    [ -z "$SIG_REVIEWER" ] || [ -z "$SIG_AT" ]; then
+-    refuse "incomplete_approval_signal bead=$BEAD verdict=${SIG_VERDICT:-<empty>} pr=${SIG_PR:-<empty>} sha=${SIG_SHA:-<empty>} reviewer=${SIG_REVIEWER:-<empty>} recorded_at=${SIG_AT:-<empty>}"
+-fi
+-
+-if [ "$SIG_VERDICT" != "approved" ]; then
+-    refuse "verdict_not_approved verdict=$SIG_VERDICT"
+-fi
+-if [[ ! "$SIG_PR" =~ ^[1-9][0-9]*$ ]]; then
+-    refuse "malformed_pr_number pr=$SIG_PR"
+-fi
+-if [[ ! "$SIG_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+-    refuse "malformed_head_sha sha=$SIG_SHA"
+-fi
+-
+-# The bead must name the branch, or there is nothing to bind the PR to.
+-if [ -z "$BEAD_BRANCH" ]; then
+-    refuse "bead_has_no_branch bead=$BEAD"
+-fi
+-# An approval for a different PR is not an approval for this one.
+-if [ -n "$BEAD_PR" ] && [ "$BEAD_PR" != "$SIG_PR" ]; then
+-    refuse "pr_number_mismatch signal_pr=$SIG_PR bead_pr=$BEAD_PR"
+-fi
+-
+-if [ -n "$MERGE_SHA" ]; then
+-    MERGE_SHA=$(printf '%s' "$MERGE_SHA" | tr '[:upper:]' '[:lower:]')
+-    if [[ ! "$MERGE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+-        undecidable "malformed_merge_sha merge_sha=$MERGE_SHA"
+-    fi
+-    if [ "$MERGE_SHA" != "$SIG_SHA" ]; then
+-        refuse "merge_sha_not_approved merge_sha=$MERGE_SHA approved_sha=$SIG_SHA"
+-    fi
+-fi
+-
+-resolve_github_token() {
+-    local token="${GH_TOKEN:-${GITHUB_TOKEN:-${GIT_TOKEN:-}}}"
+-    if [ -n "$token" ]; then
+-        printf '%s\n' "$token"
+-        return 0
+-    fi
+-    printf 'protocol=https\nhost=github.com\n\n' |
+-        GIT_TERMINAL_PROMPT=0 git credential fill 2>/dev/null |
+-        sed -n 's/^password=//p' | head -n 1
+-}
+-
+-# --- origin-repo-resolution:begin ---
+-# Both lookup paths must ask the SAME repository, and it must be the one this
+-# rig's branches were actually pushed to. `gh` resolves its base repo with its
+-# own heuristic, which on a fork that also carries an `upstream` remote answers
+-# the PARENT — so an unscoped `gh pr view 2` read a stranger's pull request and
+-# judged the approval against it, refusing every valid approval (gcp-3ty).
+-# Parse `git remote get-url origin` directly and treat gh's guess as something
+-# to override, never to trust; same call mol-refinery-patrol's mr lane made in
+-# gcp-6qp. Resolution lives here once so the gh and REST paths cannot disagree.
+-ORIGIN_URL=""
+-ORIGIN_REPO=""
+-ORIGIN_REPO_ERROR=""
+-
+-resolve_origin_repo() {
+-    local origin
+-    ORIGIN_URL=$(git remote get-url origin 2>/dev/null)
+-    if [ -z "$ORIGIN_URL" ]; then
+-        ORIGIN_REPO_ERROR="origin_remote_unreadable"
+-        return 1
+-    fi
+-    origin="$ORIGIN_URL"
+-    case "$origin" in
+-        git@github.com:*) origin=${origin#git@github.com:} ;;
+-        https://github.com/*) origin=${origin#https://github.com/} ;;
+-        ssh://git@github.com/*) origin=${origin#ssh://git@github.com/} ;;
+-        *)
+-            ORIGIN_REPO_ERROR="unsupported_origin_remote"
+-            return 1
+-            ;;
+-    esac
+-    origin=${origin%.git}
+-    if [[ ! "$origin" =~ ^[^/]+/[^/]+$ ]]; then
+-        ORIGIN_REPO_ERROR="unparseable_origin_remote"
+-        return 1
+-    fi
+-    ORIGIN_REPO="$origin"
+-    return 0
+-}
+-# --- origin-repo-resolution:end ---
+-
+-# Mirrors mol-refinery-patrol's own gh-or-REST split so the gate stays usable in
+-# rigs without the gh CLI. Without the fallback those rigs would be permanently
+-# refused — fail-closed, but permanently deadlocked, which is the bug this gate
+-# exists to end.
+-lookup_pr_rest() {
+-    local number="$1" owner repo token raw
+-    [ -n "$ORIGIN_REPO" ] || return 1
+-    owner=${ORIGIN_REPO%%/*}
+-    repo=${ORIGIN_REPO#*/}
+-    token=$(resolve_github_token)
+-    [ -n "$token" ] || return 1
+-    raw=$(curl -fsS \
+-        -H "Accept: application/vnd.github+json" \
+-        -H "Authorization: Bearer $token" \
+-        -H "X-GitHub-Api-Version: 2022-11-28" \
+-        "https://api.github.com/repos/$owner/$repo/pulls/$number" 2>/dev/null) || return 1
+-    printf '%s' "$raw" |
+-        jq '{number, state: (.state | ascii_upcase), headRefName: .head.ref, headRefOid: .head.sha}' 2>/dev/null
+-}
+-
+-lookup_pr() {
+-    local number="$1"
+-    if command -v gh >/dev/null 2>&1; then
+-        gh pr view "$number" --repo "$ORIGIN_REPO" \
+-            --json number,state,headRefName,headRefOid 2>/dev/null
+-        return $?
+-    fi
+-    lookup_pr_rest "$number"
+-}
+-
+-# An unscoped lookup is the defect itself, so there is no degraded mode: without
+-# a resolved origin the gate has no repository it may safely ask about, and a
+-# gate that cannot ask does not merge.
+-if ! resolve_origin_repo; then
+-    undecidable "origin_repo_unresolved cause=$ORIGIN_REPO_ERROR origin=${ORIGIN_URL:-<empty>}"
+-fi
+-
+-if ! PR_INFO=$(lookup_pr "$SIG_PR") || [ -z "$PR_INFO" ]; then
+-    undecidable "pr_lookup_failed pr=$SIG_PR"
+-fi
+-
+-LIVE_NUMBER=$(printf '%s' "$PR_INFO" | jq -r '.number // ""' 2>/dev/null)
+-LIVE_STATE=$(printf '%s' "$PR_INFO" | jq -r '.state // ""' 2>/dev/null | tr '[:lower:]' '[:upper:]')
+-LIVE_HEAD_REF=$(printf '%s' "$PR_INFO" | jq -r '.headRefName // ""' 2>/dev/null)
+-LIVE_HEAD_SHA=$(printf '%s' "$PR_INFO" | jq -r '.headRefOid // ""' 2>/dev/null | tr '[:upper:]' '[:lower:]')
+-
+-if [ -z "$LIVE_NUMBER" ] || [ -z "$LIVE_STATE" ] || [ -z "$LIVE_HEAD_REF" ]; then
+-    undecidable "pr_lookup_incomplete pr=$SIG_PR"
+-fi
+-if [ "$LIVE_NUMBER" != "$SIG_PR" ]; then
+-    undecidable "pr_identity_mismatch asked=$SIG_PR got=$LIVE_NUMBER"
+-fi
+-if [[ ! "$LIVE_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+-    undecidable "unresolvable_live_head_sha pr=$SIG_PR head=${LIVE_HEAD_SHA:-<empty>}"
+-fi
+-if [ "$LIVE_STATE" != "OPEN" ]; then
+-    refuse "pr_not_open pr=$SIG_PR state=$LIVE_STATE"
+-fi
+-if [ "$LIVE_HEAD_REF" != "$BEAD_BRANCH" ]; then
+-    refuse "pr_branch_mismatch pr=$SIG_PR pr_head_ref=$LIVE_HEAD_REF bead_branch=$BEAD_BRANCH"
+-fi
+-if [ "$LIVE_HEAD_SHA" != "$SIG_SHA" ]; then
+-    refuse "stale_head_sha pr=$SIG_PR approved_sha=$SIG_SHA live_head_sha=$LIVE_HEAD_SHA"
+-fi
+-
+-echo "GATE: approved bead=$BEAD pr=$SIG_PR sha=$SIG_SHA reviewer=$SIG_REVIEWER recorded_at=$SIG_AT"
+-exit 0
+diff --git a/gastown/assets/scripts/record-merge-approval.sh b/gastown/assets/scripts/record-merge-approval.sh
+deleted file mode 100755
+index 5d9d1acf..00000000
+--- a/gastown/assets/scripts/record-merge-approval.sh
++++ /dev/null
+@@ -1,123 +0,0 @@
+-#!/usr/bin/env bash
+-# Producer for the gc-native merge approval signal.
+-#
+-# gc has no way to emit a formal GitHub review event, so the refinery had no
+-# reviewed-merge signal it could read: `merge_strategy=direct` merged unreviewed
+-# and `mr` published a PR without ever merging. This script is the missing
+-# producer. A reviewer agent records its verdict on the work bead itself — gc's
+-# own durable store — keyed to the PR number AND the exact head SHA it reviewed.
+-#
+-# The head SHA is what makes the signal safe to consume: an approval names one
+-# commit, so commits pushed after review do not inherit it. The consumer
+-# (checks/merge-approval-gate.sh) refuses any signal whose SHA is not the live
+-# PR head.
+-#
+-# Usage:
+-#   record-merge-approval.sh --bead <id> --pr <number|#number|url> \
+-#       --sha <40-hex-head-sha> --verdict approved|changes_requested \
+-#       [--reviewer <identity>]
+-#
+-# The reviewer identity defaults to $GC_AGENT, then $BEADS_ACTOR.
+-#
+-# Exit codes:
+-#   0  signal recorded
+-#   1  bead store write failed (nothing was recorded)
+-#   2  invalid usage or invalid argument (nothing was recorded)
+-
+-set -uo pipefail
+-
+-SELF=$(basename "$0")
+-
+-usage() {
+-    cat >&2 <<EOF
+-usage: $SELF --bead <id> --pr <number|#number|url> --sha <40-hex> \\
+-           --verdict approved|changes_requested [--reviewer <identity>]
+-EOF
+-}
+-
+-die_usage() {
+-    echo "ERROR: $*" >&2
+-    usage
+-    exit 2
+-}
+-
+-BEAD=""
+-PR_ARG=""
+-SHA_ARG=""
+-VERDICT=""
+-REVIEWER=""
+-
+-need_value() {
+-    # $1 = remaining arg count including the flag itself, $2 = flag name
+-    [ "$1" -ge 2 ] || die_usage "$2 requires a value"
+-}
+-
+-while [ "$#" -gt 0 ]; do
+-    case "$1" in
+-        --bead) need_value "$#" --bead; BEAD="$2"; shift 2 ;;
+-        --bead=*) BEAD="${1#*=}"; shift ;;
+-        --pr) need_value "$#" --pr; PR_ARG="$2"; shift 2 ;;
+-        --pr=*) PR_ARG="${1#*=}"; shift ;;
+-        --sha) need_value "$#" --sha; SHA_ARG="$2"; shift 2 ;;
+-        --sha=*) SHA_ARG="${1#*=}"; shift ;;
+-        --verdict) need_value "$#" --verdict; VERDICT="$2"; shift 2 ;;
+-        --verdict=*) VERDICT="${1#*=}"; shift ;;
+-        --reviewer) need_value "$#" --reviewer; REVIEWER="$2"; shift 2 ;;
+-        --reviewer=*) REVIEWER="${1#*=}"; shift ;;
+-        -h|--help) usage; exit 0 ;;
+-        *) die_usage "unknown argument: $1" ;;
+-    esac
+-done
+-
+-[ -n "$BEAD" ] || die_usage "--bead is required"
+-[ -n "$PR_ARG" ] || die_usage "--pr is required"
+-[ -n "$SHA_ARG" ] || die_usage "--sha is required"
+-[ -n "$VERDICT" ] || die_usage "--verdict is required"
+-
+-# Accept the three shapes a reviewer agent naturally has on hand: a bare
+-# number, a `#123` reference, or the PR URL the refinery recorded in
+-# metadata.pr_url. Everything downstream compares plain integers.
+-PR_NUMBER=$(printf '%s\n' "$PR_ARG" |
+-    sed -nE 's|^[Hh][Tt][Tt][Pp][Ss]?://[^/]+/[^/]+/[^/]+/pull/([0-9]+)/?$|\1|p; s|^#([0-9]+)$|\1|p; s|^([0-9]+)$|\1|p' |
+-    head -n 1)
+-if [[ ! "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+-    die_usage "could not read a pull request number from --pr $PR_ARG"
+-fi
+-
+-# Require the full 40-hex object name. An abbreviated SHA cannot be compared for
+-# equality against the live head the gate reads back from GitHub, and a prefix
+-# comparison is exactly the kind of near-match that would let a stale approval
+-# through.
+-if [[ ! "$SHA_ARG" =~ ^[0-9a-fA-F]{40}$ ]]; then
+-    die_usage "--sha must be a full 40-character hex commit SHA"
+-fi
+-HEAD_SHA=$(printf '%s' "$SHA_ARG" | tr '[:upper:]' '[:lower:]')
+-
+-case "$VERDICT" in
+-    approved|changes_requested) ;;
+-    *) die_usage "--verdict must be approved or changes_requested" ;;
+-esac
+-
+-if [ -z "$REVIEWER" ]; then
+-    REVIEWER="${GC_AGENT:-${BEADS_ACTOR:-}}"
+-fi
+-if [ -z "$REVIEWER" ]; then
+-    die_usage "--reviewer is required when neither GC_AGENT nor BEADS_ACTOR is set"
+-fi
+-
+-RECORDED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+-
+-# One update, five keys. A half-written signal is the dangerous state — a
+-# verdict without its SHA would read as "approved" to a naive consumer — so the
+-# whole signal lands atomically or not at all.
+-if ! gc bd update "$BEAD" \
+-    --set-metadata merge_approval.verdict="$VERDICT" \
+-    --set-metadata merge_approval.pr_number="$PR_NUMBER" \
+-    --set-metadata merge_approval.head_sha="$HEAD_SHA" \
+-    --set-metadata merge_approval.reviewer="$REVIEWER" \
+-    --set-metadata merge_approval.recorded_at="$RECORDED_AT"; then
+-    echo "ERROR: failed to record merge approval signal on $BEAD" >&2
+-    exit 1
+-fi
+-
+-echo "merge approval recorded: bead=$BEAD verdict=$VERDICT pr=$PR_NUMBER sha=$HEAD_SHA reviewer=$REVIEWER at=$RECORDED_AT"
+diff --git a/gastown/assets/scripts/refinery/acceptance-check.sh b/gastown/assets/scripts/refinery/acceptance-check.sh
+index d7d8155a..e37d6fa0 100755
+--- a/gastown/assets/scripts/refinery/acceptance-check.sh
++++ b/gastown/assets/scripts/refinery/acceptance-check.sh
+@@ -20,7 +20,7 @@
+ #   acceptance-check.sh record --work <id> --verdict <CONFORMS|DECLARED|MISS|SKIP>
+ #                              --tip <sha> [--mode <warn|reject>] [config flags]
+ # Config flags are merge-push.sh's (--rig, --target-default, --binding-prefix,
+-# --require-approval, --review-agent, --delete-merged-branches, --gh). Run inside
++# --delete-merged-branches, --gh). Run inside
+ # the refinery's clone, after the caller ran `git fetch --prune origin` once: the
+ # script reads origin/<branch> and origin/<target> as it finds them and fetches
+ # nothing.
+diff --git a/gastown/assets/scripts/refinery/merge-batch.sh b/gastown/assets/scripts/refinery/merge-batch.sh
+index 2e43d99c..3860cbfa 100755
+--- a/gastown/assets/scripts/refinery/merge-batch.sh
++++ b/gastown/assets/scripts/refinery/merge-batch.sh
+@@ -6,8 +6,7 @@
+ # The AGENT decides how long the batch is and what a red means; this checked-in
+ # script does the mechanics, so the agent never hand-renders a batch lane. It is
+ # a sibling of merge-push.sh and sources it in source-only mode for
+-# resolve_config, resolve_merge_strategy, resolve_approval_required and the
+-# merge-state helpers. Nothing here copies them, so a batch member is eligible
++# resolve_config, resolve_merge_strategy and the merge-state helpers. Nothing here copies them, so a batch member is eligible
+ # by the single-bead lane's own rules and the two cannot drift.
+ #
+ # Batching only ever SHORTENS to the single-bead lane. No batch failure may block
+@@ -20,17 +19,15 @@
+ #   merge-batch.sh land   --head <id> [config flags]
+ #   merge-batch.sh serial --head <id> [config flags]
+ # Config flags are merge-push.sh's (--rig, --target-default, --binding-prefix,
+-# --require-approval, --review-agent, --delete-merged-branches, --gh), and the
+-# config resolves the way merge-push.sh resolves it, including the fail-closed
+-# approval switch. Run inside the refinery's clone.
++# --delete-merged-branches, --gh), and the config resolves the way merge-push.sh
++# resolves it. Run inside the refinery's clone.
+ #
+ # select  Print the batch's member ids, one per line, head first, and exit 0.
+ #         The members are a PREFIX of the refinery's assignee scan in
+ #         find-work's order (priority, then first_submitted_at // created_at),
+ #         cut at the first ineligible bead and at K. The head is printed even
+ #         when it is itself ineligible: a batch of one is the single-bead lane.
+-#         K is forced to 1 when the approval gate resolves ON, and an unreadable
+-#         config resolves it ON. A member is eligible when its strategy is
++#         A member is eligible when its strategy is
+ #         direct, its target is the head's, metadata.fork_sha is present, it has
+ #         no existing_pr, and it has no merge_batch_serial equal to its current
+ #         origin/<branch> tip. --max defaults to 1. Any failure after the head is
+@@ -70,9 +67,7 @@
+ #         statuses are the lane's: 0 landed, 2 hard stop, 3 the re-rebase
+ #         conflicted, 5 no-op, 6 retries exhausted, 7 the remote refused. Any of
+ #         2/3/5/6/7 from the push writes nothing but the artifact proof below and
+-#         leaves the manifest where it is. Status 4 cannot arise: land stops with
+-#         2 when the approval gate is on, because a batch of more than one never
+-#         rode it.
++#         leaves the manifest where it is.
+ #         Before the push, every member gets the task-artifact proof the patrol's
+ #         rebase step records for the head (upstream #245): artifact_source_sha
+ #         and artifact_cleanup_state=pending (mb_capture_artifact_proof). A member
+@@ -108,7 +103,7 @@
+ #         again until its branch moves) and writes one note. A fetch, rev-parse or
+ #         stamp failure leaves the member in failed=; a note failure is a WARN.
+ #         It never writes rejection_reason, assignee or status and never closes a
+-#         bead, and it does not consult the approval gate. Then, whatever
++#         bead. Then, whatever
+ #         happened per member, it removes the manifest and cleans up `temp`.
+ #         Takes the manifest checks land does. Status 0 when every member is
+ #         stamped, 2 when any failed. Every serial exit, guards included, ends its
+@@ -300,11 +295,6 @@ cmd_select() {
+   esac
+   # resolve_config reports on stdout; select's stdout is the ids alone.
+   resolve_config --work "$sel_head" ${sel_pass[@]+"${sel_pass[@]}"} >&2 || return 1
+-  resolve_approval_required
+-  if [ "$APPROVAL_REQUIRED" -eq 1 ]; then
+-    echo "merge-batch: the approval gate is on; a batch of 1." >&2
+-    sel_max=1
+-  fi
+ 
+   # The head is always the first line, whatever happens after it.
+   printf '%s\n' "$sel_head"
+@@ -538,7 +528,6 @@ cmd_stack() {
+     return 1
+   fi
+   resolve_config --work "$stk_head" ${stk_pass[@]+"${stk_pass[@]}"} >&2 || return 1
+-  resolve_approval_required
+ 
+   if ! SB_ENTRY=$(git rev-parse --verify -q refs/heads/temp); then
+     echo "merge-batch: there is no temp branch to stack onto." >&2
+@@ -592,10 +581,7 @@ cmd_stack() {
+   SB_MEMBERS_JSON="[$SB_HEAD_ENTRY]"
+ 
+   stk_batchable=1
+-  if [ "$APPROVAL_REQUIRED" -eq 1 ]; then
+-    echo "merge-batch: the approval gate is on; a batch of 1."
+-    stk_batchable=0
+-  elif ! mb_check_member "$SB_HEAD" "$SB_TARGET"; then
++  if ! mb_check_member "$SB_HEAD" "$SB_TARGET"; then
+     if [ "$MB_READ_FAILED" -eq 1 ]; then
+       sb_degrade "$MB_WHY"
+       return 0
+@@ -814,7 +800,6 @@ lb_land() {
+     batch_usage >&2
+     return 1
+   fi
+-  resolve_approval_required
+ 
+   lb_read_manifest "$lnd_head" land || return 1
+   # The target is known from here, so cmd_land drops temp on the way out
+@@ -825,10 +810,6 @@ lb_land() {
+ 
+   # From here a guard is a hard stop (2): the manifest is well-formed, so what
+   # fails is the state around it. Nothing is pushed or written.
+-  if [ "$APPROVAL_REQUIRED" -eq 1 ]; then
+-    echo "merge-batch: the approval gate is on (or unreadable); a batch of more than one never rode it. Nothing landed." >&2
+-    return 2
+-  fi
+   LB_HEAD="$lnd_head"
+   lnd_last_tip=$(lb_member $((LB_SIZE - 1)) tip)
+   lnd_temp=$(git rev-parse --verify -q refs/heads/temp 2>/dev/null)
+@@ -847,11 +828,9 @@ lb_land() {
+     fi
+   done
+ 
+-  # merge_ff_push reads TARGET (set above), BRANCH (messages only) and
+-  # APPROVAL_REQUIRED, and is not copied here: the batch lands exactly as the
+-  # single-bead lane does.
++  # merge_ff_push reads TARGET (set above) and BRANCH (messages only), and is
++  # not copied here: the batch lands exactly as the single-bead lane does.
+   BRANCH=$(lb_member 0 branch)
+-  APPROVAL_REQUIRED=0
+   merge_ff_push
+   lnd_push=$?
+   if [ "$lnd_push" -ne 0 ]; then
+diff --git a/gastown/assets/scripts/refinery/merge-push.sh b/gastown/assets/scripts/refinery/merge-push.sh
+index d7e1cdd3..910938cb 100755
+--- a/gastown/assets/scripts/refinery/merge-push.sh
++++ b/gastown/assets/scripts/refinery/merge-push.sh
+@@ -11,9 +11,9 @@
+ # The helpers and lane text are the merge-push step's blocks taken through
+ # tomllib, the renderer's own un-escape, with only these edits: every template
+ # variable became its resolved CFG_* value; every gh call goes through "$GH";
+-# every place that ended the agent's shell returns a status instead; the
+-# approval gate is found as this script's sibling; and the lane glue the step's
+-# prose described became lane_direct, lane_mr and lane_local. Messages keep
++# every place that ended the agent's shell returns a status instead; and the
++# lane glue the step's prose described became lane_direct, lane_mr and
++# lane_local. Messages keep
+ # their wording. gastown/tests/test_refinery_merge_lanes.sh runs every lane
+ # case through this script, started by the merge-push step's own invoke block
+ # taken from the formula. The formula no longer holds a copy of the lane to run
+@@ -21,7 +21,6 @@
+ #
+ # Usage:
+ #   merge-push.sh --work <id> [--rig R] [--target-default B] [--binding-prefix P]
+-#                 [--require-approval V] [--review-agent A]
+ #                 [--delete-merged-branches V] [--gh BIN]
+ #
+ # Run it inside the refinery's clone, with `temp` rebased onto the target, as
+@@ -32,8 +31,6 @@
+ # Config, highest precedence first: the flag; the rig's FormulaVars (a key that
+ # is PRESENT wins even when empty); a value derived from the session; the
+ # embedded default.
+-#   require_merge_approval  --require-approval        default false
+-#   review_agent            --review-agent            default ""
+ #   delete_merged_branches  --delete-merged-branches  default true; deprecated,
+ #                           deletes nothing: a verified merge keeps its source
+ #                           branch as the task artifact's recovery copy
+@@ -46,9 +43,7 @@
+ # FormulaVars come from `gc config show --json`, or from the file named by
+ # MERGE_PUSH_CONFIG_JSON (a test seam; unset in production). They are never
+ # read from `gc bd formula show ... .vars`, which reports formula DEFAULTS
+-# whatever the rig sets, so it would silently disarm a re-armed approval gate.
+-# If the config cannot be read, or has no entry for the rig, require_merge_approval
+-# resolves ON (fail closed): an unreadable switch is not permission to skip review.
++# whatever the rig sets.
+ #
+ # GH="${REFINERY_GH:-gh}", overridden by --gh.
+ #
+@@ -58,9 +53,9 @@
+ # Exit status. The merge-push step owns patrol-loop control for every status;
+ # this script never ends the agent's session and never pours or burns a wisp.
+ #    0  handed off: the work bead is closed and its task artifact cleaned
+-#       (landed direct, or mr after approval, or closed as already merged), or,
+-#       for mr with approval off, the pull request is recorded pending and the
+-#       bead is BLOCKED until `gc gastown pr-merge-reconcile` verifies the merge
++#       (landed direct, or closed as already merged), or, for mr, the pull
++#       request is recorded pending and the bead is BLOCKED until
++#       `gc gastown pr-merge-reconcile` verifies the merge
+ #    1  usage or config error; nothing touched
+ #    2  hard stop; do not mutate bead state. Also returned when a merge landed
+ #       but its task-artifact cleanup did not converge (a pending state is
+@@ -70,8 +65,6 @@
+ #       --force-with-lease failed (temp is dropped; the next patrol's rebase step
+ #       re-runs its ancestry decision on the moved branch).
+ #    3  the re-rebase onto the moved target conflicted
+-#    4  parked awaiting review (the gate refused, or the approved head no longer
+-#       fast-forwards the target)
+ #    5  the ff-merge was a no-op; nothing landed
+ #    6  retries exhausted; the target moved under every attempt
+ #    7  the remote refused the push while the target stood still
+@@ -86,20 +79,14 @@
+ # characterized under, a plain bash shell, and every command that matters is
+ # checked on its own exit status.
+ 
+-# Canonicalized now, before anything changes directory, so the sibling gate
+-# path below stays right wherever the lane runs.
+-MERGE_PUSH_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+ GH="${REFINERY_GH:-gh}"
+ 
+ # Must equal mol-refinery-patrol.toml's [vars.<name>].default; the lane suite
+ # pins that.
+-MERGE_PUSH_DEFAULT_REQUIRE_MERGE_APPROVAL=false
+-MERGE_PUSH_DEFAULT_REVIEW_AGENT=""
+ MERGE_PUSH_DEFAULT_DELETE_MERGED_BRANCHES=true
+ 
+ usage() {
+   echo "usage: merge-push.sh --work <id> [--rig R] [--target-default B] [--binding-prefix P]"
+-  echo "                     [--require-approval V] [--review-agent A]"
+   echo "                     [--delete-merged-branches V] [--gh BIN]"
+ }
+ 
+@@ -119,12 +106,10 @@ resolve_config() {
+   rc_rig="" rc_rig_set=0
+   rc_target="" rc_target_set=0
+   rc_prefix="" rc_prefix_set=0
+-  rc_approval="" rc_approval_set=0
+-  rc_review="" rc_review_set=0
+   rc_delete="" rc_delete_set=0
+   while [ "$#" -gt 0 ]; do
+     case "$1" in
+-      --work|--rig|--target-default|--binding-prefix|--require-approval|--review-agent|--delete-merged-branches|--gh)
++      --work|--rig|--target-default|--binding-prefix|--delete-merged-branches|--gh)
+         if [ "$#" -lt 2 ]; then
+           echo "merge-push: $1 needs a value." >&2
+           usage >&2
+@@ -135,8 +120,6 @@ resolve_config() {
+           --rig) rc_rig="$2" rc_rig_set=1 ;;
+           --target-default) rc_target="$2" rc_target_set=1 ;;
+           --binding-prefix) rc_prefix="$2" rc_prefix_set=1 ;;
+-          --require-approval) rc_approval="$2" rc_approval_set=1 ;;
+-          --review-agent) rc_review="$2" rc_review_set=1 ;;
+           --delete-merged-branches) rc_delete="$2" rc_delete_set=1 ;;
+           --gh) GH="$2" ;;
+         esac
+@@ -183,25 +166,6 @@ resolve_config() {
+     fi
+   fi
+ 
+-  if [ "$rc_approval_set" -eq 1 ]; then
+-    CFG_REQUIRE_MERGE_APPROVAL="$rc_approval"
+-  elif rc_value=$(rc_formula_var require_merge_approval); then
+-    CFG_REQUIRE_MERGE_APPROVAL="$rc_value"
+-  elif [ "$rc_config_ok" -ne 1 ]; then
+-    CFG_REQUIRE_MERGE_APPROVAL=true
+-    echo "merge-push: cannot read rig config for $CFG_RIG ($rc_config_why); require_merge_approval resolves ON (fail closed). An unreadable switch is not permission to skip review."
+-  else
+-    CFG_REQUIRE_MERGE_APPROVAL="$MERGE_PUSH_DEFAULT_REQUIRE_MERGE_APPROVAL"
+-  fi
+-
+-  if [ "$rc_review_set" -eq 1 ]; then
+-    CFG_REVIEW_AGENT="$rc_review"
+-  elif rc_value=$(rc_formula_var review_agent); then
+-    CFG_REVIEW_AGENT="$rc_value"
+-  else
+-    CFG_REVIEW_AGENT="$MERGE_PUSH_DEFAULT_REVIEW_AGENT"
+-  fi
+-
+   if [ "$rc_delete_set" -eq 1 ]; then
+     CFG_DELETE_MERGED_BRANCHES="$rc_delete"
+   elif rc_value=$(rc_formula_var delete_merged_branches); then
+@@ -240,7 +204,7 @@ resolve_config() {
+     esac
+   fi
+ 
+-  echo "merge-push: config rig=$CFG_RIG target_default=${CFG_TARGET_DEFAULT:-<none>} require_merge_approval=$CFG_REQUIRE_MERGE_APPROVAL review_agent=$CFG_REVIEW_AGENT delete_merged_branches=$CFG_DELETE_MERGED_BRANCHES binding_prefix=$CFG_BINDING_PREFIX gh=$GH"
++  echo "merge-push: config rig=$CFG_RIG target_default=${CFG_TARGET_DEFAULT:-<none>} delete_merged_branches=$CFG_DELETE_MERGED_BRANCHES binding_prefix=$CFG_BINDING_PREFIX gh=$GH"
+   return 0
+ }
+ 
+@@ -250,7 +214,6 @@ result_summary() {
+     1) echo "usage or config error; nothing touched" ;;
+     2) echo "hard stop; do not mutate bead state" ;;
+     3) echo "re-rebase onto the moved target conflicted" ;;
+-    4) echo "parked awaiting review" ;;
+     5) echo "ff-merge was a no-op; nothing landed" ;;
+     6) echo "retries exhausted; the target moved under every attempt" ;;
+     7) echo "push refused while the target stood still" ;;
+@@ -261,109 +224,6 @@ result_summary() {
+   esac
+ }
+ 
+-# --- approval gate ----------------------------------------------------------
+-
+-# merge-approval-gate.sh ships beside this script in the same pack tree
+-# (assets/scripts/checks/ next to assets/scripts/refinery/). The sibling path is
+-# therefore present whenever this script is, and version-coherent with it by
+-# construction: a script from pin X can never reach a gate from pin Y. That is
+-# what the formula's `gc formula list` lookup existed to guarantee (gcp-amo);
+-# the sibling path gets it without a gc call.
+-resolve_approval_gate() {
+-  rag_dir=$(cd "$MERGE_PUSH_DIR/../checks" 2>/dev/null && pwd) || return 1
+-  if [ -f "$rag_dir/merge-approval-gate.sh" ]; then
+-    printf '%s\n' "$rag_dir/merge-approval-gate.sh"
+-    return 0
+-  fi
+-  return 1
+-}
+-
+-run_approval_gate() {
+-  # $1 = the commit the refinery is about to land. Passing it closes the gap
+-  # where the local rebased tip has drifted from the reviewed PR head.
+-  ag_sha="${1:-}"
+-  set -- --bead "$WORK" --required "$CFG_REQUIRE_MERGE_APPROVAL"
+-  if [ -n "$ag_sha" ]; then
+-    set -- "$@" --merge-sha "$ag_sha"
+-  fi
+-  bash "$APPROVAL_GATE" "$@"
+-}
+-
+-# Reviewer addressing. review_agent is written unqualified in the rig's
+-# formula_vars (`specialists.iris`, `gastown.mayor`) and the rig prefix used to
+-# be pasted on unconditionally. That is right for a rig-scoped reviewer and
+-# wrong for a town-level one: gascity-packs names `gastown.mayor`, whose only
+-# session address is the bare name, so every park nudged
+-# `gascity-packs/gastown.mayor`, got "session not found", and — fire-and-forget,
+-# with no retry and no marker — never told the reviewer anything. On a rig whose
+-# whole point is a review gate, that turns "reviewed merges" into "merges that
+-# wait forever" (gcp-a22).
+-#
+-# So resolve rather than assume. A bare name is tried rig-scoped first and then
+-# town-level: the rig attempt stays first so a rig-local reviewer is never
+-# shadowed by a town agent that happens to share its name. An address the
+-# operator already qualified (`otherrig/agent`) is taken verbatim, and a leading
+-# `/` forces town-level and skips the rig attempt.
+-nudge_review_agent() {
+-  # $1 = message. Echoes the address that accepted it, or — on return 1 — a
+-  # flattened diagnostic naming every scope that refused.
+-  nra_msg="$1"
+-  nra_addr="$CFG_REVIEW_AGENT"
+-  case "$nra_addr" in
+-    /*) set -- "${nra_addr#/}" ;;
+-    */*) set -- "$nra_addr" ;;
+-    *)
+-      if [ -n "${GC_RIG:-}" ]; then
+-        set -- "$GC_RIG/$nra_addr" "$nra_addr"
+-      else
+-        set -- "$nra_addr"
+-      fi
+-      ;;
+-  esac
+-  nra_errors=""
+-  for nra_try in "$@"; do
+-    if nra_out=$(gc session nudge "$nra_try" "$nra_msg" 2>&1); then
+-      printf '%s' "$nra_try"
+-      return 0
+-    fi
+-    nra_errors="${nra_errors:+$nra_errors; }$nra_try: $(printf '%s' "$nra_out" | tr '
+-' ' ')"
+-  done
+-  printf '%s' "$nra_errors"
+-  return 1
+-}
+-
+-park_awaiting_review() {
+-  # A refused merge is not a failure and not an incident: the branch is fine,
+-  # the reviewer simply has not approved THIS commit. Leave the bead open and
+-  # assigned to the refinery with the refusal recorded, nudge the reviewer if
+-  # the rig named one, and let the next patrol iteration re-check. Never
+-  # close, never escalate, never retry the merge in this iteration.
+-  # The gate reports on stderr and can emit more than one line; metadata is a
+-  # single-line store, so flatten before writing.
+-  ag_reason=$(printf '%s' "$1" | tr '
+-' ' ')
+-  if ! gc bd update "$WORK" --set-metadata merge_approval_state=awaiting_review --set-metadata merge_approval_gate_reason="$ag_reason"; then
+-    echo "WARN could not record the gate refusal on $WORK; the bead stays open and unmerged regardless."
+-  fi
+-  if [ -n "$CFG_REVIEW_AGENT" ]; then
+-    # The nudge is the only thing that tells the reviewer this bead is waiting,
+-    # so its outcome goes into durable state either way — a failure visible only
+-    # in a patrol transcript is exactly how gcp-a22 stayed invisible. One field,
+-    # rewritten on every park, so a later delivery cannot leave a stale failure
+-    # standing behind it.
+-    if ag_nudge=$(nudge_review_agent "REVIEW NEEDED: $WORK — ${PR_URL:-$BRANCH} awaiting merge approval. Record a verdict with record-merge-approval.sh (--pr + --sha of the live head)."); then
+-      gc bd update "$WORK" --set-metadata merge_approval_nudge="delivered: $ag_nudge" ||
+-        echo "WARN could not record the review nudge delivery on $WORK."
+-    else
+-      echo "WARN review nudge for $WORK reached no reviewer session: $ag_nudge"
+-      gc bd update "$WORK" --set-metadata merge_approval_nudge="failed: $ag_nudge" ||
+-        echo "WARN could not record the review nudge failure on $WORK; it is visible only in this transcript."
+-    fi
+-  fi
+-  echo "APPROVAL GATE REFUSED: $WORK — $1"
+-  echo "Bead left open and assigned to the refinery; skip the merge and run patrol-summary + next-iteration."
+-}
+ # --- existing_pr escalation -------------------------------------------------
+ 
+ block_existing_pr() {
+@@ -632,14 +492,13 @@ lookup_pr_info() {
+ 
+ # --- merge_ff_push ----------------------------------------------------------
+ 
+-# Land `temp` on $TARGET and prove it landed. Reads BRANCH, TARGET,
+-# APPROVAL_REQUIRED; sets TEMP_SHA, MERGED_SHA, MERGED_SHORT on success.
++# Land `temp` on $TARGET and prove it landed. Reads BRANCH, TARGET; sets
++# TEMP_SHA, MERGED_SHA, MERGED_SHORT on success.
+ #
+ # Exit status:
+ #   0 = landed and verified (MERGED_SHA is $TEMP_SHA, reachable on the target)
+ #   2 = hard stop; do not mutate bead state
+ #   3 = the re-rebase onto the new tip conflicted
+-#   4 = approval-gated and the branch must move; park awaiting review
+ #   5 = no-op: origin/$TARGET already contains temp; nothing to land here
+ #   6 = retries exhausted while losing the race (measured: the target moved
+ #       under every attempt)
+@@ -711,10 +570,6 @@ merge_ff_push() {
+     if [ "$mfp_merge_status" -ne 0 ]; then
+       merge_ff_push_cleanup_wt
+       echo "merge-ff-push: ff-merge of $TEMP_SHA onto $BEFORE_SHA failed (status $mfp_merge_status) — origin/$TARGET moved under this patrol."
+-      if [ "${APPROVAL_REQUIRED:-0}" -eq 1 ]; then
+-        echo "merge-ff-push: approval is keyed to the current head; refusing to re-rebase it. Park for review."
+-        return 4
+-      fi
+       if [ "$mfp_attempt" -ge "$mfp_max" ]; then
+         break
+       fi
+@@ -776,10 +631,6 @@ merge_ff_push() {
+         return 7
+       fi
+       echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status); origin/$TARGET moved $BEFORE_SHA -> $mfp_reject_sha, so the target really did advance between the fetch and the push."
+-      if [ "${APPROVAL_REQUIRED:-0}" -eq 1 ]; then
+-        echo "merge-ff-push: approval is keyed to the current head; refusing to re-rebase it. Park for review."
+-        return 4
+-      fi
+       if [ "$mfp_attempt" -ge "$mfp_max" ]; then
+         break
+       fi
+@@ -824,32 +675,19 @@ merge_ff_push() {
+ # bodies, printf formats) whose content indentation would change.
+ 
+ # "1. Merge, push, verify, and close work bead": land `temp` and close the
+-# bead. Shared by the direct lane and 4b (approved); 4b passes `mr` and closes
+-# with the verified-PR evidence its cleanup needs (see lane_mr). Cleanup is the
+-# caller's.
++# bead. Cleanup is the caller's.
+ direct_close() {
+-dc_lane="${1:-direct}"
+ merge_ff_push
+ MERGE_LAND_STATUS=$?
+ case "$MERGE_LAND_STATUS" in
+   0)
+-    if [ "$dc_lane" = mr ]; then
+-      gc bd update "$WORK" --set-metadata merge_result=mr_merged --set-metadata merged_sha="$MERGED_SHA" --set-metadata merged_target="$TARGET" --set-metadata pr_head_sha="$PR_HEAD_SHA" --set-metadata pr_number="$PR_NUMBER" --unset-metadata rejection_reason
+-    else
+-      gc bd update "$WORK" --set-metadata merge_result=merged --set-metadata merged_sha="$MERGED_SHA" --set-metadata merged_target="$TARGET" --unset-metadata rejection_reason
+-    fi
+-    DC_RECORDED=$?
+-    if [ "$DC_RECORDED" -eq 0 ] && gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT"; then
++    if gc bd update "$WORK" --set-metadata merge_result=merged --set-metadata merged_sha="$MERGED_SHA" --set-metadata merged_target="$TARGET" --unset-metadata rejection_reason && gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT"; then
+       MP_SUMMARY="merged to $TARGET at $MERGED_SHORT"
+       return 0
+     fi
+     echo "merge-ff-push landed $BRANCH on $TARGET at $MERGED_SHORT, but recording the merge on $WORK failed; the bead is still open. STOP. The next patrol's merge-state gate closes it as already merged."
+     return 2
+     ;;
+-  4)
+-    park_awaiting_review "the approved head no longer fast-forwards $TARGET; the branch must be re-rebased and re-reviewed before it can land"
+-    return 4
+-    ;;
+   *)
+     echo "merge-ff-push did not land $BRANCH on $TARGET (status $MERGE_LAND_STATUS). STOP. Do not mutate bead state."
+     return "$MERGE_LAND_STATUS"
+@@ -1009,13 +847,12 @@ direct_close
+ LAND_STATUS=$?
+ case "$LAND_STATUS" in
+   0) direct_cleanup || return $? ;;
+-  4) cleanup_temp ;;
+ esac
+ return "$LAND_STATUS"
+ }
+ 
+ # MERGE_STRATEGY = mr: refuse a 0-diff branch, push it, publish and verify the
+-# pull request, record it, then hand off (4a) or gate the merge (4b).
++# pull request, record it, then hand off (4a).
+ lane_mr() {
+ branch_has_real_change "origin/$TARGET" temp
+ BHRC_STATUS=$?
+@@ -1227,59 +1064,23 @@ if [ -z "$PR_URL" ] || [ "$PR_URL" = null ] || [ -z "$PR_NUMBER" ] || [ "$PR_NUM
+   return 2
+ fi
+ 
+-if [ "$APPROVAL_REQUIRED" -eq 0 ]; then
+-  # 4a. Approval gate off: record the pending PR WITHOUT closing the work bead
+-  # (upstream #245). The bead moves to blocked, so its dependents stay blocked,
+-  # until `gc gastown pr-merge-reconcile` verifies the merge on a later patrol.
+-  # No task-artifact cleanup here: reconciliation runs it after the verified
+-  # close.
+-  if ! gc gastown pr-merge-reconcile record "$WORK" "$PR_URL" "$PR_NUMBER" "$TARGET" "$PR_HEAD_SHA"; then
+-    echo "Failed to record pending PR state. STOP. Do not close $WORK."
+-    return 2
+-  fi
+-  if ! gc mail send mayor/ -s "PR ready for review: $WORK" -m "Work bead: $WORK
++# 4a. Record the pending PR WITHOUT closing the work bead (upstream #245). The
++# bead moves to blocked, so its dependents stay blocked, until
++# `gc gastown pr-merge-reconcile` verifies the merge on a later patrol.
++# No task-artifact cleanup here: reconciliation runs it after the verified
++# close.
++if ! gc gastown pr-merge-reconcile record "$WORK" "$PR_URL" "$PR_NUMBER" "$TARGET" "$PR_HEAD_SHA"; then
++  echo "Failed to record pending PR state. STOP. Do not close $WORK."
++  return 2
++fi
++if ! gc mail send mayor/ -s "PR ready for review: $WORK" -m "Work bead: $WORK
+ Pull request: $PR_URL
+  The bead and its dependents remain blocked until a refinery patrol verifies the merge."; then
+-    echo "Pending PR state is safe, but mayor notification failed; report the delivery failure."
+-  fi
+-  MP_SUMMARY="pull request pending merge: $PR_URL"
+-  cleanup_temp
+-  return 0
+-fi
+-
+-# 4b. Breadcrumbs first: the approval gate reads pr_number back to check the
+-# reviewer approved THIS pull request.
+-gc bd update $WORK --set-metadata pr_url="$PR_URL" --set-metadata pr_number="$PR_NUMBER" --set-metadata merged_target="$TARGET" --unset-metadata rejection_reason
+-
+-# 4b. Approval gate on: refused parks the bead; approved lands it with the
+-# direct path's merge.
+-APPROVAL_GATE_OUTPUT=$(run_approval_gate "$(git rev-parse temp)" 2>&1)
+-APPROVAL_GATE_STATUS=$?
+-echo "$APPROVAL_GATE_OUTPUT"
+-if [ "$APPROVAL_GATE_STATUS" -ne 0 ]; then
+-  park_awaiting_review "$APPROVAL_GATE_OUTPUT"
+-  cleanup_temp
+-  return 4
++  echo "Pending PR state is safe, but mayor notification failed; report the delivery failure."
+ fi
+-gc bd update "$WORK" --set-metadata merge_approval_state=approved --unset-metadata merge_approval_gate_reason
+-# The close records the verified-PR evidence (merge_result=mr_merged,
+-# pr_head_sha, pr_number, merged_sha), not the direct lane's merged. The push
+-# above moved origin/$BRANCH to the validated head, so cleanup's direct-merge arm,
+-# which needs origin/$BRANCH still at the PRE-rebase artifact_source_sha, blocks
+-# whenever the rebase rewrote the branch, and a real merge then exited 2. What
+-# this lane can prove is the verified-PR arm's evidence: origin/$BRANCH (or
+-# refs/pull/<n>/head) at pr_head_sha, the head GitHub reported and the gate
+-# approved, and merged_sha on the target. They are one commit: with approval on,
+-# merge_ff_push never re-rebases temp. GitHub's pr_state and pr_merged_at are
+-# not written: the refinery landed the head itself, and those fields belong to
+-# pr-merge-reconcile, which only scans beads carrying pr_reconcile_pending.
+-direct_close mr
+-LAND_STATUS=$?
+-case "$LAND_STATUS" in
+-  0) direct_cleanup || return $? ;;
+-  4) cleanup_temp ;;
+-esac
+-return "$LAND_STATUS"
++MP_SUMMARY="pull request pending merge: $PR_URL"
++cleanup_temp
++return 0
+ }
+ 
+ # MERGE_STRATEGY = local: unsupported. Escalate and leave everything as it is.
+@@ -1292,11 +1093,11 @@ return 11
+ }
+ 
+ # resolve_merge_strategy <bead-id> — print the strategy the lane would run for
+-# the bead before the approval gate is considered: its metadata.merge_strategy
+-# (default direct), with pr read as mr, and an existing_pr forcing mr. The
+-# forcing notice goes to stderr so stdout is the strategy alone. merge-batch.sh
+-# calls this for each batch candidate, so a member is eligible by the lane's own
+-# rule and the two cannot drift (gcp-l8td.8).
++# the bead: its metadata.merge_strategy (default direct), with pr read as mr,
++# and an existing_pr forcing mr. The forcing notice goes to stderr so stdout is
++# the strategy alone. merge-batch.sh calls this for each batch candidate, so a
++# member is eligible by the lane's own rule and the two cannot drift
++# (gcp-l8td.8).
+ resolve_merge_strategy() {
+   rms_json=$(gc bd show "$1" --json) || return 1
+   rms_strategy=$(printf '%s' "$rms_json" | jq -r '.[0].metadata.merge_strategy // "direct"')
+@@ -1311,18 +1112,6 @@ resolve_merge_strategy() {
+   printf '%s\n' "$rms_strategy"
+ }
+ 
+-# resolve_approval_required — set APPROVAL_REQUIRED (0 or 1) from
+-# CFG_REQUIRE_MERGE_APPROVAL. Approval gate opt-in: only the recognized off
+-# values disable it; anything unrecognized (a typo in the rig's formula_vars)
+-# turns it ON, because the failure mode of a mis-read switch must be "review
+-# required", never "review silently skipped".
+-resolve_approval_required() {
+-  case "$(printf '%s' "$CFG_REQUIRE_MERGE_APPROVAL" | tr '[:upper:]' '[:lower:]')" in
+-    ''|false|0|no|off) APPROVAL_REQUIRED=0 ;;
+-    *) APPROVAL_REQUIRED=1 ;;
+-  esac
+-}
+-
+ main() {
+ resolve_config "$@" || return 1
+ WORK="$CFG_WORK"
+@@ -1339,14 +1128,6 @@ MP_TEMP_CONSUMED=1
+ 
+ resolve_origin_repo
+ MERGE_STRATEGY=$(resolve_merge_strategy "$WORK")
+-resolve_approval_required
+-if [ "$APPROVAL_REQUIRED" -eq 1 ] && [ "$MERGE_STRATEGY" = "direct" ]; then
+-  # A reviewed merge needs something to review. Without this promotion the
+-  # gate would refuse every direct-mode bead forever (fail-closed, but
+-  # permanently deadlocked) because no PR would ever exist to approve.
+-  echo "require_merge_approval is on; a reviewed merge needs a pull request — using merge_strategy=mr."
+-  MERGE_STRATEGY="mr"
+-fi
+ case "$MERGE_STRATEGY" in
+   direct|mr|local) echo "merge-push: LANE $MERGE_STRATEGY" ;;
+   *)
+@@ -1355,15 +1136,6 @@ case "$MERGE_STRATEGY" in
+     ;;
+ esac
+ 
+-APPROVAL_GATE=""
+-if [ "$APPROVAL_REQUIRED" -eq 1 ]; then
+-  APPROVAL_GATE=$(resolve_approval_gate)
+-  if [ -z "$APPROVAL_GATE" ]; then
+-    echo "require_merge_approval is on but merge-approval-gate.sh was not found. STOP. Do not mutate bead state."
+-    echo "An unreadable gate is not an approval."
+-    return 2
+-  fi
+-fi
+ if [ "$MERGE_STRATEGY" = "mr" ] && [ -n "$EXISTING_PR" ]; then
+   if [ -z "$BRANCH" ] || [ "$BRANCH" = "null" ]; then
+     block_existing_pr "metadata.existing_pr is set but metadata.branch is missing."
+diff --git a/gastown/formulas/mol-polecat-work.toml b/gastown/formulas/mol-polecat-work.toml
+index 14cfc5df..b9b61d8a 100644
+--- a/gastown/formulas/mol-polecat-work.toml
++++ b/gastown/formulas/mol-polecat-work.toml
+@@ -716,8 +716,7 @@ test_command is `go test` (gcp-98gh).
+ ```bash
+ # --- resolve-known-red:begin ---
+ # resolve_known_red <formula> prints the path of the pack's known-red and
+-# returns 0, or returns 1. Located the way mol-refinery-patrol's
+-# resolve_approval_gate is: the named formula's own source anchors the pack, so
++# returns 0, or returns 1. The named formula's own source anchors the pack, so
+ # the matcher is always the copy shipped beside the formula being run.
+ # GC_PACK_DIR is only a fallback, because gc exports it to pack commands and
+ # not to agent shells.
+@@ -941,8 +940,7 @@ diff). Each phase is named after the formula var that holds its command.
+ : "${BASE_REF:?base ref not resolved — run step 1 of this step first}"
+ # --- resolve-known-red:begin ---
+ # resolve_known_red <formula> prints the path of the pack's known-red and
+-# returns 0, or returns 1. Located the way mol-refinery-patrol's
+-# resolve_approval_gate is: the named formula's own source anchors the pack, so
++# returns 0, or returns 1. The named formula's own source anchors the pack, so
+ # the matcher is always the copy shipped beside the formula being run.
+ # GC_PACK_DIR is only a fallback, because gc exports it to pack commands and
+ # not to agent shells.
+@@ -1777,11 +1775,11 @@ carries the marker.
+ ```bash
+ REFINERY_TARGET="${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery"
+ # NEVER clear gc.routed_to when it reads `human`. That value is an operator
+-# escalation — the refinery writes it when it REFUSES to land a bead, typically
+-# on an armed require_merge_approval gate. Reassigning to the refinery there
+-# does not resume the work, it silently undoes the one control that makes
+-# reviewed merges real (gcp-rz8a). The branch is already pushed and recorded, so
+-# halting here loses nothing: the human owns the next move.
++# escalation — the refinery writes it when it REFUSES to land a bead (an
++# existing PR it cannot use, a false completion). Reassigning to the refinery
++# there does not resume the work, it silently undoes the escalation
++# (gcp-rz8a). The branch is already pushed and recorded, so halting here loses
++# nothing: the human owns the next move.
+ ROUTED_TO=$(gc bd show "$WORK_BEAD_ID" --json 2>/dev/null | jq -r '.[0].metadata."gc.routed_to" // empty')
+ if [ "$ROUTED_TO" = "human" ]; then
+     echo "HANDOFF HALTED: $WORK_BEAD_ID is routed to human — an operator escalation."
+diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
+index e25740dc..9b45d78f 100644
+--- a/gastown/formulas/mol-refinery-patrol.toml
++++ b/gastown/formulas/mol-refinery-patrol.toml
+@@ -30,13 +30,6 @@ and closes its bead only after the merge commit is verified on the
+ recorded target branch. This preserves dependency ordering: downstream
+ beads cannot become ready against code that has not landed.
+ 
+-Rigs that require review set `require_merge_approval = "true"` in their
+-`formula_vars`. That promotes `direct` to `mr` and turns PR publication into
+-the start of review rather than the handoff: nothing lands until a reviewer
+-records an approval signal on the work bead naming the PR and the exact head
+-SHA. See the merge-push step for the full lane. Default is off, so rigs that
+-do not require review behave exactly as before.
+-
+ Read each step's description before acting — Config values override defaults."""
+ formula = "mol-refinery-patrol"
+ 
+@@ -80,28 +73,6 @@ default = "main"
+ description = "Deprecated compatibility setting; successful artifact handoffs retain source branches for recovery"
+ default = "true"
+ 
+-[vars.require_merge_approval]
+-description = """
+-Opt-in review gate. When true, no branch lands without a gc-native approval
+-signal on the work bead naming this PR and the exact head SHA the reviewer
+-read (see the merge-push step). Default false, so rigs that do not require
+-review are unaffected. Set it in the rig's `formula_vars`. Turning it on
+-implies the pull-request lane: a reviewed merge needs a PR to review, so
+-merge_strategy=direct is promoted to mr."""
+-default = "false"
+-
+-[vars.review_agent]
+-description = """
+-Optional agent address to nudge when the approval gate parks a bead awaiting
+-review, e.g. `specialists.iris`. A bare name is tried rig-scoped first and then
+-town-level, so both a rig-local reviewer and a town agent such as
+-`gastown.mayor` are reachable without the operator having to know which scope
+-owns the session. Write `rig/agent` to pin another rig, or a leading `/`
+-(`/gastown.mayor`) to force town-level and skip the rig attempt. Empty = no
+-nudge, and the reviewer is expected to find the parked bead another way.
+-From rig `formula_vars`."""
+-default = ""
+-
+ [vars.integration_branch_auto_land]
+ description = "Auto-create work beads to land completed integration branches"
+ default = "false"
+@@ -127,8 +98,8 @@ single-bead lane, exactly as it runs without batching. The patrol is poured
+ root-only, so no pour carries this var: a rig sets it in its
+ `[rigs.formula_vars]`, and a placeholder left unrendered, an empty value or a
+ non-integer means 1 (find-work prints an INFO line, not a WARN). It batches the
+-direct lane only: a bead that came from the routed claim, one that needs the
+-approval gate, one with an `existing_pr` and one a red already sent serial are
++direct lane only: a bead that came from the routed claim, one with an
++`existing_pr` and one a red already sent serial are
+ never batched. One batch counts as ONE iteration for `restart_after_iterations`.
+ 2-4 is the recommended range."""
+ default = "1"
+@@ -1208,8 +1179,7 @@ TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_bran
+ ```bash
+ # --- resolve-known-red:begin ---
+ # resolve_known_red <formula> prints the path of the pack's known-red and
+-# returns 0, or returns 1. Located the way mol-refinery-patrol's
+-# resolve_approval_gate is: the named formula's own source anchors the pack, so
++# returns 0, or returns 1. The named formula's own source anchors the pack, so
+ # the matcher is always the copy shipped beside the formula being run.
+ # GC_PACK_DIR is only a fallback, because gc exports it to pack commands and
+ # not to agent shells.
+@@ -1532,10 +1502,9 @@ description = """
+ Run the merge lane with ONE command. `merge-push.sh` reads the work bead's
+ metadata (`branch`, `target`, `merge_strategy`, `existing_pr`), chooses the lane,
+ and runs all of it: the already-merged and false-completion gates, the
+-fast-forward merge, push and verify, the pull request, the approval gate, every
++fast-forward merge, push and verify, the pull request, every
+ bead write and its own cleanup. Every config value it needs (the target default,
+-`require_merge_approval`, `review_agent`, `delete_merged_branches`, the binding
+-prefix) it resolves itself, from its flags, the rig's `formula_vars` and the
++`delete_merged_branches`, the binding prefix) it resolves itself, from its flags, the rig's `formula_vars` and the
+ session, so nothing in this step is rendered and there is nothing to hand-edit.
+ Do NOT re-type the lane, run any of its commands yourself, or run a second
+ cleanup: the script already ran its own.
+@@ -1601,7 +1570,7 @@ fi
+ MP_STATUS=$?
+ cat "$MP_LOG"
+ case "$MP_STATUS" in
+-  0|4)
++  0)
+     echo "merge-push: status $MP_STATUS: continue to patrol-summary."
+     ;;
+   9)
+@@ -1689,11 +1658,10 @@ What each status means, and what this step does about it:
+ 
+ | Status | Meaning | This step |
+ |---|---|---|
+-| 0 | Handed off: the work bead is closed and its task-artifact cleanup completed (landed direct, or mr after approval, or closed as already merged), or, for mr with approval off, the pull request is recorded pending and the bead is blocked until `gc gastown pr-merge-reconcile` verifies the merge on a later patrol. A closed bead whose cleanup did not converge is status 2, not 0. | Continue to patrol-summary. The script already ran its cleanup; do not run another. |
++| 0 | Handed off: the work bead is closed and its task-artifact cleanup completed (landed direct, or closed as already merged), or, for mr, the pull request is recorded pending and the bead is blocked until `gc gastown pr-merge-reconcile` verifies the merge on a later patrol. A closed bead whose cleanup did not converge is status 2, not 0. | Continue to patrol-summary. The script already ran its cleanup; do not run another. |
+ | 1 | Usage or config error; nothing was touched. | STOP and drain. Read the output above the RESULT line. |
+ | 2 | Hard stop; do not mutate bead state. Also returned when a merge landed but recording it on the bead failed: the next patrol's merge-state gate closes it as already merged. Also returned when the bead closed but its task-artifact cleanup did not converge: its `pending` or `blocked` state stays on the bead, find-work's sweep retries a `pending` one, and a `blocked` one is never retried and waits for review. In mr, also returned when `--force-with-lease` failed because the PR branch moved: the script dropped `temp`, and the next patrol's rebase step re-runs its ancestry decision on the moved branch. Upstream re-enters the rebase step in the same patrol instead; this fork drains the session. | STOP and drain. |
+ | 3 | The re-rebase onto the moved target conflicted. | STOP and drain. |
+-| 4 | Parked awaiting review: the approval gate refused, or the approved head no longer fast-forwards the target. This is not a failure; the bead stays open and assigned to the refinery. | Continue to patrol-summary. |
+ | 5 | The ff-merge was a no-op; nothing landed. | STOP and drain. |
+ | 6 | Retries exhausted; the target moved under every attempt. | STOP and drain. |
+ | 7 | The remote refused the push while the target stood still. | STOP and drain; see below. |
+@@ -1705,7 +1673,7 @@ What each status means, and what this step does about it:
+ With a batch (a manifest of 2+ members) the block ran `merge-batch.sh land`
+ instead, and its last output line is `merge-batch: RESULT <status> landed=<ids>
+ left-open=<ids>`. Its statuses 0, 1, 2, 3, 5, 6 and 7 mean what the table says and
+-this step does what the table says; `land` never returns 4, 9 or 11. `land`
++this step does what the table says; `land` never returns 9 or 11. `land`
+ records each member's task-artifact proof before its push, as the rebase step
+ does for the head, keeps every member's source branch, and runs each member's
+ task-artifact cleanup after its close. Status 0 is every member closed and
+diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
+index 35d2b88e..c41017f7 100755
+--- a/gastown/tests/test_gastown_pack_assets.sh
++++ b/gastown/tests/test_gastown_pack_assets.sh
+@@ -1045,8 +1045,8 @@ PY
+         fail "the polecat never closes the work bead; only the refinery does"
+ 
+     # gcp-rz8a's severity line: a replayed step 6 clears gc.routed_to="human",
+-    # which is how a bead the refinery parked on an armed require_merge_approval
+-    # gate gets pulled back out of an operator escalation. The guard must be
++    # which is how a bead the refinery refused to land gets pulled back out of an
++    # operator escalation. The guard must be
+     # read and acted on BEFORE the update that clears the routing.
+     [[ "$submit_block" == *'[ "$ROUTED_TO" = "human" ]'* ]] ||
+         fail "the refinery handoff must refuse to run when gc.routed_to is human"
+diff --git a/gastown/tests/test_merge_approval_gate.sh b/gastown/tests/test_merge_approval_gate.sh
+deleted file mode 100755
+index 04b63a77..00000000
+--- a/gastown/tests/test_merge_approval_gate.sh
++++ /dev/null
+@@ -1,1139 +0,0 @@
+-#!/usr/bin/env bash
+-# Contract tests for the gc-native merge approval signal.
+-#
+-# The producer must never leave a half-written signal behind, and the gate must
+-# refuse every path that is not a current, matching approval — including the
+-# paths where it cannot reach a verdict at all. Most of what follows is
+-# fail-closed coverage; the happy paths are the two small tests at the end.
+-set -euo pipefail
+-
+-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+-PRODUCER="$ROOT/gastown/assets/scripts/record-merge-approval.sh"
+-GATE="$ROOT/gastown/assets/scripts/checks/merge-approval-gate.sh"
+-MERGE_PUSH="$ROOT/gastown/assets/scripts/refinery/merge-push.sh"
+-
+-SHA_APPROVED=$(printf 'a%.0s' $(seq 1 40))
+-SHA_OTHER=$(printf 'b%.0s' $(seq 1 40))
+-
+-fail() {
+-    echo "FAIL: $*" >&2
+-    exit 1
+-}
+-
+-write_gc_stub() {
+-    local bin="$1"
+-    mkdir -p "$bin"
+-    cat >"$bin/gc" <<'SH'
+-#!/usr/bin/env bash
+-# Only `gc bd show <id> --json` and `gc bd update <id> --set-metadata ...`
+-# are exercised here.
+-case "${1:-} ${2:-}" in
+-    "bd show") # gc-bd-argv-tail: case label matching the fake gc's argv tail
+-        if [ -n "${STUB_BEAD_JSON:-}" ] && [ -f "$STUB_BEAD_JSON" ]; then
+-            cat "$STUB_BEAD_JSON"
+-            exit 0
+-        fi
+-        exit 1
+-        ;;
+-    "bd update") # gc-bd-argv-tail: case label matching the fake gc's argv tail
+-        printf '%s\n' "$*" >>"${STUB_UPDATE_LOG:-/dev/null}"
+-        exit "${STUB_UPDATE_EXIT:-0}"
+-        ;;
+-esac
+-exit 0
+-SH
+-    chmod +x "$bin/gc"
+-}
+-
+-write_gh_stub() {
+-    local bin="$1"
+-    mkdir -p "$bin"
+-    cat >"$bin/gh" <<'SH'
+-#!/usr/bin/env bash
+-# Only `gh pr view <number> --json ...` is exercised here.
+-if [ "${STUB_GH_EXIT:-0}" != "0" ]; then
+-    echo "gh: simulated failure" >&2
+-    exit "${STUB_GH_EXIT}"
+-fi
+-if [ -n "${STUB_PR_JSON:-}" ] && [ -f "$STUB_PR_JSON" ]; then
+-    cat "$STUB_PR_JSON"
+-    exit 0
+-fi
+-exit 1
+-SH
+-    chmod +x "$bin/gh"
+-}
+-
+-# The gate resolves the repository to query from the origin remote, so every
+-# gate test needs one it controls. Reading the ambient checkout's remote would
+-# make these tests depend on where they happen to be cloned.
+-write_git_stub() {
+-    local bin="$1"
+-    mkdir -p "$bin"
+-    cat >"$bin/git" <<'SH'
+-#!/usr/bin/env bash
+-if [ "${1:-}" = "remote" ] && [ "${2:-}" = "get-url" ]; then
+-    [ "${STUB_ORIGIN_EXIT:-0}" = "0" ] || exit "$STUB_ORIGIN_EXIT"
+-    printf '%s\n' "${STUB_ORIGIN_URL:-https://github.com/acme/widgets.git}"
+-    exit 0
+-fi
+-exit 1
+-SH
+-    chmod +x "$bin/git"
+-}
+-
+-# bead_json writes a work bead payload in the shape `gc bd show --json` returns
+-# (a single-element array). $1 = output path, remaining args = metadata k=v.
+-bead_json() {
+-    local out="$1"
+-    shift
+-    local jq_args=(-n)
+-    local filter='{id: "wb-1", metadata: {}}'
+-    local i=0
+-    for pair in "$@"; do
+-        i=$((i + 1))
+-        jq_args+=(--arg "k$i" "${pair%%=*}" --arg "v$i" "${pair#*=}")
+-        filter="$filter | .metadata[\$k$i] = \$v$i"
+-    done
+-    jq "${jq_args[@]}" "[$filter]" >"$out"
+-}
+-
+-pr_json() {
+-    local out="$1" number="$2" state="$3" head_ref="$4" head_sha="$5"
+-    jq -n \
+-        --argjson number "$number" \
+-        --arg state "$state" \
+-        --arg headRefName "$head_ref" \
+-        --arg headRefOid "$head_sha" \
+-        '{number: $number, state: $state, headRefName: $headRefName, headRefOid: $headRefOid}' \
+-        >"$out"
+-}
+-
+-# run_gate invokes the gate with the standard stub environment and captures its
+-# exit status and stderr. Sets GATE_STATUS and GATE_OUTPUT.
+-run_gate() {
+-    local bin="$1" bead_file="$2" pr_file="$3"
+-    shift 3
+-    set +e
+-    GATE_OUTPUT=$(PATH="$bin:$PATH" \
+-        STUB_BEAD_JSON="$bead_file" \
+-        STUB_PR_JSON="$pr_file" \
+-        STUB_GH_EXIT="${STUB_GH_EXIT:-0}" \
+-        STUB_ORIGIN_URL="${STUB_ORIGIN_URL:-https://github.com/acme/widgets.git}" \
+-        STUB_ORIGIN_EXIT="${STUB_ORIGIN_EXIT:-0}" \
+-        STUB_GH_REPO_LOG="${STUB_GH_REPO_LOG:-}" \
+-        bash "$GATE" --bead wb-1 --required true "$@" 2>&1)
+-    GATE_STATUS=$?
+-    set -e
+-}
+-
+-expect_refusal() {
+-    local want_reason="$1"
+-    [ "$GATE_STATUS" -eq 1 ] ||
+-        fail "expected refusal (exit 1) for $want_reason, got exit $GATE_STATUS: $GATE_OUTPUT"
+-    grep -F "reason=$want_reason" <<<"$GATE_OUTPUT" >/dev/null ||
+-        fail "expected refusal reason=$want_reason, got: $GATE_OUTPUT"
+-}
+-
+-expect_undecidable() {
+-    local want_reason="$1"
+-    [ "$GATE_STATUS" -eq 2 ] ||
+-        fail "expected undecidable (exit 2) for $want_reason, got exit $GATE_STATUS: $GATE_OUTPUT"
+-    grep -F "reason=$want_reason" <<<"$GATE_OUTPUT" >/dev/null ||
+-        fail "expected undecidable reason=$want_reason, got: $GATE_OUTPUT"
+-}
+-
+-# ── Producer ────────────────────────────────────────────────────────────────
+-
+-test_producer_records_complete_signal() {
+-    local tmp bin log
+-    tmp=$(mktemp -d)
+-    bin="$tmp/bin"
+-    log="$tmp/update.log"
+-    write_gc_stub "$bin"
+-
+-    PATH="$bin:$PATH" STUB_UPDATE_LOG="$log" GC_AGENT="rig/specialists.iris" \
+-        bash "$PRODUCER" \
+-        --bead wb-1 \
+-        --pr "https://github.com/acme/widgets/pull/7" \
+-        --sha "$(printf '%s' "$SHA_APPROVED" | tr '[:lower:]' '[:upper:]')" \
+-        --verdict approved >/dev/null ||
+-        fail "producer failed on a valid approval"
+-
+-    [[ "$(wc -l <"$log")" -eq 1 ]] ||
+-        fail "producer must write the whole signal in a single bd update" # gc-bd-argv-tail: failure message, not an invocation
+-    local line
+-    line=$(cat "$log")
+-    grep -F 'merge_approval.verdict=approved' <<<"$line" >/dev/null ||
+-        fail "verdict not recorded: $line"
+-    grep -F 'merge_approval.pr_number=7' <<<"$line" >/dev/null ||
+-        fail "PR URL was not normalized to a number: $line"
+-    grep -F "merge_approval.head_sha=$SHA_APPROVED" <<<"$line" >/dev/null ||
+-        fail "head SHA not normalized to lowercase: $line"
+-    grep -F 'merge_approval.reviewer=rig/specialists.iris' <<<"$line" >/dev/null ||
+-        fail "reviewer identity not recorded from GC_AGENT: $line"
+-    grep -E 'merge_approval\.recorded_at=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z' <<<"$line" >/dev/null ||
+-        fail "timestamp not recorded: $line"
+-}
+-
+-test_producer_rejects_invalid_input() {
+-    local tmp bin log status
+-    tmp=$(mktemp -d)
+-    bin="$tmp/bin"
+-    log="$tmp/update.log"
+-    write_gc_stub "$bin"
+-    : >"$log"
+-
+-    # An abbreviated SHA cannot be compared against the live head, so it must
+-    # not be recordable at all.
+-    set +e
+-    PATH="$bin:$PATH" STUB_UPDATE_LOG="$log" GC_AGENT="iris" bash "$PRODUCER" \
+-        --bead wb-1 --pr 7 --sha "aaaaaaa" --verdict approved >/dev/null 2>&1
+-    status=$?
+-    set -e
+-    [ "$status" -eq 2 ] || fail "abbreviated SHA should be rejected with exit 2, got $status"
+-
+-    set +e
+-    PATH="$bin:$PATH" STUB_UPDATE_LOG="$log" GC_AGENT="iris" bash "$PRODUCER" \
+-        --bead wb-1 --pr 7 --sha "$SHA_APPROVED" --verdict lgtm >/dev/null 2>&1
+-    status=$?
+-    set -e
+-    [ "$status" -eq 2 ] || fail "unknown verdict should be rejected with exit 2, got $status"
+-
+-    set +e
+-    PATH="$bin:$PATH" STUB_UPDATE_LOG="$log" GC_AGENT="iris" bash "$PRODUCER" \
+-        --bead wb-1 --pr "not-a-pr" --sha "$SHA_APPROVED" --verdict approved >/dev/null 2>&1
+-    status=$?
+-    set -e
+-    [ "$status" -eq 2 ] || fail "unparseable PR reference should be rejected with exit 2, got $status"
+-
+-    # No reviewer identity anywhere: an anonymous approval is not a signal.
+-    set +e
+-    PATH="$bin:$PATH" STUB_UPDATE_LOG="$log" GC_AGENT="" BEADS_ACTOR="" bash "$PRODUCER" \
+-        --bead wb-1 --pr 7 --sha "$SHA_APPROVED" --verdict approved >/dev/null 2>&1
+-    status=$?
+-    set -e
+-    [ "$status" -eq 2 ] || fail "missing reviewer identity should be rejected with exit 2, got $status"
+-
+-    [[ ! -s "$log" ]] || fail "rejected input must not write anything to the bead: $(cat "$log")"
+-}
+-
+-test_producer_surfaces_write_failure() {
+-    local tmp bin status
+-    tmp=$(mktemp -d)
+-    bin="$tmp/bin"
+-    write_gc_stub "$bin"
+-
+-    set +e
+-    PATH="$bin:$PATH" STUB_UPDATE_EXIT=1 GC_AGENT="iris" bash "$PRODUCER" \
+-        --bead wb-1 --pr 7 --sha "$SHA_APPROVED" --verdict approved >/dev/null 2>&1
+-    status=$?
+-    set -e
+-    [ "$status" -eq 1 ] || fail "a failed bead write must exit 1, got $status"
+-}
+-
+-# ── Gate: opt-in ────────────────────────────────────────────────────────────
+-
+-test_gate_is_opt_in() {
+-    local tmp bin status output
+-    tmp=$(mktemp -d)
+-    bin="$tmp/bin"
+-    write_gc_stub "$bin"
+-    write_gh_stub "$bin"
+-    write_git_stub "$bin"
+-
+-    # No bead payload is staged: a gate that reached the store would fail. The
+-    # disabled gate must not look at all.
+-    for value in "" false FALSE 0 no off; do
+-        set +e
+-        output=$(PATH="$bin:$PATH" bash "$GATE" --bead wb-1 --required "$value" 2>&1)
+-        status=$?
+-        set -e
+-        [ "$status" -eq 0 ] ||
+-            fail "--required '$value' should disable the gate, got exit $status: $output"
+-        grep -F 'GATE: not-required' <<<"$output" >/dev/null ||
+-            fail "--required '$value' should report not-required, got: $output"
+-    done
+-
+-    # Unset falls back to the env var, which is also unset here.
+-    set +e
+-    output=$(PATH="$bin:$PATH" bash "$GATE" --bead wb-1 2>&1)
+-    status=$?
+-    set -e
+-    [ "$status" -eq 0 ] || fail "an unset opt-in should disable the gate, got exit $status: $output"
+-}
+-
+-test_gate_treats_unrecognized_opt_in_as_enabled() {
+-    local tmp bin bead pr
+-    tmp=$(mktemp -d)
+-    bin="$tmp/bin"
+-    bead="$tmp/bead.json"
+-    pr="$tmp/pr.json"
+-    write_gc_stub "$bin"
+-    write_gh_stub "$bin"
+-    write_git_stub "$bin"
+-    bead_json "$bead" "branch=polecat/wb-1"
+-    pr_json "$pr" 7 OPEN "polecat/wb-1" "$SHA_APPROVED"
+-
+-    # A typo in the rig config must not silently disable review.
+-    set +e
+-    GATE_OUTPUT=$(PATH="$bin:$PATH" STUB_BEAD_JSON="$bead" STUB_PR_JSON="$pr" \
+-        bash "$GATE" --bead wb-1 --required "ture" 2>&1)
+-    GATE_STATUS=$?
+-    set -e
+-    expect_refusal "no_approval_signal"
+-}
+-
+-# ── Gate: fail-closed refusals ──────────────────────────────────────────────
+-
+-test_gate_refuses_missing_and_partial_signals() {
+-    local tmp bin bead pr
+-    tmp=$(mktemp -d)
+-    bin="$tmp/bin"
+-    bead="$tmp/bead.json"
+-    pr="$tmp/pr.json"
+-    write_gc_stub "$bin"
+-    write_gh_stub "$bin"
+-    write_git_stub "$bin"
+-    pr_json "$pr" 7 OPEN "polecat/wb-1" "$SHA_APPROVED"
+-
+-    bead_json "$bead" "branch=polecat/wb-1"
+-    run_gate "$bin" "$bead" "$pr"
+-    expect_refusal "no_approval_signal"
+-
+-    # A verdict without the SHA that scopes it is the dangerous half-write.
+-    bead_json "$bead" \
+-        "branch=polecat/wb-1" \
+-        "merge_approval.verdict=approved" \
+-        "merge_approval.pr_number=7"
+-    run_gate "$bin" "$bead" "$pr"
+-    expect_refusal "incomplete_approval_signal"
+-
+-    # Reviewer identity and timestamp are part of the signal, not decoration.
+-    bead_json "$bead" \
+-        "branch=polecat/wb-1" \
+-        "merge_approval.verdict=approved" \
+-        "merge_approval.pr_number=7" \
+-        "merge_approval.head_sha=$SHA_APPROVED"
+-    run_gate "$bin" "$bead" "$pr"
+-    expect_refusal "incomplete_approval_signal"
+-}
+-
+-test_gate_refuses_non_approving_verdict() {
+-    local tmp bin bead pr
+-    tmp=$(mktemp -d)
+-    bin="$tmp/bin"
+-    bead="$tmp/bead.json"
+-    pr="$tmp/pr.json"
+-    write_gc_stub "$bin"
+-    write_gh_stub "$bin"
+-    write_git_stub "$bin"
+-    pr_json "$pr" 7 OPEN "polecat/wb-1" "$SHA_APPROVED"
+-    bead_json "$bead" \
+-        "branch=polecat/wb-1" \
+-        "merge_approval.verdict=changes_requested" \
+-        "merge_approval.pr_number=7" \
+-        "merge_approval.head_sha=$SHA_APPROVED" \
+-        "merge_approval.reviewer=iris" \
+-        "merge_approval.recorded_at=2026-07-31T18:00:00Z"
+-
+-    run_gate "$bin" "$bead" "$pr"
+-    expect_refusal "verdict_not_approved"
+-}
+-
+-test_gate_refuses_wrong_pr_number() {
+-    local tmp bin bead pr
+-    tmp=$(mktemp -d)
+-    bin="$tmp/bin"
+-    bead="$tmp/bead.json"
+-    pr="$tmp/pr.json"
+-    write_gc_stub "$bin"
+-    write_gh_stub "$bin"
+-    write_git_stub "$bin"
+-    pr_json "$pr" 7 OPEN "polecat/wb-1" "$SHA_APPROVED"
+-
+-    # An approval recorded against a different PR cannot authorize this one.
+-    bead_json "$bead" \
+-        "branch=polecat/wb-1" \
+-        "pr_number=7" \
+-        "merge_approval.verdict=approved" \
+-        "merge_approval.pr_number=9" \
+-        "merge_approval.head_sha=$SHA_APPROVED" \
+-        "merge_approval.reviewer=iris" \
+-        "merge_approval.recorded_at=2026-07-31T18:00:00Z"
+-    run_gate "$bin" "$bead" "$pr"
+-    expect_refusal "pr_number_mismatch"
+-
+-    # Same check when the bead carries only the PR URL form.
+-    bead_json "$bead" \
+-        "branch=polecat/wb-1" \
+-        "pr_url=https://github.com/acme/widgets/pull/7" \
+-        "merge_approval.verdict=approved" \
+-        "merge_approval.pr_number=9" \
+-        "merge_approval.head_sha=$SHA_APPROVED" \
+-        "merge_approval.reviewer=iris" \
+-        "merge_approval.recorded_at=2026-07-31T18:00:00Z"
+-    run_gate "$bin" "$bead" "$pr"
+-    expect_refusal "pr_number_mismatch"
+-}
+-
+-test_gate_refuses_stale_head_sha() {
+-    local tmp bin bead pr
+-    tmp=$(mktemp -d)
+-    bin="$tmp/bin"
+-    bead="$tmp/bead.json"
+-    pr="$tmp/pr.json"
+-    write_gc_stub "$bin"
+-    write_gh_stub "$bin"
+-    write_git_stub "$bin"
+-
+-    # Approval was recorded for SHA_APPROVED; the author has since pushed
+-    # SHA_OTHER. The approval must not follow the branch forward.
+-    pr_json "$pr" 7 OPEN "polecat/wb-1" "$SHA_OTHER"
+-    bead_json "$bead" \
+-        "branch=polecat/wb-1" \
+-        "pr_number=7" \
+-        "merge_approval.verdict=approved" \
+-        "merge_approval.pr_number=7" \
+-        "merge_approval.head_sha=$SHA_APPROVED" \
+-        "merge_approval.reviewer=iris" \
+-        "merge_approval.recorded_at=2026-07-31T18:00:00Z"
+-
+-    run_gate "$bin" "$bead" "$pr"
+-    expect_refusal "stale_head_sha"
+-}
+-
+-test_gate_refuses_merge_sha_that_was_not_approved() {
+-    local tmp bin bead pr
+-    tmp=$(mktemp -d)
+-    bin="$tmp/bin"
+-    bead="$tmp/bead.json"
+-    pr="$tmp/pr.json"
+-    write_gc_stub "$bin"
+-    write_gh_stub "$bin"
+-    write_git_stub "$bin"
+-    pr_json "$pr" 7 OPEN "polecat/wb-1" "$SHA_APPROVED"
+-    bead_json "$bead" \
+-        "branch=polecat/wb-1" \
+-        "pr_number=7" \
+-        "merge_approval.verdict=approved" \
+-        "merge_approval.pr_number=7" \
+-        "merge_approval.head_sha=$SHA_APPROVED" \
+-        "merge_approval.reviewer=iris" \
+-        "merge_approval.recorded_at=2026-07-31T18:00:00Z"
+-
+-    # The refinery is about to merge a commit that is not the reviewed one:
+-    # the local branch tip drifted from the PR head.
+-    run_gate "$bin" "$bead" "$pr" --merge-sha "$SHA_OTHER"
+-    expect_refusal "merge_sha_not_approved"
+-}
+-
+-test_gate_refuses_unbindable_or_closed_pr() {
+-    local tmp bin bead pr
+-    tmp=$(mktemp -d)
+-    bin="$tmp/bin"
+-    bead="$tmp/bead.json"
+-    pr="$tmp/pr.json"
+-    write_gc_stub "$bin"
+-    write_gh_stub "$bin"
+-    write_git_stub "$bin"
+-
+-    # No branch on the bead: nothing ties the reviewed PR to this work.
+-    pr_json "$pr" 7 OPEN "polecat/wb-1" "$SHA_APPROVED"
+-    bead_json "$bead" \
+-        "merge_approval.verdict=approved" \
+-        "merge_approval.pr_number=7" \
+-        "merge_approval.head_sha=$SHA_APPROVED" \
+-        "merge_approval.reviewer=iris" \
+-        "merge_approval.recorded_at=2026-07-31T18:00:00Z"
+-    run_gate "$bin" "$bead" "$pr"
+-    expect_refusal "bead_has_no_branch"
+-
+-    # The reviewed PR belongs to some other branch.
+-    pr_json "$pr" 7 OPEN "polecat/other" "$SHA_APPROVED"
+-    bead_json "$bead" \
+-        "branch=polecat/wb-1" \
+-        "merge_approval.verdict=approved" \
+-        "merge_approval.pr_number=7" \
+-        "merge_approval.head_sha=$SHA_APPROVED" \
+-        "merge_approval.reviewer=iris" \
+-        "merge_approval.recorded_at=2026-07-31T18:00:00Z"
+-    run_gate "$bin" "$bead" "$pr"
+-    expect_refusal "pr_branch_mismatch"
+-
+-    # A closed PR is not a live approval target.
+-    pr_json "$pr" 7 CLOSED "polecat/wb-1" "$SHA_APPROVED"
+-    bead_json "$bead" \
+-        "branch=polecat/wb-1" \
+-        "merge_approval.verdict=approved" \
+-        "merge_approval.pr_number=7" \
+-        "merge_approval.head_sha=$SHA_APPROVED" \
+-        "merge_approval.reviewer=iris" \
+-        "merge_approval.recorded_at=2026-07-31T18:00:00Z"
+-    run_gate "$bin" "$bead" "$pr"
+-    expect_refusal "pr_not_open"
+-}
+-
+-test_gate_refuses_when_it_cannot_evaluate() {
+-    local tmp bin bead pr
+-    tmp=$(mktemp -d)
+-    bin="$tmp/bin"
+-    bead="$tmp/bead.json"
+-    pr="$tmp/pr.json"
+-    write_gc_stub "$bin"
+-    write_gh_stub "$bin"
+-    write_git_stub "$bin"
+-    pr_json "$pr" 7 OPEN "polecat/wb-1" "$SHA_APPROVED"
+-    bead_json "$bead" \
+-        "branch=polecat/wb-1" \
+-        "merge_approval.verdict=approved" \
+-        "merge_approval.pr_number=7" \
+-        "merge_approval.head_sha=$SHA_APPROVED" \
+-        "merge_approval.reviewer=iris" \
+-        "merge_approval.recorded_at=2026-07-31T18:00:00Z"
+-
+-    # The PR lookup fails: the gate cannot tell whether the approval is
+-    # current, so it must not merge.
+-    STUB_GH_EXIT=1 run_gate "$bin" "$bead" "$pr"
+-    unset STUB_GH_EXIT
+-    expect_undecidable "pr_lookup_failed"
+-
+-    # GitHub answered but without a usable head SHA.
+-    jq -n '{number: 7, state: "OPEN", headRefName: "polecat/wb-1", headRefOid: ""}' >"$pr"
+-    run_gate "$bin" "$bead" "$pr"
+-    expect_undecidable "unresolvable_live_head_sha"
+-
+-    # The bead store is unreadable.
+-    pr_json "$pr" 7 OPEN "polecat/wb-1" "$SHA_APPROVED"
+-    run_gate "$bin" "$tmp/missing-bead.json" "$pr"
+-    expect_undecidable "bead_unreadable"
+-}
+-
+-# ── Gate: origin-repo scoping (gcp-3ty) ─────────────────────────────────────
+-#
+-# On a fork carrying an `upstream` remote, `gh pr view <n>` with no `--repo`
+-# resolves the PARENT. The gate read PR n of a repository the branch was never
+-# pushed to and compared the approval against it, so every approval was refused
+-# — a permanent merge deadlock dressed up as reviewer inaction.
+-#
+-# The stub below answers DIFFERENTLY depending on whether `--repo` was passed:
+-# the unscoped answer is the upstream's unrelated PR n, the scoped answer is the
+-# origin's. A stub that ignored `--repo` could not tell the two apart and so
+-# could not catch this bug at all.
+-
+-write_fork_aware_gh_stub() {
+-    local bin="$1"
+-    mkdir -p "$bin"
+-    cat >"$bin/gh" <<'SH'
+-#!/usr/bin/env bash
+-repo=""
+-prev=""
+-for arg in "$@"; do
+-    case "$arg" in
+-        --repo=*) repo="${arg#*=}" ;;
+-        *) [ "$prev" = "--repo" ] && repo="$arg" ;;
+-    esac
+-    prev="$arg"
+-done
+-printf '%s\n' "repo=${repo:-<unscoped>}" >>"${STUB_GH_REPO_LOG:-/dev/null}"
+-if [ "$repo" = "${STUB_ORIGIN_REPO:-}" ]; then
+-    cat "$STUB_PR_JSON"
+-else
+-    # What gh's base-repo heuristic hands back on a fork: same number,
+-    # different repository, entirely unrelated pull request.
+-    cat "$STUB_UPSTREAM_PR_JSON"
+-fi
+-exit 0
+-SH
+-    chmod +x "$bin/gh"
+-}
+-
+-test_gate_scopes_the_pr_lookup_to_the_origin_repo() {
+-    local tmp bin bead pr upstream log
+-    tmp=$(mktemp -d)
+-    bin="$tmp/bin"
+-    bead="$tmp/bead.json"
+-    pr="$tmp/pr.json"
+-    upstream="$tmp/upstream-pr.json"
+-    log="$tmp/gh-repo.log"
+-    write_gc_stub "$bin"
+-    write_fork_aware_gh_stub "$bin"
+-    write_git_stub "$bin"
+-
+-    # The origin fork's PR 7: open, on our branch, at the approved SHA.
+-    pr_json "$pr" 7 OPEN "polecat/wb-1" "$SHA_APPROVED"
+-    # The upstream parent's PR 7: a stranger's change, long since merged. This
+-    # is what the pre-fix gate reported as `pr_not_open state=MERGED`.
+-    pr_json "$upstream" 7 MERGED "someone/unrelated" "$SHA_OTHER"
+-    bead_json "$bead" \
+-        "branch=polecat/wb-1" \
+-        "pr_number=7" \
+-        "merge_approval.verdict=approved" \
+-        "merge_approval.pr_number=7" \
+-        "merge_approval.head_sha=$SHA_APPROVED" \
+-        "merge_approval.reviewer=rig/specialists.iris" \
+-        "merge_approval.recorded_at=2026-07-31T18:00:00Z"
+-
+-    # bash 3.2 leaks assignments that prefix a function call, so every stub var
+-    # is unset again before the next case reads a stale one.
+-    STUB_ORIGIN_URL="https://github.com/hough-labs/gascity-packs.git" \
+-        STUB_ORIGIN_REPO="hough-labs/gascity-packs" \
+-        STUB_UPSTREAM_PR_JSON="$upstream" \
+-        STUB_GH_REPO_LOG="$log" \
+-        run_gate "$bin" "$bead" "$pr" --merge-sha "$SHA_APPROVED"
+-    unset STUB_ORIGIN_URL STUB_ORIGIN_REPO STUB_UPSTREAM_PR_JSON STUB_GH_REPO_LOG
+-
+-    [ "$GATE_STATUS" -eq 0 ] ||
+-        fail "the gate must read the origin fork's PR, not the upstream parent's: $GATE_OUTPUT"
+-    grep -Fx "repo=hough-labs/gascity-packs" "$log" >/dev/null ||
+-        fail "expected the lookup scoped to the origin repo, gh saw: $(cat "$log")"
+-    grep -F "repo=<unscoped>" "$log" >/dev/null &&
+-        fail "the gate must never issue an unscoped gh lookup: $(cat "$log")"
+-
+-    # Same signal, ssh remote: resolution must not depend on the URL form.
+-    : >"$log"
+-    STUB_ORIGIN_URL="git@github.com:hough-labs/gascity-packs.git" \
+-        STUB_ORIGIN_REPO="hough-labs/gascity-packs" \
+-        STUB_UPSTREAM_PR_JSON="$upstream" \
+-        STUB_GH_REPO_LOG="$log" \
+-        run_gate "$bin" "$bead" "$pr" --merge-sha "$SHA_APPROVED"
+-    unset STUB_ORIGIN_URL STUB_ORIGIN_REPO STUB_UPSTREAM_PR_JSON STUB_GH_REPO_LOG
+-    [ "$GATE_STATUS" -eq 0 ] ||
+-        fail "an ssh origin remote should resolve the same way: $GATE_OUTPUT"
+-    grep -Fx "repo=hough-labs/gascity-packs" "$log" >/dev/null ||
+-        fail "ssh remote did not scope the lookup, gh saw: $(cat "$log")"
+-
+-    rm -rf "$tmp"
+-}
+-
+-test_gate_refuses_rather_than_querying_an_unscoped_repo() {
+-    local tmp bin bead pr upstream log
+-    tmp=$(mktemp -d)
+-    bin="$tmp/bin"
+-    bead="$tmp/bead.json"
+-    pr="$tmp/pr.json"
+-    upstream="$tmp/upstream-pr.json"
+-    log="$tmp/gh-repo.log"
+-    write_gc_stub "$bin"
+-    write_fork_aware_gh_stub "$bin"
+-    write_git_stub "$bin"
+-    pr_json "$pr" 7 OPEN "polecat/wb-1" "$SHA_APPROVED"
+-    pr_json "$upstream" 7 MERGED "someone/unrelated" "$SHA_OTHER"
+-    bead_json "$bead" \
+-        "branch=polecat/wb-1" \
+-        "pr_number=7" \
+-        "merge_approval.verdict=approved" \
+-        "merge_approval.pr_number=7" \
+-        "merge_approval.head_sha=$SHA_APPROVED" \
+-        "merge_approval.reviewer=iris" \
+-        "merge_approval.recorded_at=2026-07-31T18:00:00Z"
+-
+-    # No origin remote at all: there is nothing safe to scope to, and falling
+-    # back to gh's own guess is precisely the defect.
+-    : >"$log"
+-    STUB_ORIGIN_EXIT=1 STUB_UPSTREAM_PR_JSON="$upstream" STUB_GH_REPO_LOG="$log" \
+-        run_gate "$bin" "$bead" "$pr"
+-    unset STUB_ORIGIN_EXIT STUB_UPSTREAM_PR_JSON STUB_GH_REPO_LOG
+-    expect_undecidable "origin_repo_unresolved"
+-    [ ! -s "$log" ] ||
+-        fail "an unresolvable origin must not reach gh at all, gh saw: $(cat "$log")"
+-
+-    # A remote this parser cannot read is the same situation: undecidable, not
+-    # a licence to ask gh where it thinks it is.
+-    : >"$log"
+-    STUB_ORIGIN_URL="https://git.example.com/acme/widgets.git" \
+-        STUB_UPSTREAM_PR_JSON="$upstream" STUB_GH_REPO_LOG="$log" \
+-        run_gate "$bin" "$bead" "$pr"
+-    unset STUB_ORIGIN_URL STUB_UPSTREAM_PR_JSON STUB_GH_REPO_LOG
+-    expect_undecidable "origin_repo_unresolved"
+-    grep -F "cause=unsupported_origin_remote" <<<"$GATE_OUTPUT" >/dev/null ||
+-        fail "expected the unsupported-remote cause to be reported: $GATE_OUTPUT"
+-    [ ! -s "$log" ] ||
+-        fail "an unsupported origin must not reach gh at all, gh saw: $(cat "$log")"
+-
+-    rm -rf "$tmp"
+-}
+-
+-# ── Gate: permitted merges ──────────────────────────────────────────────────
+-
+-test_gate_permits_current_approval() {
+-    local tmp bin bead pr
+-    tmp=$(mktemp -d)
+-    bin="$tmp/bin"
+-    bead="$tmp/bead.json"
+-    pr="$tmp/pr.json"
+-    write_gc_stub "$bin"
+-    write_gh_stub "$bin"
+-    write_git_stub "$bin"
+-    pr_json "$pr" 7 OPEN "polecat/wb-1" "$SHA_APPROVED"
+-    bead_json "$bead" \
+-        "branch=polecat/wb-1" \
+-        "pr_number=7" \
+-        "merge_approval.verdict=approved" \
+-        "merge_approval.pr_number=7" \
+-        "merge_approval.head_sha=$SHA_APPROVED" \
+-        "merge_approval.reviewer=rig/specialists.iris" \
+-        "merge_approval.recorded_at=2026-07-31T18:00:00Z"
+-
+-    run_gate "$bin" "$bead" "$pr" --merge-sha "$SHA_APPROVED"
+-    [ "$GATE_STATUS" -eq 0 ] ||
+-        fail "a current approval matching the live head should permit the merge: $GATE_OUTPUT"
+-    grep -F "GATE: approved" <<<"$GATE_OUTPUT" >/dev/null ||
+-        fail "the permitted path should report the approval it acted on: $GATE_OUTPUT"
+-    grep -F "reviewer=rig/specialists.iris" <<<"$GATE_OUTPUT" >/dev/null ||
+-        fail "the permitted path should name the approving reviewer: $GATE_OUTPUT"
+-}
+-
+-test_gate_resolves_pr_without_gh_cli() {
+-    local tmp bin bead pr status output
+-    tmp=$(mktemp -d)
+-    bin="$tmp/bin"
+-    bead="$tmp/bead.json"
+-    pr="$tmp/pr.json"
+-    mkdir -p "$bin"
+-    write_gc_stub "$bin"
+-
+-    # Rigs without the gh CLI must still be able to reach a verdict, otherwise
+-    # the fail-closed gate deadlocks them permanently — the very failure this
+-    # gate exists to end. Build a hermetic PATH so the host's real gh cannot
+-    # satisfy `command -v gh`.
+-    local tool
+-    for tool in bash basename cat tr sed head awk jq sleep; do
+-        ln -sf "$(command -v "$tool")" "$bin/$tool"
+-    done
+-    cat >"$bin/git" <<'SH'
+-#!/usr/bin/env bash
+-if [ "${1:-}" = "remote" ] && [ "${2:-}" = "get-url" ]; then
+-    echo "https://github.com/acme/widgets.git"
+-    exit 0
+-fi
+-exit 1
+-SH
+-    chmod +x "$bin/git"
+-    cat >"$bin/curl" <<'SH'
+-#!/usr/bin/env bash
+-# Answer only the pulls endpoint for the expected repo, in REST shape.
+-for arg in "$@"; do
+-    case "$arg" in
+-        https://api.github.com/repos/acme/widgets/pulls/7)
+-            cat "$STUB_REST_JSON"
+-            exit 0
+-            ;;
+-    esac
+-done
+-exit 22
+-SH
+-    chmod +x "$bin/curl"
+-
+-    jq -n --arg sha "$SHA_APPROVED" \
+-        '{number: 7, state: "open", head: {ref: "polecat/wb-1", sha: $sha}}' >"$pr"
+-    bead_json "$bead" \
+-        "branch=polecat/wb-1" \
+-        "pr_number=7" \
+-        "merge_approval.verdict=approved" \
+-        "merge_approval.pr_number=7" \
+-        "merge_approval.head_sha=$SHA_APPROVED" \
+-        "merge_approval.reviewer=iris" \
+-        "merge_approval.recorded_at=2026-07-31T18:00:00Z"
+-
+-    set +e
+-    output=$(PATH="$bin" STUB_BEAD_JSON="$bead" STUB_REST_JSON="$pr" GH_TOKEN=stub-token \
+-        "$bin/bash" "$GATE" --bead wb-1 --required true --merge-sha "$SHA_APPROVED" 2>&1)
+-    status=$?
+-    set -e
+-    [ "$status" -eq 0 ] ||
+-        fail "REST fallback should reach the same verdict without gh, got exit $status: $output"
+-    grep -F "GATE: approved" <<<"$output" >/dev/null ||
+-        fail "REST fallback should report the approval: $output"
+-}
+-
+-# ── Formula wiring ──────────────────────────────────────────────────────────
+-
+-test_refinery_patrol_consumes_the_gate() {
+-    local formula="$ROOT/gastown/formulas/mol-refinery-patrol.toml"
+-
+-    # Parse the TOML rather than grepping around the var block: the default
+-    # sits after a multi-line description, and an off-by-default gate is the
+-    # single most important property to assert.
+-    python3 - "$formula" <<'PY' || fail "require_merge_approval must be declared and default to off"
+-import sys, tomllib
+-
+-with open(sys.argv[1], "rb") as handle:
+-    formula = tomllib.load(handle)
+-var = formula.get("vars", {}).get("require_merge_approval")
+-if var is None:
+-    sys.exit("patrol formula does not declare require_merge_approval")
+-if var.get("default") != "false":
+-    sys.exit(f"require_merge_approval default is {var.get('default')!r}, want 'false'")
+-PY
+-    # The lane lives in merge-push.sh (gcp-l8td.6); the formula's merge-push
+-    # step runs it through its invoke block.
+-    python3 - "$formula" <<'PY' || fail "the merge-push step's invoke block must run merge-push.sh"
+-import sys, tomllib
+-
+-with open(sys.argv[1], "rb") as handle:
+-    formula = tomllib.load(handle)
+-text = next(s["description"] for s in formula["steps"] if s["id"] == "merge-push")
+-begin, end = "# --- merge-push:invoke:begin ---", "# --- merge-push:invoke:end ---"
+-if text.count(begin) != 1 or text.count(end) != 1:
+-    sys.exit("the merge-push step has no single merge-push:invoke block")
+-block = text.split(begin, 1)[1].split(end, 1)[0]
+-if "merge-push.sh" not in block:
+-    sys.exit("the invoke block does not name merge-push.sh")
+-PY
+-    grep -F 'merge-approval-gate.sh' "$MERGE_PUSH" >/dev/null ||
+-        fail "merge-push.sh should invoke the merge approval gate"
+-    grep -F '../checks' "$MERGE_PUSH" >/dev/null ||
+-        fail "merge-push.sh should resolve the gate as ../checks/merge-approval-gate.sh"
+-    grep -F 'APPROVAL_GATE_STATUS' "$MERGE_PUSH" >/dev/null ||
+-        fail "merge-push.sh should branch on the gate's exit status"
+-    grep -F 'merge_approval_state=awaiting_review' "$MERGE_PUSH" >/dev/null ||
+-        fail "a refused merge should park the bead as awaiting_review, not close it"
+-    # The script must not be reachable only through GC_PACK_DIR / the city
+-    # scripts dir again — neither exists in the refinery's shell (gcp-amo). The
+-    # formula finds the script from its own resolved source path, and the script
+-    # finds the gate beside itself.
+-    grep -F 'gc formula list' "$formula" >/dev/null ||
+-        fail "merge-push.sh must be resolved from the formula's own pack tree, not env vars alone"
+-}
+-
+-# ── Gate resolution (gcp-amo) ───────────────────────────────────────────────
+-#
+-# The four-candidate lookup this formula shipped with could not resolve the
+-# gate from the context the refinery actually runs in: GC_PACK_DIR is exported
+-# only for gc *pack commands* and is unset in every agent process, and nothing
+-# materializes pack check scripts into `$GC_CITY/.gc/scripts/checks/`. The gate
+-# was therefore permanently unresolvable, so turning require_merge_approval on
+-# hard-stopped patrol instead of gating it.
+-#
+-# merge-push.sh now owns the resolution (gcp-l8td.6): the gate ships beside it in
+-# the same pack tree, so the sibling path is present whenever the script is. These
+-# tests copy the shipped script and gate into a pack-shaped tree and run the
+-# script's own resolve_approval_gate, so they fail if the resolution strategy
+-# regresses. GC_PACK_DIR is unset throughout — that is the real runtime
+-# condition, not a hypothetical.
+-
+-# write_lane_gc_stub writes a `gc` that logs every bead-write, nudge and
+-# `runtime drain-ack` invocation to $STUB_UPDATE_LOG, serves the work bead's
+-# JSON from $STUB_BEAD_JSON when it is set, and answers nothing else.
+-#
+-# Nudge delivery is modelled after the real session router: when
+-# STUB_NUDGE_OK_ADDR is set, only that exact address resolves and every other
+-# one fails the way gc does ("session not found", exit 1). Unset = every address
+-# resolves, which is what the tests written before the addressing fix assume.
+-write_lane_gc_stub() {
+-    local bin="$1"
+-    mkdir -p "$bin"
+-    cat >"$bin/gc" <<'SH'
+-#!/usr/bin/env bash
+-# Subcommands are matched one word at a time so this stub never spells a
+-# bare beads invocation that tests/test_no_bare_bd_commands.py would flag.
+-case "${1:-}" in
+-    bd)
+-        printf '%s\n' "$*" >>"${STUB_UPDATE_LOG:-/dev/null}"
+-        if [ "${2:-}" = "show" ] && [ -n "${STUB_BEAD_JSON:-}" ] && [ -f "$STUB_BEAD_JSON" ]; then
+-            cat "$STUB_BEAD_JSON"
+-        fi
+-        exit 0
+-        ;;
+-    session)
+-        printf '%s\n' "$*" >>"${STUB_UPDATE_LOG:-/dev/null}"
+-        if [ "${2:-}" = "nudge" ] && [ -n "${STUB_NUDGE_OK_ADDR+x}" ] &&
+-            [ "${3:-}" != "$STUB_NUDGE_OK_ADDR" ]; then
+-            printf 'gc session nudge: session not found: "%s"\n' "${3:-}" >&2
+-            exit 1
+-        fi
+-        exit 0
+-        ;;
+-    runtime)
+-        [ "${2:-}" = "drain-ack" ] &&
+-            printf 'drain-ack\n' >>"${STUB_UPDATE_LOG:-/dev/null}"
+-        exit 0
+-        ;;
+-esac
+-exit 0
+-SH
+-    chmod +x "$bin/gc"
+-}
+-
+-# plant_pack_tree materializes a pack tree at $1 holding the real merge-push.sh
+-# and, unless $2 is "nogate", the real gate beside it, and echoes the planted
+-# script's path.
+-plant_pack_tree() {
+-    local pack="$1" gate="${2:-gate}"
+-    mkdir -p "$pack/assets/scripts/refinery" "$pack/assets/scripts/checks"
+-    cp "$MERGE_PUSH" "$pack/assets/scripts/refinery/merge-push.sh"
+-    if [ "$gate" != "nogate" ]; then
+-        cp "$GATE" "$pack/assets/scripts/checks/merge-approval-gate.sh"
+-    fi
+-    printf '%s\n' "$pack/assets/scripts/refinery/merge-push.sh"
+-}
+-
+-# resolve_planted_gate sources the planted script (defining its functions only)
+-# in an isolated shell with GC_PACK_DIR unset. Sets RESOLVE_OUTPUT to what
+-# resolve_approval_gate printed and RESOLVE_STATUS to its status.
+-resolve_planted_gate() {
+-    local script="$1"
+-    set +e
+-    RESOLVE_OUTPUT=$(env -u GC_PACK_DIR MERGE_PUSH_SOURCE_ONLY=1 bash -c '
+-        . "$1"
+-        resolve_approval_gate
+-    ' _ "$script" 2>&1)
+-    RESOLVE_STATUS=$?
+-    set -e
+-}
+-
+-test_gate_resolver_finds_the_pack_tree_without_gc_pack_dir() {
+-    local tmp pack script
+-    tmp=$(mktemp -d)
+-    pack="$tmp/pack/gastown"
+-    script=$(plant_pack_tree "$pack")
+-
+-    # No city scripts dir anywhere: the pack tree is the only thing that can
+-    # answer, which is exactly the production shape.
+-    resolve_planted_gate "$script"
+-
+-    [ "$RESOLVE_STATUS" -eq 0 ] ||
+-        fail "the script should resolve the gate with GC_PACK_DIR unset, got exit $RESOLVE_STATUS: $RESOLVE_OUTPUT"
+-    [ "$RESOLVE_OUTPUT" = "$pack/assets/scripts/checks/merge-approval-gate.sh" ] ||
+-        fail "expected the gate resolved from the script's own pack tree, got: $RESOLVE_OUTPUT"
+-    rm -rf "$tmp"
+-}
+-
+-test_gate_resolver_works_for_a_sha_pinned_pack() {
+-    local tmp pack script
+-    tmp=$(mktemp -d)
+-    # gc checks a SHA pin out into the content-addressed pack cache and reports
+-    # that path, so a pinned rig must resolve the same way a branch-tracking one
+-    # does. Mirror the cache layout rather than a checkout-shaped path.
+-    pack="$tmp/.gc/cache/repos/$(printf 'c%.0s' $(seq 1 64))/gastown"
+-    script=$(plant_pack_tree "$pack")
+-
+-    resolve_planted_gate "$script"
+-
+-    [ "$RESOLVE_STATUS" -eq 0 ] ||
+-        fail "a SHA-pinned pack should resolve, got exit $RESOLVE_STATUS: $RESOLVE_OUTPUT"
+-    [ "$RESOLVE_OUTPUT" = "$pack/assets/scripts/checks/merge-approval-gate.sh" ] ||
+-        fail "expected the gate resolved from the pinned pack cache, got: $RESOLVE_OUTPUT"
+-    rm -rf "$tmp"
+-}
+-
+-test_gate_wiring_still_fails_closed_when_nothing_resolves() {
+-    local tmp bin script log bead output status
+-    tmp=$(mktemp -d)
+-    bin="$tmp/bin"
+-    log="$tmp/update.log"
+-    bead="$tmp/bead.json"
+-    # The script is present but the gate beside it is not.
+-    script=$(plant_pack_tree "$tmp/pack/gastown" nogate)
+-    write_lane_gc_stub "$bin"
+-    write_git_stub "$bin"
+-    bead_json "$bead" "branch=polecat/wb-1" "target=main"
+-
+-    # The whole script runs: with approval on and nothing to resolve it has to
+-    # stop before it touches the branch or the bead.
+-    set +e
+-    output=$(PATH="$bin:$PATH" STUB_UPDATE_LOG="$log" STUB_BEAD_JSON="$bead" \
+-        env -u GC_PACK_DIR GC_RIG=testrig GC_AGENT=testrig/gastown.refinery \
+-        bash "$script" --work wb-1 --require-approval true 2>&1)
+-    status=$?
+-    set -e
+-
+-    [ "$status" -eq 2 ] ||
+-        fail "an unresolvable gate must stop with exit 2, got exit $status: $output"
+-    grep -F "merge-approval-gate.sh was not found" <<<"$output" >/dev/null ||
+-        fail "expected the not-found line, got: $output"
+-    grep -F "An unreadable gate is not an approval." <<<"$output" >/dev/null ||
+-        fail "expected the fail-closed refusal message, got: $output"
+-    grep -E 'bd (update|close)' "$log" >/dev/null &&
+-        fail "the fail-closed path must not mutate bead state: $(cat "$log")"
+-    rm -rf "$tmp"
+-}
+-
+-test_resolved_gate_parks_an_unapproved_bead_instead_of_stopping() {
+-    local tmp bin script pack log bead output status
+-    tmp=$(mktemp -d)
+-    bin="$tmp/bin"
+-    pack="$tmp/pack/gastown"
+-    log="$tmp/update.log"
+-    bead="$tmp/bead.json"
+-    script=$(plant_pack_tree "$pack")
+-    write_lane_gc_stub "$bin"
+-    write_git_stub "$bin"
+-    # A work bead with a PR but no approval signal at all — the ordinary state
+-    # of every bead the moment it reaches the refinery.
+-    bead_json "$bead" "pr_url=https://github.com/acme/widgets/pull/7"
+-
+-    # The mr lane's 4b: resolve the gate beside the script, run it, and park the
+-    # bead when it refuses. The whole-lane status (4) is asserted by
+-    # test_refinery_merge_lanes.sh's lane_mr_4b_refused_parks, against a real rig.
+-    set +e
+-    output=$(PATH="$bin:$PATH" STUB_UPDATE_LOG="$log" STUB_BEAD_JSON="$bead" \
+-        env -u GC_PACK_DIR MERGE_PUSH_SOURCE_ONLY=1 \
+-        bash -c '
+-            . "$1"
+-            CFG_REQUIRE_MERGE_APPROVAL=true
+-            CFG_REVIEW_AGENT=""
+-            WORK=wb-1
+-            BRANCH=polecat/wb-1
+-            APPROVAL_GATE=$(resolve_approval_gate) || { echo "GATE_UNRESOLVED"; exit 12; }
+-            gate_output=$(run_approval_gate "$2" 2>&1)
+-            gate_status=$?
+-            if [ "$gate_status" -ne 0 ]; then
+-              park_awaiting_review "$gate_output"
+-            else
+-              echo "MERGED"
+-            fi
+-        ' _ "$script" "$SHA_APPROVED" 2>&1)
+-    status=$?
+-    set -e
+-
+-    [ "$status" -eq 0 ] ||
+-        fail "an unapproved bead should park, not abort the iteration, got exit $status: $output"
+-    grep -F "MERGED" <<<"$output" >/dev/null &&
+-        fail "an unapproved bead must not merge: $output"
+-    grep -F "APPROVAL GATE REFUSED" <<<"$output" >/dev/null ||
+-        fail "expected the parked-refusal report, got: $output"
+-    grep -F "merge_approval_state=awaiting_review" "$log" >/dev/null ||
+-        fail "expected the bead parked as awaiting_review, log: $(cat "$log")"
+-    grep -F "drain-ack" "$log" >/dev/null &&
+-        fail "parking must not drain-ack the patrol: $(cat "$log")"
+-    rm -rf "$tmp"
+-}
+-
+-# park_with_reviewer parks an unapproved bead with review_agent = $1, against a
+-# session router where only address $2 resolves, in rig $3. Sets PARK_STATUS,
+-# PARK_OUTPUT, PARK_LOG and PARK_TMP (the caller removes PARK_TMP).
+-park_with_reviewer() {
+-    local review_agent="$1" ok_addr="$2" rig="$3"
+-    local tmp bin script pack bead
+-    tmp=$(mktemp -d)
+-    PARK_TMP="$tmp"
+-    bin="$tmp/bin"
+-    pack="$tmp/pack/gastown"
+-    PARK_LOG="$tmp/update.log"
+-    bead="$tmp/bead.json"
+-    script=$(plant_pack_tree "$pack")
+-    write_lane_gc_stub "$bin"
+-    write_git_stub "$bin"
+-    bead_json "$bead" "pr_url=https://github.com/acme/widgets/pull/7"
+-
+-    set +e
+-    PARK_OUTPUT=$(PATH="$bin:$PATH" STUB_UPDATE_LOG="$PARK_LOG" STUB_BEAD_JSON="$bead" \
+-        STUB_NUDGE_OK_ADDR="$ok_addr" GC_RIG="$rig" \
+-        env -u GC_PACK_DIR MERGE_PUSH_SOURCE_ONLY=1 \
+-        bash -c '
+-            . "$1"
+-            CFG_REQUIRE_MERGE_APPROVAL=true
+-            CFG_REVIEW_AGENT="$3"
+-            WORK=wb-1
+-            BRANCH=polecat/wb-1
+-            APPROVAL_GATE=$(resolve_approval_gate) || { echo "GATE_UNRESOLVED"; exit 12; }
+-            gate_output=$(run_approval_gate "$2" 2>&1)
+-            park_awaiting_review "$gate_output"
+-        ' _ "$script" "$SHA_APPROVED" "$review_agent" 2>&1)
+-    PARK_STATUS=$?
+-    set -e
+-}
+-
+-# nudge_attempts echoes the addresses the park path actually nudged, one per
+-# line, in the order it tried them.
+-nudge_attempts() {
+-    sed -n 's/^session nudge \([^ ]*\) .*$/\1/p' "$PARK_LOG"
+-}
+-
+-test_review_nudge_falls_back_to_a_town_level_reviewer() {
+-    # gascity-packs names `gastown.mayor`, a TOWN-level agent: the rig-scoped
+-    # address it used to be given does not exist, so the reviewer was never told
+-    # a bead had parked. The fallback must reach the bare address (gcp-a22).
+-    park_with_reviewer "gastown.mayor" "gastown.mayor" "gascity-packs"
+-
+-    [ "$PARK_STATUS" -eq 0 ] ||
+-        fail "parking with a town-level reviewer should not abort, got exit $PARK_STATUS: $PARK_OUTPUT"
+-    [ "$(nudge_attempts)" = "gascity-packs/gastown.mayor
+-gastown.mayor" ] ||
+-        fail "expected the rig scope tried first then town-level, got: $(nudge_attempts)"
+-    grep -F "merge_approval_nudge=delivered: gastown.mayor" "$PARK_LOG" >/dev/null ||
+-        fail "expected the delivery recorded on the bead, log: $(cat "$PARK_LOG")"
+-    rm -rf "$PARK_TMP"
+-}
+-
+-test_review_nudge_prefers_the_rig_scoped_reviewer() {
+-    # The fallback must not weaken the rig-scoped case it was added around: a
+-    # rig-local session must never be shadowed by a town agent that shares its
+-    # name, so a successful rig-scoped nudge ends the search.
+-    park_with_reviewer "specialists.iris" "gascity-packs/specialists.iris" "gascity-packs"
+-
+-    [ "$(nudge_attempts)" = "gascity-packs/specialists.iris" ] ||
+-        fail "a rig-scoped reviewer must be nudged once, at rig scope, got: $(nudge_attempts)"
+-    grep -F "merge_approval_nudge=delivered: gascity-packs/specialists.iris" "$PARK_LOG" >/dev/null ||
+-        fail "expected the delivery recorded on the bead, log: $(cat "$PARK_LOG")"
+-    rm -rf "$PARK_TMP"
+-}
+-
+-test_explicit_town_level_address_skips_the_rig_scope() {
+-    # A leading "/" is the operator's escape hatch: address this reviewer at
+-    # town level and do not spend a doomed rig-scoped attempt on it.
+-    park_with_reviewer "/gastown.mayor" "gastown.mayor" "gascity-packs"
+-
+-    [ "$(nudge_attempts)" = "gastown.mayor" ] ||
+-        fail "a leading-slash address must be nudged once, town-level, got: $(nudge_attempts)"
+-    grep -F "merge_approval_nudge=delivered: gastown.mayor" "$PARK_LOG" >/dev/null ||
+-        fail "expected the delivery recorded on the bead, log: $(cat "$PARK_LOG")"
+-    rm -rf "$PARK_TMP"
+-}
+-
+-test_undeliverable_review_nudge_is_recorded_on_the_bead() {
+-    # The failure that made gcp-a22 invisible: fire-and-forget, no retry, no
+-    # marker. An undeliverable nudge must still park the bead AND leave the
+-    # failure in durable state, naming every scope that refused.
+-    park_with_reviewer "gastown.mayor" "__no-session__" "gascity-packs"
+-
+-    [ "$PARK_STATUS" -eq 0 ] ||
+-        fail "an undeliverable nudge must not abort the iteration, got exit $PARK_STATUS: $PARK_OUTPUT"
+-    grep -F "APPROVAL GATE REFUSED" <<<"$PARK_OUTPUT" >/dev/null ||
+-        fail "expected the bead to still park, got: $PARK_OUTPUT"
+-    grep -F "merge_approval_state=awaiting_review" "$PARK_LOG" >/dev/null ||
+-        fail "expected the bead parked as awaiting_review, log: $(cat "$PARK_LOG")"
+-    grep -F "merge_approval_nudge=failed:" "$PARK_LOG" >/dev/null ||
+-        fail "an undeliverable nudge must leave a durable marker, log: $(cat "$PARK_LOG")"
+-    local marker
+-    marker=$(grep -F "merge_approval_nudge=failed:" "$PARK_LOG")
+-    grep -F "gascity-packs/gastown.mayor" <<<"$marker" >/dev/null ||
+-        fail "the marker must name the rig scope that refused, got: $marker"
+-    grep -F "session not found" <<<"$marker" >/dev/null ||
+-        fail "the marker must carry the router's diagnostic, got: $marker"
+-    [ "$(wc -l <<<"$marker" | tr -d ' ')" = "1" ] ||
+-        fail "the marker must be a single metadata line, got: $marker"
+-    grep -F "WARN review nudge for wb-1 reached no reviewer session" <<<"$PARK_OUTPUT" >/dev/null ||
+-        fail "expected the undeliverable nudge reported in the patrol output, got: $PARK_OUTPUT"
+-    rm -rf "$PARK_TMP"
+-}
+-
+-test_producer_records_complete_signal
+-test_producer_rejects_invalid_input
+-test_producer_surfaces_write_failure
+-test_gate_is_opt_in
+-test_gate_treats_unrecognized_opt_in_as_enabled
+-test_gate_refuses_missing_and_partial_signals
+-test_gate_refuses_non_approving_verdict
+-test_gate_refuses_wrong_pr_number
+-test_gate_refuses_stale_head_sha
+-test_gate_refuses_merge_sha_that_was_not_approved
+-test_gate_refuses_unbindable_or_closed_pr
+-test_gate_refuses_when_it_cannot_evaluate
+-test_gate_scopes_the_pr_lookup_to_the_origin_repo
+-test_gate_refuses_rather_than_querying_an_unscoped_repo
+-test_gate_permits_current_approval
+-test_gate_resolves_pr_without_gh_cli
+-test_refinery_patrol_consumes_the_gate
+-test_gate_resolver_finds_the_pack_tree_without_gc_pack_dir
+-test_gate_resolver_works_for_a_sha_pinned_pack
+-test_gate_wiring_still_fails_closed_when_nothing_resolves
+-test_resolved_gate_parks_an_unapproved_bead_instead_of_stopping
+-test_review_nudge_falls_back_to_a_town_level_reviewer
+-test_review_nudge_prefers_the_rig_scoped_reviewer
+-test_explicit_town_level_address_skips_the_rig_scope
+-test_undeliverable_review_nudge_is_recorded_on_the_bead
+-
+-echo "merge approval gate tests passed"
+diff --git a/gastown/tests/test_polecat_artifact_dir.sh b/gastown/tests/test_polecat_artifact_dir.sh
+index edc82cef..438630d2 100755
+--- a/gastown/tests/test_polecat_artifact_dir.sh
++++ b/gastown/tests/test_polecat_artifact_dir.sh
+@@ -1722,7 +1722,6 @@ for fragment in (
+     '0) direct_cleanup || return $? ;;',
+     'gc gastown pr-merge-reconcile record "$WORK" "$PR_URL" "$PR_NUMBER" "$TARGET" "$PR_HEAD_SHA"',
+     'if [ "$PR_HEAD_SHA" != "$EXPECTED_PR_HEAD" ]',
+-    "merge_result=mr_merged",
+     "origin/$BRANCH is deliberately kept",
+     "deletes nothing",
+ ):
+@@ -1730,19 +1729,13 @@ for fragment in (
+         raise SystemExit(f"refinery artifact cleanup contract missing from merge-push.sh: {fragment}")
+ if "--set-metadata artifact_cleanup_state=complete" not in cleanup:
+     raise SystemExit("task-artifact cleanup does not record artifact_cleanup_state=complete")
+-# The publication path (approval off) records the pending PR and must not run
+-# cleanup: reconciliation does that after the verified close.
++# The publication path records the pending PR and must not run cleanup:
++# reconciliation does that after the verified close.
+ publication = mp[
+-    mp.index('if [ "$APPROVAL_REQUIRED" -eq 0 ]; then'):mp.index("# 4b. Breadcrumbs first")
++    mp.index("# 4a. Record the pending PR"):mp.index("# MERGE_STRATEGY = local")
+ ]
+ if "task-artifact-cleanup" in publication or "direct_cleanup" in publication:
+     raise SystemExit("refinery runs task-artifact cleanup on the PR publication path")
+-# MR reconciliation records its merge evidence, and only then runs cleanup.
+-if mp.index("merge_result=mr_merged") > mp.index('gc bd close "$WORK" --reason "Merged to'):
+-    raise SystemExit("refinery closes an MR-merged bead before recording its merge evidence")
+-mr_land = mp.index("direct_close mr\nLAND_STATUS=$?")
+-if "0) direct_cleanup || return $? ;;" not in mp[mr_land:]:
+-    raise SystemExit("refinery does not run task-artifact cleanup after landing the MR head")
+ if "git push origin --delete" in mp:
+     raise SystemExit("successful direct cleanup can still delete its recovery source ref")
+ if "leak the merged branch" in merge or "leak the merged branch" in mp:
+diff --git a/gastown/tests/test_refinery_merge_batch.sh b/gastown/tests/test_refinery_merge_batch.sh
+index c02b1546..5e20fb13 100755
+--- a/gastown/tests/test_refinery_merge_batch.sh
++++ b/gastown/tests/test_refinery_merge_batch.sh
+@@ -36,7 +36,7 @@
+ # in. SCRIPT may point at another copy of merge-batch.sh; it finds merge-push.sh
+ # beside itself, so stage a copy as a pack tree.
+ #
+-# The suite fails unless all 23 cases ran.
++# The suite fails unless all 22 cases ran.
+ set -uo pipefail
+ 
+ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+@@ -44,7 +44,7 @@ PACK_DIR="$ROOT/gastown"
+ SCRIPT="${SCRIPT:-$PACK_DIR/assets/scripts/refinery/merge-batch.sh}"
+ PUSH_SCRIPT="$(dirname "$SCRIPT")/merge-push.sh"
+ CLEANUP_SCRIPT="$ROOT/gastown/assets/scripts/task-artifact-cleanup.sh"
+-EXPECTED_CASES=23
++EXPECTED_CASES=22
+ 
+ AGENT=testrig/gastown.refinery
+ TARGET_NAME=integration
+@@ -248,7 +248,7 @@ end_case() {
+     PASS_CASES=$((PASS_CASES + 1))
+ }
+ 
+-# write_config [require_merge_approval=value] — the city config the script reads
++# write_config [key=value ...] — the city config the script reads
+ # through MERGE_PUSH_CONFIG_JSON.
+ write_config() {
+     local vars='{}' kv
+@@ -545,7 +545,7 @@ case_select_truncation() {
+     reset_queue
+     set_meta gcp-q1 merge_strategy mr
+     assert_eq "an ineligible HEAD is still printed: a batch of one is the single-bead lane" \
+-        gcp-q1 "$(selected --head gcp-q1 --max 4 --require-approval false)"
++        gcp-q1 "$(selected --head gcp-q1 --max 4)"
+ 
+     # A member whose branch cannot be fetched cannot be shown eligible.
+     reset_queue
+@@ -555,39 +555,6 @@ case_select_truncation() {
+     end_case
+ }
+ 
+-case_select_approval() {
+-    new_case select-approval
+-    init_rig
+-    local i
+-    for i in 1 2 3 4; do add_branch "gcp-q$i" "f$i.txt" "bead $i"; done
+-    finish_rig gcp-q1
+-    for i in 1 2 3 4; do write_bead "gcp-q$i" 1 "2026-10-02T0$i:00:00Z"; done
+-    all="gcp-q1 gcp-q2 gcp-q3 gcp-q4"
+-
+-    write_config require_merge_approval=false
+-    assert_eq "baseline: approval off batches whole" "$all" "$(selected --head gcp-q1 --max 4)"
+-
+-    write_config require_merge_approval=true
+-    assert_eq "require_merge_approval=true prints the head only" gcp-q1 "$(selected --head gcp-q1 --max 4)"
+-    assert_eq "approval on is not an error" 0 "$(last_rc)"
+-
+-    write_config require_merge_approval=sometimes
+-    assert_eq "an unrecognized approval value counts as ON" gcp-q1 "$(selected --head gcp-q1 --max 4)"
+-
+-    write_config
+-    EXTRA_ENV=(MERGE_PUSH_CONFIG_JSON="$T/missing-config.json")
+-    assert_eq "an unreadable config (a missing file) prints the head only" gcp-q1 "$(selected --head gcp-q1 --max 4)"
+-    assert_eq "an unreadable config is not an error" 0 "$(last_rc)"
+-    grep -q 'fail closed' "$T/err" || fail "select did not say the unreadable config resolved approval ON"
+-    EXTRA_ENV=()
+-
+-    printf 'not json' >"$T/garbled.json"
+-    EXTRA_ENV=(MERGE_PUSH_CONFIG_JSON="$T/garbled.json")
+-    assert_eq "an unparseable config prints the head only" gcp-q1 "$(selected --head gcp-q1 --max 4)"
+-    EXTRA_ENV=()
+-    end_case
+-}
+-
+ case_stack_clean() {
+     new_case stack-clean
+     init_rig
+@@ -820,13 +787,7 @@ case_invariants() {
+     assert_eq "stack without --head exits 1" 1 "$(last_rc)"
+     assert_eq "usage errors touch no bead" 0 "$(db_writes)"
+ 
+-    # Approval ON: stack leaves a batch of one however many members it was given.
+     write_bead gcp-i1 1 2026-10-02T01:00:00Z
+-    write_config require_merge_approval=true
+-    run_batch stack --head gcp-i1 --members gcp-i1,gcp-i2
+-    assert_eq "stack with approval on exits 0" 0 "$(last_rc)"
+-    assert_eq "stack with approval on holds the head alone" gcp-i1 "$(mf '[.members[].id] | join(" ")')"
+-
+     # A head that would not ride the direct lane is a batch of one, too.
+     write_config
+     set_meta gcp-i1 merge_strategy mr
+@@ -1257,15 +1218,6 @@ case_land_guards() {
+     guard_holds "a member with no commits" 1
+ 
+     cp -f "$T/manifest.before" "$(manifest_path)"
+-    write_config require_merge_approval=true
+-    run_batch land --head gcp-h1
+-    guard_holds "approval required" 2
+-
+-    write_config
+-    EXTRA_ENV=(MERGE_PUSH_CONFIG_JSON="$T/missing-config.json")
+-    run_batch land --head gcp-h1
+-    guard_holds "an unreadable config" 2
+-    EXTRA_ENV=()
+ 
+     git_q -C "$REFINERY" reset --hard HEAD~1
+     run_batch land --head gcp-h1
+@@ -1381,20 +1333,17 @@ case_serial_guards() {
+     end_case
+ }
+ 
+-# The two functions the batch's eligibility is built on live in merge-push.sh, and
+-# main calls them, so the lane and the batch cannot decide differently.
++# The function the batch's eligibility is built on lives in merge-push.sh, and
++# main calls it, so the lane and the batch cannot decide differently.
+ case_extraction() {
+     new_case extraction
+     local declared
+-    declared=$(MERGE_PUSH_SOURCE_ONLY=1 "$BASH" -c ". '$PUSH_SCRIPT'; declare -F resolve_merge_strategy resolve_approval_required" 2>&1)
+-    assert_eq "merge-push.sh defines both functions" \
+-        "resolve_merge_strategy
+-resolve_approval_required" "$declared"
++    declared=$(MERGE_PUSH_SOURCE_ONLY=1 "$BASH" -c ". '$PUSH_SCRIPT'; declare -F resolve_merge_strategy" 2>&1)
++    assert_eq "merge-push.sh defines the function" resolve_merge_strategy "$declared"
+     local main_body
+     main_body=$(sed -n '/^main() {/,/^}/p' "$PUSH_SCRIPT")
+     # shellcheck disable=SC2016
+     printf '%s\n' "$main_body" | grep -q 'resolve_merge_strategy "\$WORK"' || fail "main does not call resolve_merge_strategy"
+-    printf '%s\n' "$main_body" | grep -q '^resolve_approval_required' || fail "main does not call resolve_approval_required"
+     end_case
+ }
+ 
+@@ -1405,7 +1354,6 @@ resolve_approval_required" "$declared"
+ 
+ case_select_order
+ case_select_truncation
+-case_select_approval
+ case_stack_clean
+ case_stack_conflict
+ case_stack_already_landed
+diff --git a/gastown/tests/test_refinery_merge_lanes.sh b/gastown/tests/test_refinery_merge_lanes.sh
+index a3284d66..500d0fae 100644
+--- a/gastown/tests/test_refinery_merge_lanes.sh
++++ b/gastown/tests/test_refinery_merge_lanes.sh
+@@ -20,23 +20,18 @@
+ # FORMULA at another copy of the formula to check that. A missing or duplicated
+ # sentinel, or a `{{` left in the block, aborts the whole suite. Point SCRIPT at
+ # another copy of the script to check that the suite can fail; that copy is
+-# staged as a pack tree, because the block finds the script, and the script finds
+-# the approval gate, by position.
++# staged as a pack tree, because the block finds the script by position.
+ #
+-# The suite fails unless the 24 lane cases and the 2 locator cases ran. A handful
++# The suite fails unless the 20 lane cases and the 2 locator cases ran. A handful
+ # of script-only cases (config resolution, invariants) run once, after them.
+ #
+ # The rig is real git: a bare origin, a polecat clone that pushed the branch,
+ # and the refinery's clone with `temp` rebased onto the target, which is what
+ # the `rebase` step leaves behind. Everything else is stubbed and journalled:
+ #   gc    beads against a JSON fixture of the work bead, plus mail, nudges,
+-#         drain-ack, the next-wisp pour/burn, and `formula list`. A case can
+-#         set GC_STUB_REAL_CLEANUP to run the REAL task-artifact-cleanup.sh in
+-#         place of journalling the call; the bead calls that script scopes
+-#         with `--rig <rig>` reach the same fixture. `formula list`
++#         drain-ack, the next-wisp pour/burn, and `formula list`. `formula list`
+ #         answers with no formulas, so the block falls back to GC_PACK_DIR, which
+-#         points at the real pack: the lane runs the REAL merge-push.sh and, when
+-#         approval is on, the REAL merge-approval-gate.sh beside it.
++#         points at the real pack: the lane runs the REAL merge-push.sh.
+ #   gh    pull requests from a JSON fixture; the live head sha is read off the
+ #         bare origin, as GitHub would report it.
+ #   curl  the GitHub REST fallback, used when gh is absent.
+@@ -126,12 +121,6 @@ edit_bead() {
+     tmp=$(mktemp) || exit 70
+     jq "$@" "$GC_STUB_BEAD" >"$tmp" && mv -f "$tmp" "$GC_STUB_BEAD"
+ }
+-# task-artifact-cleanup.sh scopes its bead calls with `--rig <rig>` before the
+-# verb; the fixture is that rig's.
+-if [ "${1:-}" = bd ] && [ "${2:-}" = --rig ]; then
+-    [ -n "${GC_STUB_RIG:-}" ] && [ "${3:-}" = "$GC_STUB_RIG" ] || unexpected
+-    set -- bd "${@:4}"
+-fi
+ case "${1:-}" in
+ bd)
+     case "${2:-}" in
+@@ -188,12 +177,8 @@ gastown)
+     case "${2:-}" in
+     task-artifact-cleanup)
+         # Run after a verified close (upstream's task-artifact lifecycle).
+-        # Journalled only, unless the case asked for the real script; its own
+-        # suite owns its behaviour.
++        # Journalled only; its own suite owns its behaviour.
+         { [ "$#" -eq 3 ] && [ "$3" = "$GC_STUB_WORK" ]; } || unexpected
+-        if [ -n "${GC_STUB_REAL_CLEANUP:-}" ]; then
+-            exec "$GC_STUB_REAL_CLEANUP" "$3"
+-        fi
+         ;;
+     pr-merge-reconcile)
+         # `record <work> <url> <number> <target> <head>`: upstream #245's
+@@ -423,8 +408,6 @@ end_case() {
+ #   empty           the polecat committed nothing; the target never moved
+ #   empty_moved     the polecat committed nothing and the target moved on, so
+ #                   `temp` is no longer the branch tip
+-#   moved           an ordinary merge candidate whose target moved on after the
+-#                   fork, so the rebase rewrote it: `temp` is not the branch tip
+ build_rig() {
+     local shape="$1" seed="$T/seed" polecat="$T/polecat"
+     git_q init --bare "$ORIGIN"
+@@ -464,7 +447,7 @@ build_rig() {
+         LANDED_SHA=$(git -C "$seed" rev-parse HEAD)
+         git_q -C "$seed" push "$ORIGIN" HEAD:integration
+         ;;
+-    moved | empty_moved)
++    empty_moved)
+         echo "another bead's work" >"$seed/elsewhere.txt"
+         git_q -C "$seed" add elsewhere.txt
+         git_q -C "$seed" commit -m "feat: a different bead entirely"
+@@ -558,7 +541,7 @@ write_config_json() {
+     for kv in "$@"; do
+         case "${kv%%=*}" in
+         rig_name) ;;
+-        require_merge_approval | review_agent | delete_merged_branches | target_branch | binding_prefix)
++        delete_merged_branches | target_branch | binding_prefix)
+             vars=$(jq -c --arg k "${kv%%=*}" --arg v "${kv#*=}" '. + {($k): $v}' <<<"$vars")
+             ;;
+         *)
+@@ -834,20 +817,6 @@ HOOK
+     end_case
+ }
+ 
+-test_lane_direct_approval_on_promotes_to_mr() {
+-    new_case direct_approval_on_promotes_to_mr
+-    build_rig unmerged
+-    write_bead
+-    run_lane require_merge_approval=true
+-    output_has 'using merge_strategy=mr' || fail "no 'using merge_strategy=mr' promotion message"
+-    expect_lane mr
+-    grep -qE '^gh pr (create|view) ' "$T/gh.log" || fail "the mr lane made no pull request call"
+-    expect "merge_approval_state" "$(meta merge_approval_state)" awaiting_review
+-    expect_not_closed
+-    expect_target_unchanged
+-    end_case
+-}
+-
+ test_lane_direct_cleanup_with_target_in_second_worktree() {
+     new_case direct_cleanup_with_target_in_second_worktree
+     build_rig unmerged
+@@ -992,7 +961,7 @@ test_lane_mr_existing_pr_wrong_head_repo_blocks() {
+     end_case
+ }
+ 
+-# Upstream #245: approval off, PR publication is a PENDING handoff, never a
++# Upstream #245: PR publication is a PENDING handoff, never a
+ # close. The bead is blocked (so its dependents stay blocked) until
+ # `gc gastown pr-merge-reconcile` verifies the merge on a later patrol.
+ test_lane_mr_4a_records_pending_pull_request() {
+@@ -1018,102 +987,6 @@ test_lane_mr_4a_records_pending_pull_request() {
+     end_case
+ }
+ 
+-test_lane_mr_4b_refused_parks() {
+-    new_case mr_4b_refused_parks
+-    build_rig unmerged
+-    write_bead merge_strategy=mr
+-    run_lane require_merge_approval=true
+-    expect_lane mr
+-    expect "pr_number" "$(meta pr_number)" 7
+-    expect "merge_approval_state" "$(meta merge_approval_state)" awaiting_review
+-    case "$(meta merge_approval_gate_reason)" in
+-    "<unset>" | "") fail "merge_approval_gate_reason was not recorded" ;;
+-    esac
+-    output_has 'APPROVAL GATE REFUSED' || fail "no 'APPROVAL GATE REFUSED' in the output"
+-    expect_not_closed
+-    expect_not_drained
+-    expect_target_unchanged
+-    end_case
+-}
+-
+-test_lane_mr_4b_approved_lands_and_closes() {
+-    new_case mr_4b_approved_lands_and_closes
+-    build_rig unmerged
+-    # What record-merge-approval.sh writes, for the head the lane will push.
+-    write_bead merge_strategy=mr \
+-        merge_approval.verdict=approved \
+-        merge_approval.pr_number=7 \
+-        "merge_approval.head_sha=$TEMP_SHA" \
+-        merge_approval.reviewer=testrig/specialists.iris \
+-        merge_approval.recorded_at=2026-09-27T00:00:00Z
+-    run_lane require_merge_approval=true
+-    expect_lane mr
+-    output_has 'GATE: approved' || fail "the real approval gate did not approve"
+-    expect "merge_approval_state" "$(meta merge_approval_state)" approved
+-    expect "merge_approval_gate_reason" "$(meta merge_approval_gate_reason)" "<unset>"
+-    expect "origin/integration" "$(origin_tip)" "$TEMP_SHA"
+-    # The verified-PR evidence task-artifact cleanup's mr_merged arm checks.
+-    expect "merge_result" "$(meta merge_result)" mr_merged
+-    expect "pr_head_sha" "$(meta pr_head_sha)" "$TEMP_SHA"
+-    expect "pr_number" "$(meta pr_number)" 7
+-    expect "merged_sha" "$(meta merged_sha)" "$TEMP_SHA"
+-    expect "status" "$(bead status)" closed
+-    expect "close reason" "$(bead close_reason)" "Merged to $TARGET_NAME at $(short_sha "$TEMP_SHA")"
+-    end_case
+-}
+-
+-# The approved 4b landing, with the REAL task-artifact cleanup after it. The
+-# target moved after the fork, so the rebase rewrote the branch and the mr lane's
+-# force-push moved origin/$BRANCH off the pre-rebase sha the rebase step captured
+-# as artifact_source_sha. A close as merge_result=merged sends cleanup down its
+-# direct-merge arm, which requires origin/$BRANCH to still hold that sha: it does
+-# not, so cleanup blocks and a real merge exits 2. The verified-PR evidence
+-# (mr_merged, pr_head_sha, pr_number, merged_sha) is what this lane can prove.
+-test_lane_mr_4b_approved_after_target_moved_cleans_up() {
+-    local city artifact
+-    new_case mr_4b_approved_after_target_moved_cleans_up
+-    build_rig moved
+-    [ "$TEMP_SHA" != "$BRANCH_SHA" ] || fail "harness bug: the rebase did not rewrite the branch"
+-    # The polecat's task worktree, as the polecat leaves it: on its branch, at
+-    # the sha it pushed, under the rig's artifact namespace.
+-    city="$T/city"
+-    artifact="$city/.gc/worktrees/testrig/artifacts/worktrees/$WORK_ID"
+-    mkdir -p "$(dirname "$artifact")"
+-    git_q -C "$T/polecat" checkout --detach
+-    git_q -C "$T/polecat" worktree add "$artifact" "$BRANCH_NAME" ||
+-        fail "harness bug: could not add the task worktree"
+-    write_bead merge_strategy=mr \
+-        merge_approval.verdict=approved \
+-        merge_approval.pr_number=7 \
+-        "merge_approval.head_sha=$TEMP_SHA" \
+-        merge_approval.reviewer=testrig/specialists.iris \
+-        merge_approval.recorded_at=2026-09-27T00:00:00Z \
+-        "artifact_dir=$artifact" \
+-        "artifact_source_sha=$BRANCH_SHA" \
+-        artifact_cleanup_state=pending
+-    LANE_ENV_EXTRA=(GC_STUB_REAL_CLEANUP="$ROOT/gastown/assets/scripts/task-artifact-cleanup.sh"
+-        GC_STUB_RIG=testrig GC_CITY_PATH="$city" GC_RIG_ROOT="$T/polecat")
+-    run_lane require_merge_approval=true
+-    expect_lane mr
+-    expect "merge-push.sh's status" "$SCRIPT_STATUS" 0
+-    expect_status 0
+-    expect_not_drained
+-    expect "origin/integration" "$(origin_tip)" "$TEMP_SHA"
+-    expect "status" "$(bead status)" closed
+-    expect "merge_result" "$(meta merge_result)" mr_merged
+-    expect "pr_head_sha" "$(meta pr_head_sha)" "$TEMP_SHA"
+-    expect "pr_number" "$(meta pr_number)" 7
+-    expect "merged_sha" "$(meta merged_sha)" "$TEMP_SHA"
+-    expect "merged_target" "$(meta merged_target)" "$TARGET_NAME"
+-    expect "artifact_cleanup_state" "$(meta artifact_cleanup_state)" complete
+-    expect "artifact_dir" "$(meta artifact_dir)" "<unset>"
+-    [ ! -e "$artifact" ] || fail "the task worktree $artifact was not removed"
+-    output_has '^ARTIFACT_CLEANUP_COMPLETE ' || fail "the real cleanup did not report ARTIFACT_CLEANUP_COMPLETE"
+-    # The source branch is the recovery copy, at the head that was validated.
+-    expect "origin/$BRANCH_NAME" "$(origin_ref "$BRANCH_NAME")" "$TEMP_SHA"
+-    end_case
+-}
+-
+ test_lane_mr_zero_diff_halts() {
+     new_case mr_zero_diff_halts
+     build_rig empty_moved
+@@ -1239,8 +1112,7 @@ resolve_in_source_mode() {
+         # shellcheck source=/dev/null # the script under test, chosen at run time
+         . "$SCRIPT" || exit 91
+         resolve_config --work "$WORK_ID" "$@" >/dev/null || exit
+-        printf '%s\n' "require=$CFG_REQUIRE_MERGE_APPROVAL" "review=$CFG_REVIEW_AGENT" \
+-            "delete=$CFG_DELETE_MERGED_BRANCHES" "target=$CFG_TARGET_DEFAULT" \
++        printf '%s\n' "delete=$CFG_DELETE_MERGED_BRANCHES" "target=$CFG_TARGET_DEFAULT" \
+             "prefix=$CFG_BINDING_PREFIX" "rig=$CFG_RIG"
+     )
+ }
+@@ -1254,7 +1126,7 @@ resolved() {
+ # values must never be read) with the given FormulaVars.
+ write_rig_config() {
+     jq -n --argjson vars "$2" '{config: {Rigs: [
+-        {Name: "otherrig", DefaultBranch: "decoy", FormulaVars: {review_agent: "decoy", target_branch: "decoy"}},
++        {Name: "otherrig", DefaultBranch: "decoy", FormulaVars: {target_branch: "decoy"}},
+         {Name: "testrig", DefaultBranch: "integration", FormulaVars: $vars}]}}' >"$1"
+ }
+ 
+@@ -1269,17 +1141,14 @@ test_script_invariants() {
+ test_config_precedence() {
+     local out
+     new_case config_precedence
+-    write_rig_config "$T/vars.json" '{"review_agent": "specialists.iris", "require_merge_approval": "true",
+-        "delete_merged_branches": "false", "target_branch": "develop", "binding_prefix": "vars."}'
++    write_rig_config "$T/vars.json" '{"delete_merged_branches": "false", "target_branch": "develop", "binding_prefix": "vars."}'
+     write_rig_config "$T/bare.json" '{}'
+-    write_rig_config "$T/empty.json" '{"review_agent": "", "target_branch": "", "require_merge_approval": ""}'
++    write_rig_config "$T/empty.json" '{"target_branch": ""}'
+ 
+     # A flag beats FormulaVars.
+     out=$(resolve_in_source_mode "$T/vars.json" testrig/gastown.refinery \
+-        --require-approval off --review-agent flag.agent --delete-merged-branches maybe \
++        --delete-merged-branches maybe \
+         --target-default main --binding-prefix flag.) || fail "resolve_config failed with flags"
+-    expect "require_merge_approval (flag over FormulaVars)" "$(resolved "$out" require)" off
+-    expect "review_agent (flag over FormulaVars)" "$(resolved "$out" review)" flag.agent
+     expect "delete_merged_branches (flag over FormulaVars)" "$(resolved "$out" delete)" maybe
+     expect "target default (flag over FormulaVars)" "$(resolved "$out" target)" main
+     expect "binding_prefix (flag over FormulaVars)" "$(resolved "$out" prefix)" flag.
+@@ -1287,8 +1156,6 @@ test_config_precedence() {
+     # FormulaVars beat derived values and the embedded defaults.
+     out=$(resolve_in_source_mode "$T/vars.json" testrig/gastown.refinery) ||
+         fail "resolve_config failed with FormulaVars"
+-    expect "require_merge_approval (FormulaVars over default)" "$(resolved "$out" require)" true
+-    expect "review_agent (FormulaVars over default)" "$(resolved "$out" review)" specialists.iris
+     expect "delete_merged_branches (FormulaVars over default)" "$(resolved "$out" delete)" false
+     expect "target default (FormulaVars over DefaultBranch)" "$(resolved "$out" target)" develop
+     expect "binding_prefix (FormulaVars over GC_AGENT)" "$(resolved "$out" prefix)" vars.
+@@ -1299,16 +1166,12 @@ test_config_precedence() {
+         fail "resolve_config failed with empty FormulaVars"
+     expect "target default (derived from DefaultBranch)" "$(resolved "$out" target)" integration
+     expect "binding_prefix (derived from GC_AGENT)" "$(resolved "$out" prefix)" gastown.
+-    expect "require_merge_approval (default)" "$(resolved "$out" require)" false
+-    expect "review_agent (default)" "$(resolved "$out" review)" ""
+     expect "delete_merged_branches (default)" "$(resolved "$out" delete)" true
+ 
+     # A FormulaVars key that is PRESENT wins even when empty.
+     out=$(resolve_in_source_mode "$T/empty.json" testrig/gastown.refinery) ||
+         fail "resolve_config failed with present-but-empty FormulaVars"
+-    expect "review_agent (present but empty)" "$(resolved "$out" review)" ""
+     expect "target default (present but empty, not DefaultBranch)" "$(resolved "$out" target)" ""
+-    expect "require_merge_approval (present but empty)" "$(resolved "$out" require)" ""
+     end_case
+ }
+ 
+@@ -1340,28 +1203,13 @@ test_config_binding_prefix_derivation() {
+     end_case
+ }
+ 
+-test_config_unreadable_turns_gate_on() {
+-    new_case config_unreadable_turns_gate_on
+-    build_rig unmerged
+-    write_bead
+-    LANE_ENV_EXTRA=(MERGE_PUSH_CONFIG_JSON="$T/no-such-config.json")
+-    run_lane
+-    expect_lane mr
+-    expect "the script's exit status" "$SCRIPT_STATUS" 4
+-    output_has 'require_merge_approval resolves ON \(fail closed\)' || fail "no fail-closed line in the output"
+-    output_has 'APPROVAL GATE REFUSED' || fail "no 'APPROVAL GATE REFUSED' in the output"
+-    expect_not_closed
+-    expect_target_unchanged
+-    end_case
+-}
+-
+ test_config_defaults_match_formula_vars() {
+     local out name key want
+     new_case config_defaults_match_formula_vars
+     write_rig_config "$T/bare.json" '{}'
+     out=$(resolve_in_source_mode "$T/bare.json" testrig/gastown.refinery) ||
+         fail "resolve_config failed with empty FormulaVars"
+-    for name in require_merge_approval:require review_agent:review delete_merged_branches:delete; do
++    for name in delete_merged_branches:delete; do
+         key="${name#*:}"
+         name="${name%%:*}"
+         want=$(python3 - "$FORMULA" "$name" <<'PY'
+@@ -1412,12 +1260,10 @@ if ! extract_invoke "$HARNESS/invoke.sh"; then
+     exit 1
+ fi
+ 
+-# The block finds merge-push.sh, and the script finds the approval gate, by
+-# position in a pack tree. A SCRIPT override is staged as one, beside the real
+-# gate, so the same block runs it.
++# The block finds merge-push.sh by position in a pack tree. A SCRIPT override is
++# staged as one, so the same block runs it.
+ if [ "$SCRIPT" != "$PACK_DIR/assets/scripts/refinery/merge-push.sh" ]; then
+     mkdir -p "$HARNESS/pack/assets/scripts/refinery"
+-    cp -R "$PACK_DIR/assets/scripts/checks" "$HARNESS/pack/assets/scripts/checks"
+     cp -f "$SCRIPT" "$HARNESS/pack/assets/scripts/refinery/merge-push.sh"
+     chmod +x "$HARNESS/pack/assets/scripts/refinery/merge-push.sh"
+     PACK_DIR="$HARNESS/pack"
+@@ -1431,7 +1277,6 @@ run_all_cases() {
+     test_lane_direct_false_completion_halts
+     test_lane_direct_lost_race_then_lands
+     test_lane_direct_push_veto_status_7
+-    test_lane_direct_approval_on_promotes_to_mr
+     test_lane_mr_creates_pr_via_gh
+     test_lane_mr_reuses_existing_pr
+     test_lane_mr_rest_fallback_without_gh
+@@ -1442,9 +1287,6 @@ run_all_cases() {
+     test_lane_mr_existing_pr_wrong_repo_blocks
+     test_lane_mr_existing_pr_wrong_head_repo_blocks
+     test_lane_mr_4a_records_pending_pull_request
+-    test_lane_mr_4b_refused_parks
+-    test_lane_mr_4b_approved_lands_and_closes
+-    test_lane_mr_4b_approved_after_target_moved_cleans_up
+     test_lane_mr_zero_diff_halts
+     test_lane_local_mails_mayor
+     test_lane_direct_cleanup_with_target_in_second_worktree
+@@ -1455,15 +1297,14 @@ run_all_cases() {
+ }
+ 
+ run_all_cases
+-if [ "$PASS_CASES" -ne 26 ]; then
+-    echo "FAIL: want 26 cases (24 lane, 2 locator); ran $PASS_CASES" >&2
++if [ "$PASS_CASES" -ne 22 ]; then
++    echo "FAIL: want 22 cases (20 lane, 2 locator); ran $PASS_CASES" >&2
+     FAILURES=$((FAILURES + 1))
+ fi
+ 
+ test_script_invariants
+ test_config_precedence
+ test_config_binding_prefix_derivation
+-test_config_unreadable_turns_gate_on
+ test_config_defaults_match_formula_vars
+ test_script_honors_refinery_gh
+ 
+diff --git a/gastown/tests/test_refinery_merge_push.sh b/gastown/tests/test_refinery_merge_push.sh
+index 40aea06f..bad46f3e 100755
+--- a/gastown/tests/test_refinery_merge_push.sh
++++ b/gastown/tests/test_refinery_merge_push.sh
+@@ -103,7 +103,6 @@ race_the_target() {
+ # "<status>|<MERGED_SHA>|<TEMP_SHA>" and streams the block's own output to
+ # stderr so a failing test is debuggable.
+ run_merge() {
+-    local approval="${1:-0}"
+     (
+         cd "$WORK" || exit 90
+         # No `set -e` here on purpose: the block must abort on its own explicit
+@@ -114,8 +113,6 @@ run_merge() {
+         BRANCH=polecat/test
+         # shellcheck disable=SC2034
+         TARGET=dev
+-        # shellcheck disable=SC2034
+-        APPROVAL_REQUIRED="$approval"
+         MERGED_SHA=""
+         TEMP_SHA=""
+         # shellcheck disable=SC1090
+@@ -140,7 +137,7 @@ test_clean_ff_lands_and_reports_the_branch_tip() {
+     before=$(origin_tip)
+     want=$(git -C "$WORK" rev-parse temp)
+ 
+-    got=$(run_merge 0 2>/dev/null)
++    got=$(run_merge 2>/dev/null)
+     after=$(origin_tip)
+ 
+     [ "$(status_of "$got")" = "0" ] ||
+@@ -164,7 +161,7 @@ test_lost_race_rerebases_and_lands_this_branch() {
+     make_rig "$tmp"
+     racing=$(race_the_target "$tmp")
+ 
+-    got=$(run_merge 0 2>/dev/null)
++    got=$(run_merge 2>/dev/null)
+     after=$(origin_tip)
+     merged=$(merged_of "$got")
+ 
+@@ -201,7 +198,7 @@ test_failed_ff_with_conflicting_rebase_pushes_nothing() {
+     git_q -C "$racer" push origin dev
+     before=$(origin_tip)
+ 
+-    got=$(run_merge 0 2>/dev/null)
++    got=$(run_merge 2>/dev/null)
+     after=$(origin_tip)
+ 
+     [ "$(status_of "$got")" = "3" ] ||
+@@ -211,30 +208,6 @@ test_failed_ff_with_conflicting_rebase_pushes_nothing() {
+     rm -rf "$tmp"
+ }
+ 
+-test_failed_ff_under_approval_parks_without_moving_the_branch() {
+-    # An approval authorizes one commit. On a lost race the lane must refuse to
+-    # re-rebase (that would land something no reviewer read), park, and push
+-    # nothing.
+-    local tmp got before after temp_before temp_after
+-    tmp=$(mktemp -d)
+-    make_rig "$tmp"
+-    race_the_target "$tmp" >/dev/null
+-    before=$(origin_tip)
+-    temp_before=$(git -C "$WORK" rev-parse temp)
+-
+-    got=$(run_merge 1 2>/dev/null)
+-    after=$(origin_tip)
+-    temp_after=$(git -C "$WORK" rev-parse temp)
+-
+-    [ "$(status_of "$got")" = "4" ] ||
+-        fail "lost race under approval returned $(status_of "$got"), want 4 (park)"
+-    [ "$after" = "$before" ] ||
+-        fail "lost race under approval moved origin/dev from $before to $after"
+-    [ "$temp_after" = "$temp_before" ] ||
+-        fail "lost race under approval re-rebased temp ($temp_before -> $temp_after); the approved head must not move here"
+-    rm -rf "$tmp"
+-}
+-
+ test_push_that_does_not_advance_the_target_is_refused() {
+     # The tautology, isolated: a push that exits 0 while the target ends up
+     # where it started. The old guard compared the pre-push snapshot to itself
+@@ -251,7 +224,7 @@ git --git-dir="$ORIGIN" update-ref refs/heads/dev $before
+ HOOK
+     chmod +x "$ORIGIN/hooks/post-receive"
+ 
+-    got=$(run_merge 0 2>/dev/null)
++    got=$(run_merge 2>/dev/null)
+     after=$(origin_tip)
+ 
+     [ "$after" = "$before" ] ||
+@@ -282,7 +255,7 @@ git --git-dir="$ORIGIN" update-ref refs/heads/dev $other
+ HOOK
+     chmod +x "$ORIGIN/hooks/post-receive"
+ 
+-    got=$(run_merge 0 2>/dev/null)
++    got=$(run_merge 2>/dev/null)
+ 
+     [ "$(origin_tip)" = "$other" ] ||
+         fail "harness bug: dev should be $other, found $(origin_tip)"
+@@ -301,7 +274,7 @@ test_noop_ff_does_not_report_a_merge() {
+     git_q -C "$WORK" push origin temp:dev
+     before=$(origin_tip)
+ 
+-    got=$(run_merge 0 2>/dev/null)
++    got=$(run_merge 2>/dev/null)
+ 
+     [ "$(status_of "$got")" = "5" ] ||
+         fail "no-op ff returned $(status_of "$got"), want 5"
+@@ -330,7 +303,7 @@ exit 1
+ HOOK
+     chmod +x "$ORIGIN/hooks/pre-receive"
+ 
+-    got=$(run_merge 0 2>/dev/null)
++    got=$(run_merge 2>/dev/null)
+     after=$(origin_tip)
+     attempts=$(wc -l <"$tmp/push-attempts" | tr -d ' ')
+ 
+@@ -386,7 +359,7 @@ exit 1
+ HOOK
+     chmod +x "$ORIGIN/hooks/pre-receive"
+ 
+-    got=$(run_merge 0 2>/dev/null)
++    got=$(run_merge 2>/dev/null)
+     attempts=$(wc -l <"$tmp/push-attempts" | tr -d ' ')
+ 
+     [ "$(status_of "$got")" = "6" ] ||
+@@ -417,7 +390,7 @@ exit 0
+ HOOK
+     chmod +x "$WORK/.git/hooks/pre-push"
+ 
+-    got=$(run_merge 0 2>/dev/null)
++    got=$(run_merge 2>/dev/null)
+ 
+     [ "$(status_of "$got")" = "0" ] ||
+         fail "harness bug: the budget probe hook should not have blocked the merge (status $(status_of "$got"))"
+@@ -774,7 +747,6 @@ test_block_does_not_rely_on_set_e
+ test_clean_ff_lands_and_reports_the_branch_tip
+ test_lost_race_rerebases_and_lands_this_branch
+ test_failed_ff_with_conflicting_rebase_pushes_nothing
+-test_failed_ff_under_approval_parks_without_moving_the_branch
+ test_push_that_does_not_advance_the_target_is_refused
+ test_target_advanced_by_someone_else_is_refused
+ test_noop_ff_does_not_report_a_merge
+diff --git a/scripts/gascity_pack_inference_gate.py b/scripts/gascity_pack_inference_gate.py
+index 8e12cfc8..70a6eb6d 100644
+--- a/scripts/gascity_pack_inference_gate.py
++++ b/scripts/gascity_pack_inference_gate.py
+@@ -349,7 +349,7 @@ GASTOWN_SCRIPT_CONTRACTS = {
+         '--set-metadata merged_sha="$MERGED_SHA"',
+         'gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT"',
+         '"$GH" pr create',
+-        # Upstream #245: approval off, a PR is a PENDING handoff recorded with
++        # Upstream #245: a PR is a PENDING handoff recorded with
+         # the validated head; the bead is blocked, never closed at publication.
+         "gc gastown pr-merge-reconcile record",
+         '"$WORK" "$PR_URL" "$PR_NUMBER" "$TARGET" "$PR_HEAD_SHA"',
+diff --git a/tests/test_no_bare_bd_commands.py b/tests/test_no_bare_bd_commands.py
+index b3c73f8e..22c4befe 100644
+--- a/tests/test_no_bare_bd_commands.py
++++ b/tests/test_no_bare_bd_commands.py
+@@ -163,12 +163,6 @@ GC_BD_ARGV_TAIL_ALLOWLIST: dict[Path, set[str]] = {
+         '*"bd list --json --limit 1000"*) # gc-bd-argv-tail: fake gc receives the wrapper\'s argv tail',
+         'assert "bd show fi-root --json" in args_path.read_text(encoding="utf-8")  # gc-bd-argv-tail',
+     },
+-    Path("gastown/tests/test_merge_approval_gate.sh"): {
+-        '"bd show") # gc-bd-argv-tail: case label matching the fake gc\'s argv tail',
+-        '"bd update") # gc-bd-argv-tail: case label matching the fake gc\'s argv tail',
+-        'fail "producer must write the whole signal in a single bd update"'
+-        " # gc-bd-argv-tail: failure message, not an invocation",
+-    },
+     Path("gastown/tests/test_polecat_handoff_stamp.sh"): {
+         (
+             "grep -E '^bd update ' \"$TMP/calls.log\" || true"
+-- 
+2.54.0 (Apple Git-157)
+

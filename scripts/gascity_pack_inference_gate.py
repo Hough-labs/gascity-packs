@@ -349,7 +349,7 @@ GASTOWN_SCRIPT_CONTRACTS = {
         '--set-metadata merged_sha="$MERGED_SHA"',
         'gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT"',
         '"$GH" pr create',
-        # Upstream #245: approval off, a PR is a PENDING handoff recorded with
+        # Upstream #245: a PR is a PENDING handoff recorded with
         # the validated head; the bead is blocked, never closed at publication.
         "gc gastown pr-merge-reconcile record",
         '"$WORK" "$PR_URL" "$PR_NUMBER" "$TARGET" "$PR_HEAD_SHA"',

@@ -36,7 +36,7 @@
 # in. SCRIPT may point at another copy of merge-batch.sh; it finds merge-push.sh
 # beside itself, so stage a copy as a pack tree.
 #
-# The suite fails unless all 23 cases ran.
+# The suite fails unless all 22 cases ran.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -44,7 +44,7 @@ PACK_DIR="$ROOT/gastown"
 SCRIPT="${SCRIPT:-$PACK_DIR/assets/scripts/refinery/merge-batch.sh}"
 PUSH_SCRIPT="$(dirname "$SCRIPT")/merge-push.sh"
 CLEANUP_SCRIPT="$ROOT/gastown/assets/scripts/task-artifact-cleanup.sh"
-EXPECTED_CASES=23
+EXPECTED_CASES=22
 
 AGENT=testrig/gastown.refinery
 TARGET_NAME=integration
@@ -248,7 +248,7 @@ end_case() {
     PASS_CASES=$((PASS_CASES + 1))
 }
 
-# write_config [require_merge_approval=value] — the city config the script reads
+# write_config [key=value ...] — the city config the script reads
 # through MERGE_PUSH_CONFIG_JSON.
 write_config() {
     local vars='{}' kv
@@ -545,46 +545,13 @@ case_select_truncation() {
     reset_queue
     set_meta gcp-q1 merge_strategy mr
     assert_eq "an ineligible HEAD is still printed: a batch of one is the single-bead lane" \
-        gcp-q1 "$(selected --head gcp-q1 --max 4 --require-approval false)"
+        gcp-q1 "$(selected --head gcp-q1 --max 4)"
 
     # A member whose branch cannot be fetched cannot be shown eligible.
     reset_queue
     git_q -C "$REFINERY" push origin --delete polecat/gcp-q3
     assert_eq "a member whose branch is gone from origin ends the batch" "gcp-q1 gcp-q2" "$(sel)"
     assert_eq "select writes no bead" 0 "$(db_writes)"
-    end_case
-}
-
-case_select_approval() {
-    new_case select-approval
-    init_rig
-    local i
-    for i in 1 2 3 4; do add_branch "gcp-q$i" "f$i.txt" "bead $i"; done
-    finish_rig gcp-q1
-    for i in 1 2 3 4; do write_bead "gcp-q$i" 1 "2026-10-02T0$i:00:00Z"; done
-    all="gcp-q1 gcp-q2 gcp-q3 gcp-q4"
-
-    write_config require_merge_approval=false
-    assert_eq "baseline: approval off batches whole" "$all" "$(selected --head gcp-q1 --max 4)"
-
-    write_config require_merge_approval=true
-    assert_eq "require_merge_approval=true prints the head only" gcp-q1 "$(selected --head gcp-q1 --max 4)"
-    assert_eq "approval on is not an error" 0 "$(last_rc)"
-
-    write_config require_merge_approval=sometimes
-    assert_eq "an unrecognized approval value counts as ON" gcp-q1 "$(selected --head gcp-q1 --max 4)"
-
-    write_config
-    EXTRA_ENV=(MERGE_PUSH_CONFIG_JSON="$T/missing-config.json")
-    assert_eq "an unreadable config (a missing file) prints the head only" gcp-q1 "$(selected --head gcp-q1 --max 4)"
-    assert_eq "an unreadable config is not an error" 0 "$(last_rc)"
-    grep -q 'fail closed' "$T/err" || fail "select did not say the unreadable config resolved approval ON"
-    EXTRA_ENV=()
-
-    printf 'not json' >"$T/garbled.json"
-    EXTRA_ENV=(MERGE_PUSH_CONFIG_JSON="$T/garbled.json")
-    assert_eq "an unparseable config prints the head only" gcp-q1 "$(selected --head gcp-q1 --max 4)"
-    EXTRA_ENV=()
     end_case
 }
 
@@ -820,13 +787,7 @@ case_invariants() {
     assert_eq "stack without --head exits 1" 1 "$(last_rc)"
     assert_eq "usage errors touch no bead" 0 "$(db_writes)"
 
-    # Approval ON: stack leaves a batch of one however many members it was given.
     write_bead gcp-i1 1 2026-10-02T01:00:00Z
-    write_config require_merge_approval=true
-    run_batch stack --head gcp-i1 --members gcp-i1,gcp-i2
-    assert_eq "stack with approval on exits 0" 0 "$(last_rc)"
-    assert_eq "stack with approval on holds the head alone" gcp-i1 "$(mf '[.members[].id] | join(" ")')"
-
     # A head that would not ride the direct lane is a batch of one, too.
     write_config
     set_meta gcp-i1 merge_strategy mr
@@ -1257,15 +1218,6 @@ case_land_guards() {
     guard_holds "a member with no commits" 1
 
     cp -f "$T/manifest.before" "$(manifest_path)"
-    write_config require_merge_approval=true
-    run_batch land --head gcp-h1
-    guard_holds "approval required" 2
-
-    write_config
-    EXTRA_ENV=(MERGE_PUSH_CONFIG_JSON="$T/missing-config.json")
-    run_batch land --head gcp-h1
-    guard_holds "an unreadable config" 2
-    EXTRA_ENV=()
 
     git_q -C "$REFINERY" reset --hard HEAD~1
     run_batch land --head gcp-h1
@@ -1381,20 +1333,17 @@ case_serial_guards() {
     end_case
 }
 
-# The two functions the batch's eligibility is built on live in merge-push.sh, and
-# main calls them, so the lane and the batch cannot decide differently.
+# The function the batch's eligibility is built on lives in merge-push.sh, and
+# main calls it, so the lane and the batch cannot decide differently.
 case_extraction() {
     new_case extraction
     local declared
-    declared=$(MERGE_PUSH_SOURCE_ONLY=1 "$BASH" -c ". '$PUSH_SCRIPT'; declare -F resolve_merge_strategy resolve_approval_required" 2>&1)
-    assert_eq "merge-push.sh defines both functions" \
-        "resolve_merge_strategy
-resolve_approval_required" "$declared"
+    declared=$(MERGE_PUSH_SOURCE_ONLY=1 "$BASH" -c ". '$PUSH_SCRIPT'; declare -F resolve_merge_strategy" 2>&1)
+    assert_eq "merge-push.sh defines the function" resolve_merge_strategy "$declared"
     local main_body
     main_body=$(sed -n '/^main() {/,/^}/p' "$PUSH_SCRIPT")
     # shellcheck disable=SC2016
     printf '%s\n' "$main_body" | grep -q 'resolve_merge_strategy "\$WORK"' || fail "main does not call resolve_merge_strategy"
-    printf '%s\n' "$main_body" | grep -q '^resolve_approval_required' || fail "main does not call resolve_approval_required"
     end_case
 }
 
@@ -1405,7 +1354,6 @@ resolve_approval_required" "$declared"
 
 case_select_order
 case_select_truncation
-case_select_approval
 case_stack_clean
 case_stack_conflict
 case_stack_already_landed

@@ -716,8 +716,7 @@ test_command is `go test` (gcp-98gh).
 ```bash
 # --- resolve-known-red:begin ---
 # resolve_known_red <formula> prints the path of the pack's known-red and
-# returns 0, or returns 1. Located the way mol-refinery-patrol's
-# resolve_approval_gate is: the named formula's own source anchors the pack, so
+# returns 0, or returns 1. The named formula's own source anchors the pack, so
 # the matcher is always the copy shipped beside the formula being run.
 # GC_PACK_DIR is only a fallback, because gc exports it to pack commands and
 # not to agent shells.
@@ -941,8 +940,7 @@ diff). Each phase is named after the formula var that holds its command.
 : "${BASE_REF:?base ref not resolved — run step 1 of this step first}"
 # --- resolve-known-red:begin ---
 # resolve_known_red <formula> prints the path of the pack's known-red and
-# returns 0, or returns 1. Located the way mol-refinery-patrol's
-# resolve_approval_gate is: the named formula's own source anchors the pack, so
+# returns 0, or returns 1. The named formula's own source anchors the pack, so
 # the matcher is always the copy shipped beside the formula being run.
 # GC_PACK_DIR is only a fallback, because gc exports it to pack commands and
 # not to agent shells.
@@ -1777,11 +1775,11 @@ carries the marker.
 ```bash
 REFINERY_TARGET="${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery"
 # NEVER clear gc.routed_to when it reads `human`. That value is an operator
-# escalation — the refinery writes it when it REFUSES to land a bead, typically
-# on an armed require_merge_approval gate. Reassigning to the refinery there
-# does not resume the work, it silently undoes the one control that makes
-# reviewed merges real (gcp-rz8a). The branch is already pushed and recorded, so
-# halting here loses nothing: the human owns the next move.
+# escalation — the refinery writes it when it REFUSES to land a bead (an
+# existing PR it cannot use, a false completion). Reassigning to the refinery
+# there does not resume the work, it silently undoes the escalation
+# (gcp-rz8a). The branch is already pushed and recorded, so halting here loses
+# nothing: the human owns the next move.
 ROUTED_TO=$(gc bd show "$WORK_BEAD_ID" --json 2>/dev/null | jq -r '.[0].metadata."gc.routed_to" // empty')
 if [ "$ROUTED_TO" = "human" ]; then
     echo "HANDOFF HALTED: $WORK_BEAD_ID is routed to human — an operator escalation."

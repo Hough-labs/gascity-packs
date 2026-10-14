@@ -163,12 +163,6 @@ GC_BD_ARGV_TAIL_ALLOWLIST: dict[Path, set[str]] = {
         '*"bd list --json --limit 1000"*) # gc-bd-argv-tail: fake gc receives the wrapper\'s argv tail',
         'assert "bd show fi-root --json" in args_path.read_text(encoding="utf-8")  # gc-bd-argv-tail',
     },
-    Path("gastown/tests/test_merge_approval_gate.sh"): {
-        '"bd show") # gc-bd-argv-tail: case label matching the fake gc\'s argv tail',
-        '"bd update") # gc-bd-argv-tail: case label matching the fake gc\'s argv tail',
-        'fail "producer must write the whole signal in a single bd update"'
-        " # gc-bd-argv-tail: failure message, not an invocation",
-    },
     Path("gastown/tests/test_polecat_handoff_stamp.sh"): {
         (
             "grep -E '^bd update ' \"$TMP/calls.log\" || true"

@@ -103,7 +103,6 @@ race_the_target() {
 # "<status>|<MERGED_SHA>|<TEMP_SHA>" and streams the block's own output to
 # stderr so a failing test is debuggable.
 run_merge() {
-    local approval="${1:-0}"
     (
         cd "$WORK" || exit 90
         # No `set -e` here on purpose: the block must abort on its own explicit
@@ -114,8 +113,6 @@ run_merge() {
         BRANCH=polecat/test
         # shellcheck disable=SC2034
         TARGET=dev
-        # shellcheck disable=SC2034
-        APPROVAL_REQUIRED="$approval"
         MERGED_SHA=""
         TEMP_SHA=""
         # shellcheck disable=SC1090
@@ -140,7 +137,7 @@ test_clean_ff_lands_and_reports_the_branch_tip() {
     before=$(origin_tip)
     want=$(git -C "$WORK" rev-parse temp)
 
-    got=$(run_merge 0 2>/dev/null)
+    got=$(run_merge 2>/dev/null)
     after=$(origin_tip)
 
     [ "$(status_of "$got")" = "0" ] ||
@@ -164,7 +161,7 @@ test_lost_race_rerebases_and_lands_this_branch() {
     make_rig "$tmp"
     racing=$(race_the_target "$tmp")
 
-    got=$(run_merge 0 2>/dev/null)
+    got=$(run_merge 2>/dev/null)
     after=$(origin_tip)
     merged=$(merged_of "$got")
 
@@ -201,37 +198,13 @@ test_failed_ff_with_conflicting_rebase_pushes_nothing() {
     git_q -C "$racer" push origin dev
     before=$(origin_tip)
 
-    got=$(run_merge 0 2>/dev/null)
+    got=$(run_merge 2>/dev/null)
     after=$(origin_tip)
 
     [ "$(status_of "$got")" = "3" ] ||
         fail "conflicting re-rebase returned $(status_of "$got"), want 3"
     [ "$after" = "$before" ] ||
         fail "conflicting re-rebase moved origin/dev from $before to $after — nothing may be pushed"
-    rm -rf "$tmp"
-}
-
-test_failed_ff_under_approval_parks_without_moving_the_branch() {
-    # An approval authorizes one commit. On a lost race the lane must refuse to
-    # re-rebase (that would land something no reviewer read), park, and push
-    # nothing.
-    local tmp got before after temp_before temp_after
-    tmp=$(mktemp -d)
-    make_rig "$tmp"
-    race_the_target "$tmp" >/dev/null
-    before=$(origin_tip)
-    temp_before=$(git -C "$WORK" rev-parse temp)
-
-    got=$(run_merge 1 2>/dev/null)
-    after=$(origin_tip)
-    temp_after=$(git -C "$WORK" rev-parse temp)
-
-    [ "$(status_of "$got")" = "4" ] ||
-        fail "lost race under approval returned $(status_of "$got"), want 4 (park)"
-    [ "$after" = "$before" ] ||
-        fail "lost race under approval moved origin/dev from $before to $after"
-    [ "$temp_after" = "$temp_before" ] ||
-        fail "lost race under approval re-rebased temp ($temp_before -> $temp_after); the approved head must not move here"
     rm -rf "$tmp"
 }
 
@@ -251,7 +224,7 @@ git --git-dir="$ORIGIN" update-ref refs/heads/dev $before
 HOOK
     chmod +x "$ORIGIN/hooks/post-receive"
 
-    got=$(run_merge 0 2>/dev/null)
+    got=$(run_merge 2>/dev/null)
     after=$(origin_tip)
 
     [ "$after" = "$before" ] ||
@@ -282,7 +255,7 @@ git --git-dir="$ORIGIN" update-ref refs/heads/dev $other
 HOOK
     chmod +x "$ORIGIN/hooks/post-receive"
 
-    got=$(run_merge 0 2>/dev/null)
+    got=$(run_merge 2>/dev/null)
 
     [ "$(origin_tip)" = "$other" ] ||
         fail "harness bug: dev should be $other, found $(origin_tip)"
@@ -301,7 +274,7 @@ test_noop_ff_does_not_report_a_merge() {
     git_q -C "$WORK" push origin temp:dev
     before=$(origin_tip)
 
-    got=$(run_merge 0 2>/dev/null)
+    got=$(run_merge 2>/dev/null)
 
     [ "$(status_of "$got")" = "5" ] ||
         fail "no-op ff returned $(status_of "$got"), want 5"
@@ -330,7 +303,7 @@ exit 1
 HOOK
     chmod +x "$ORIGIN/hooks/pre-receive"
 
-    got=$(run_merge 0 2>/dev/null)
+    got=$(run_merge 2>/dev/null)
     after=$(origin_tip)
     attempts=$(wc -l <"$tmp/push-attempts" | tr -d ' ')
 
@@ -386,7 +359,7 @@ exit 1
 HOOK
     chmod +x "$ORIGIN/hooks/pre-receive"
 
-    got=$(run_merge 0 2>/dev/null)
+    got=$(run_merge 2>/dev/null)
     attempts=$(wc -l <"$tmp/push-attempts" | tr -d ' ')
 
     [ "$(status_of "$got")" = "6" ] ||
@@ -417,7 +390,7 @@ exit 0
 HOOK
     chmod +x "$WORK/.git/hooks/pre-push"
 
-    got=$(run_merge 0 2>/dev/null)
+    got=$(run_merge 2>/dev/null)
 
     [ "$(status_of "$got")" = "0" ] ||
         fail "harness bug: the budget probe hook should not have blocked the merge (status $(status_of "$got"))"
@@ -774,7 +747,6 @@ test_block_does_not_rely_on_set_e
 test_clean_ff_lands_and_reports_the_branch_tip
 test_lost_race_rerebases_and_lands_this_branch
 test_failed_ff_with_conflicting_rebase_pushes_nothing
-test_failed_ff_under_approval_parks_without_moving_the_branch
 test_push_that_does_not_advance_the_target_is_refused
 test_target_advanced_by_someone_else_is_refused
 test_noop_ff_does_not_report_a_merge

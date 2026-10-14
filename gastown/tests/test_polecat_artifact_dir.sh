@@ -1722,7 +1722,6 @@ for fragment in (
     '0) direct_cleanup || return $? ;;',
     'gc gastown pr-merge-reconcile record "$WORK" "$PR_URL" "$PR_NUMBER" "$TARGET" "$PR_HEAD_SHA"',
     'if [ "$PR_HEAD_SHA" != "$EXPECTED_PR_HEAD" ]',
-    "merge_result=mr_merged",
     "origin/$BRANCH is deliberately kept",
     "deletes nothing",
 ):
@@ -1730,19 +1729,13 @@ for fragment in (
         raise SystemExit(f"refinery artifact cleanup contract missing from merge-push.sh: {fragment}")
 if "--set-metadata artifact_cleanup_state=complete" not in cleanup:
     raise SystemExit("task-artifact cleanup does not record artifact_cleanup_state=complete")
-# The publication path (approval off) records the pending PR and must not run
-# cleanup: reconciliation does that after the verified close.
+# The publication path records the pending PR and must not run cleanup:
+# reconciliation does that after the verified close.
 publication = mp[
-    mp.index('if [ "$APPROVAL_REQUIRED" -eq 0 ]; then'):mp.index("# 4b. Breadcrumbs first")
+    mp.index("# 4a. Record the pending PR"):mp.index("# MERGE_STRATEGY = local")
 ]
 if "task-artifact-cleanup" in publication or "direct_cleanup" in publication:
     raise SystemExit("refinery runs task-artifact cleanup on the PR publication path")
-# MR reconciliation records its merge evidence, and only then runs cleanup.
-if mp.index("merge_result=mr_merged") > mp.index('gc bd close "$WORK" --reason "Merged to'):
-    raise SystemExit("refinery closes an MR-merged bead before recording its merge evidence")
-mr_land = mp.index("direct_close mr\nLAND_STATUS=$?")
-if "0) direct_cleanup || return $? ;;" not in mp[mr_land:]:
-    raise SystemExit("refinery does not run task-artifact cleanup after landing the MR head")
 if "git push origin --delete" in mp:
     raise SystemExit("successful direct cleanup can still delete its recovery source ref")
 if "leak the merged branch" in merge or "leak the merged branch" in mp:

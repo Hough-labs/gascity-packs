@@ -6,8 +6,7 @@
 # The AGENT decides how long the batch is and what a red means; this checked-in
 # script does the mechanics, so the agent never hand-renders a batch lane. It is
 # a sibling of merge-push.sh and sources it in source-only mode for
-# resolve_config, resolve_merge_strategy, resolve_approval_required and the
-# merge-state helpers. Nothing here copies them, so a batch member is eligible
+# resolve_config, resolve_merge_strategy and the merge-state helpers. Nothing here copies them, so a batch member is eligible
 # by the single-bead lane's own rules and the two cannot drift.
 #
 # Batching only ever SHORTENS to the single-bead lane. No batch failure may block
@@ -20,17 +19,15 @@
 #   merge-batch.sh land   --head <id> [config flags]
 #   merge-batch.sh serial --head <id> [config flags]
 # Config flags are merge-push.sh's (--rig, --target-default, --binding-prefix,
-# --require-approval, --review-agent, --delete-merged-branches, --gh), and the
-# config resolves the way merge-push.sh resolves it, including the fail-closed
-# approval switch. Run inside the refinery's clone.
+# --delete-merged-branches, --gh), and the config resolves the way merge-push.sh
+# resolves it. Run inside the refinery's clone.
 #
 # select  Print the batch's member ids, one per line, head first, and exit 0.
 #         The members are a PREFIX of the refinery's assignee scan in
 #         find-work's order (priority, then first_submitted_at // created_at),
 #         cut at the first ineligible bead and at K. The head is printed even
 #         when it is itself ineligible: a batch of one is the single-bead lane.
-#         K is forced to 1 when the approval gate resolves ON, and an unreadable
-#         config resolves it ON. A member is eligible when its strategy is
+#         A member is eligible when its strategy is
 #         direct, its target is the head's, metadata.fork_sha is present, it has
 #         no existing_pr, and it has no merge_batch_serial equal to its current
 #         origin/<branch> tip. --max defaults to 1. Any failure after the head is
@@ -70,9 +67,7 @@
 #         statuses are the lane's: 0 landed, 2 hard stop, 3 the re-rebase
 #         conflicted, 5 no-op, 6 retries exhausted, 7 the remote refused. Any of
 #         2/3/5/6/7 from the push writes nothing but the artifact proof below and
-#         leaves the manifest where it is. Status 4 cannot arise: land stops with
-#         2 when the approval gate is on, because a batch of more than one never
-#         rode it.
+#         leaves the manifest where it is.
 #         Before the push, every member gets the task-artifact proof the patrol's
 #         rebase step records for the head (upstream #245): artifact_source_sha
 #         and artifact_cleanup_state=pending (mb_capture_artifact_proof). A member
@@ -108,7 +103,7 @@
 #         again until its branch moves) and writes one note. A fetch, rev-parse or
 #         stamp failure leaves the member in failed=; a note failure is a WARN.
 #         It never writes rejection_reason, assignee or status and never closes a
-#         bead, and it does not consult the approval gate. Then, whatever
+#         bead. Then, whatever
 #         happened per member, it removes the manifest and cleans up `temp`.
 #         Takes the manifest checks land does. Status 0 when every member is
 #         stamped, 2 when any failed. Every serial exit, guards included, ends its
@@ -300,11 +295,6 @@ cmd_select() {
   esac
   # resolve_config reports on stdout; select's stdout is the ids alone.
   resolve_config --work "$sel_head" ${sel_pass[@]+"${sel_pass[@]}"} >&2 || return 1
-  resolve_approval_required
-  if [ "$APPROVAL_REQUIRED" -eq 1 ]; then
-    echo "merge-batch: the approval gate is on; a batch of 1." >&2
-    sel_max=1
-  fi
 
   # The head is always the first line, whatever happens after it.
   printf '%s\n' "$sel_head"
@@ -538,7 +528,6 @@ cmd_stack() {
     return 1
   fi
   resolve_config --work "$stk_head" ${stk_pass[@]+"${stk_pass[@]}"} >&2 || return 1
-  resolve_approval_required
 
   if ! SB_ENTRY=$(git rev-parse --verify -q refs/heads/temp); then
     echo "merge-batch: there is no temp branch to stack onto." >&2
@@ -592,10 +581,7 @@ cmd_stack() {
   SB_MEMBERS_JSON="[$SB_HEAD_ENTRY]"
 
   stk_batchable=1
-  if [ "$APPROVAL_REQUIRED" -eq 1 ]; then
-    echo "merge-batch: the approval gate is on; a batch of 1."
-    stk_batchable=0
-  elif ! mb_check_member "$SB_HEAD" "$SB_TARGET"; then
+  if ! mb_check_member "$SB_HEAD" "$SB_TARGET"; then
     if [ "$MB_READ_FAILED" -eq 1 ]; then
       sb_degrade "$MB_WHY"
       return 0
@@ -814,7 +800,6 @@ lb_land() {
     batch_usage >&2
     return 1
   fi
-  resolve_approval_required
 
   lb_read_manifest "$lnd_head" land || return 1
   # The target is known from here, so cmd_land drops temp on the way out
@@ -825,10 +810,6 @@ lb_land() {
 
   # From here a guard is a hard stop (2): the manifest is well-formed, so what
   # fails is the state around it. Nothing is pushed or written.
-  if [ "$APPROVAL_REQUIRED" -eq 1 ]; then
-    echo "merge-batch: the approval gate is on (or unreadable); a batch of more than one never rode it. Nothing landed." >&2
-    return 2
-  fi
   LB_HEAD="$lnd_head"
   lnd_last_tip=$(lb_member $((LB_SIZE - 1)) tip)
   lnd_temp=$(git rev-parse --verify -q refs/heads/temp 2>/dev/null)
@@ -847,11 +828,9 @@ lb_land() {
     fi
   done
 
-  # merge_ff_push reads TARGET (set above), BRANCH (messages only) and
-  # APPROVAL_REQUIRED, and is not copied here: the batch lands exactly as the
-  # single-bead lane does.
+  # merge_ff_push reads TARGET (set above) and BRANCH (messages only), and is
+  # not copied here: the batch lands exactly as the single-bead lane does.
   BRANCH=$(lb_member 0 branch)
-  APPROVAL_REQUIRED=0
   merge_ff_push
   lnd_push=$?
   if [ "$lnd_push" -ne 0 ]; then

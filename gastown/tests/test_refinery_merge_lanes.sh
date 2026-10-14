@@ -20,23 +20,18 @@
 # FORMULA at another copy of the formula to check that. A missing or duplicated
 # sentinel, or a `{{` left in the block, aborts the whole suite. Point SCRIPT at
 # another copy of the script to check that the suite can fail; that copy is
-# staged as a pack tree, because the block finds the script, and the script finds
-# the approval gate, by position.
+# staged as a pack tree, because the block finds the script by position.
 #
-# The suite fails unless the 24 lane cases and the 2 locator cases ran. A handful
+# The suite fails unless the 20 lane cases and the 2 locator cases ran. A handful
 # of script-only cases (config resolution, invariants) run once, after them.
 #
 # The rig is real git: a bare origin, a polecat clone that pushed the branch,
 # and the refinery's clone with `temp` rebased onto the target, which is what
 # the `rebase` step leaves behind. Everything else is stubbed and journalled:
 #   gc    beads against a JSON fixture of the work bead, plus mail, nudges,
-#         drain-ack, the next-wisp pour/burn, and `formula list`. A case can
-#         set GC_STUB_REAL_CLEANUP to run the REAL task-artifact-cleanup.sh in
-#         place of journalling the call; the bead calls that script scopes
-#         with `--rig <rig>` reach the same fixture. `formula list`
+#         drain-ack, the next-wisp pour/burn, and `formula list`. `formula list`
 #         answers with no formulas, so the block falls back to GC_PACK_DIR, which
-#         points at the real pack: the lane runs the REAL merge-push.sh and, when
-#         approval is on, the REAL merge-approval-gate.sh beside it.
+#         points at the real pack: the lane runs the REAL merge-push.sh.
 #   gh    pull requests from a JSON fixture; the live head sha is read off the
 #         bare origin, as GitHub would report it.
 #   curl  the GitHub REST fallback, used when gh is absent.
@@ -126,12 +121,6 @@ edit_bead() {
     tmp=$(mktemp) || exit 70
     jq "$@" "$GC_STUB_BEAD" >"$tmp" && mv -f "$tmp" "$GC_STUB_BEAD"
 }
-# task-artifact-cleanup.sh scopes its bead calls with `--rig <rig>` before the
-# verb; the fixture is that rig's.
-if [ "${1:-}" = bd ] && [ "${2:-}" = --rig ]; then
-    [ -n "${GC_STUB_RIG:-}" ] && [ "${3:-}" = "$GC_STUB_RIG" ] || unexpected
-    set -- bd "${@:4}"
-fi
 case "${1:-}" in
 bd)
     case "${2:-}" in
@@ -188,12 +177,8 @@ gastown)
     case "${2:-}" in
     task-artifact-cleanup)
         # Run after a verified close (upstream's task-artifact lifecycle).
-        # Journalled only, unless the case asked for the real script; its own
-        # suite owns its behaviour.
+        # Journalled only; its own suite owns its behaviour.
         { [ "$#" -eq 3 ] && [ "$3" = "$GC_STUB_WORK" ]; } || unexpected
-        if [ -n "${GC_STUB_REAL_CLEANUP:-}" ]; then
-            exec "$GC_STUB_REAL_CLEANUP" "$3"
-        fi
         ;;
     pr-merge-reconcile)
         # `record <work> <url> <number> <target> <head>`: upstream #245's
@@ -423,8 +408,6 @@ end_case() {
 #   empty           the polecat committed nothing; the target never moved
 #   empty_moved     the polecat committed nothing and the target moved on, so
 #                   `temp` is no longer the branch tip
-#   moved           an ordinary merge candidate whose target moved on after the
-#                   fork, so the rebase rewrote it: `temp` is not the branch tip
 build_rig() {
     local shape="$1" seed="$T/seed" polecat="$T/polecat"
     git_q init --bare "$ORIGIN"
@@ -464,7 +447,7 @@ build_rig() {
         LANDED_SHA=$(git -C "$seed" rev-parse HEAD)
         git_q -C "$seed" push "$ORIGIN" HEAD:integration
         ;;
-    moved | empty_moved)
+    empty_moved)
         echo "another bead's work" >"$seed/elsewhere.txt"
         git_q -C "$seed" add elsewhere.txt
         git_q -C "$seed" commit -m "feat: a different bead entirely"
@@ -558,7 +541,7 @@ write_config_json() {
     for kv in "$@"; do
         case "${kv%%=*}" in
         rig_name) ;;
-        require_merge_approval | review_agent | delete_merged_branches | target_branch | binding_prefix)
+        delete_merged_branches | target_branch | binding_prefix)
             vars=$(jq -c --arg k "${kv%%=*}" --arg v "${kv#*=}" '. + {($k): $v}' <<<"$vars")
             ;;
         *)
@@ -834,20 +817,6 @@ HOOK
     end_case
 }
 
-test_lane_direct_approval_on_promotes_to_mr() {
-    new_case direct_approval_on_promotes_to_mr
-    build_rig unmerged
-    write_bead
-    run_lane require_merge_approval=true
-    output_has 'using merge_strategy=mr' || fail "no 'using merge_strategy=mr' promotion message"
-    expect_lane mr
-    grep -qE '^gh pr (create|view) ' "$T/gh.log" || fail "the mr lane made no pull request call"
-    expect "merge_approval_state" "$(meta merge_approval_state)" awaiting_review
-    expect_not_closed
-    expect_target_unchanged
-    end_case
-}
-
 test_lane_direct_cleanup_with_target_in_second_worktree() {
     new_case direct_cleanup_with_target_in_second_worktree
     build_rig unmerged
@@ -992,7 +961,7 @@ test_lane_mr_existing_pr_wrong_head_repo_blocks() {
     end_case
 }
 
-# Upstream #245: approval off, PR publication is a PENDING handoff, never a
+# Upstream #245: PR publication is a PENDING handoff, never a
 # close. The bead is blocked (so its dependents stay blocked) until
 # `gc gastown pr-merge-reconcile` verifies the merge on a later patrol.
 test_lane_mr_4a_records_pending_pull_request() {
@@ -1015,102 +984,6 @@ test_lane_mr_4a_records_pending_pull_request() {
     expect "origin/$BRANCH_NAME" "$(origin_ref "$BRANCH_NAME")" "$TEMP_SHA"
     expect_target_unchanged
     expect_not_drained
-    end_case
-}
-
-test_lane_mr_4b_refused_parks() {
-    new_case mr_4b_refused_parks
-    build_rig unmerged
-    write_bead merge_strategy=mr
-    run_lane require_merge_approval=true
-    expect_lane mr
-    expect "pr_number" "$(meta pr_number)" 7
-    expect "merge_approval_state" "$(meta merge_approval_state)" awaiting_review
-    case "$(meta merge_approval_gate_reason)" in
-    "<unset>" | "") fail "merge_approval_gate_reason was not recorded" ;;
-    esac
-    output_has 'APPROVAL GATE REFUSED' || fail "no 'APPROVAL GATE REFUSED' in the output"
-    expect_not_closed
-    expect_not_drained
-    expect_target_unchanged
-    end_case
-}
-
-test_lane_mr_4b_approved_lands_and_closes() {
-    new_case mr_4b_approved_lands_and_closes
-    build_rig unmerged
-    # What record-merge-approval.sh writes, for the head the lane will push.
-    write_bead merge_strategy=mr \
-        merge_approval.verdict=approved \
-        merge_approval.pr_number=7 \
-        "merge_approval.head_sha=$TEMP_SHA" \
-        merge_approval.reviewer=testrig/specialists.iris \
-        merge_approval.recorded_at=2026-09-27T00:00:00Z
-    run_lane require_merge_approval=true
-    expect_lane mr
-    output_has 'GATE: approved' || fail "the real approval gate did not approve"
-    expect "merge_approval_state" "$(meta merge_approval_state)" approved
-    expect "merge_approval_gate_reason" "$(meta merge_approval_gate_reason)" "<unset>"
-    expect "origin/integration" "$(origin_tip)" "$TEMP_SHA"
-    # The verified-PR evidence task-artifact cleanup's mr_merged arm checks.
-    expect "merge_result" "$(meta merge_result)" mr_merged
-    expect "pr_head_sha" "$(meta pr_head_sha)" "$TEMP_SHA"
-    expect "pr_number" "$(meta pr_number)" 7
-    expect "merged_sha" "$(meta merged_sha)" "$TEMP_SHA"
-    expect "status" "$(bead status)" closed
-    expect "close reason" "$(bead close_reason)" "Merged to $TARGET_NAME at $(short_sha "$TEMP_SHA")"
-    end_case
-}
-
-# The approved 4b landing, with the REAL task-artifact cleanup after it. The
-# target moved after the fork, so the rebase rewrote the branch and the mr lane's
-# force-push moved origin/$BRANCH off the pre-rebase sha the rebase step captured
-# as artifact_source_sha. A close as merge_result=merged sends cleanup down its
-# direct-merge arm, which requires origin/$BRANCH to still hold that sha: it does
-# not, so cleanup blocks and a real merge exits 2. The verified-PR evidence
-# (mr_merged, pr_head_sha, pr_number, merged_sha) is what this lane can prove.
-test_lane_mr_4b_approved_after_target_moved_cleans_up() {
-    local city artifact
-    new_case mr_4b_approved_after_target_moved_cleans_up
-    build_rig moved
-    [ "$TEMP_SHA" != "$BRANCH_SHA" ] || fail "harness bug: the rebase did not rewrite the branch"
-    # The polecat's task worktree, as the polecat leaves it: on its branch, at
-    # the sha it pushed, under the rig's artifact namespace.
-    city="$T/city"
-    artifact="$city/.gc/worktrees/testrig/artifacts/worktrees/$WORK_ID"
-    mkdir -p "$(dirname "$artifact")"
-    git_q -C "$T/polecat" checkout --detach
-    git_q -C "$T/polecat" worktree add "$artifact" "$BRANCH_NAME" ||
-        fail "harness bug: could not add the task worktree"
-    write_bead merge_strategy=mr \
-        merge_approval.verdict=approved \
-        merge_approval.pr_number=7 \
-        "merge_approval.head_sha=$TEMP_SHA" \
-        merge_approval.reviewer=testrig/specialists.iris \
-        merge_approval.recorded_at=2026-09-27T00:00:00Z \
-        "artifact_dir=$artifact" \
-        "artifact_source_sha=$BRANCH_SHA" \
-        artifact_cleanup_state=pending
-    LANE_ENV_EXTRA=(GC_STUB_REAL_CLEANUP="$ROOT/gastown/assets/scripts/task-artifact-cleanup.sh"
-        GC_STUB_RIG=testrig GC_CITY_PATH="$city" GC_RIG_ROOT="$T/polecat")
-    run_lane require_merge_approval=true
-    expect_lane mr
-    expect "merge-push.sh's status" "$SCRIPT_STATUS" 0
-    expect_status 0
-    expect_not_drained
-    expect "origin/integration" "$(origin_tip)" "$TEMP_SHA"
-    expect "status" "$(bead status)" closed
-    expect "merge_result" "$(meta merge_result)" mr_merged
-    expect "pr_head_sha" "$(meta pr_head_sha)" "$TEMP_SHA"
-    expect "pr_number" "$(meta pr_number)" 7
-    expect "merged_sha" "$(meta merged_sha)" "$TEMP_SHA"
-    expect "merged_target" "$(meta merged_target)" "$TARGET_NAME"
-    expect "artifact_cleanup_state" "$(meta artifact_cleanup_state)" complete
-    expect "artifact_dir" "$(meta artifact_dir)" "<unset>"
-    [ ! -e "$artifact" ] || fail "the task worktree $artifact was not removed"
-    output_has '^ARTIFACT_CLEANUP_COMPLETE ' || fail "the real cleanup did not report ARTIFACT_CLEANUP_COMPLETE"
-    # The source branch is the recovery copy, at the head that was validated.
-    expect "origin/$BRANCH_NAME" "$(origin_ref "$BRANCH_NAME")" "$TEMP_SHA"
     end_case
 }
 
@@ -1239,8 +1112,7 @@ resolve_in_source_mode() {
         # shellcheck source=/dev/null # the script under test, chosen at run time
         . "$SCRIPT" || exit 91
         resolve_config --work "$WORK_ID" "$@" >/dev/null || exit
-        printf '%s\n' "require=$CFG_REQUIRE_MERGE_APPROVAL" "review=$CFG_REVIEW_AGENT" \
-            "delete=$CFG_DELETE_MERGED_BRANCHES" "target=$CFG_TARGET_DEFAULT" \
+        printf '%s\n' "delete=$CFG_DELETE_MERGED_BRANCHES" "target=$CFG_TARGET_DEFAULT" \
             "prefix=$CFG_BINDING_PREFIX" "rig=$CFG_RIG"
     )
 }
@@ -1254,7 +1126,7 @@ resolved() {
 # values must never be read) with the given FormulaVars.
 write_rig_config() {
     jq -n --argjson vars "$2" '{config: {Rigs: [
-        {Name: "otherrig", DefaultBranch: "decoy", FormulaVars: {review_agent: "decoy", target_branch: "decoy"}},
+        {Name: "otherrig", DefaultBranch: "decoy", FormulaVars: {target_branch: "decoy"}},
         {Name: "testrig", DefaultBranch: "integration", FormulaVars: $vars}]}}' >"$1"
 }
 
@@ -1269,17 +1141,14 @@ test_script_invariants() {
 test_config_precedence() {
     local out
     new_case config_precedence
-    write_rig_config "$T/vars.json" '{"review_agent": "specialists.iris", "require_merge_approval": "true",
-        "delete_merged_branches": "false", "target_branch": "develop", "binding_prefix": "vars."}'
+    write_rig_config "$T/vars.json" '{"delete_merged_branches": "false", "target_branch": "develop", "binding_prefix": "vars."}'
     write_rig_config "$T/bare.json" '{}'
-    write_rig_config "$T/empty.json" '{"review_agent": "", "target_branch": "", "require_merge_approval": ""}'
+    write_rig_config "$T/empty.json" '{"target_branch": ""}'
 
     # A flag beats FormulaVars.
     out=$(resolve_in_source_mode "$T/vars.json" testrig/gastown.refinery \
-        --require-approval off --review-agent flag.agent --delete-merged-branches maybe \
+        --delete-merged-branches maybe \
         --target-default main --binding-prefix flag.) || fail "resolve_config failed with flags"
-    expect "require_merge_approval (flag over FormulaVars)" "$(resolved "$out" require)" off
-    expect "review_agent (flag over FormulaVars)" "$(resolved "$out" review)" flag.agent
     expect "delete_merged_branches (flag over FormulaVars)" "$(resolved "$out" delete)" maybe
     expect "target default (flag over FormulaVars)" "$(resolved "$out" target)" main
     expect "binding_prefix (flag over FormulaVars)" "$(resolved "$out" prefix)" flag.
@@ -1287,8 +1156,6 @@ test_config_precedence() {
     # FormulaVars beat derived values and the embedded defaults.
     out=$(resolve_in_source_mode "$T/vars.json" testrig/gastown.refinery) ||
         fail "resolve_config failed with FormulaVars"
-    expect "require_merge_approval (FormulaVars over default)" "$(resolved "$out" require)" true
-    expect "review_agent (FormulaVars over default)" "$(resolved "$out" review)" specialists.iris
     expect "delete_merged_branches (FormulaVars over default)" "$(resolved "$out" delete)" false
     expect "target default (FormulaVars over DefaultBranch)" "$(resolved "$out" target)" develop
     expect "binding_prefix (FormulaVars over GC_AGENT)" "$(resolved "$out" prefix)" vars.
@@ -1299,16 +1166,12 @@ test_config_precedence() {
         fail "resolve_config failed with empty FormulaVars"
     expect "target default (derived from DefaultBranch)" "$(resolved "$out" target)" integration
     expect "binding_prefix (derived from GC_AGENT)" "$(resolved "$out" prefix)" gastown.
-    expect "require_merge_approval (default)" "$(resolved "$out" require)" false
-    expect "review_agent (default)" "$(resolved "$out" review)" ""
     expect "delete_merged_branches (default)" "$(resolved "$out" delete)" true
 
     # A FormulaVars key that is PRESENT wins even when empty.
     out=$(resolve_in_source_mode "$T/empty.json" testrig/gastown.refinery) ||
         fail "resolve_config failed with present-but-empty FormulaVars"
-    expect "review_agent (present but empty)" "$(resolved "$out" review)" ""
     expect "target default (present but empty, not DefaultBranch)" "$(resolved "$out" target)" ""
-    expect "require_merge_approval (present but empty)" "$(resolved "$out" require)" ""
     end_case
 }
 
@@ -1340,28 +1203,13 @@ test_config_binding_prefix_derivation() {
     end_case
 }
 
-test_config_unreadable_turns_gate_on() {
-    new_case config_unreadable_turns_gate_on
-    build_rig unmerged
-    write_bead
-    LANE_ENV_EXTRA=(MERGE_PUSH_CONFIG_JSON="$T/no-such-config.json")
-    run_lane
-    expect_lane mr
-    expect "the script's exit status" "$SCRIPT_STATUS" 4
-    output_has 'require_merge_approval resolves ON \(fail closed\)' || fail "no fail-closed line in the output"
-    output_has 'APPROVAL GATE REFUSED' || fail "no 'APPROVAL GATE REFUSED' in the output"
-    expect_not_closed
-    expect_target_unchanged
-    end_case
-}
-
 test_config_defaults_match_formula_vars() {
     local out name key want
     new_case config_defaults_match_formula_vars
     write_rig_config "$T/bare.json" '{}'
     out=$(resolve_in_source_mode "$T/bare.json" testrig/gastown.refinery) ||
         fail "resolve_config failed with empty FormulaVars"
-    for name in require_merge_approval:require review_agent:review delete_merged_branches:delete; do
+    for name in delete_merged_branches:delete; do
         key="${name#*:}"
         name="${name%%:*}"
         want=$(python3 - "$FORMULA" "$name" <<'PY'
@@ -1412,12 +1260,10 @@ if ! extract_invoke "$HARNESS/invoke.sh"; then
     exit 1
 fi
 
-# The block finds merge-push.sh, and the script finds the approval gate, by
-# position in a pack tree. A SCRIPT override is staged as one, beside the real
-# gate, so the same block runs it.
+# The block finds merge-push.sh by position in a pack tree. A SCRIPT override is
+# staged as one, so the same block runs it.
 if [ "$SCRIPT" != "$PACK_DIR/assets/scripts/refinery/merge-push.sh" ]; then
     mkdir -p "$HARNESS/pack/assets/scripts/refinery"
-    cp -R "$PACK_DIR/assets/scripts/checks" "$HARNESS/pack/assets/scripts/checks"
     cp -f "$SCRIPT" "$HARNESS/pack/assets/scripts/refinery/merge-push.sh"
     chmod +x "$HARNESS/pack/assets/scripts/refinery/merge-push.sh"
     PACK_DIR="$HARNESS/pack"
@@ -1431,7 +1277,6 @@ run_all_cases() {
     test_lane_direct_false_completion_halts
     test_lane_direct_lost_race_then_lands
     test_lane_direct_push_veto_status_7
-    test_lane_direct_approval_on_promotes_to_mr
     test_lane_mr_creates_pr_via_gh
     test_lane_mr_reuses_existing_pr
     test_lane_mr_rest_fallback_without_gh
@@ -1442,9 +1287,6 @@ run_all_cases() {
     test_lane_mr_existing_pr_wrong_repo_blocks
     test_lane_mr_existing_pr_wrong_head_repo_blocks
     test_lane_mr_4a_records_pending_pull_request
-    test_lane_mr_4b_refused_parks
-    test_lane_mr_4b_approved_lands_and_closes
-    test_lane_mr_4b_approved_after_target_moved_cleans_up
     test_lane_mr_zero_diff_halts
     test_lane_local_mails_mayor
     test_lane_direct_cleanup_with_target_in_second_worktree
@@ -1455,15 +1297,14 @@ run_all_cases() {
 }
 
 run_all_cases
-if [ "$PASS_CASES" -ne 26 ]; then
-    echo "FAIL: want 26 cases (24 lane, 2 locator); ran $PASS_CASES" >&2
+if [ "$PASS_CASES" -ne 22 ]; then
+    echo "FAIL: want 22 cases (20 lane, 2 locator); ran $PASS_CASES" >&2
     FAILURES=$((FAILURES + 1))
 fi
 
 test_script_invariants
 test_config_precedence
 test_config_binding_prefix_derivation
-test_config_unreadable_turns_gate_on
 test_config_defaults_match_formula_vars
 test_script_honors_refinery_gh
 

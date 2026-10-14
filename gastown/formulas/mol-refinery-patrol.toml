@@ -30,13 +30,6 @@ and closes its bead only after the merge commit is verified on the
 recorded target branch. This preserves dependency ordering: downstream
 beads cannot become ready against code that has not landed.
 
-Rigs that require review set `require_merge_approval = "true"` in their
-`formula_vars`. That promotes `direct` to `mr` and turns PR publication into
-the start of review rather than the handoff: nothing lands until a reviewer
-records an approval signal on the work bead naming the PR and the exact head
-SHA. See the merge-push step for the full lane. Default is off, so rigs that
-do not require review behave exactly as before.
-
 Read each step's description before acting — Config values override defaults."""
 formula = "mol-refinery-patrol"
 
@@ -80,28 +73,6 @@ default = "main"
 description = "Deprecated compatibility setting; successful artifact handoffs retain source branches for recovery"
 default = "true"
 
-[vars.require_merge_approval]
-description = """
-Opt-in review gate. When true, no branch lands without a gc-native approval
-signal on the work bead naming this PR and the exact head SHA the reviewer
-read (see the merge-push step). Default false, so rigs that do not require
-review are unaffected. Set it in the rig's `formula_vars`. Turning it on
-implies the pull-request lane: a reviewed merge needs a PR to review, so
-merge_strategy=direct is promoted to mr."""
-default = "false"
-
-[vars.review_agent]
-description = """
-Optional agent address to nudge when the approval gate parks a bead awaiting
-review, e.g. `specialists.iris`. A bare name is tried rig-scoped first and then
-town-level, so both a rig-local reviewer and a town agent such as
-`gastown.mayor` are reachable without the operator having to know which scope
-owns the session. Write `rig/agent` to pin another rig, or a leading `/`
-(`/gastown.mayor`) to force town-level and skip the rig attempt. Empty = no
-nudge, and the reviewer is expected to find the parked bead another way.
-From rig `formula_vars`."""
-default = ""
-
 [vars.integration_branch_auto_land]
 description = "Auto-create work beads to land completed integration branches"
 default = "false"
@@ -127,8 +98,8 @@ single-bead lane, exactly as it runs without batching. The patrol is poured
 root-only, so no pour carries this var: a rig sets it in its
 `[rigs.formula_vars]`, and a placeholder left unrendered, an empty value or a
 non-integer means 1 (find-work prints an INFO line, not a WARN). It batches the
-direct lane only: a bead that came from the routed claim, one that needs the
-approval gate, one with an `existing_pr` and one a red already sent serial are
+direct lane only: a bead that came from the routed claim, one with an
+`existing_pr` and one a red already sent serial are
 never batched. One batch counts as ONE iteration for `restart_after_iterations`.
 2-4 is the recommended range."""
 default = "1"
@@ -1208,8 +1179,7 @@ TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_bran
 ```bash
 # --- resolve-known-red:begin ---
 # resolve_known_red <formula> prints the path of the pack's known-red and
-# returns 0, or returns 1. Located the way mol-refinery-patrol's
-# resolve_approval_gate is: the named formula's own source anchors the pack, so
+# returns 0, or returns 1. The named formula's own source anchors the pack, so
 # the matcher is always the copy shipped beside the formula being run.
 # GC_PACK_DIR is only a fallback, because gc exports it to pack commands and
 # not to agent shells.
@@ -1532,10 +1502,9 @@ description = """
 Run the merge lane with ONE command. `merge-push.sh` reads the work bead's
 metadata (`branch`, `target`, `merge_strategy`, `existing_pr`), chooses the lane,
 and runs all of it: the already-merged and false-completion gates, the
-fast-forward merge, push and verify, the pull request, the approval gate, every
+fast-forward merge, push and verify, the pull request, every
 bead write and its own cleanup. Every config value it needs (the target default,
-`require_merge_approval`, `review_agent`, `delete_merged_branches`, the binding
-prefix) it resolves itself, from its flags, the rig's `formula_vars` and the
+`delete_merged_branches`, the binding prefix) it resolves itself, from its flags, the rig's `formula_vars` and the
 session, so nothing in this step is rendered and there is nothing to hand-edit.
 Do NOT re-type the lane, run any of its commands yourself, or run a second
 cleanup: the script already ran its own.
@@ -1601,7 +1570,7 @@ fi
 MP_STATUS=$?
 cat "$MP_LOG"
 case "$MP_STATUS" in
-  0|4)
+  0)
     echo "merge-push: status $MP_STATUS: continue to patrol-summary."
     ;;
   9)
@@ -1689,11 +1658,10 @@ What each status means, and what this step does about it:
 
 | Status | Meaning | This step |
 |---|---|---|
-| 0 | Handed off: the work bead is closed and its task-artifact cleanup completed (landed direct, or mr after approval, or closed as already merged), or, for mr with approval off, the pull request is recorded pending and the bead is blocked until `gc gastown pr-merge-reconcile` verifies the merge on a later patrol. A closed bead whose cleanup did not converge is status 2, not 0. | Continue to patrol-summary. The script already ran its cleanup; do not run another. |
+| 0 | Handed off: the work bead is closed and its task-artifact cleanup completed (landed direct, or closed as already merged), or, for mr, the pull request is recorded pending and the bead is blocked until `gc gastown pr-merge-reconcile` verifies the merge on a later patrol. A closed bead whose cleanup did not converge is status 2, not 0. | Continue to patrol-summary. The script already ran its cleanup; do not run another. |
 | 1 | Usage or config error; nothing was touched. | STOP and drain. Read the output above the RESULT line. |
 | 2 | Hard stop; do not mutate bead state. Also returned when a merge landed but recording it on the bead failed: the next patrol's merge-state gate closes it as already merged. Also returned when the bead closed but its task-artifact cleanup did not converge: its `pending` or `blocked` state stays on the bead, find-work's sweep retries a `pending` one, and a `blocked` one is never retried and waits for review. In mr, also returned when `--force-with-lease` failed because the PR branch moved: the script dropped `temp`, and the next patrol's rebase step re-runs its ancestry decision on the moved branch. Upstream re-enters the rebase step in the same patrol instead; this fork drains the session. | STOP and drain. |
 | 3 | The re-rebase onto the moved target conflicted. | STOP and drain. |
-| 4 | Parked awaiting review: the approval gate refused, or the approved head no longer fast-forwards the target. This is not a failure; the bead stays open and assigned to the refinery. | Continue to patrol-summary. |
 | 5 | The ff-merge was a no-op; nothing landed. | STOP and drain. |
 | 6 | Retries exhausted; the target moved under every attempt. | STOP and drain. |
 | 7 | The remote refused the push while the target stood still. | STOP and drain; see below. |
@@ -1705,7 +1673,7 @@ What each status means, and what this step does about it:
 With a batch (a manifest of 2+ members) the block ran `merge-batch.sh land`
 instead, and its last output line is `merge-batch: RESULT <status> landed=<ids>
 left-open=<ids>`. Its statuses 0, 1, 2, 3, 5, 6 and 7 mean what the table says and
-this step does what the table says; `land` never returns 4, 9 or 11. `land`
+this step does what the table says; `land` never returns 9 or 11. `land`
 records each member's task-artifact proof before its push, as the rebase step
 does for the head, keeps every member's source branch, and runs each member's
 task-artifact cleanup after its close. Status 0 is every member closed and

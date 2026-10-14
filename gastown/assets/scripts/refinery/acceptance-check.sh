@@ -20,7 +20,7 @@
 #   acceptance-check.sh record --work <id> --verdict <CONFORMS|DECLARED|MISS|SKIP>
 #                              --tip <sha> [--mode <warn|reject>] [config flags]
 # Config flags are merge-push.sh's (--rig, --target-default, --binding-prefix,
-# --require-approval, --review-agent, --delete-merged-branches, --gh). Run inside
+# --delete-merged-branches, --gh). Run inside
 # the refinery's clone, after the caller ran `git fetch --prune origin` once: the
 # script reads origin/<branch> and origin/<target> as it finds them and fetches
 # nothing.

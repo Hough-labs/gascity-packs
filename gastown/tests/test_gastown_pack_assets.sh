@@ -1045,8 +1045,8 @@ PY
         fail "the polecat never closes the work bead; only the refinery does"
 
     # gcp-rz8a's severity line: a replayed step 6 clears gc.routed_to="human",
-    # which is how a bead the refinery parked on an armed require_merge_approval
-    # gate gets pulled back out of an operator escalation. The guard must be
+    # which is how a bead the refinery refused to land gets pulled back out of an
+    # operator escalation. The guard must be
     # read and acted on BEFORE the update that clears the routing.
     [[ "$submit_block" == *'[ "$ROUTED_TO" = "human" ]'* ]] ||
         fail "the refinery handoff must refuse to run when gc.routed_to is human"
