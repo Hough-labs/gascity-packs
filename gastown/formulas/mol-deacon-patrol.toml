@@ -869,7 +869,10 @@ Write exactly:
 IDLE: no work, exiting turn.
 ```
 Then stop immediately. Do NOT sleep, call ScheduleWakeup, or use Monitor.
-The session_sleep policy will restart this session after the configured idle interval;
-the next wisp is already assigned and the restarted session resumes from it.
+Nothing restarts this session on an idle interval. The deacon is a
+mode="always" named session, and gc refuses any sleep policy on one. The
+controller stops it after the agent's idle_timeout (1h; gc may defer that
+while the session holds assigned work) and starts a fresh one at once.
+The next wisp is already assigned and the restarted session resumes from it.
 
 **Exit criteria:** Next wisp poured and assigned, this wisp burned, turn ended with IDLE signal."""

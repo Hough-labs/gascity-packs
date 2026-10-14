@@ -546,7 +546,10 @@ Write exactly:
 IDLE: no work, exiting turn.
 ```
 Then stop immediately. Do NOT sleep, call ScheduleWakeup, or use Monitor.
-The session_sleep policy will restart this session after the configured idle interval.
+Nothing restarts this session on an idle interval: the refinery sets no
+sleep_after_idle. It is a mode="on_demand" named session, so the controller
+stops it after the agent's idle_timeout (2h) and starts a fresh one when
+work is routed to it.
 When restarted, re-read formula steps — this step stays open until a work bead is found.
 
 **Do not close this step until you have a work bead with branch metadata.**"""

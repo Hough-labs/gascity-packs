@@ -1,0 +1,159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Wed, 14 Oct 2026 17:09:31 -0400
+Subject: [PATCH 163/163] fix(gastown): stop promising a session_sleep restart
+ gc forbids on the IDLE exits (gcp-hnhg)
+
+The deacon, witness and refinery patrol formulas end an idle turn with
+"The session_sleep policy will restart this session after the configured
+idle interval". gc rejects a sleep policy on a mode="always" named session at
+config load (internal/config/config.go, 'named_session %q: mode %q is
+incompatible with sleep_after_idle'), and the deacon and witness are
+mode="always" in pack.toml, so no city or rig session_sleep value can ever
+cover them. The refinery is mode="on_demand" but sets no sleep_after_idle
+either. Agents followed the text, ended their turn with IDLE, and sat
+silent for 1.2-5.5h; gcp-m7dn was merge-ready for ~1.5h behind one such stall.
+
+This is fix (1) of the bead, prose only. Each IDLE exit now says nothing
+restarts the session on an idle interval and names the mechanism that does:
+the controller's idle_timeout stop (deacon/witness 1h, refinery 2h) followed
+by an immediate restart for the always-mode roles, or a restart on routed
+work for the on_demand refinery. The deferral gc applies while a session
+holds assigned work is stated for the always-mode roles. Every nudge clause
+is struck. The matching comment in witness-heartbeat-check.sh is corrected;
+STALE_MIN and its arithmetic are unchanged. The existing pin that the deacon
+formula keeps 'the restarted session resumes from it' still holds.
+
+test_idle_exit_promises_no_session_sleep_restart pins both halves: no
+'session_sleep policy (will restart|restarts)' anywhere in the pack outside
+tests, and each IDLE exit carries the corrected wording exactly once. It
+fails on the old text with 4 hits.
+
+Not changed, by design: pack.toml modes, agents/, idle_timeout, any
+[session_sleep] block (a hard config-load error), and a real resume path for
+always-mode roles (fix (2), not filed per the seat ruling).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../assets/scripts/witness-heartbeat-check.sh |  5 ++--
+ gastown/formulas/mol-deacon-patrol.toml       |  7 +++--
+ gastown/formulas/mol-refinery-patrol.toml     |  5 +++-
+ gastown/formulas/mol-witness-patrol.toml      |  7 +++--
+ gastown/tests/test_gastown_pack_assets.sh     | 29 +++++++++++++++++++
+ 5 files changed, 46 insertions(+), 7 deletions(-)
+
+diff --git a/gastown/assets/scripts/witness-heartbeat-check.sh b/gastown/assets/scripts/witness-heartbeat-check.sh
+index fb19a488..7d6e75fd 100755
+--- a/gastown/assets/scripts/witness-heartbeat-check.sh
++++ b/gastown/assets/scripts/witness-heartbeat-check.sh
+@@ -71,8 +71,9 @@ if [ -z "${GC_CITY:-}" ] || [ ! -f "$GC_CITY/city.toml" ]; then
+ fi
+ 
+ # Default window: the gastown witness does NOT self-schedule a ~60s wakeup — it
+-# ends its turn with `IDLE:` and the controller's session_sleep policy restarts
+-# it, bounded by the witness agent's idle_timeout of 1h. 1h is therefore the
++# ends its turn with `IDLE:` and nothing restarts it on an idle interval (it is
++# mode="always", which gc refuses to pair with a sleep policy); the controller
++# restarts it after the witness agent's idle_timeout of 1h. 1h is therefore the
+ # longest legitimate silence for a healthy witness, so the window sits at 1.5x
+ # that. Well clear of legitimate idle, and still an order of magnitude under the
+ # 14h floor of the stalls this check exists to catch. Lower it only if your
+diff --git a/gastown/formulas/mol-deacon-patrol.toml b/gastown/formulas/mol-deacon-patrol.toml
+index 52f65704..e5dd3a45 100644
+--- a/gastown/formulas/mol-deacon-patrol.toml
++++ b/gastown/formulas/mol-deacon-patrol.toml
+@@ -869,7 +869,10 @@ Write exactly:
+ IDLE: no work, exiting turn.
+ ```
+ Then stop immediately. Do NOT sleep, call ScheduleWakeup, or use Monitor.
+-The session_sleep policy will restart this session after the configured idle interval;
+-the next wisp is already assigned and the restarted session resumes from it.
++Nothing restarts this session on an idle interval. The deacon is a
++mode="always" named session, and gc refuses any sleep policy on one. The
++controller stops it after the agent's idle_timeout (1h; gc may defer that
++while the session holds assigned work) and starts a fresh one at once.
++The next wisp is already assigned and the restarted session resumes from it.
+ 
+ **Exit criteria:** Next wisp poured and assigned, this wisp burned, turn ended with IDLE signal."""
+diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
+index 1a907ed4..8df09b51 100644
+--- a/gastown/formulas/mol-refinery-patrol.toml
++++ b/gastown/formulas/mol-refinery-patrol.toml
+@@ -546,7 +546,10 @@ Write exactly:
+ IDLE: no work, exiting turn.
+ ```
+ Then stop immediately. Do NOT sleep, call ScheduleWakeup, or use Monitor.
+-The session_sleep policy will restart this session after the configured idle interval.
++Nothing restarts this session on an idle interval: the refinery sets no
++sleep_after_idle. It is a mode="on_demand" named session, so the controller
++stops it after the agent's idle_timeout (2h) and starts a fresh one when
++work is routed to it.
+ When restarted, re-read formula steps — this step stays open until a work bead is found.
+ 
+ **Do not close this step until you have a work bead with branch metadata.**"""
+diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
+index d3567b06..279de764 100644
+--- a/gastown/formulas/mol-witness-patrol.toml
++++ b/gastown/formulas/mol-witness-patrol.toml
+@@ -1453,7 +1453,10 @@ Write exactly:
+ IDLE: no work, exiting turn.
+ ```
+ Then stop immediately. Do NOT sleep, call ScheduleWakeup, or use Monitor.
+-The session_sleep policy will restart this session after the configured idle interval;
+-the next wisp is already assigned and the restarted session resumes from it.
++Nothing restarts this session on an idle interval. The witness is a
++mode="always" named session, and gc refuses any sleep policy on one. The
++controller stops it after the agent's idle_timeout (1h; gc may defer that
++while the session holds assigned work) and starts a fresh one at once.
++The next wisp is already assigned and the restarted session resumes from it.
+ 
+ **Exit criteria:** Next wisp poured, this wisp burned, turn ended with IDLE signal."""
+diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
+index 466cd859..e36946cb 100755
+--- a/gastown/tests/test_gastown_pack_assets.sh
++++ b/gastown/tests/test_gastown_pack_assets.sh
+@@ -1233,6 +1233,34 @@ PY
+     done
+ }
+ 
++# The patrol formulas end an idle turn with `IDLE:` and tell the agent what
++# resumes it. gc refuses any sleep policy on a mode="always" named session at
++# config load, so a "session_sleep policy will restart this session" sentence
++# promises a mechanism the pack itself forbids (gcp-hnhg). Pin both halves:
++# the false promise stays gone anywhere in the pack, and each IDLE exit keeps
++# the corrected wording that names the real restart (the agent's idle_timeout).
++test_idle_exit_promises_no_session_sleep_restart() {
++    local hits formula path count
++    hits="$(grep -rnE 'session_sleep policy (will restart|restarts)' "$GASTOWN" --exclude-dir=tests || true)"
++    [[ -z "$hits" ]] ||
++        fail "gcp-hnhg: a session_sleep restart is promised, but gc rejects a sleep policy on mode=\"always\" sessions at config load; name the idle_timeout restart instead:
++$hits"
++
++    for formula in mol-deacon-patrol mol-witness-patrol mol-refinery-patrol; do
++        path="$GASTOWN/formulas/$formula.toml"
++        count="$(grep -cF 'Nothing restarts this session on an idle interval' "$path" || true)"
++        [[ "$count" -eq 1 ]] ||
++            fail "gcp-hnhg: $formula.toml must state exactly once that nothing restarts the session on an idle interval (found $count)"
++    done
++
++    for formula in mol-deacon-patrol mol-witness-patrol; do
++        path="$GASTOWN/formulas/$formula.toml"
++        count="$(grep -cF 'mode="always" named session, and gc refuses any sleep policy on one' "$path" || true)"
++        [[ "$count" -eq 1 ]] ||
++            fail "gcp-hnhg: $formula.toml must say its session is mode=\"always\" and gc refuses any sleep policy on one, exactly once (found $count)"
++    done
++}
++
+ test_dog_assets_are_pack_local
+ test_retired_dog_formulas_are_not_reintroduced
+ test_work_bead_is_never_claimed
+@@ -1256,5 +1284,6 @@ test_boot_patrol_burn_resolves_current_wisp
+ test_boot_deacon_observation_query_sees_wisps_tier
+ test_refinery_direct_merge_is_worktree_safe_and_fail_closed
+ test_refinery_rebase_guidance_matches_the_guarded_step
++test_idle_exit_promises_no_session_sleep_restart
+ 
+ echo "gastown pack asset tests passed"
+-- 
+2.54.0 (Apple Git-157)
+

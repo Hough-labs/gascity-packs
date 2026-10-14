@@ -1233,6 +1233,34 @@ PY
     done
 }
 
+# The patrol formulas end an idle turn with `IDLE:` and tell the agent what
+# resumes it. gc refuses any sleep policy on a mode="always" named session at
+# config load, so a "session_sleep policy will restart this session" sentence
+# promises a mechanism the pack itself forbids (gcp-hnhg). Pin both halves:
+# the false promise stays gone anywhere in the pack, and each IDLE exit keeps
+# the corrected wording that names the real restart (the agent's idle_timeout).
+test_idle_exit_promises_no_session_sleep_restart() {
+    local hits formula path count
+    hits="$(grep -rnE 'session_sleep policy (will restart|restarts)' "$GASTOWN" --exclude-dir=tests || true)"
+    [[ -z "$hits" ]] ||
+        fail "gcp-hnhg: a session_sleep restart is promised, but gc rejects a sleep policy on mode=\"always\" sessions at config load; name the idle_timeout restart instead:
+$hits"
+
+    for formula in mol-deacon-patrol mol-witness-patrol mol-refinery-patrol; do
+        path="$GASTOWN/formulas/$formula.toml"
+        count="$(grep -cF 'Nothing restarts this session on an idle interval' "$path" || true)"
+        [[ "$count" -eq 1 ]] ||
+            fail "gcp-hnhg: $formula.toml must state exactly once that nothing restarts the session on an idle interval (found $count)"
+    done
+
+    for formula in mol-deacon-patrol mol-witness-patrol; do
+        path="$GASTOWN/formulas/$formula.toml"
+        count="$(grep -cF 'mode="always" named session, and gc refuses any sleep policy on one' "$path" || true)"
+        [[ "$count" -eq 1 ]] ||
+            fail "gcp-hnhg: $formula.toml must say its session is mode=\"always\" and gc refuses any sleep policy on one, exactly once (found $count)"
+    done
+}
+
 test_dog_assets_are_pack_local
 test_retired_dog_formulas_are_not_reintroduced
 test_work_bead_is_never_claimed
@@ -1256,5 +1284,6 @@ test_boot_patrol_burn_resolves_current_wisp
 test_boot_deacon_observation_query_sees_wisps_tier
 test_refinery_direct_merge_is_worktree_safe_and_fail_closed
 test_refinery_rebase_guidance_matches_the_guarded_step
+test_idle_exit_promises_no_session_sleep_restart
 
 echo "gastown pack asset tests passed"
