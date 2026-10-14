@@ -2,6 +2,7 @@
 # worktree-setup.sh — idempotent git worktree creation for Gas City agents.
 #
 # Usage: worktree-setup.sh <rig-root> <target-dir> <agent-name> [--sync]
+#                          [--default-branch <branch>]
 #
 # Ensures the target directory is a git worktree of the rig repo. For
 # backward compatibility, the older <repo-dir> <agent-name> <city-root>
@@ -10,6 +11,13 @@
 #
 # Called from pre_start in pack configs. Runs before the session is created
 # so the agent starts IN the worktree directory.
+#
+# --default-branch <branch> is the rig's configured default_branch, which gc
+# renders as {{.DefaultBranch}} in pre_start. The worktree is cut from, and
+# --sync fast-forwards to, that branch. origin/HEAD is a per-clone pointer that
+# drifts independently of the rig config, so it is only the fallback for the
+# cases where gc does not know the branch: the flag absent, its value empty, or
+# an unrendered {{...}} left by a gc that predates the variable.
 #
 # BOUNDED: pre_start is killed at [session] setup_timeout (10s by default) and
 # a killed pre_start fails the WHOLE session start; six of those in an hour
@@ -96,7 +104,7 @@ run_bounded() {
     return "$_rb_rc"
 }
 
-RIG_ROOT="${1:?usage: worktree-setup.sh <rig-root> <target-dir> <agent-name> [--sync]}"
+RIG_ROOT="${1:?usage: worktree-setup.sh <rig-root> <target-dir> <agent-name> [--sync] [--default-branch <branch>]}"
 ARG2="${2:?missing target-dir}"
 ARG3="${3:?missing agent-name}"
 
@@ -114,12 +122,38 @@ if is_path_like "$ARG3"; then
     CITY="$ARG3"
     RIG=$(basename "$RIG_ROOT")
     WT="$CITY/.gc/worktrees/$RIG/$AGENT"
-    SYNC="${4:-}"
 else
     WT="$ARG2"
     AGENT="$ARG3"
-    SYNC="${4:-}"
 fi
+
+SYNC=""
+RIG_DEFAULT_BRANCH=""
+shift 3
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --sync) SYNC="--sync" ;;
+        --default-branch)
+            # A bare trailing flag is an empty value, not an error: it is what
+            # an unquoted empty {{.DefaultBranch}} leaves behind.
+            if [ "$#" -gt 1 ]; then
+                RIG_DEFAULT_BRANCH="$2"
+                shift
+            else
+                RIG_DEFAULT_BRANCH=""
+            fi
+            ;;
+        *)
+            echo "worktree-setup: unknown argument: $1" >&2
+            exit 2
+            ;;
+    esac
+    shift
+done
+# A gc that predates {{.DefaultBranch}} passes the template text through.
+case "$RIG_DEFAULT_BRANCH" in
+    *'{{'*) RIG_DEFAULT_BRANCH="" ;;
+esac
 
 branch_name() {
     # Namescape worktree branches by target path so multiple cities or rigs
@@ -147,6 +181,51 @@ validate_existing_worktree() {
     [ "$WT_COMMON" = "$RIG_COMMON" ]
 }
 
+BRANCH_DISAGREEMENT_REPORTED=""
+
+# Say once per run when the rig's default_branch overrides what origin/HEAD
+# names, so the disagreement is visible instead of silently decided.
+report_branch_disagreement() {
+    [ -n "$RIG_DEFAULT_BRANCH" ] || return 0
+    [ -z "$BRANCH_DISAGREEMENT_REPORTED" ] || return 0
+    BRANCH_DISAGREEMENT_REPORTED=1
+    _rbd_head=$(git -C "$RIG_ROOT" symbolic-ref \
+        refs/remotes/origin/HEAD 2>/dev/null || true)
+    _rbd_head=${_rbd_head#refs/remotes/origin/}
+    if [ -n "$_rbd_head" ] && [ "$_rbd_head" != "$RIG_DEFAULT_BRANCH" ]; then
+        echo "worktree-setup: rig default_branch $RIG_DEFAULT_BRANCH differs from origin/HEAD ($_rbd_head); using $RIG_DEFAULT_BRANCH" >&2
+    fi
+}
+
+# Remote, then local, else stop: the rule of mol-polecat-work.toml workspace-setup (GUARD base-resolve).
+# Sets DEFAULT_REF to the fully-qualified ref for the rig's default_branch. Both
+# arms name refs/remotes/ and refs/heads/ outright, because git resolves a
+# same-named tag ahead of a bare branch name.
+resolve_rig_base() {
+    _rrb_remote="refs/remotes/origin/$RIG_DEFAULT_BRANCH"
+    _rrb_local="refs/heads/$RIG_DEFAULT_BRANCH"
+    if git -C "$RIG_ROOT" show-ref --verify --quiet "$_rrb_remote"; then
+        if git -C "$RIG_ROOT" show-ref --verify --quiet "$_rrb_local" &&
+            ! git -C "$RIG_ROOT" merge-base --is-ancestor "$_rrb_local" "$_rrb_remote"; then
+            # Not an ancestor: stale (every commit still on some remote branch)
+            # or carrying work no remote has. Count, rather than guess.
+            _rrb_only=$(git -C "$RIG_ROOT" rev-list --count "$_rrb_local" --not --remotes) || _rrb_only=err
+            if [ "$_rrb_only" != "0" ]; then
+                echo "worktree-setup: STOP: local $RIG_DEFAULT_BRANCH has commits that are on no remote; reconcile or push it first" >&2
+                return 1
+            fi
+            echo "worktree-setup: note: local $RIG_DEFAULT_BRANCH is stale (0 commits off-remote); branching from origin" >&2
+        fi
+        DEFAULT_REF="$_rrb_remote"
+    elif git -C "$RIG_ROOT" show-ref --verify --quiet "$_rrb_local"; then
+        DEFAULT_REF="$_rrb_local"
+        echo "worktree-setup: note: base branch $RIG_DEFAULT_BRANCH is local-only — it does not exist on origin" >&2
+    else
+        echo "worktree-setup: STOP: base branch $RIG_DEFAULT_BRANCH exists neither on origin nor locally in $RIG_ROOT; not substituting origin/HEAD" >&2
+        return 1
+    fi
+}
+
 sync_worktree() {
     [ "$SYNC" = "--sync" ] || return 0
 
@@ -163,31 +242,47 @@ sync_worktree() {
         return 1
     fi
 
-    DEFAULT_REF=$(git -C "$RIG_ROOT" symbolic-ref \
-        refs/remotes/origin/HEAD 2>/dev/null || true)
-    if [ -z "$DEFAULT_REF" ]; then
-        # Remote-facing: shares this run's network budget (see BOUNDED above).
-        if ! run_bounded "$(budget_left)" git -C "$RIG_ROOT" remote set-head origin --auto >/dev/null 2>&1; then
-            echo "worktree-setup: could not discover origin/HEAD for $RIG_ROOT" >&2
-            return 1
+    if [ -n "$RIG_DEFAULT_BRANCH" ]; then
+        DEFAULT_BRANCH="$RIG_DEFAULT_BRANCH"
+        report_branch_disagreement
+        # Remote-facing: bounded like every other network call here. A failed
+        # fetch refuses only when origin/<branch> is already known locally; a
+        # local-only base has nothing to fetch and still resolves.
+        if ! run_bounded "$(budget_left)" git -C "$RIG_ROOT" fetch origin "$DEFAULT_BRANCH"; then
+            if git -C "$RIG_ROOT" show-ref --verify --quiet \
+                "refs/remotes/origin/$DEFAULT_BRANCH"; then
+                echo "worktree-setup: could not refresh origin/$DEFAULT_BRANCH within the network budget" >&2
+                return 1
+            fi
         fi
+        resolve_rig_base || return 1
+    else
         DEFAULT_REF=$(git -C "$RIG_ROOT" symbolic-ref \
             refs/remotes/origin/HEAD 2>/dev/null || true)
-    fi
-    if [ -z "$DEFAULT_REF" ]; then
-        echo "worktree-setup: origin/HEAD is not configured for $RIG_ROOT" >&2
-        return 1
-    fi
-    DEFAULT_BRANCH=${DEFAULT_REF#refs/remotes/origin/}
-    [ -n "$DEFAULT_BRANCH" ] || {
-        echo "worktree-setup: could not resolve origin default branch for $RIG_ROOT" >&2
-        return 1
-    }
-    # Remote-facing: bounded like every other network call here. A fetch that
-    # runs out of budget refuses the sync exactly as a failed one does.
-    if ! run_bounded "$(budget_left)" git -C "$RIG_ROOT" fetch origin "$DEFAULT_BRANCH"; then
-        echo "worktree-setup: could not refresh origin/$DEFAULT_BRANCH within the network budget" >&2
-        return 1
+        if [ -z "$DEFAULT_REF" ]; then
+            # Remote-facing: shares this run's network budget (see BOUNDED above).
+            if ! run_bounded "$(budget_left)" git -C "$RIG_ROOT" remote set-head origin --auto >/dev/null 2>&1; then
+                echo "worktree-setup: could not discover origin/HEAD for $RIG_ROOT" >&2
+                return 1
+            fi
+            DEFAULT_REF=$(git -C "$RIG_ROOT" symbolic-ref \
+                refs/remotes/origin/HEAD 2>/dev/null || true)
+        fi
+        if [ -z "$DEFAULT_REF" ]; then
+            echo "worktree-setup: origin/HEAD is not configured for $RIG_ROOT" >&2
+            return 1
+        fi
+        DEFAULT_BRANCH=${DEFAULT_REF#refs/remotes/origin/}
+        [ -n "$DEFAULT_BRANCH" ] || {
+            echo "worktree-setup: could not resolve origin default branch for $RIG_ROOT" >&2
+            return 1
+        }
+        # Remote-facing: bounded like every other network call here. A fetch that
+        # runs out of budget refuses the sync exactly as a failed one does.
+        if ! run_bounded "$(budget_left)" git -C "$RIG_ROOT" fetch origin "$DEFAULT_BRANCH"; then
+            echo "worktree-setup: could not refresh origin/$DEFAULT_BRANCH within the network budget" >&2
+            return 1
+        fi
     fi
     if ! git -C "$RIG_ROOT" rev-parse --verify \
         "$DEFAULT_REF^{commit}" >/dev/null 2>&1; then
@@ -354,10 +449,20 @@ BRANCH=$(branch_name)
 # to drift behind origin's, and feature branches cut from it carry
 # already-merged commits that the refinery rebase rejects as spurious
 # duplicates with mismatched hashes.
-DEFAULT_REF=$(git -C "$RIG_ROOT" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null || true)
-if [ -n "$DEFAULT_REF" ]; then
-    DEFAULT_BRANCH=${DEFAULT_REF#refs/remotes/origin/}
+if [ -n "$RIG_DEFAULT_BRANCH" ]; then
+    DEFAULT_BRANCH="$RIG_DEFAULT_BRANCH"
+    report_branch_disagreement
     run_bounded "$(budget_left)" git -C "$RIG_ROOT" fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1 || true
+    resolve_rig_base || {
+        restore_stage
+        exit 1
+    }
+else
+    DEFAULT_REF=$(git -C "$RIG_ROOT" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null || true)
+    if [ -n "$DEFAULT_REF" ]; then
+        DEFAULT_BRANCH=${DEFAULT_REF#refs/remotes/origin/}
+        run_bounded "$(budget_left)" git -C "$RIG_ROOT" fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1 || true
+    fi
 fi
 
 if git -C "$RIG_ROOT" show-ref --verify --quiet "refs/heads/$BRANCH"; then

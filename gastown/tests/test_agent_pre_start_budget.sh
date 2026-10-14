@@ -52,8 +52,8 @@ fail() {
 #       it expires — a worktree one fetch behind is fixed next cycle.
 EXPECTED_PRE_STARTS=$(
     cat <<'INVENTORY'
-gastown/agents/polecat/agent.toml	{{.ConfigDir}}/assets/scripts/worktree-setup.sh {{.RigRoot}} {{.WorkDir}} {{.AgentBase}} --sync
-gastown/agents/refinery/agent.toml	{{.ConfigDir}}/assets/scripts/worktree-setup.sh {{.RigRoot}} {{.WorkDir}} {{.AgentBase}} --sync
+gastown/agents/polecat/agent.toml	{{.ConfigDir}}/assets/scripts/worktree-setup.sh {{.RigRoot}} {{.WorkDir}} {{.AgentBase}} --sync --default-branch '{{.DefaultBranch}}'
+gastown/agents/refinery/agent.toml	{{.ConfigDir}}/assets/scripts/worktree-setup.sh {{.RigRoot}} {{.WorkDir}} {{.AgentBase}} --sync --default-branch '{{.DefaultBranch}}'
 INVENTORY
 )
 

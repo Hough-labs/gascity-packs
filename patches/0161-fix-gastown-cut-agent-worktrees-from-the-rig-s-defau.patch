@@ -1,0 +1,534 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Wed, 14 Oct 2026 00:04:13 -0400
+Subject: [PATCH 161/161] fix(gastown): cut agent worktrees from the rig's
+ default_branch, not origin/HEAD (gcp-8v32)
+
+worktree-setup.sh took the base for a new agent worktree, and for --sync, from
+refs/remotes/origin/HEAD. That pointer is per-clone and drifts independently of
+the rig's configured default_branch, so on a rig where the two disagree (feryn:
+master vs dev; gascity: main vs edge-integration) the script silently cut the
+agent from the wrong mainline. `git worktree add -b <branch> <remote-ref>` also
+takes the upstream from the start point, so the same line mis-tracked the
+branch, and a later `git pull --rebase` replayed the agent's work onto a stale
+base. Crew seats are the load-bearing case: they have no workspace-setup step,
+so the pre_start worktree is where they work permanently.
+
+The script now accepts `--default-branch <branch>` and both pre_start lines pass
+gc's `{{.DefaultBranch}}`, quoted so an empty value survives as an argument.
+When the value is non-empty the sync site and the create site resolve the base
+with the rule mol-polecat-work's workspace-setup uses: origin/<branch> if it
+exists (halting only when the local branch holds commits on no remote, counted
+with `rev-list --count ... --not --remotes`, and merely noting a stale one),
+else the local branch, else STOP without substituting origin/HEAD. A failed
+sync fetch refuses only when origin/<branch> is already known locally. The
+disagreement with origin/HEAD is reported once per run. origin/HEAD stays the
+fallback when the flag is absent, empty, bare, or an unrendered `{{...}}` left
+by a gc that predates the variable. Unknown arguments now exit 2.
+
+Not changed: the reuse path still ignores the start point, so an existing
+mis-tracked branch is repointed by `gc doctor session-branch-upstream --fix`,
+not here. The city-local copies of the script are city config (gc-57uso).
+
+Validation: nine new cases in test_worktree_setup_sync.sh (RED against the old
+script on the HEAD assertion of the first; each of the two NEW arms deleted in
+turn fails its own case), test_agent_pre_start_budget.sh pins the new strings,
+shellcheck reports nothing beyond the base's SC1007/SC1083.
+---
+ gastown/agents/polecat/agent.toml            |   2 +-
+ gastown/agents/refinery/agent.toml           |   2 +-
+ gastown/assets/scripts/worktree-setup.sh     | 161 +++++++++++---
+ gastown/tests/test_agent_pre_start_budget.sh |   4 +-
+ gastown/tests/test_worktree_setup_sync.sh    | 208 +++++++++++++++++++
+ 5 files changed, 345 insertions(+), 32 deletions(-)
+
+diff --git a/gastown/agents/polecat/agent.toml b/gastown/agents/polecat/agent.toml
+index 5a50116f..0374c366 100644
+--- a/gastown/agents/polecat/agent.toml
++++ b/gastown/agents/polecat/agent.toml
+@@ -2,7 +2,7 @@ scope = "rig"
+ wake_mode = "fresh"
+ work_dir = ".gc/worktrees/{{.Rig}}/polecats/{{.AgentBase}}"
+ nudge = "Run gc hook --claim --json now; if it returns work, execute the claimed formula immediately."
+-pre_start = ["{{.ConfigDir}}/assets/scripts/worktree-setup.sh {{.RigRoot}} {{.WorkDir}} {{.AgentBase}} --sync"]
++pre_start = ["{{.ConfigDir}}/assets/scripts/worktree-setup.sh {{.RigRoot}} {{.WorkDir}} {{.AgentBase}} --sync --default-branch '{{.DefaultBranch}}'"]
+ # Agent-level default: outranks a city's [agent_defaults], so a city that routes
+ # polecat slings elsewhere must say so in a [[patches.agent]] block. See
+ # ../../README.md ("Default Sling Formula").
+diff --git a/gastown/agents/refinery/agent.toml b/gastown/agents/refinery/agent.toml
+index c7d129bd..7c3f7a79 100644
+--- a/gastown/agents/refinery/agent.toml
++++ b/gastown/agents/refinery/agent.toml
+@@ -2,6 +2,6 @@ scope = "rig"
+ wake_mode = "fresh"
+ work_dir = ".gc/worktrees/{{.Rig}}/refinery"
+ nudge = "Run 'gc prime' to check merge queue and begin processing."
+-pre_start = ["{{.ConfigDir}}/assets/scripts/worktree-setup.sh {{.RigRoot}} {{.WorkDir}} {{.AgentBase}} --sync"]
++pre_start = ["{{.ConfigDir}}/assets/scripts/worktree-setup.sh {{.RigRoot}} {{.WorkDir}} {{.AgentBase}} --sync --default-branch '{{.DefaultBranch}}'"]
+ idle_timeout = "2h"
+ max_active_sessions = 1
+diff --git a/gastown/assets/scripts/worktree-setup.sh b/gastown/assets/scripts/worktree-setup.sh
+index c5f1aaba..c47b2dfc 100755
+--- a/gastown/assets/scripts/worktree-setup.sh
++++ b/gastown/assets/scripts/worktree-setup.sh
+@@ -2,6 +2,7 @@
+ # worktree-setup.sh — idempotent git worktree creation for Gas City agents.
+ #
+ # Usage: worktree-setup.sh <rig-root> <target-dir> <agent-name> [--sync]
++#                          [--default-branch <branch>]
+ #
+ # Ensures the target directory is a git worktree of the rig repo. For
+ # backward compatibility, the older <repo-dir> <agent-name> <city-root>
+@@ -11,6 +12,13 @@
+ # Called from pre_start in pack configs. Runs before the session is created
+ # so the agent starts IN the worktree directory.
+ #
++# --default-branch <branch> is the rig's configured default_branch, which gc
++# renders as {{.DefaultBranch}} in pre_start. The worktree is cut from, and
++# --sync fast-forwards to, that branch. origin/HEAD is a per-clone pointer that
++# drifts independently of the rig config, so it is only the fallback for the
++# cases where gc does not know the branch: the flag absent, its value empty, or
++# an unrendered {{...}} left by a gc that predates the variable.
++#
+ # BOUNDED: pre_start is killed at [session] setup_timeout (10s by default) and
+ # a killed pre_start fails the WHOLE session start; six of those in an hour
+ # latch the supervisor circuit breaker open and the rig loses that agent
+@@ -96,7 +104,7 @@ run_bounded() {
+     return "$_rb_rc"
+ }
+ 
+-RIG_ROOT="${1:?usage: worktree-setup.sh <rig-root> <target-dir> <agent-name> [--sync]}"
++RIG_ROOT="${1:?usage: worktree-setup.sh <rig-root> <target-dir> <agent-name> [--sync] [--default-branch <branch>]}"
+ ARG2="${2:?missing target-dir}"
+ ARG3="${3:?missing agent-name}"
+ 
+@@ -114,13 +122,39 @@ if is_path_like "$ARG3"; then
+     CITY="$ARG3"
+     RIG=$(basename "$RIG_ROOT")
+     WT="$CITY/.gc/worktrees/$RIG/$AGENT"
+-    SYNC="${4:-}"
+ else
+     WT="$ARG2"
+     AGENT="$ARG3"
+-    SYNC="${4:-}"
+ fi
+ 
++SYNC=""
++RIG_DEFAULT_BRANCH=""
++shift 3
++while [ "$#" -gt 0 ]; do
++    case "$1" in
++        --sync) SYNC="--sync" ;;
++        --default-branch)
++            # A bare trailing flag is an empty value, not an error: it is what
++            # an unquoted empty {{.DefaultBranch}} leaves behind.
++            if [ "$#" -gt 1 ]; then
++                RIG_DEFAULT_BRANCH="$2"
++                shift
++            else
++                RIG_DEFAULT_BRANCH=""
++            fi
++            ;;
++        *)
++            echo "worktree-setup: unknown argument: $1" >&2
++            exit 2
++            ;;
++    esac
++    shift
++done
++# A gc that predates {{.DefaultBranch}} passes the template text through.
++case "$RIG_DEFAULT_BRANCH" in
++    *'{{'*) RIG_DEFAULT_BRANCH="" ;;
++esac
++
+ branch_name() {
+     # Namescape worktree branches by target path so multiple cities or rigs
+     # can share one underlying repo without colliding on global refs like
+@@ -147,6 +181,51 @@ validate_existing_worktree() {
+     [ "$WT_COMMON" = "$RIG_COMMON" ]
+ }
+ 
++BRANCH_DISAGREEMENT_REPORTED=""
++
++# Say once per run when the rig's default_branch overrides what origin/HEAD
++# names, so the disagreement is visible instead of silently decided.
++report_branch_disagreement() {
++    [ -n "$RIG_DEFAULT_BRANCH" ] || return 0
++    [ -z "$BRANCH_DISAGREEMENT_REPORTED" ] || return 0
++    BRANCH_DISAGREEMENT_REPORTED=1
++    _rbd_head=$(git -C "$RIG_ROOT" symbolic-ref \
++        refs/remotes/origin/HEAD 2>/dev/null || true)
++    _rbd_head=${_rbd_head#refs/remotes/origin/}
++    if [ -n "$_rbd_head" ] && [ "$_rbd_head" != "$RIG_DEFAULT_BRANCH" ]; then
++        echo "worktree-setup: rig default_branch $RIG_DEFAULT_BRANCH differs from origin/HEAD ($_rbd_head); using $RIG_DEFAULT_BRANCH" >&2
++    fi
++}
++
++# Remote, then local, else stop: the rule of mol-polecat-work.toml workspace-setup (GUARD base-resolve).
++# Sets DEFAULT_REF to the fully-qualified ref for the rig's default_branch. Both
++# arms name refs/remotes/ and refs/heads/ outright, because git resolves a
++# same-named tag ahead of a bare branch name.
++resolve_rig_base() {
++    _rrb_remote="refs/remotes/origin/$RIG_DEFAULT_BRANCH"
++    _rrb_local="refs/heads/$RIG_DEFAULT_BRANCH"
++    if git -C "$RIG_ROOT" show-ref --verify --quiet "$_rrb_remote"; then
++        if git -C "$RIG_ROOT" show-ref --verify --quiet "$_rrb_local" &&
++            ! git -C "$RIG_ROOT" merge-base --is-ancestor "$_rrb_local" "$_rrb_remote"; then
++            # Not an ancestor: stale (every commit still on some remote branch)
++            # or carrying work no remote has. Count, rather than guess.
++            _rrb_only=$(git -C "$RIG_ROOT" rev-list --count "$_rrb_local" --not --remotes) || _rrb_only=err
++            if [ "$_rrb_only" != "0" ]; then
++                echo "worktree-setup: STOP: local $RIG_DEFAULT_BRANCH has commits that are on no remote; reconcile or push it first" >&2
++                return 1
++            fi
++            echo "worktree-setup: note: local $RIG_DEFAULT_BRANCH is stale (0 commits off-remote); branching from origin" >&2
++        fi
++        DEFAULT_REF="$_rrb_remote"
++    elif git -C "$RIG_ROOT" show-ref --verify --quiet "$_rrb_local"; then
++        DEFAULT_REF="$_rrb_local"
++        echo "worktree-setup: note: base branch $RIG_DEFAULT_BRANCH is local-only — it does not exist on origin" >&2
++    else
++        echo "worktree-setup: STOP: base branch $RIG_DEFAULT_BRANCH exists neither on origin nor locally in $RIG_ROOT; not substituting origin/HEAD" >&2
++        return 1
++    fi
++}
++
+ sync_worktree() {
+     [ "$SYNC" = "--sync" ] || return 0
+ 
+@@ -163,31 +242,47 @@ sync_worktree() {
+         return 1
+     fi
+ 
+-    DEFAULT_REF=$(git -C "$RIG_ROOT" symbolic-ref \
+-        refs/remotes/origin/HEAD 2>/dev/null || true)
+-    if [ -z "$DEFAULT_REF" ]; then
+-        # Remote-facing: shares this run's network budget (see BOUNDED above).
+-        if ! run_bounded "$(budget_left)" git -C "$RIG_ROOT" remote set-head origin --auto >/dev/null 2>&1; then
+-            echo "worktree-setup: could not discover origin/HEAD for $RIG_ROOT" >&2
+-            return 1
++    if [ -n "$RIG_DEFAULT_BRANCH" ]; then
++        DEFAULT_BRANCH="$RIG_DEFAULT_BRANCH"
++        report_branch_disagreement
++        # Remote-facing: bounded like every other network call here. A failed
++        # fetch refuses only when origin/<branch> is already known locally; a
++        # local-only base has nothing to fetch and still resolves.
++        if ! run_bounded "$(budget_left)" git -C "$RIG_ROOT" fetch origin "$DEFAULT_BRANCH"; then
++            if git -C "$RIG_ROOT" show-ref --verify --quiet \
++                "refs/remotes/origin/$DEFAULT_BRANCH"; then
++                echo "worktree-setup: could not refresh origin/$DEFAULT_BRANCH within the network budget" >&2
++                return 1
++            fi
+         fi
++        resolve_rig_base || return 1
++    else
+         DEFAULT_REF=$(git -C "$RIG_ROOT" symbolic-ref \
+             refs/remotes/origin/HEAD 2>/dev/null || true)
+-    fi
+-    if [ -z "$DEFAULT_REF" ]; then
+-        echo "worktree-setup: origin/HEAD is not configured for $RIG_ROOT" >&2
+-        return 1
+-    fi
+-    DEFAULT_BRANCH=${DEFAULT_REF#refs/remotes/origin/}
+-    [ -n "$DEFAULT_BRANCH" ] || {
+-        echo "worktree-setup: could not resolve origin default branch for $RIG_ROOT" >&2
+-        return 1
+-    }
+-    # Remote-facing: bounded like every other network call here. A fetch that
+-    # runs out of budget refuses the sync exactly as a failed one does.
+-    if ! run_bounded "$(budget_left)" git -C "$RIG_ROOT" fetch origin "$DEFAULT_BRANCH"; then
+-        echo "worktree-setup: could not refresh origin/$DEFAULT_BRANCH within the network budget" >&2
+-        return 1
++        if [ -z "$DEFAULT_REF" ]; then
++            # Remote-facing: shares this run's network budget (see BOUNDED above).
++            if ! run_bounded "$(budget_left)" git -C "$RIG_ROOT" remote set-head origin --auto >/dev/null 2>&1; then
++                echo "worktree-setup: could not discover origin/HEAD for $RIG_ROOT" >&2
++                return 1
++            fi
++            DEFAULT_REF=$(git -C "$RIG_ROOT" symbolic-ref \
++                refs/remotes/origin/HEAD 2>/dev/null || true)
++        fi
++        if [ -z "$DEFAULT_REF" ]; then
++            echo "worktree-setup: origin/HEAD is not configured for $RIG_ROOT" >&2
++            return 1
++        fi
++        DEFAULT_BRANCH=${DEFAULT_REF#refs/remotes/origin/}
++        [ -n "$DEFAULT_BRANCH" ] || {
++            echo "worktree-setup: could not resolve origin default branch for $RIG_ROOT" >&2
++            return 1
++        }
++        # Remote-facing: bounded like every other network call here. A fetch that
++        # runs out of budget refuses the sync exactly as a failed one does.
++        if ! run_bounded "$(budget_left)" git -C "$RIG_ROOT" fetch origin "$DEFAULT_BRANCH"; then
++            echo "worktree-setup: could not refresh origin/$DEFAULT_BRANCH within the network budget" >&2
++            return 1
++        fi
+     fi
+     if ! git -C "$RIG_ROOT" rev-parse --verify \
+         "$DEFAULT_REF^{commit}" >/dev/null 2>&1; then
+@@ -354,10 +449,20 @@ BRANCH=$(branch_name)
+ # to drift behind origin's, and feature branches cut from it carry
+ # already-merged commits that the refinery rebase rejects as spurious
+ # duplicates with mismatched hashes.
+-DEFAULT_REF=$(git -C "$RIG_ROOT" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null || true)
+-if [ -n "$DEFAULT_REF" ]; then
+-    DEFAULT_BRANCH=${DEFAULT_REF#refs/remotes/origin/}
++if [ -n "$RIG_DEFAULT_BRANCH" ]; then
++    DEFAULT_BRANCH="$RIG_DEFAULT_BRANCH"
++    report_branch_disagreement
+     run_bounded "$(budget_left)" git -C "$RIG_ROOT" fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1 || true
++    resolve_rig_base || {
++        restore_stage
++        exit 1
++    }
++else
++    DEFAULT_REF=$(git -C "$RIG_ROOT" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null || true)
++    if [ -n "$DEFAULT_REF" ]; then
++        DEFAULT_BRANCH=${DEFAULT_REF#refs/remotes/origin/}
++        run_bounded "$(budget_left)" git -C "$RIG_ROOT" fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1 || true
++    fi
+ fi
+ 
+ if git -C "$RIG_ROOT" show-ref --verify --quiet "refs/heads/$BRANCH"; then
+diff --git a/gastown/tests/test_agent_pre_start_budget.sh b/gastown/tests/test_agent_pre_start_budget.sh
+index f76885d2..8e9e36d1 100755
+--- a/gastown/tests/test_agent_pre_start_budget.sh
++++ b/gastown/tests/test_agent_pre_start_budget.sh
+@@ -52,8 +52,8 @@ fail() {
+ #       it expires — a worktree one fetch behind is fixed next cycle.
+ EXPECTED_PRE_STARTS=$(
+     cat <<'INVENTORY'
+-gastown/agents/polecat/agent.toml	{{.ConfigDir}}/assets/scripts/worktree-setup.sh {{.RigRoot}} {{.WorkDir}} {{.AgentBase}} --sync
+-gastown/agents/refinery/agent.toml	{{.ConfigDir}}/assets/scripts/worktree-setup.sh {{.RigRoot}} {{.WorkDir}} {{.AgentBase}} --sync
++gastown/agents/polecat/agent.toml	{{.ConfigDir}}/assets/scripts/worktree-setup.sh {{.RigRoot}} {{.WorkDir}} {{.AgentBase}} --sync --default-branch '{{.DefaultBranch}}'
++gastown/agents/refinery/agent.toml	{{.ConfigDir}}/assets/scripts/worktree-setup.sh {{.RigRoot}} {{.WorkDir}} {{.AgentBase}} --sync --default-branch '{{.DefaultBranch}}'
+ INVENTORY
+ )
+ 
+diff --git a/gastown/tests/test_worktree_setup_sync.sh b/gastown/tests/test_worktree_setup_sync.sh
+index 1734d4b7..f26009ac 100755
+--- a/gastown/tests/test_worktree_setup_sync.sh
++++ b/gastown/tests/test_worktree_setup_sync.sh
+@@ -110,6 +110,204 @@ test_sync_still_works_with_configured_tracking() {
+         fail "sync should have kept the worktree on $branch"
+ }
+ 
++# new_split_rig <dir> — a bare upstream whose HEAD is main, with three
++# branches: main = init, integration = init + one commit, archive = init + one
++# other commit. The rig is cloned from it, so origin/HEAD = main while the
++# rig's configured default_branch (what gc passes as --default-branch) is a
++# different branch -- the disagreement worktree-setup.sh used to resolve by
++# guessing from origin/HEAD.
++new_split_rig() {
++    local base="$1"
++    mkdir -p "$base"
++    git_c init -q --bare -b main "$base/upstream.git"
++    git_c init -q -b main "$base/seed"
++    (cd "$base/seed" \
++        && git_c remote add origin "$base/upstream.git" \
++        && git_c commit -q --allow-empty -m init \
++        && git_c push -q origin main \
++        && git_c checkout -q -b integration \
++        && git_c commit -q --allow-empty -m "integration work" \
++        && git_c push -q origin integration \
++        && git_c checkout -q -b archive main \
++        && git_c commit -q --allow-empty -m "archive work" \
++        && git_c push -q origin archive)
++    git_c clone -q "$base/upstream.git" "$base/rig"
++}
++
++# ref_sha <repo> <ref> — the commit a ref names.
++ref_sha() {
++    git_c -C "$1" rev-parse --verify "$2^{commit}"
++}
++
++# setup_run <rig> <wt> <err-file> <args...> — run the script as the pre_start
++# does, with the agent name fixed to "a". Prints nothing, leaves stderr in
++# <err-file>, and returns the script's exit status.
++setup_run() {
++    local rig="$1" wt="$2" err="$3"
++    shift 3
++    sh "$SCRIPT" "$rig" "$wt" a "$@" 2>"$err"
++}
++
++test_worktree_start_point_prefers_rig_default_branch() {
++    local base="$1/${FUNCNAME[0]}"
++    new_split_rig "$base"
++    local rig="$base/rig" wt="$base/wt" err="$base/err"
++    local branch merge
++    branch=$(stable_branch "$rig" "$wt" a)
++
++    # No --sync: this is the create site alone.
++    setup_run "$rig" "$wt" "$err" --default-branch integration ||
++        fail "create with --default-branch integration failed: $(cat "$err")"
++
++    [ "$(ref_sha "$wt" HEAD)" = "$(ref_sha "$rig" refs/remotes/origin/integration)" ] ||
++        fail "worktree should be cut from origin/integration, not origin/HEAD (main); got $(ref_sha "$wt" HEAD)"
++    merge=$(git_c -C "$rig" config --get "branch.$branch.merge" || true)
++    case "$merge" in
++        '' | refs/heads/integration) ;;
++        *) fail "$branch must not track a mainline other than integration; merge=$merge" ;;
++    esac
++}
++
++test_sync_moves_a_mis_cut_branch_to_rig_default_branch() {
++    local base="$1/${FUNCNAME[0]}"
++    new_split_rig "$base"
++    local rig="$base/rig" wt="$base/wt" err="$base/err"
++    local branch
++    branch=$(stable_branch "$rig" "$wt" a)
++
++    # A branch cut from origin/HEAD before the rig's default_branch was passed.
++    git_c -C "$rig" worktree add -q --no-track "$wt" -b "$branch" refs/remotes/origin/main
++
++    setup_run "$rig" "$wt" "$err" --sync --default-branch integration ||
++        fail "sync with --default-branch integration failed: $(cat "$err")"
++
++    [ "$(ref_sha "$wt" HEAD)" = "$(ref_sha "$rig" refs/remotes/origin/integration)" ] ||
++        fail "sync should move the mis-cut branch to origin/integration; got $(ref_sha "$wt" HEAD)"
++    [ "$(git_c -C "$wt" branch --show-current)" = "$branch" ] ||
++        fail "sync should have kept the worktree on $branch"
++}
++
++test_disagreement_emits_a_diagnostic() {
++    local base="$1/${FUNCNAME[0]}"
++    new_split_rig "$base"
++    local rig="$base/rig" wt="$base/wt" err="$base/err"
++    local line='worktree-setup: rig default_branch integration differs from origin/HEAD (main); using integration'
++
++    setup_run "$rig" "$wt" "$err" --sync --default-branch integration ||
++        fail "setup failed: $(cat "$err")"
++
++    # The create site and the sync site both run, but the guard prints it once.
++    [ "$(grep -cxF "$line" "$err")" = 1 ] ||
++        fail "the disagreement line should appear exactly once; stderr was: $(cat "$err")"
++}
++
++test_agreeing_rig_is_unchanged_and_quiet() {
++    local base="$1/${FUNCNAME[0]}"
++    new_split_rig "$base"
++    local rig="$base/rig" wt="$base/wt" err="$base/err"
++
++    setup_run "$rig" "$wt" "$err" --sync --default-branch main ||
++        fail "setup with an agreeing default_branch failed: $(cat "$err")"
++
++    [ "$(ref_sha "$wt" HEAD)" = "$(ref_sha "$rig" refs/remotes/origin/main)" ] ||
++        fail "an agreeing rig should still be cut from origin/main; got $(ref_sha "$wt" HEAD)"
++    if grep -q 'differs from origin/HEAD' "$err"; then
++        fail "an agreeing rig must not print the disagreement line: $(cat "$err")"
++    fi
++}
++
++test_origin_head_is_only_a_fallback() {
++    local base="$1/${FUNCNAME[0]}"
++    new_split_rig "$base"
++    local rig="$base/rig" err="$base/err"
++    local wt label
++
++    # Four ways gc can hand over "no default_branch": nothing, an empty value,
++    # a value an older gc left unrendered, and a flag with no value.
++    for label in none empty unrendered bare; do
++        wt="$base/wt-$label"
++        case "$label" in
++            none) setup_run "$rig" "$wt" "$err" --sync ;;
++            empty) setup_run "$rig" "$wt" "$err" --sync --default-branch '' ;;
++            unrendered) setup_run "$rig" "$wt" "$err" --sync --default-branch '{{.DefaultBranch}}' ;;
++            bare) setup_run "$rig" "$wt" "$err" --sync --default-branch ;;
++        esac || fail "$label: should fall back to origin/HEAD, but exited non-zero: $(cat "$err")"
++        [ "$(ref_sha "$wt" HEAD)" = "$(ref_sha "$rig" refs/remotes/origin/main)" ] ||
++            fail "$label: should be cut from origin/HEAD (main); got $(ref_sha "$wt" HEAD)"
++    done
++}
++
++test_local_only_default_branch_is_used() {
++    local base="$1/${FUNCNAME[0]}"
++    new_split_rig "$base"
++    local rig="$base/rig" wt="$base/wt" err="$base/err"
++    local edge
++
++    # A rig default_branch that was never pushed.
++    edge=$(git_c -C "$rig" commit-tree -p refs/remotes/origin/main -m edge 'refs/remotes/origin/main^{tree}')
++    git_c -C "$rig" update-ref refs/heads/edge "$edge"
++
++    setup_run "$rig" "$wt" "$err" --sync --default-branch edge ||
++        fail "a local-only default_branch should still resolve: $(cat "$err")"
++
++    [ "$(ref_sha "$wt" HEAD)" = "$edge" ] ||
++        fail "worktree should sit on the local-only edge ($edge); got $(ref_sha "$wt" HEAD)"
++    grep -qxF 'worktree-setup: note: base branch edge is local-only — it does not exist on origin' "$err" ||
++        fail "expected the local-only note; stderr was: $(cat "$err")"
++}
++
++test_missing_default_branch_stops_without_substituting() {
++    local base="$1/${FUNCNAME[0]}"
++    new_split_rig "$base"
++    local rig="$base/rig" wt="$base/wt" err="$base/err"
++    local branch rc=0
++    branch=$(stable_branch "$rig" "$wt" a)
++
++    setup_run "$rig" "$wt" "$err" --sync --default-branch nope || rc=$?
++
++    [ "$rc" = 1 ] || fail "a default_branch that exists nowhere should exit 1; got $rc"
++    grep -qxF "worktree-setup: STOP: base branch nope exists neither on origin nor locally in $rig; not substituting origin/HEAD" "$err" ||
++        fail "expected the STOP line; stderr was: $(cat "$err")"
++    if git_c -C "$rig" show-ref --verify --quiet "refs/heads/$branch"; then
++        fail "no branch should be created when the base cannot be resolved"
++    fi
++}
++
++test_stale_local_default_branch_branches_from_origin() {
++    local base="$1/${FUNCNAME[0]}"
++    new_split_rig "$base"
++    local rig="$base/rig" wt="$base/wt" err="$base/err"
++
++    # A local integration that is not an ancestor of origin's, yet holds nothing
++    # that no remote branch has: archive's tip is on origin/archive.
++    git_c -C "$rig" branch integration refs/remotes/origin/archive
++
++    setup_run "$rig" "$wt" "$err" --sync --default-branch integration ||
++        fail "a stale local default_branch should not halt: $(cat "$err")"
++
++    [ "$(ref_sha "$wt" HEAD)" = "$(ref_sha "$rig" refs/remotes/origin/integration)" ] ||
++        fail "worktree should be cut from origin/integration; got $(ref_sha "$wt" HEAD)"
++    grep -qxF 'worktree-setup: note: local integration is stale (0 commits off-remote); branching from origin' "$err" ||
++        fail "expected the stale note; stderr was: $(cat "$err")"
++}
++
++test_local_only_commits_on_default_branch_stop() {
++    local base="$1/${FUNCNAME[0]}"
++    new_split_rig "$base"
++    local rig="$base/rig" wt="$base/wt" err="$base/err"
++    local ahead rc=0
++
++    # origin/integration plus one commit that no remote has.
++    ahead=$(git_c -C "$rig" commit-tree -p refs/remotes/origin/integration -m unpushed 'refs/remotes/origin/integration^{tree}')
++    git_c -C "$rig" update-ref refs/heads/integration "$ahead"
++
++    setup_run "$rig" "$wt" "$err" --sync --default-branch integration || rc=$?
++
++    [ "$rc" = 1 ] || fail "local-only commits on the default branch should exit 1; got $rc"
++    grep -qxF 'worktree-setup: STOP: local integration has commits that are on no remote; reconcile or push it first' "$err" ||
++        fail "expected the local-only-commits STOP line; stderr was: $(cat "$err")"
++}
++
+ tmp=$(mktemp -d)
+ trap 'rm -rf "$tmp"' EXIT
+ new_upstream_and_rig "$tmp"
+@@ -117,4 +315,14 @@ new_upstream_and_rig "$tmp"
+ test_sync_pulls_when_branch_lacks_origin_tracking "$tmp"
+ test_sync_still_works_with_configured_tracking "$tmp"
+ 
++test_worktree_start_point_prefers_rig_default_branch "$tmp"
++test_sync_moves_a_mis_cut_branch_to_rig_default_branch "$tmp"
++test_disagreement_emits_a_diagnostic "$tmp"
++test_agreeing_rig_is_unchanged_and_quiet "$tmp"
++test_origin_head_is_only_a_fallback "$tmp"
++test_local_only_default_branch_is_used "$tmp"
++test_missing_default_branch_stops_without_substituting "$tmp"
++test_stale_local_default_branch_branches_from_origin "$tmp"
++test_local_only_commits_on_default_branch_stop "$tmp"
++
+ echo "worktree-setup sync tests passed"
+-- 
+2.54.0 (Apple Git-157)
+

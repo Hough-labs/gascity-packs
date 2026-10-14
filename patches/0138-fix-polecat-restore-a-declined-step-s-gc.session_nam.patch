@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sat, 10 Oct 2026 16:33:29 -0400
-Subject: [PATCH 138/160] fix(polecat): restore a declined step's
+Subject: [PATCH 138/161] fix(polecat): restore a declined step's
  gc.session_name from the live session row (gcp-fooz4)
 
 When the live-owner guard declines a duplicate pour it puts the owner's

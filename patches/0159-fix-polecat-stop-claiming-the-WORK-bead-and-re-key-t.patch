@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Tue, 13 Oct 2026 22:59:48 -0400
-Subject: [PATCH 159/160] fix(polecat): stop claiming the WORK bead and re-key
+Subject: [PATCH 159/161] fix(polecat): stop claiming the WORK bead and re-key
  the live-owner guard to the molecule's last holder (gcp-952j9)
 
 The fork's polecat claimed its WORK bead in_progress for the whole run
