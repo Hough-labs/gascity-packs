@@ -6,6 +6,11 @@ RECONCILE="$ROOT/gastown/commands/pr-merge-reconcile/run.sh"
 CLEANUP="$ROOT/gastown/assets/scripts/task-artifact-cleanup.sh"
 REAL_GIT=$(command -v git)
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/gascity-pr-artifact-test.XXXXXX")
+# mktemp -d returns /var/folders/... on macOS, where /var is a symlink to
+# /private/var. Production writes artifact_dir in its pwd -P form, and the
+# cleanup script cannot resolve an artifact path that is already removed, so
+# the fixture must start physical too (gcp-xspkl).
+TMP=$(cd "$TMP" && pwd -P)
 trap 'rm -rf "$TMP"' EXIT
 
 BIN="$TMP/bin"

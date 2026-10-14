@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Wed, 14 Oct 2026 15:27:27 -0400
+Subject: [PATCH 162/162] fix(gastown): make test_pr_artifact_lifecycle's
+ fixture TMP physical on darwin (gcp-xspkl)
+
+test_pr_artifact_lifecycle.sh took TMP straight from mktemp -d. On macOS
+that is /var/folders/..., and /var is a symlink to /private/var, so the
+artifact_dir written to the fake bead was a non-physical path. The cleanup
+script canonicalises its city and rig namespace with pwd -P, and its
+missing-path branch cannot realpath an artifact that is already removed, so
+task_artifact_path_shape compared the raw /var/... string against the
+/private/var namespace and rejected it: ARTIFACT_CLEANUP_BLOCKED ... unsafe
+layout for it-1, exit 1. Linux CI passes because /tmp is physical there.
+
+The fixture was at fault, not the script. Production writes artifact_dir from
+validate_artifact_worktree, which returns the pwd -P form, so the pwd -P
+strictness in the cleanup script is the safety property and stays untouched.
+The fix resolves TMP physically right after mktemp, as
+test_polecat_artifact_dir.sh and test_shutdown_progress_lane_homes.sh already do.
+
+Validation (darwin, GIT_CONFIG_GLOBAL=/dev/null): the test was rc=1 with the
+unsafe-layout line before the change. After it, rc=0 with the default TMPDIR,
+with TMPDIR=/tmp, and with an already-physical TMPDIR. Deleting only the new
+line reproduces rc=1 and the same line.
+---
+ gastown/tests/test_pr_artifact_lifecycle.sh | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/gastown/tests/test_pr_artifact_lifecycle.sh b/gastown/tests/test_pr_artifact_lifecycle.sh
+index 6514face..508a1d28 100755
+--- a/gastown/tests/test_pr_artifact_lifecycle.sh
++++ b/gastown/tests/test_pr_artifact_lifecycle.sh
+@@ -6,6 +6,11 @@ RECONCILE="$ROOT/gastown/commands/pr-merge-reconcile/run.sh"
+ CLEANUP="$ROOT/gastown/assets/scripts/task-artifact-cleanup.sh"
+ REAL_GIT=$(command -v git)
+ TMP=$(mktemp -d "${TMPDIR:-/tmp}/gascity-pr-artifact-test.XXXXXX")
++# mktemp -d returns /var/folders/... on macOS, where /var is a symlink to
++# /private/var. Production writes artifact_dir in its pwd -P form, and the
++# cleanup script cannot resolve an artifact path that is already removed, so
++# the fixture must start physical too (gcp-xspkl).
++TMP=$(cd "$TMP" && pwd -P)
+ trap 'rm -rf "$TMP"' EXIT
+ 
+ BIN="$TMP/bin"
+-- 
+2.54.0 (Apple Git-157)
+

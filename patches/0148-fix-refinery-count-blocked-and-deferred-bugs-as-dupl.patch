@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sat, 10 Oct 2026 17:01:50 -0400
-Subject: [PATCH 148/161] fix(refinery): count blocked and deferred bugs as
+Subject: [PATCH 148/162] fix(refinery): count blocked and deferred bugs as
  duplicates too (gcp-fooz4)
 
 The duplicate check's --status list must exclude closed bugs and nothing
