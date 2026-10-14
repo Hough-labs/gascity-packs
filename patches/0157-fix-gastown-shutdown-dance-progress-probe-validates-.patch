@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Tue, 13 Oct 2026 21:35:04 -0400
-Subject: [PATCH 157/158] fix(gastown): shutdown-dance progress probe validates
+Subject: [PATCH 157/159] fix(gastown): shutdown-dance progress probe validates
  specialists lane homes (gcp-5unsj)
 
 validate_progress_artifact_dir accepted a provider home only when its parent

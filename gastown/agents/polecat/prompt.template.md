@@ -310,9 +310,12 @@ STEP_REF="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].metadata."gc.step_ref" // emp
 # duplicate declined by judgement, and had it not, it would have stomped a live
 # worktree. This block is that judgement made mechanical (gcp-mjjg).
 #
-# What makes the check possible is that the release only ever reaches the STEP.
-# The WORK bead carries no `gc.routed_to`, so it is not a release candidate and
-# its assignee survives as the durable record of who owns this molecule. Ask it.
+# What makes the check possible is that the release only touches the step's
+# status and assignee (ReleaseIfCurrent). The step's own `polecat_session`
+# survives it, and so does every sibling step's assignee, so the molecule keeps
+# a durable record of its last holder. Ask that. The WORK bead is never read:
+# the polecat does not claim it, and a crew seat's name on it is the slinger's,
+# not a holder's (gcp-952j9).
 #
 # "Is the owner us?" is a test against the session's whole identity SET, not
 # the one spelling EXPECTED_ASSIGNEE picks: the same session is its alias, its
@@ -336,23 +339,19 @@ claim_assignee_is_ours() {
 # off the ordinary step-to-step path, where a molecule's own preassigned steps
 # come back as `ready_assignment` every time. An unknown reason still checks.
 if [ -n "$STEP_REF" ] && { [ -z "$CLAIM_REASON" ] || [ "$CLAIM_REASON" = "claimed" ]; }; then
-  # Same derivation the formula's own steps use: step -> molecule root ->
-  # convoy -> the convoy's single child. Never a bare or guessed id.
+  # The molecule's last holder. Source 1 is the claimed step's own
+  # `polecat_session`, which gc's release and our hook claim both leave alone.
+  # Source 2 is required because mid-run steps are claimed with a bare
+  # `gc hook --claim` and carry no `polecat_session`: the most recently updated
+  # sibling step that still names an assignee stands in for it.
   GUARD_ROOT="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].metadata."gc.root_bead_id" // empty' 2>/dev/null)"
-  GUARD_CONVOY=""
-  [ -n "$GUARD_ROOT" ] && GUARD_CONVOY="$(gc bd show "$GUARD_ROOT" --json 2>/dev/null |
-    jq -r '.[0].metadata."gc.input_convoy_id" // .[0].metadata."gc.var.convoy_id" // empty' 2>/dev/null)"
-  GUARD_WORK_BEAD=""
-  [ -n "$GUARD_CONVOY" ] && GUARD_WORK_BEAD="$(gc convoy status "$GUARD_CONVOY" --json 2>/dev/null |
-    jq -r 'if (.children | length) == 1 then .children[0].id else empty end' 2>/dev/null)"
-  GUARD_OWNER=""
-  GUARD_OWNER_SID=""
-  if [ -n "$GUARD_WORK_BEAD" ]; then
-    GUARD_WORK_JSON="$(gc bd show "$GUARD_WORK_BEAD" --json 2>/dev/null)"
-    GUARD_OWNER="$(printf '%s' "$GUARD_WORK_JSON" | jq -r '.[0].assignee // empty' 2>/dev/null)"
-    GUARD_OWNER_SID="$(printf '%s' "$GUARD_WORK_JSON" | jq -r '.[0].metadata."gc.session_id" // empty' 2>/dev/null)"
+  GUARD_OWNER="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].metadata.polecat_session // empty' 2>/dev/null)"
+  if [ -z "$GUARD_OWNER" ] && [ -n "$GUARD_ROOT" ]; then
+    GUARD_OWNER="$(gc bd list --metadata-field "gc.root_bead_id=$GUARD_ROOT" --all --limit=0 --json 2>/dev/null |
+      jq -r --arg me "$WORK_ID" '[.[] | select(.id != $me and (.assignee // "") != "")]
+        | sort_by(.updated_at // "") | last | .assignee // empty' 2>/dev/null)"
   fi
-  if [ -z "$GUARD_WORK_BEAD" ] || [ -z "$GUARD_OWNER" ]; then
+  if [ -z "$GUARD_OWNER" ]; then
     # An unresolvable or unowned molecule is not evidence of a duplicate pour.
     # Proceed exactly as this block did before the guard existed.
     echo "WARN live-owner guard could not resolve an owner for this molecule; proceeding unguarded"
@@ -361,11 +360,11 @@ if [ -n "$STEP_REF" ] && { [ -z "$CLAIM_REASON" ] || [ "$CLAIM_REASON" = "claime
       # Another spelling of THIS session: gc 1.4.3 claimed under the runtime
       # session_name, a gc 1.5.0 namepool polecat acts under its alias. Its
       # live row is us, so probing liveness would decline our own molecule.
-      echo "WARN work bead $GUARD_WORK_BEAD names $GUARD_OWNER, another identity of this session ($EXPECTED_ASSIGNEE); it is ours."
+      echo "WARN molecule $GUARD_ROOT was last held by $GUARD_OWNER, another identity of this session ($EXPECTED_ASSIGNEE); it is ours."
     else
       # Someone else's name is on the molecule. Only a LIVE someone blocks: a
       # restarted session usually claims under a new identity, so a DEAD prior
-      # owner on the work bead is the ordinary resume case and must not stall
+      # holder is the ordinary resume case and must not stall
       # the engine.
       # `gc session list` omits closed sessions by default, so a hit there is
       # the liveness answer. asleep and draining count as alive — both still own
@@ -392,7 +391,7 @@ if [ -n "$STEP_REF" ] && { [ -z "$CLAIM_REASON" ] || [ "$CLAIM_REASON" = "claime
         sleep "$GUARD_TRY"
       done
       # Only a live WORKER blocks. A crew, specialist or mayor seat is always
-      # live and never runs polecat steps: when one is the work bead's assignee
+      # live and never runs polecat steps: when one is the molecule's last holder
       # it is the slinger, and declining would hand the step to a seat that will
       # not run it and strand the molecule (gcp-qjkp). A worker is a live row
       # whose template is EXACTLY the polecat or the refinery. A row with no
@@ -413,7 +412,7 @@ if [ -n "$STEP_REF" ] && { [ -z "$CLAIM_REASON" ] || [ "$CLAIM_REASON" = "claime
         # slot and the bead stays claimable, proceeding stomps a live worktree
         # and corrupts whatever the owner is mid-write on. Fail closed.
         echo "CLAIM_DECLINED_LIVE_OWNER $WORK_ID"
-        echo "  work bead $GUARD_WORK_BEAD is held by $GUARD_OWNER, and this session is $EXPECTED_ASSIGNEE."
+        echo "  molecule $GUARD_ROOT was last held by $GUARD_OWNER, and this session is $EXPECTED_ASSIGNEE."
         if [ "$GUARD_LIST_OK" -ne 1 ]; then
           echo "  session liveness was UNREADABLE after retries — declining rather than assuming the owner is gone."
         else
@@ -421,95 +420,34 @@ if [ -n "$STEP_REF" ] && { [ -z "$CLAIM_REASON" ] || [ "$CLAIM_REASON" = "claime
         fi
         echo "  Restoring the step to its owner and draining. No code, branch, or worktree touched."
         # The hook stamped OUR gc.session_id/gc.session_name onto the step
-        # during the claim. Put the owner's back. The session name is the live
-        # row's: GUARD_OWNER is an assignee, which under gc 1.5.0 is an alias or
-        # a session bead id, not the runtime session name gc reads from this
-        # key. When either value cannot be read, clear the key rather than leave
-        # ours standing — a wrong binding is worse than an absent one, and the
-        # owner's next write restores it.
+        # during the claim. Put the owner's back. Both come from the live row:
+        # GUARD_OWNER is an assignee, which under gc 1.5.0 is an alias or a
+        # session bead id, not the runtime session name or id gc reads from
+        # these keys. When either value cannot be read, clear the key rather
+        # than leave ours standing — a wrong binding is worse than an absent
+        # one, and the owner's next write restores it.
         gc bd update "$WORK_ID" --assignee="$GUARD_OWNER" \
           --set-metadata gc.session_name="$GUARD_OWNER_SN" \
           --set-metadata polecat_session="$GUARD_OWNER" \
-          --set-metadata gc.session_id="$GUARD_OWNER_SID" \
+          --set-metadata gc.session_id="$GUARD_ALIVE" \
           || echo "WARN could not restore $WORK_ID to $GUARD_OWNER — the step is left claimed by a session that will not run it; escalate to the witness"
         gc session nudge "${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}witness" \
-          "DUPLICATE_POUR declined: step $WORK_ID poured onto $EXPECTED_ASSIGNEE while work bead $GUARD_WORK_BEAD is held by $GUARD_OWNER. Step restored to its owner." \
+          "DUPLICATE_POUR declined: step $WORK_ID poured onto $EXPECTED_ASSIGNEE while molecule $GUARD_ROOT was last held by $GUARD_OWNER. Step restored to its owner." \
           >/dev/null 2>&1 || true
         gc runtime drain-ack
         exit 0
       fi
       if [ -n "$GUARD_ALIVE" ]; then
-        echo "WARN work bead $GUARD_WORK_BEAD is held by $GUARD_OWNER, a live $GUARD_OWNER_TPL session: that is the slinger, not a worker; proceeding."
+        echo "WARN molecule $GUARD_ROOT was last held by $GUARD_OWNER, a live $GUARD_OWNER_TPL session: that is the slinger, not a worker; proceeding."
       else
-        echo "WARN work bead $GUARD_WORK_BEAD still names $GUARD_OWNER, but no live session holds that identity — treating this as a resume and proceeding."
+        echo "WARN molecule $GUARD_ROOT was last held by $GUARD_OWNER, but no live session holds that identity — treating this as a resume and proceeding."
       fi
-    fi
-    # Take the work bead over, as workspace-setup's claim would. It is held
-    # in_progress for the whole run, bd >= 1.3.0 refuses a plain --assignee
-    # write over another actor's in_progress claim (and compares spellings, so
-    # an old spelling of this session counts as another actor), and nothing
-    # after this re-claims it: left where it is, submit-and-exit's step-6
-    # handoff to the refinery is refused with the branch already pushed.
-    # --if-assignee makes it a compare-and-set on the holder just read, so a
-    # bead that changed hands since is not stomped. The refinery and an operator
-    # escalation are never taken over; workspace-setup skips the same two.
-    GUARD_ROUTED_TO="$(printf '%s' "$GUARD_WORK_JSON" | jq -r '.[0].metadata."gc.routed_to" // empty' 2>/dev/null)"
-    if [ "$GUARD_OWNER" = "${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}refinery" ] || [ "$GUARD_ROUTED_TO" = "human" ]; then
-      echo "WARN work bead $GUARD_WORK_BEAD is held by the refinery or an operator escalation; leaving its assignee alone."
-    else
-      gc bd update "$GUARD_WORK_BEAD" --assignee="$EXPECTED_ASSIGNEE" \
-        --set-metadata polecat_session="$EXPECTED_ASSIGNEE" --if-assignee "$GUARD_OWNER" \
-        || echo "WARN could not take work bead $GUARD_WORK_BEAD over from $GUARD_OWNER; submit-and-exit cannot hand it to the refinery while another actor holds it — escalate to the witness"
     fi
   fi
 fi
 # GUARD_END live-owner
 
-# Ownership confirmed. Now make sure this is a STEP, not the work bead itself.
-# mol-polecat-work claims the WORK bead for the whole run (status=in_progress,
-# assignee=this session) so it stops sitting in `gc bd ready` where a second sling
-# can land on it. The cost is that `gc hook --claim`'s crash-recovery tier —
-# `gc bd list --status in_progress --assignee=<you> --limit=1` — can now hand that
-# work bead back instead of your next formula step. It happens at every step
-# boundary: the step you just closed is gone and its successor is still stored
-# `open`, so the work bead is the only in_progress match. Working it directly
-# skips self-review and submit-and-exit, and the branch is never pushed. When
-# the hook returns a bead carrying no `gc.step_ref`, re-point at the molecule's
-# next ready step. (gcp-tl8 is the same shape on the refinery: a held work bead
-# resumed as the patrol wisp on every restart.) `STEP_REF` was read above, for
-# the live-owner guard.
-if [ -z "$STEP_REF" ]; then
-  # An in-flight step comes first. `gc bd ready` is blocker-aware but EXCLUDES
-  # in_progress, so it cannot see a step this session already claimed — and the
-  # hook's recovery tier (`--status in_progress --assignee=<you> --limit=1`)
-  # matches BOTH that step and the held work bead, returning either one. Land on
-  # the work bead with `gc bd ready` as the only fallback and the re-point finds
-  # nothing, which is the stall it exists to prevent. Resume the claimed step.
-  NEXT_STEP_ID="$(gc bd list --assignee="$EXPECTED_ASSIGNEE" --status=in_progress \
-    --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null |
-    jq -r '.[0].id // empty' 2>/dev/null)"
-  # Otherwise take the next step the molecule has actually unblocked. This one
-  # must stay blocker-aware — an `open` step whose predecessor has not closed is
-  # not runnable, and jumping to it skips the step in between. Filtered to
-  # formula steps in jq rather than by a flag, so this stays readable on any bd
-  # the hook itself can drive.
-  [ -n "$NEXT_STEP_ID" ] ||
-    NEXT_STEP_ID="$(gc bd ready --assignee="$EXPECTED_ASSIGNEE" --limit=0 --json 2>/dev/null |
-      jq -r '[.[] | select((.metadata."gc.step_ref" // "") != "")] | .[0].id // empty' 2>/dev/null)"
-  if [ -n "$NEXT_STEP_ID" ] && [ "$NEXT_STEP_ID" != "$WORK_ID" ]; then
-    gc bd update "$NEXT_STEP_ID" --claim >/dev/null 2>&1 \
-      || echo "WARN could not claim step bead $NEXT_STEP_ID; it is already assigned to this session, so executing it anyway"
-    echo "STEP_REPOINTED hook returned work bead $WORK_ID; this session is mid-molecule, continuing with step $NEXT_STEP_ID"
-    WORK_ID="$NEXT_STEP_ID"
-    SHOW_JSON="$(gc bd show "$WORK_ID" --json 2>/dev/null)"
-    [ -n "$SHOW_JSON" ] ||
-      echo "WARN could not re-read $WORK_ID; run 'gc bd show $WORK_ID' before you start the step"
-  fi
-  # Neither query matching means the molecule has nothing runnable right now:
-  # keep the work bead, read your formula steps, and let the done sequence
-  # decide.
-fi
-
+# Ownership confirmed.
 # Stamp a stable session identity so the churn-watcher and the resume re-verify
 # can key on metadata.polecat_session.
 gc bd update "$WORK_ID" --set-metadata polecat_session="$EXPECTED_ASSIGNEE" \
@@ -530,27 +468,23 @@ falls through to unassigned pool work routed to
 `${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat`.
 
 `CLAIM_DECLINED_LIVE_OWNER` means the claim itself was clean — the step bead was
-genuinely open and unassigned when you took it — but the molecule's WORK bead is
-still held by another POLECAT or by the REFINERY that is still alive (or session
-liveness could not be read). That is a duplicate pour, not a handoff, and a clean
+genuinely open and unassigned when you took it — but the molecule was last held
+by another POLECAT or by the REFINERY that is still alive (or session liveness
+could not be read). That is a duplicate pour, not a handoff, and a clean
 claim cannot distinguish the two on its own: a step
 bead released out from under a live owner is byte-identical to one that was
-never claimed. The work bead is the tiebreaker because it is never routed to the
-pool and so is never released. Declining costs one pool slot; proceeding stomps
+never claimed. The molecule's last holder is the tiebreaker: it is the claimed
+step's own `polecat_session`, else the most recently updated sibling step that
+names an assignee, and a release never clears either. The work bead's assignee
+is never read. Declining costs one pool slot; proceeding stomps
 a live worktree, so the guard also declines when session liveness is unreadable.
 Do NOT re-run the claim to get a different answer, and do NOT work the bead
 anyway — the block has already restored the step to its owner and drained.
 
-A live crew, specialist or mayor seat on the work bead does not decline. That seat
-is the slinger, not a worker: it never runs polecat steps, so handing it the step
-would strand the molecule. The guard prints a `WARN` naming the seat, proceeds,
-and takes the work bead over from it.
-
-`STEP_REPOINTED` is not a bail-out and never drain-acks. It means the assigned
-tier handed back this session's own in-flight WORK bead — which
-`mol-polecat-work` holds `in_progress` for the whole run, so a second sling
-cannot land on it — instead of your next formula step, and the block moved you
-onto that step. The `CLAIMED_BEAD_ID` printed after it is the bead to run.
+A live crew, specialist or mayor seat as the molecule's last holder does not
+decline. That seat is the slinger, not a worker: it never runs polecat steps, so
+handing it the step would strand the molecule. The guard prints a `WARN` naming
+the seat and proceeds.
 
 **Resume / crash re-verify (FIRST action on restart).** A restart is a new
 session, and usually a new claim identity: gc 1.4.x and an unaliased gc 1.5.0
@@ -741,9 +675,9 @@ done
 # Only POSITIVE evidence counts: the bead is closed, or it is held by the
 # REFINERY — the one assignee submit-and-exit's handoff actually produces. Every
 # weaker test has been observed draining a session with the branch unpushed.
-# "Not in_progress for me" is not evidence: workspace-setup holds the work bead
-# in_progress for this session only from that step on, and never takes it from
-# the refinery or an operator escalation. Nor is a bare "assigned to
+# "Not in_progress for me" is not evidence: the polecat never claims the work
+# bead (only the refinery handoff writes its status and assignee), so what it
+# reads says nothing about this session. Nor is a bare "assigned to
 # somebody else", which is equally true of a resumed molecule finding the bead
 # still held by its own PREVIOUS session (a restarted session usually claims
 # under a new identity) and

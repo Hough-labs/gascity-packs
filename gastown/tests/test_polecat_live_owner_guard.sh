@@ -13,6 +13,11 @@
 # against a stubbed `gc` and assert that the refusal is now mechanical: a live
 # owner is declined and the step restored, a dead owner is not (that is the
 # ordinary post-restart resume, and stalling it would stall the engine).
+#
+# The owner is the molecule's LAST HOLDER, never the WORK bead's assignee (the
+# polecat does not claim the work bead; gcp-952j9): the claimed step's own
+# polecat_session, else the most recently updated sibling step that names an
+# assignee. run_guard seeds that sibling from its `owner` argument.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -52,6 +57,7 @@ case "$1 $2" in
             *) printf '[]' ;;
         esac
         ;;
+    "bd list") cat "$GC_LIST_JSON" ;; # gc-bd-argv-tail: case label matching the fake gc's argv tail
     "convoy status") cat "$GC_CONVOY_JSON" ;;
     "session list") cat "$GC_SESSIONS_JSON" ;;
     "bd update") exit "${GC_UPDATE_EXIT:-0}" ;; # gc-bd-argv-tail: case label matching the fake gc's argv tail
@@ -73,7 +79,12 @@ run_guard() {
     local dir="$1" owner_assignee="$2" me="$3" step_ref="${4-mol-polecat-work.implement}"
     local root_meta="${5-\"gc.root_bead_id\":\"winnow-5azcp\",}"
     local claim_reason="${6-claimed}"
-    local work_meta="${7-}"
+    # step_tag is the claimed step's own polecat_session; work_assignee seeds an
+    # assignee on the WORK bead, which the guard must never read.
+    local step_tag="${7-}" work_assignee="${8-}"
+    local tag_meta="" work_owner=""
+    [[ -z "$step_tag" ]] || tag_meta="\"polecat_session\":\"$step_tag\","
+    [[ -z "$work_assignee" ]] || work_owner="\"assignee\":\"$work_assignee\","
 
     cat >"$dir/root.json" <<'JSON'
 [{"id":"winnow-5azcp","status":"in_progress","metadata":{"gc.input_convoy_id":"winnow-0inqp"}}]
@@ -82,7 +93,15 @@ JSON
 {"children":[{"id":"winnow-pcpn6","status":"in_progress"}]}
 JSON
     cat >"$dir/work.json" <<JSON
-[{"id":"winnow-pcpn6","status":"in_progress","assignee":"$owner_assignee","metadata":{${work_meta}"gc.session_id":"gc-8a4d"}}]
+[{"id":"winnow-pcpn6","status":"open",${work_owner}"metadata":{"gc.session_id":"gc-8a4d"}}]
+JSON
+    # The molecule's steps: an older sibling held by a long-gone session, the
+    # last holder named by owner_assignee, and the claimed step itself with a
+    # LATER stamp, so a guard that fails to exclude its own step picks us.
+    cat >"$dir/list.json" <<JSON
+[{"id":"winnow-sib0","status":"closed","assignee":"winnow/gastown.old","updated_at":"2026-09-07T19:00:00Z","metadata":{"gc.root_bead_id":"winnow-5azcp"}},
+ {"id":"winnow-sib1","status":"closed","assignee":"$owner_assignee","updated_at":"2026-09-07T20:30:00Z","metadata":{"gc.root_bead_id":"winnow-5azcp"}},
+ {"id":"winnow-iaroy","status":"in_progress","assignee":"$me","updated_at":"2026-09-07T20:40:00Z","metadata":{"gc.root_bead_id":"winnow-5azcp"}}]
 JSON
     cat >"$dir/guard-harness.sh" <<HARNESS
 unset BEADS_ACTOR GC_ALIAS GC_SESSION_ID GC_SESSION_NAME GC_AGENT
@@ -92,7 +111,7 @@ WORK_ID="winnow-iaroy"
 EXPECTED_ASSIGNEE="$me"
 STEP_REF="$step_ref"
 CLAIM_REASON="$claim_reason"
-SHOW_JSON='[{"id":"winnow-iaroy","status":"in_progress","assignee":"$me","metadata":{${root_meta}"gc.step_ref":"$step_ref"}}]'
+SHOW_JSON='[{"id":"winnow-iaroy","status":"in_progress","assignee":"$me","metadata":{${root_meta}${tag_meta}"gc.step_ref":"$step_ref"}}]'
 GC_RIG="winnow"
 HARNESS
     cat "$dir/guard.sh" >>"$dir/guard-harness.sh"
@@ -100,7 +119,7 @@ HARNESS
 
     GC_CALLS="$dir/calls.log" \
         GC_ROOT_BEAD="winnow-5azcp" GC_ROOT_JSON="$dir/root.json" \
-        GC_WORK_BEAD="winnow-pcpn6" GC_WORK_JSON="$dir/work.json" \
+        GC_WORK_BEAD="winnow-pcpn6" GC_WORK_JSON="$dir/work.json" GC_LIST_JSON="$dir/list.json" \
         GC_CONVOY_JSON="$dir/convoy.json" GC_SESSIONS_JSON="$dir/sessions.json" \
         PATH="$dir/bin:$PATH" bash "$dir/guard-harness.sh"
 }
@@ -132,7 +151,7 @@ test_live_owner_is_declined_and_the_step_restored() {
     live_sessions "$dir"
 
     # The incident, exactly: nux/gc-psfm holds a clean claim on the implement
-    # step while furiosa/gc-8a4d still holds the work bead and is active.
+    # step while furiosa/gc-8a4d last held the molecule and is active.
     out=$(run_guard "$dir" "gastown__polecat-gc-8a4d" "gastown__polecat-gc-psfm")
 
     grep -F 'CLAIM_DECLINED_LIVE_OWNER winnow-iaroy' <<<"$out" >/dev/null ||
@@ -191,7 +210,7 @@ test_restore_takes_the_session_name_from_the_live_row() {
 # session's own molecule. Upstream #360 (9f98ea4e) settled this for the claim:
 # any of BEADS_ACTOR, GC_ALIAS, GC_SESSION_ID, GC_SESSION_NAME, GC_AGENT is us.
 test_own_molecule_under_another_spelling_is_not_declined() {
-    local dir out line
+    local dir out
     dir=$(new_case)
     live_sessions "$dir"
 
@@ -206,11 +225,10 @@ test_own_molecule_under_another_spelling_is_not_declined() {
         fail "the guard probed liveness for an owner that is one of this session's own identities"
     ! grep -F -- '--assignee=gastown__polecat-gc-psfm' "$dir/calls.log" >/dev/null ||
         fail "the guard restored the step as if to another owner"
-    # bd checks writes against BEADS_ACTOR, so the bead moves to the spelling
-    # this session acts under, or step 6's handoff is refused.
-    line=$(takeover_line winnow/gastown.nux "$dir" gastown__polecat-gc-psfm)
-    [[ -n "$line" ]] ||
-        fail "the work bead was left under the old spelling of this session: $(cat "$dir/calls.log")"
+    # Nothing is written: the work bead is not ours to move, and the step is
+    # already ours.
+    ! grep -F 'bd update' "$dir/calls.log" >/dev/null || # gc-bd-argv-tail: stub call log, not an invocation
+        fail "the guard wrote to a bead for this session's own molecule: $(cat "$dir/calls.log")"
 }
 
 test_dead_owner_is_a_resume_and_proceeds() {
@@ -231,66 +249,6 @@ JSON
         fail "a dead prior owner was wrongly treated as a live duplicate: $out"
     ! grep -F -- '--assignee=gastown__polecat-gc-8a4d' "$dir/calls.log" >/dev/null ||
         fail "resume path wrote the dead owner back onto the step"
-}
-
-# bd >= 1.3.0 refuses a plain --assignee write over another actor's in_progress
-# claim, and the WORK bead is held in_progress for the whole run (0060). A resume
-# that leaves it under the dead owner therefore fails submit-and-exit's step-6
-# handoff to the refinery with the branch already pushed, so the resume takes
-# the bead over, as a compare-and-set on the owner it just found dead.
-takeover_line() {
-    grep -F -- "winnow-pcpn6 --assignee=$1" "$2/calls.log" | grep -F -- "--if-assignee $3" || true
-}
-
-test_dead_owner_resume_takes_the_work_bead_over() {
-    local dir out line
-    dir=$(new_case)
-    cat >"$dir/sessions.json" <<'JSON'
-{"sessions":[{"id":"gc-psfm","name":"winnow/gastown.nux","session_name":"gastown__polecat-gc-psfm","state":"active","closed":false}]}
-JSON
-
-    out=$(run_guard "$dir" "gastown__polecat-gc-8a4d" "gastown__polecat-gc-psfm")
-
-    grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null || fail "the resume did not proceed: $out"
-    line=$(takeover_line gastown__polecat-gc-psfm "$dir" gastown__polecat-gc-8a4d)
-    [[ -n "$line" ]] ||
-        fail "the resume left the work bead under its dead owner, so step 6's handoff will be refused: $(cat "$dir/calls.log")"
-    [[ "$line" == *"--set-metadata polecat_session=gastown__polecat-gc-psfm"* ]] ||
-        fail "the takeover moved the assignee without polecat_session, which must ride along with it: $line"
-}
-
-test_resume_never_takes_over_from_the_refinery_or_an_escalation() {
-    local dir out
-    # The refinery is not running, so it reads as a dead owner. Taking its bead
-    # would pull a handed-off bead out of the merge queue; workspace-setup's
-    # claim skips the same two owners.
-    dir=$(new_case)
-    printf '{"sessions":[]}' >"$dir/sessions.json"
-    out=$(run_guard "$dir" "winnow/{{ .BindingPrefix }}refinery" "gastown__polecat-gc-psfm")
-    grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null || fail "the resume did not proceed: $out"
-    [[ -z "$(takeover_line gastown__polecat-gc-psfm "$dir" "winnow/{{ .BindingPrefix }}refinery")" ]] ||
-        fail "the resume took a work bead over from the refinery"
-
-    dir=$(new_case)
-    printf '{"sessions":[]}' >"$dir/sessions.json"
-    out=$(run_guard "$dir" "winnow/crew.valkyrie" "gastown__polecat-gc-psfm" \
-        "mol-polecat-work.implement" '"gc.root_bead_id":"winnow-5azcp",' "claimed" '"gc.routed_to":"human",')
-    grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null || fail "the resume did not proceed: $out"
-    [[ -z "$(takeover_line gastown__polecat-gc-psfm "$dir" winnow/crew.valkyrie)" ]] ||
-        fail "the resume pulled a gc.routed_to=human bead out of its operator escalation"
-}
-
-test_refused_takeover_warns_and_still_resumes() {
-    local dir out
-    dir=$(new_case)
-    printf '{"sessions":[]}' >"$dir/sessions.json"
-
-    # 13 is bd's stale --if-assignee exit: the bead changed hands since the read.
-    out=$(GC_UPDATE_EXIT=13 run_guard "$dir" "gastown__polecat-gc-8a4d" "gastown__polecat-gc-psfm")
-
-    grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null || fail "a refused takeover stalled the resume: $out"
-    grep -F 'WARN could not take work bead winnow-pcpn6 over from gastown__polecat-gc-8a4d' <<<"$out" >/dev/null ||
-        fail "a refused takeover passed silently: $out"
 }
 
 test_closed_session_still_listed_is_not_live() {
@@ -356,21 +314,20 @@ test_unresolvable_molecule_proceeds_unguarded() {
         fail "an unresolvable molecule blocked the engine: $out"
 }
 
-test_work_bead_claim_skips_the_guard() {
+test_non_step_claim_skips_the_guard() {
     local dir out
     dir=$(new_case)
     live_sessions "$dir"
 
-    # No gc.step_ref means the hook handed back the WORK bead itself, which
-    # post-claim ownership verification has already proved is ours. There is no
-    # foreign owner to find, and the convoy walk would be three wasted reads on
+    # No gc.step_ref means the claim is not a formula step, so there is no
+    # molecule to find a last holder in, and the lookup would be wasted reads on
     # the hot startup path.
     out=$(run_guard "$dir" "gastown__polecat-gc-8a4d" "gastown__polecat-gc-psfm" "")
 
     grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null ||
-        fail "a work-bead claim was blocked by the step guard: $out"
-    ! grep -F 'convoy status' "$dir/calls.log" >/dev/null ||
-        fail "the guard walked the convoy for a bead carrying no gc.step_ref"
+        fail "a claim carrying no gc.step_ref was blocked by the step guard: $out"
+    [[ ! -s "$dir/calls.log" ]] ||
+        fail "the guard read bead state for a claim carrying no gc.step_ref: $(cat "$dir/calls.log")"
 }
 
 test_preassigned_step_skips_the_walk_entirely() {
@@ -406,11 +363,11 @@ test_unknown_claim_reason_still_checks() {
 }
 
 # gcp-qjkp: a crew, specialist or mayor seat is always live and never runs
-# polecat steps. When one is still the work bead's assignee it is the slinger,
-# not a worker, and declining would hand the step to a seat that will not run
-# it. Only a live POLECAT or REFINERY owner is a worker.
+# polecat steps. When one is the molecule's last holder it is the slinger, not a
+# worker, and declining would hand the step to a seat that will not run it. Only
+# a live POLECAT or REFINERY owner is a worker.
 test_live_crew_owner_is_the_slinger_and_proceeds() {
-    local dir out line
+    local dir out
     dir=$(new_case)
     live_sessions "$dir"
 
@@ -428,9 +385,66 @@ test_live_crew_owner_is_the_slinger_and_proceeds() {
         fail "the guard nudged the witness about a crew slinger"
     ! grep -F 'runtime drain-ack' "$dir/calls.log" >/dev/null ||
         fail "the guard drained on a crew slinger"
-    line=$(takeover_line winnow/gastown.nux "$dir" winnow/specialists.thomas)
-    [[ -n "$line" ]] ||
-        fail "the work bead was not taken over from the crew seat: $(cat "$dir/calls.log")"
+}
+
+# The WORK bead is unclaimed for the whole run, so with nobody on it the guard
+# must still find a duplicate pour: a live polecat last held the molecule.
+test_duplicate_pour_declines_with_the_work_bead_unclaimed() {
+    local dir out
+    dir=$(new_case)
+    live_sessions "$dir"
+
+    out=$(run_guard "$dir" "winnow/gastown.furiosa" "winnow/gastown.nux")
+
+    ! grep -F '"assignee"' "$dir/work.json" >/dev/null ||
+        fail "fixture error: the work bead should be unassigned"
+    grep -F 'CLAIM_DECLINED_LIVE_OWNER winnow-iaroy' <<<"$out" >/dev/null ||
+        fail "a duplicate pour was not declined with the work bead unclaimed: $out"
+    grep -F 'molecule winnow-5azcp was last held by winnow/gastown.furiosa' <<<"$out" >/dev/null ||
+        fail "decline did not name the molecule's last holder: $out"
+    ! grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null ||
+        fail "guard declined but still fell through to the work"
+}
+
+# A released step keeps its own polecat_session (ReleaseIfCurrent touches only
+# status and assignee), so that stamp names the holder before any sibling does.
+test_released_step_names_its_own_last_holder() {
+    local dir out
+    dir=$(new_case)
+    live_sessions "$dir"
+
+    # The siblings say the crew seat; the step's own stamp says furiosa. The
+    # stamp wins, and the sibling lookup is never made.
+    out=$(run_guard "$dir" "winnow/specialists.thomas" "winnow/gastown.nux" \
+        "mol-polecat-work.implement" '"gc.root_bead_id":"winnow-5azcp",' "claimed" \
+        "gastown__polecat-gc-8a4d")
+
+    grep -F 'CLAIM_DECLINED_LIVE_OWNER winnow-iaroy' <<<"$out" >/dev/null ||
+        fail "a released step did not name its own last holder: $out"
+    grep -F 'was last held by gastown__polecat-gc-8a4d' <<<"$out" >/dev/null ||
+        fail "decline named the sibling instead of the step's own stamp: $out"
+    ! grep -F -- '--metadata-field' "$dir/calls.log" >/dev/null ||
+        fail "the guard listed sibling steps although the step named its holder: $(cat "$dir/calls.log")"
+}
+
+# A crew seat on the WORK bead is the slinger's name, not a holder's. The guard
+# must not read it, so it neither declines on it nor takes it over.
+test_crew_assignee_on_the_work_bead_is_never_read() {
+    local dir out
+    dir=$(new_case)
+    live_sessions "$dir"
+
+    # The last holder is a dead polecat: an ordinary resume.
+    out=$(run_guard "$dir" "gastown__polecat-gc-dead" "winnow/gastown.nux" \
+        "mol-polecat-work.implement" '"gc.root_bead_id":"winnow-5azcp",' "claimed" \
+        "" "winnow/specialists.thomas")
+
+    grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null ||
+        fail "a crew assignee on the work bead stalled the resume: $out"
+    ! grep -F 'CLAIM_DECLINED_LIVE_OWNER' <<<"$out" >/dev/null ||
+        fail "a crew assignee on the work bead was read as the holder: $out"
+    ! grep -F 'winnow-pcpn6' "$dir/calls.log" >/dev/null ||
+        fail "the guard touched the work bead: $(cat "$dir/calls.log")"
 }
 
 test_live_refinery_owner_is_still_declined() {
@@ -469,18 +483,18 @@ test_live_owner_is_declined_and_the_step_restored
 test_restore_takes_the_session_name_from_the_live_row
 test_dead_owner_is_a_resume_and_proceeds
 test_own_molecule_under_another_spelling_is_not_declined
-test_dead_owner_resume_takes_the_work_bead_over
-test_resume_never_takes_over_from_the_refinery_or_an_escalation
-test_refused_takeover_warns_and_still_resumes
 test_closed_session_still_listed_is_not_live
 test_own_molecule_proceeds_without_probing_liveness
 test_unreadable_liveness_fails_closed
 test_unresolvable_molecule_proceeds_unguarded
-test_work_bead_claim_skips_the_guard
+test_non_step_claim_skips_the_guard
 test_preassigned_step_skips_the_walk_entirely
 test_unknown_claim_reason_still_checks
 test_live_crew_owner_is_the_slinger_and_proceeds
 test_live_refinery_owner_is_still_declined
 test_live_owner_without_a_template_fails_closed
+test_duplicate_pour_declines_with_the_work_bead_unclaimed
+test_released_step_names_its_own_last_holder
+test_crew_assignee_on_the_work_bead_is_never_read
 
 echo "polecat live-owner guard tests passed"

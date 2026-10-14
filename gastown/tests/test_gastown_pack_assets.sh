@@ -334,10 +334,11 @@ test_claim_verify_separates_read_failure_from_unassigned() {
 test_claim_refuses_a_pour_onto_a_live_owner() {
     # gcp-mjjg: gc's ReleaseIfCurrent returns an in-flight step bead to the pool
     # without writing a bd event, so a duplicate pour is indistinguishable from
-    # ordinary unclaimed work at claim time. The molecule's WORK bead carries no
-    # gc.routed_to and so is never released — it is the only durable record of
-    # who owns the molecule, and the guard must consult it before any work
-    # begins. Behavioural coverage lives in test_polecat_live_owner_guard.sh;
+    # ordinary unclaimed work at claim time. The step's own polecat_session and
+    # its siblings' assignees survive that release, so they are the durable
+    # record of who last held the molecule, and the guard must consult them
+    # before any work begins (the WORK bead is never read; gcp-952j9).
+    # Behavioural coverage lives in test_polecat_live_owner_guard.sh;
     # this pins the guard into the startup contract so it cannot be quietly
     # dropped from the claim block.
     local prompt="$GASTOWN/agents/polecat/prompt.template.md"
@@ -353,8 +354,7 @@ test_claim_refuses_a_pour_onto_a_live_owner() {
 
     # The guard runs BEFORE the step re-point and the polecat_session stamp:
     # both mutate bead state, and a declining polecat must touch nothing. The
-    # stamp is the write on the claimed bead; a resume's takeover of the WORK
-    # bead inside the guard also names this session, after the decline paths.
+    # stamp is the write on the claimed bead.
     local guard_line stamp_line
     guard_line=$(grep -n '# GUARD_END live-owner' "$prompt" | head -1 | cut -d: -f1)
     stamp_line=$(grep -n '"\$WORK_ID" --set-metadata polecat_session="\$EXPECTED_ASSIGNEE"' "$prompt" | head -1 | cut -d: -f1)
@@ -1109,10 +1109,9 @@ PY
 
     # The prompt-side guard could not run at all in the observed session:
     # $GC_BEAD_ID was empty, so it never resolved a work bead. Both copies must
-    # recover the convoy, and both must key on POSITIVE evidence — the work
-    # bead is in_progress for this session only once workspace-setup claims it,
-    # so "not in_progress for me" reports already-submitted on work that was
-    # never submitted.
+    # recover the convoy, and both must key on POSITIVE evidence — the polecat
+    # never claims the work bead, so "not in_progress for me" reports
+    # already-submitted on work that was never submitted.
     local guard
     for guard in "$prompt" "$fragment"; do
         grep -F 'CONVOY_ID="${GC_BEAD_ID:-}"' "$guard" >/dev/null ||
@@ -1153,164 +1152,90 @@ PY
     done
 }
 
-test_work_bead_is_claimed_for_the_whole_run() {
-    # gcp-5gir: mol-polecat-work only ever claimed its own STEP beads, so the
-    # WORK bead stayed open+unassigned from dispatch until the refinery handoff.
-    # For the whole implementation window it was indistinguishable, in
-    # `gc bd ready`, from a bead nobody had touched — and a second `gc sling` onto
-    # it spawns a duplicate polecat whose later push supersedes the first,
-    # discarding work that was already written and self-reviewed.
-    local formula prompt fragment setup_block submit_block
+test_work_bead_is_never_claimed() {
+    # gcp-952j9 retired the work-bead claim (gcp-5gir / gcp-cvbs / 0060). The
+    # polecat holds only its STEP beads. Upstream's model: the work bead is
+    # served to no pool query while it is unassigned (the graph.v2 sling never
+    # stamps gc.routed_to on it) and `gc sling` refuses a second pour onto a live
+    # workflow, so only the step-6 refinery handoff writes its status and
+    # assignee. The claim was also the only reason `gc hook --claim` ever handed
+    # the work bead back, which is what forced STEP_REPOINTED, the
+    # `gc.step_ref` close fallback and the `--if-assignee` takeover. All of that
+    # stays gone.
+    local formula prompt fragment
     formula="$GASTOWN/formulas/mol-polecat-work.toml"
     prompt="$GASTOWN/agents/polecat/prompt.template.md"
     fragment="$GASTOWN/template-fragments/approval-fallacy.template.md"
 
     parse_toml "$formula"
 
-    setup_block=$(python3 - "$formula" <<'PY'
+    # No step claims the work bead: no in_progress status, no --claim, and no
+    # --assignee other than the refinery handoff and the release back to the
+    # pool. A logical statement is a line plus its backslash continuations.
+    python3 - "$formula" <<'PY' || fail "a step of mol-polecat-work claims the WORK bead; only the refinery handoff may write its status and assignee"
+import re
 import sys
 import tomllib
 
 data = tomllib.load(open(sys.argv[1], "rb"))
-step = next(s for s in data["steps"] if s["id"] == "workspace-setup")
-print(step["description"])
+bad = []
+for step in data["steps"]:
+    text = re.sub(r"\\\n\s*", " ", step["description"])
+    for stmt in re.findall(r'gc bd update "\$WORK_BEAD_ID"[^\n]*', text):
+        if "--status=in_progress" in stmt or "--claim" in stmt:
+            bad.append((step["id"], stmt))
+        for value in re.findall(r"--assignee=(\S+)", stmt):
+            if value not in ('""', '"$REFINERY_TARGET"'):
+                bad.append((step["id"], stmt))
+if bad:
+    for item in bad:
+        print(item, file=sys.stderr)
+    raise SystemExit(1)
 PY
-)
-    submit_block=$(python3 - "$formula" <<'PY'
+
+    # The retired workarounds must not come back: the step re-point, the
+    # compare-and-set takeover, and the close fallback that tolerated a hook
+    # that named the work bead.
+    local file
+    for file in "$prompt" "$formula"; do
+        ! grep -F 'STEP_REPOINTED' "$file" >/dev/null ||
+            fail "$(basename "$file") re-points a work-bead hook result onto a step; the work bead is never claimed, so the hook never returns it"
+    done
+    ! grep -F -- '--if-assignee' "$prompt" "$formula" >/dev/null ||
+        fail "an --if-assignee takeover is back; there is no claim on the work bead to take over"
+    ! grep -F 'tier 2' "$formula" >/dev/null ||
+        fail "submit-and-exit regained its gc.step_ref close fallback"
+    ! grep -F 'gc hook current --id-only 2>/dev/null' "$formula" >/dev/null ||
+        fail "submit-and-exit tolerates an unreadable gc hook current; it must fail closed"
+    ! grep -F 'CLAIM_GUARD_BEGIN' "$formula" >/dev/null ||
+        fail "workspace-setup regained the work-bead claim block"
+
+    # What carries the handoff is still there: the single step-6 write that
+    # moves the bead to the refinery, and the done-sequence guards that tell a
+    # completed handoff by the refinery's identity.
+    python3 - "$formula" <<'PY' || fail "submit-and-exit must hand the work bead straight to the refinery"
 import sys
 import tomllib
 
 data = tomllib.load(open(sys.argv[1], "rb"))
 step = next(s for s in data["steps"] if s["id"] == "submit-and-exit")
-print(step["description"])
-PY
-)
-
-    # The claim itself. Status AND assignee: status alone leaves the witness's
-    # orphan pass blind (it skips unassigned beads), assignee alone leaves the
-    # bead in `gc bd ready`, which is the defect.
-    [[ "$setup_block" == *'gc bd update "$WORK_BEAD_ID" --status=in_progress --assignee="$POLECAT_SESSION"'* ]] ||
-        fail "workspace-setup must claim the WORK bead with both status=in_progress and an assignee"
-
-    # It has to happen before the worktree is built, not somewhere later: every
-    # second the bead spends open+unassigned is a second another planner can
-    # sling a duplicate polecat onto it.
-    python3 - "$formula" <<'PY' || fail "the work-bead claim must land in step 1, before the worktree is created"
-import sys
-import tomllib
-
-data = tomllib.load(open(sys.argv[1], "rb"))
-step = next(s for s in data["steps"] if s["id"] == "workspace-setup")
-text = step["description"]
-claim = text.index('gc bd update "$WORK_BEAD_ID" --status=in_progress')
-if claim >= text.index("**2. Ensure a safe per-bead artifact worktree exists.**"):
+if 'gc bd update "$WORK_BEAD_ID" --status=open --assignee="$REFINERY_TARGET"' not in step["description"]:
+    raise SystemExit(1)
+if "HANDOFF_FAILED" not in step["description"]:
     raise SystemExit(1)
 PY
-
-    # A write that exits 0 is not a claim: `--status` on this bead has been seen
-    # not to stick (gcp-s14g), and a status that stays `open` leaves it in
-    # `gc bd ready` with the fix reading as applied.
-    [[ "$setup_block" == *'CLAIMED_STATUS'* && "$setup_block" == *'CLAIMED_ASSIGNEE'* ]] ||
-        fail "workspace-setup must read the work-bead claim back instead of trusting the write"
-
-    # The done sequence, the resume re-verify and the worktree reaper all read
-    # `assignee == polecat_session` as "a polecat still holds this". Stamping
-    # only the assignee leaves a crashed predecessor's tag behind, and the bead
-    # reads as already handed to the refinery.
-    [[ "$setup_block" == *'--assignee="$POLECAT_SESSION" --set-metadata polecat_session="$POLECAT_SESSION"'* ]] ||
-        fail "the work-bead claim must stamp polecat_session together with the assignee"
-
-    # Never steal a bead the refinery or an operator escalation already owns —
-    # and never mistake "any assignee" for that. gcp-cvbs: the guard used to
-    # skip the claim for every non-empty assignee, which is the ordinary shape
-    # of planned work (the crew seat that filed it), so the bead stayed open in
-    # `gc bd ready` all run and a second molecule was poured on it. The skip
-    # must name its two owners. Behaviour is covered end-to-end in
-    # test_polecat_work_bead_claim_guard.sh; these pin the condition itself.
-    [[ "$setup_block" == *'[ "$CURRENT_ASSIGNEE" = "$REFINERY_TARGET" ]'* ]] ||
-        fail "the claim must identify a refinery-held bead by identity, not by 'somebody else holds it'"
-    [[ "$setup_block" == *'[ "$CURRENT_ROUTED_TO" = "human" ]'* ]] ||
-        fail "the claim must recognise the gc.routed_to=human operator escalation"
-    [[ "$setup_block" != *'if [ -n "$CURRENT_ASSIGNEE" ] && [ "$CURRENT_ASSIGNEE" != "$POLECAT_SESSION" ]'* ]] ||
-        fail "the claim skip is back to 'any assignee that is not me', which voids it on every crew-authored bead"
-
-    # The bead's own note: pool dispatch leaves gc.routed_to blank on the work
-    # bead on purpose so scale_check can see pool demand. Stamping it here
-    # breaks spawn accounting instead of fixing visibility. READING the key is
-    # how the escalation above is recognised, so the ban is on the write.
-    [[ "$setup_block" != *'set-metadata gc.routed_to'* ]] ||
-        fail "the work-bead claim must not stamp gc.routed_to; routing lives on the molecule root"
-    [[ "$setup_block" != *'unset-metadata gc.routed_to'* ]] ||
-        fail "the work-bead claim must not clear gc.routed_to; submit-and-exit is the single release point"
-
-    # Release is a single assignee move, session -> refinery. A release that
-    # passed through unassigned would re-open the very window this closes.
-    [[ "$submit_block" == *'gc bd update "$WORK_BEAD_ID" --status=open --assignee="$REFINERY_TARGET"'* ]] ||
-        fail "submit-and-exit must hand the work bead straight to the refinery"
-
-    # Holding the claim means `gc hook --claim`'s crash-recovery tier
-    # (`gc bd list --status in_progress --assignee=<you> --limit=1`) can return the
-    # WORK bead instead of the next formula step — at every step boundary, where
-    # the successor step is still stored `open`. Without the re-point the
-    # molecule stops advancing and the branch is never pushed (gcp-tl8's shape).
-    grep -F 'gc.step_ref" // empty' "$prompt" >/dev/null ||
-        fail "the startup claim block must detect a hook result that is not a formula step"
-    grep -F 'STEP_REPOINTED' "$prompt" >/dev/null ||
-        fail "the startup claim block must re-point at the molecule's next ready step"
-
-    # `gc bd ready` is blocker-aware but EXCLUDES in_progress, so on its own it
-    # cannot see a step this session already claimed. The hook's recovery tier
-    # matches the in-flight step AND the held work bead and returns either, so a
-    # ready-only re-point silently finds nothing on the work-bead outcome — the
-    # stall it exists to prevent. Resume the claimed step before falling back.
-    python3 - "$prompt" <<'PY' || fail "the step re-point must look for an in_progress step bead before falling back to the blocker-aware gc bd ready query"
-import sys
-
-text = open(sys.argv[1], encoding="utf-8").read()
-block = text[text.index("bash <<'GC_CLAIM'"): text.index("GC_CLAIM\n```")]
-inflight = block.index('--status=in_progress \\\n    --has-metadata-key gc.step_ref')
-if inflight >= block.index("gc bd ready --assignee="):
-    raise SystemExit(1)
-PY
-
-    # The fallback must stay `gc bd ready`, not a bare `gc bd list` over open
-    # steps: an `open` step whose predecessor has not closed is not runnable,
-    # and jumping to it skips the step in between.
-    [[ "$(grep -c -F 'gc bd ready --assignee=' "$prompt")" == "1" ]] ||
-        fail "the step re-point's fallback must remain the single blocker-aware gc bd ready query"
-    python3 - "$prompt" <<'PY' || fail "the step re-point must run before the polecat_session stamp, so the stamp lands on the bead actually being executed"
-import sys
-
-text = open(sys.argv[1], encoding="utf-8").read()
-block = text[text.index("bash <<'GC_CLAIM'"): text.index("GC_CLAIM\n```")]
-if "STEP_REPOINTED" not in block:
-    raise SystemExit(1)
-# Match the STAMP precisely, not any polecat_session write: the live-owner
-# guard also writes that key when it restores a step to its owner, and when a
-# resume takes the WORK bead over, and both legitimately precede the re-point.
-# The stamp is the one that names THIS session on the bead being executed.
-if block.index("STEP_REPOINTED") >= block.index('"$WORK_ID" --set-metadata polecat_session="$EXPECTED_ASSIGNEE"'):
-    raise SystemExit(1)
-PY
-
-    # A resumed molecule finds its work bead held by its own PREVIOUS session
-    # (pool restarts mint a new identity). Reading that as "handed off" drains
-    # with the branch unpushed — the failure the guard exists to prevent. The
-    # escape used to be an explicit `assignee != metadata.polecat_session`
-    # exception; gcp-0pa4 replaced it with the positive
-    # `assignee == $REFINERY_TARGET` test, which excludes a predecessor session
-    # and every other non-refinery identity by construction. Pin the property,
-    # not the mechanism: no polecat session identity is ever the refinery target.
     local guard
     for guard in "$prompt" "$fragment"; do
         grep -F '[ "$WORK_ASSIGNEE" = "$REFINERY_TARGET" ]' "$guard" >/dev/null ||
-            fail "$(basename "$guard") must not read a previous polecat session's own claim as a completed handoff"
+            fail "$(basename "$guard") must tell a completed handoff by the refinery's identity"
+        grep -F 'the polecat never claims the work' "$guard" >/dev/null ||
+            fail "$(basename "$guard") still describes a claimed work bead"
     done
 }
 
 test_dog_assets_are_pack_local
 test_retired_dog_formulas_are_not_reintroduced
-test_work_bead_is_claimed_for_the_whole_run
+test_work_bead_is_never_claimed
 test_submit_and_exit_cannot_be_replayed
 test_polecat_home_teardown_has_an_owner
 test_dolt_push_outage_detection_is_wired

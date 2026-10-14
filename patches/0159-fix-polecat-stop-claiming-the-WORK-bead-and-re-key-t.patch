@@ -1,0 +1,1896 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Tue, 13 Oct 2026 22:59:48 -0400
+Subject: [PATCH 159/159] fix(polecat): stop claiming the WORK bead and re-key
+ the live-owner guard to the molecule's last holder (gcp-952j9)
+
+The fork's polecat claimed its WORK bead in_progress for the whole run
+(gcp-5gir's claim, hardened by gcp-cvbs's work-bead claim guard). That claim
+forced two interim workarounds in the restack: de377194's re-pointed-step close
+(a gc.step_ref fallback when `gc hook current` is not this session's
+submit-and-exit step) and a0c62491's --if-assignee takeover (bd >= 1.3 refuses
+to reassign another actor's in_progress bead), plus the STEP_REPOINTED block in
+the startup claim. The claim was also the only reason `gc hook --claim` ever
+handed the WORK bead back, through its crash-recovery tier.
+
+Upstream never claims WORK and only the refinery handoff writes it. That is
+safe: the pool's tier-3 query serves only beads carrying gc.routed_to=<pool>
+with no assignee, the graph.v2 sling never stamps gc.routed_to on WORK, and
+`gc sling` refuses a second pour onto a live workflow. So this commit retires
+the claim and everything it forced:
+
+- workspace-setup step 1 loses the claim span (CLAIM_GUARD work-bead block and
+  prose). The base-resolve edit from gcp-19hoi stays byte-for-byte.
+- submit-and-exit's twelve drain sites return to #490's three-line form
+  (`gc hook current --id-only` || exit 1, then the in-progress submit-and-exit
+  check). This is `git revert` of de377194, minus its dead STEP_SESSION.
+  HANDOFF_FAILED stays: it still guards a genuinely refused write.
+- the polecat prompt drops the --if-assignee takeover arm and STEP_REPOINTED.
+- the live-owner guard no longer reads the WORK bead's assignee, which nothing
+  sets now. It keys on the molecule's last holder: the claimed step's own
+  polecat_session (a release touches only status and assignee), else the most
+  recently updated sibling step that names an assignee. qjkp's decision block
+  is unchanged, so a live crew seat as last holder still proceeds; the restore
+  takes gc.session_id from the live row.
+
+Tests: test_polecat_work_bead_claim_guard.sh and its allowlist row go.
+test_polecat_live_owner_guard.sh seeds the last holder from a sibling step
+(17 cases: three takeover cases out, test_duplicate_pour_declines_with_the_
+work_bead_unclaimed, test_released_step_names_its_own_last_holder and
+test_crew_assignee_on_the_work_bead_is_never_read in).
+test_work_bead_is_claimed_for_the_whole_run becomes
+test_work_bead_is_never_claimed. The drain-ack test keeps the 12 "hook names the
+step" cases and gains 24 that refuse when the hook names the WORK bead or
+cannot answer. test_polecat_artifact_dir.sh loses its claim-call scaffolding.
+
+Follow-up: the resume re-verify still keys on the WORK assignee (gcp-o1nij).
+Pin transition: move the city pin past this merge only when no in-progress
+WORK bead still carries a polecat_session equal to its assignee.
+
+Fold at the next baseline upgrade: drop the retired patches and fix up this commit's remaining hunks into their introducing patches; the replayed tree must equal the pre-fold tree (gcp-k6301).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ gastown/agents/polecat/prompt.template.md     | 158 +++--------
+ gastown/formulas/mol-polecat-work.toml        | 262 ++++-------------
+ .../approval-fallacy.template.md              |   6 +-
+ gastown/tests/test_gastown_pack_assets.sh     | 207 +++++---------
+ gastown/tests/test_polecat_artifact_dir.sh    |  54 ++--
+ .../tests/test_polecat_live_owner_guard.sh    | 192 +++++++------
+ .../test_polecat_work_bead_claim_guard.sh     | 264 ------------------
+ scripts/gascity_pack_inference_gate.py        |   2 +-
+ tests/test_gascity_pack_inference_gate.py     |   4 +-
+ tests/test_no_bare_bd_commands.py             |  15 +-
+ tests/test_v2_drain_ack_closes_own_step.py    |  56 ++--
+ 11 files changed, 313 insertions(+), 907 deletions(-)
+ delete mode 100755 gastown/tests/test_polecat_work_bead_claim_guard.sh
+
+diff --git a/gastown/agents/polecat/prompt.template.md b/gastown/agents/polecat/prompt.template.md
+index 94d293f1..86b681a4 100644
+--- a/gastown/agents/polecat/prompt.template.md
++++ b/gastown/agents/polecat/prompt.template.md
+@@ -310,9 +310,12 @@ STEP_REF="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].metadata."gc.step_ref" // emp
+ # duplicate declined by judgement, and had it not, it would have stomped a live
+ # worktree. This block is that judgement made mechanical (gcp-mjjg).
+ #
+-# What makes the check possible is that the release only ever reaches the STEP.
+-# The WORK bead carries no `gc.routed_to`, so it is not a release candidate and
+-# its assignee survives as the durable record of who owns this molecule. Ask it.
++# What makes the check possible is that the release only touches the step's
++# status and assignee (ReleaseIfCurrent). The step's own `polecat_session`
++# survives it, and so does every sibling step's assignee, so the molecule keeps
++# a durable record of its last holder. Ask that. The WORK bead is never read:
++# the polecat does not claim it, and a crew seat's name on it is the slinger's,
++# not a holder's (gcp-952j9).
+ #
+ # "Is the owner us?" is a test against the session's whole identity SET, not
+ # the one spelling EXPECTED_ASSIGNEE picks: the same session is its alias, its
+@@ -336,23 +339,19 @@ claim_assignee_is_ours() {
+ # off the ordinary step-to-step path, where a molecule's own preassigned steps
+ # come back as `ready_assignment` every time. An unknown reason still checks.
+ if [ -n "$STEP_REF" ] && { [ -z "$CLAIM_REASON" ] || [ "$CLAIM_REASON" = "claimed" ]; }; then
+-  # Same derivation the formula's own steps use: step -> molecule root ->
+-  # convoy -> the convoy's single child. Never a bare or guessed id.
++  # The molecule's last holder. Source 1 is the claimed step's own
++  # `polecat_session`, which gc's release and our hook claim both leave alone.
++  # Source 2 is required because mid-run steps are claimed with a bare
++  # `gc hook --claim` and carry no `polecat_session`: the most recently updated
++  # sibling step that still names an assignee stands in for it.
+   GUARD_ROOT="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].metadata."gc.root_bead_id" // empty' 2>/dev/null)"
+-  GUARD_CONVOY=""
+-  [ -n "$GUARD_ROOT" ] && GUARD_CONVOY="$(gc bd show "$GUARD_ROOT" --json 2>/dev/null |
+-    jq -r '.[0].metadata."gc.input_convoy_id" // .[0].metadata."gc.var.convoy_id" // empty' 2>/dev/null)"
+-  GUARD_WORK_BEAD=""
+-  [ -n "$GUARD_CONVOY" ] && GUARD_WORK_BEAD="$(gc convoy status "$GUARD_CONVOY" --json 2>/dev/null |
+-    jq -r 'if (.children | length) == 1 then .children[0].id else empty end' 2>/dev/null)"
+-  GUARD_OWNER=""
+-  GUARD_OWNER_SID=""
+-  if [ -n "$GUARD_WORK_BEAD" ]; then
+-    GUARD_WORK_JSON="$(gc bd show "$GUARD_WORK_BEAD" --json 2>/dev/null)"
+-    GUARD_OWNER="$(printf '%s' "$GUARD_WORK_JSON" | jq -r '.[0].assignee // empty' 2>/dev/null)"
+-    GUARD_OWNER_SID="$(printf '%s' "$GUARD_WORK_JSON" | jq -r '.[0].metadata."gc.session_id" // empty' 2>/dev/null)"
++  GUARD_OWNER="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].metadata.polecat_session // empty' 2>/dev/null)"
++  if [ -z "$GUARD_OWNER" ] && [ -n "$GUARD_ROOT" ]; then
++    GUARD_OWNER="$(gc bd list --metadata-field "gc.root_bead_id=$GUARD_ROOT" --all --limit=0 --json 2>/dev/null |
++      jq -r --arg me "$WORK_ID" '[.[] | select(.id != $me and (.assignee // "") != "")]
++        | sort_by(.updated_at // "") | last | .assignee // empty' 2>/dev/null)"
+   fi
+-  if [ -z "$GUARD_WORK_BEAD" ] || [ -z "$GUARD_OWNER" ]; then
++  if [ -z "$GUARD_OWNER" ]; then
+     # An unresolvable or unowned molecule is not evidence of a duplicate pour.
+     # Proceed exactly as this block did before the guard existed.
+     echo "WARN live-owner guard could not resolve an owner for this molecule; proceeding unguarded"
+@@ -361,11 +360,11 @@ if [ -n "$STEP_REF" ] && { [ -z "$CLAIM_REASON" ] || [ "$CLAIM_REASON" = "claime
+       # Another spelling of THIS session: gc 1.4.3 claimed under the runtime
+       # session_name, a gc 1.5.0 namepool polecat acts under its alias. Its
+       # live row is us, so probing liveness would decline our own molecule.
+-      echo "WARN work bead $GUARD_WORK_BEAD names $GUARD_OWNER, another identity of this session ($EXPECTED_ASSIGNEE); it is ours."
++      echo "WARN molecule $GUARD_ROOT was last held by $GUARD_OWNER, another identity of this session ($EXPECTED_ASSIGNEE); it is ours."
+     else
+       # Someone else's name is on the molecule. Only a LIVE someone blocks: a
+       # restarted session usually claims under a new identity, so a DEAD prior
+-      # owner on the work bead is the ordinary resume case and must not stall
++      # holder is the ordinary resume case and must not stall
+       # the engine.
+       # `gc session list` omits closed sessions by default, so a hit there is
+       # the liveness answer. asleep and draining count as alive — both still own
+@@ -392,7 +391,7 @@ if [ -n "$STEP_REF" ] && { [ -z "$CLAIM_REASON" ] || [ "$CLAIM_REASON" = "claime
+         sleep "$GUARD_TRY"
+       done
+       # Only a live WORKER blocks. A crew, specialist or mayor seat is always
+-      # live and never runs polecat steps: when one is the work bead's assignee
++      # live and never runs polecat steps: when one is the molecule's last holder
+       # it is the slinger, and declining would hand the step to a seat that will
+       # not run it and strand the molecule (gcp-qjkp). A worker is a live row
+       # whose template is EXACTLY the polecat or the refinery. A row with no
+@@ -413,7 +412,7 @@ if [ -n "$STEP_REF" ] && { [ -z "$CLAIM_REASON" ] || [ "$CLAIM_REASON" = "claime
+         # slot and the bead stays claimable, proceeding stomps a live worktree
+         # and corrupts whatever the owner is mid-write on. Fail closed.
+         echo "CLAIM_DECLINED_LIVE_OWNER $WORK_ID"
+-        echo "  work bead $GUARD_WORK_BEAD is held by $GUARD_OWNER, and this session is $EXPECTED_ASSIGNEE."
++        echo "  molecule $GUARD_ROOT was last held by $GUARD_OWNER, and this session is $EXPECTED_ASSIGNEE."
+         if [ "$GUARD_LIST_OK" -ne 1 ]; then
+           echo "  session liveness was UNREADABLE after retries — declining rather than assuming the owner is gone."
+         else
+@@ -421,95 +420,34 @@ if [ -n "$STEP_REF" ] && { [ -z "$CLAIM_REASON" ] || [ "$CLAIM_REASON" = "claime
+         fi
+         echo "  Restoring the step to its owner and draining. No code, branch, or worktree touched."
+         # The hook stamped OUR gc.session_id/gc.session_name onto the step
+-        # during the claim. Put the owner's back. The session name is the live
+-        # row's: GUARD_OWNER is an assignee, which under gc 1.5.0 is an alias or
+-        # a session bead id, not the runtime session name gc reads from this
+-        # key. When either value cannot be read, clear the key rather than leave
+-        # ours standing — a wrong binding is worse than an absent one, and the
+-        # owner's next write restores it.
++        # during the claim. Put the owner's back. Both come from the live row:
++        # GUARD_OWNER is an assignee, which under gc 1.5.0 is an alias or a
++        # session bead id, not the runtime session name or id gc reads from
++        # these keys. When either value cannot be read, clear the key rather
++        # than leave ours standing — a wrong binding is worse than an absent
++        # one, and the owner's next write restores it.
+         gc bd update "$WORK_ID" --assignee="$GUARD_OWNER" \
+           --set-metadata gc.session_name="$GUARD_OWNER_SN" \
+           --set-metadata polecat_session="$GUARD_OWNER" \
+-          --set-metadata gc.session_id="$GUARD_OWNER_SID" \
++          --set-metadata gc.session_id="$GUARD_ALIVE" \
+           || echo "WARN could not restore $WORK_ID to $GUARD_OWNER — the step is left claimed by a session that will not run it; escalate to the witness"
+         gc session nudge "${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}witness" \
+-          "DUPLICATE_POUR declined: step $WORK_ID poured onto $EXPECTED_ASSIGNEE while work bead $GUARD_WORK_BEAD is held by $GUARD_OWNER. Step restored to its owner." \
++          "DUPLICATE_POUR declined: step $WORK_ID poured onto $EXPECTED_ASSIGNEE while molecule $GUARD_ROOT was last held by $GUARD_OWNER. Step restored to its owner." \
+           >/dev/null 2>&1 || true
+         gc runtime drain-ack
+         exit 0
+       fi
+       if [ -n "$GUARD_ALIVE" ]; then
+-        echo "WARN work bead $GUARD_WORK_BEAD is held by $GUARD_OWNER, a live $GUARD_OWNER_TPL session: that is the slinger, not a worker; proceeding."
++        echo "WARN molecule $GUARD_ROOT was last held by $GUARD_OWNER, a live $GUARD_OWNER_TPL session: that is the slinger, not a worker; proceeding."
+       else
+-        echo "WARN work bead $GUARD_WORK_BEAD still names $GUARD_OWNER, but no live session holds that identity — treating this as a resume and proceeding."
++        echo "WARN molecule $GUARD_ROOT was last held by $GUARD_OWNER, but no live session holds that identity — treating this as a resume and proceeding."
+       fi
+     fi
+-    # Take the work bead over, as workspace-setup's claim would. It is held
+-    # in_progress for the whole run, bd >= 1.3.0 refuses a plain --assignee
+-    # write over another actor's in_progress claim (and compares spellings, so
+-    # an old spelling of this session counts as another actor), and nothing
+-    # after this re-claims it: left where it is, submit-and-exit's step-6
+-    # handoff to the refinery is refused with the branch already pushed.
+-    # --if-assignee makes it a compare-and-set on the holder just read, so a
+-    # bead that changed hands since is not stomped. The refinery and an operator
+-    # escalation are never taken over; workspace-setup skips the same two.
+-    GUARD_ROUTED_TO="$(printf '%s' "$GUARD_WORK_JSON" | jq -r '.[0].metadata."gc.routed_to" // empty' 2>/dev/null)"
+-    if [ "$GUARD_OWNER" = "${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}refinery" ] || [ "$GUARD_ROUTED_TO" = "human" ]; then
+-      echo "WARN work bead $GUARD_WORK_BEAD is held by the refinery or an operator escalation; leaving its assignee alone."
+-    else
+-      gc bd update "$GUARD_WORK_BEAD" --assignee="$EXPECTED_ASSIGNEE" \
+-        --set-metadata polecat_session="$EXPECTED_ASSIGNEE" --if-assignee "$GUARD_OWNER" \
+-        || echo "WARN could not take work bead $GUARD_WORK_BEAD over from $GUARD_OWNER; submit-and-exit cannot hand it to the refinery while another actor holds it — escalate to the witness"
+-    fi
+   fi
+ fi
+ # GUARD_END live-owner
+ 
+-# Ownership confirmed. Now make sure this is a STEP, not the work bead itself.
+-# mol-polecat-work claims the WORK bead for the whole run (status=in_progress,
+-# assignee=this session) so it stops sitting in `gc bd ready` where a second sling
+-# can land on it. The cost is that `gc hook --claim`'s crash-recovery tier —
+-# `gc bd list --status in_progress --assignee=<you> --limit=1` — can now hand that
+-# work bead back instead of your next formula step. It happens at every step
+-# boundary: the step you just closed is gone and its successor is still stored
+-# `open`, so the work bead is the only in_progress match. Working it directly
+-# skips self-review and submit-and-exit, and the branch is never pushed. When
+-# the hook returns a bead carrying no `gc.step_ref`, re-point at the molecule's
+-# next ready step. (gcp-tl8 is the same shape on the refinery: a held work bead
+-# resumed as the patrol wisp on every restart.) `STEP_REF` was read above, for
+-# the live-owner guard.
+-if [ -z "$STEP_REF" ]; then
+-  # An in-flight step comes first. `gc bd ready` is blocker-aware but EXCLUDES
+-  # in_progress, so it cannot see a step this session already claimed — and the
+-  # hook's recovery tier (`--status in_progress --assignee=<you> --limit=1`)
+-  # matches BOTH that step and the held work bead, returning either one. Land on
+-  # the work bead with `gc bd ready` as the only fallback and the re-point finds
+-  # nothing, which is the stall it exists to prevent. Resume the claimed step.
+-  NEXT_STEP_ID="$(gc bd list --assignee="$EXPECTED_ASSIGNEE" --status=in_progress \
+-    --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null |
+-    jq -r '.[0].id // empty' 2>/dev/null)"
+-  # Otherwise take the next step the molecule has actually unblocked. This one
+-  # must stay blocker-aware — an `open` step whose predecessor has not closed is
+-  # not runnable, and jumping to it skips the step in between. Filtered to
+-  # formula steps in jq rather than by a flag, so this stays readable on any bd
+-  # the hook itself can drive.
+-  [ -n "$NEXT_STEP_ID" ] ||
+-    NEXT_STEP_ID="$(gc bd ready --assignee="$EXPECTED_ASSIGNEE" --limit=0 --json 2>/dev/null |
+-      jq -r '[.[] | select((.metadata."gc.step_ref" // "") != "")] | .[0].id // empty' 2>/dev/null)"
+-  if [ -n "$NEXT_STEP_ID" ] && [ "$NEXT_STEP_ID" != "$WORK_ID" ]; then
+-    gc bd update "$NEXT_STEP_ID" --claim >/dev/null 2>&1 \
+-      || echo "WARN could not claim step bead $NEXT_STEP_ID; it is already assigned to this session, so executing it anyway"
+-    echo "STEP_REPOINTED hook returned work bead $WORK_ID; this session is mid-molecule, continuing with step $NEXT_STEP_ID"
+-    WORK_ID="$NEXT_STEP_ID"
+-    SHOW_JSON="$(gc bd show "$WORK_ID" --json 2>/dev/null)"
+-    [ -n "$SHOW_JSON" ] ||
+-      echo "WARN could not re-read $WORK_ID; run 'gc bd show $WORK_ID' before you start the step"
+-  fi
+-  # Neither query matching means the molecule has nothing runnable right now:
+-  # keep the work bead, read your formula steps, and let the done sequence
+-  # decide.
+-fi
+-
++# Ownership confirmed.
+ # Stamp a stable session identity so the churn-watcher and the resume re-verify
+ # can key on metadata.polecat_session.
+ gc bd update "$WORK_ID" --set-metadata polecat_session="$EXPECTED_ASSIGNEE" \
+@@ -530,27 +468,23 @@ falls through to unassigned pool work routed to
+ `${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat`.
+ 
+ `CLAIM_DECLINED_LIVE_OWNER` means the claim itself was clean — the step bead was
+-genuinely open and unassigned when you took it — but the molecule's WORK bead is
+-still held by another POLECAT or by the REFINERY that is still alive (or session
+-liveness could not be read). That is a duplicate pour, not a handoff, and a clean
++genuinely open and unassigned when you took it — but the molecule was last held
++by another POLECAT or by the REFINERY that is still alive (or session liveness
++could not be read). That is a duplicate pour, not a handoff, and a clean
+ claim cannot distinguish the two on its own: a step
+ bead released out from under a live owner is byte-identical to one that was
+-never claimed. The work bead is the tiebreaker because it is never routed to the
+-pool and so is never released. Declining costs one pool slot; proceeding stomps
++never claimed. The molecule's last holder is the tiebreaker: it is the claimed
++step's own `polecat_session`, else the most recently updated sibling step that
++names an assignee, and a release never clears either. The work bead's assignee
++is never read. Declining costs one pool slot; proceeding stomps
+ a live worktree, so the guard also declines when session liveness is unreadable.
+ Do NOT re-run the claim to get a different answer, and do NOT work the bead
+ anyway — the block has already restored the step to its owner and drained.
+ 
+-A live crew, specialist or mayor seat on the work bead does not decline. That seat
+-is the slinger, not a worker: it never runs polecat steps, so handing it the step
+-would strand the molecule. The guard prints a `WARN` naming the seat, proceeds,
+-and takes the work bead over from it.
+-
+-`STEP_REPOINTED` is not a bail-out and never drain-acks. It means the assigned
+-tier handed back this session's own in-flight WORK bead — which
+-`mol-polecat-work` holds `in_progress` for the whole run, so a second sling
+-cannot land on it — instead of your next formula step, and the block moved you
+-onto that step. The `CLAIMED_BEAD_ID` printed after it is the bead to run.
++A live crew, specialist or mayor seat as the molecule's last holder does not
++decline. That seat is the slinger, not a worker: it never runs polecat steps, so
++handing it the step would strand the molecule. The guard prints a `WARN` naming
++the seat and proceeds.
+ 
+ **Resume / crash re-verify (FIRST action on restart).** A restart is a new
+ session, and usually a new claim identity: gc 1.4.x and an unaliased gc 1.5.0
+@@ -741,9 +675,9 @@ done
+ # Only POSITIVE evidence counts: the bead is closed, or it is held by the
+ # REFINERY — the one assignee submit-and-exit's handoff actually produces. Every
+ # weaker test has been observed draining a session with the branch unpushed.
+-# "Not in_progress for me" is not evidence: workspace-setup holds the work bead
+-# in_progress for this session only from that step on, and never takes it from
+-# the refinery or an operator escalation. Nor is a bare "assigned to
++# "Not in_progress for me" is not evidence: the polecat never claims the work
++# bead (only the refinery handoff writes its status and assignee), so what it
++# reads says nothing about this session. Nor is a bare "assigned to
+ # somebody else", which is equally true of a resumed molecule finding the bead
+ # still held by its own PREVIOUS session (a restarted session usually claims
+ # under a new identity) and
+diff --git a/gastown/formulas/mol-polecat-work.toml b/gastown/formulas/mol-polecat-work.toml
+index b9b61d8a..453bafa7 100644
+--- a/gastown/formulas/mol-polecat-work.toml
++++ b/gastown/formulas/mol-polecat-work.toml
+@@ -21,9 +21,8 @@ and reassigns it to the refinery. The refinery merges and closes.
+ status=closed on it. Even if you believe the code is already merged, reassign
+ to refinery — only the refinery verifies merges and closes beads. The single
+ exception is your own formula step beads: `submit-and-exit` closes its own
+-step (resolved with `gc hook current`, or failing that from this session's own
+-in-progress submit-and-exit step) before draining, because a step left claimed
+-is handed back to the pool and re-run.
++step (resolved with `gc hook current`) before draining, because a step left
++claimed is handed back to the pool and re-run.
+ `{{base_branch}}` may come from the work bead's own `metadata.target` or
+ be inherited from a parent convoy with `metadata.target` set.
+ 
+@@ -77,7 +76,7 @@ Every check is idempotent — safe to re-run after crash/restart.
+ 2. `metadata.target` on the parent convoy chain
+ 3. the rig repo's default branch
+ 
+-**1. Fetch latest, derive your work bead, resolve the base ref, and claim it:**
++**1. Fetch latest, derive your work bead, and resolve the base ref:**
+ ```bash
+ git fetch --prune origin
+ CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
+@@ -169,127 +168,6 @@ dies with this session, so the resolution is also recorded on the work
+ bead as `metadata.base_ref`; later steps run in fresh sessions and read
+ it back from there.
+ 
+-Claim the WORK bead itself, not just the step beads the molecule claims for
+-you. Until this write lands the work bead is `open` and unassigned for the
+-whole run, so it sits in `gc bd ready` looking exactly like a bead nobody
+-has touched — while you are already building on it. Every seat that surveys ready
+-work (the mayor, a backlog groomer, another crew seat) can therefore `gc sling`
+-a second polecat onto the bead you are implementing, and per the polecat
+-contract the later push supersedes: work already written and self-reviewed is
+-discarded. Observed live on winnow-x32.4, winnow-x32.5 and winnow-48fm, and
+-reproduced first-party on this rig by the sling that dispatched gcp-5gir.
+-
+-```bash
+-# CLAIM_GUARD_BEGIN work-bead
+-POLECAT_SESSION="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
+-# Resolved with the exact expression submit-and-exit writes, so "the refinery
+-# owns this bead" means the same thing at both ends of the run.
+-REFINERY_TARGET="${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery"
+-CLAIM_JSON=$(gc bd show "$WORK_BEAD_ID" --json 2>/dev/null)
+-CURRENT_ASSIGNEE=$(printf '%s' "$CLAIM_JSON" | jq -r '.[0].assignee // empty' 2>/dev/null)
+-CURRENT_ROUTED_TO=$(printf '%s' "$CLAIM_JSON" | jq -r '.[0].metadata."gc.routed_to" // empty' 2>/dev/null)
+-# Skip the claim for the two owners this session must not displace, each NAMED
+-# rather than inferred from "somebody else's name is on it":
+-#   - the refinery, which owns a bead it is landing;
+-#   - `gc.routed_to=human`, the operator escalation the refinery writes when it
+-#     REFUSES to land one. Step 8 halts the handoff on that same marker.
+-# Everything else is claimed: unassigned, this session already, or the crew
+-# seat that authored the bead.
+-if [ "$CURRENT_ASSIGNEE" != "$POLECAT_SESSION" ] &&
+-   { [ "$CURRENT_ASSIGNEE" = "$REFINERY_TARGET" ] || [ "$CURRENT_ROUTED_TO" = "human" ]; }; then
+-    echo "WARN $WORK_BEAD_ID is held by ${CURRENT_ASSIGNEE:-nobody} (gc.routed_to=${CURRENT_ROUTED_TO:-none}); leaving the assignee alone."
+-    echo "WARN a refinery-owned or operator-escalated work bead is not yours to re-claim. Continue; submit-and-exit's guards decide the handoff."
+-else
+-    # A foreign, non-refinery, non-escalated assignee is claimed rather than
+-    # deferred to — but say so, so a duplicate pour leaves a trace instead of
+-    # passing silently. Reaching here means the startup claim block's
+-    # live-owner guard already found no LIVE session behind that name.
+-    [ -z "$CURRENT_ASSIGNEE" ] || [ "$CURRENT_ASSIGNEE" = "$POLECAT_SESSION" ] ||
+-        echo "WARN $WORK_BEAD_ID was assigned to $CURRENT_ASSIGNEE (not the refinery, not an escalation); claiming it for this session."
+-    gc bd update "$WORK_BEAD_ID" --status=in_progress --assignee="$POLECAT_SESSION" --set-metadata polecat_session="$POLECAT_SESSION"
+-    # Read the claim back. `--status` on this bead has been observed not to
+-    # stick (gcp-s14g), and a status that stays `open` leaves the bead sitting
+-    # in `gc bd ready` — the exact re-sling window this claim exists to close.
+-    # The loop always ENDS on a read, so the verdict below is never a stale
+-    # snapshot taken before the last retry landed.
+-    CLAIMED_STATUS=""
+-    CLAIMED_ASSIGNEE=""
+-    CLAIM_TRY=0
+-    while [ "$CLAIM_TRY" -lt 3 ]; do
+-        CLAIM_TRY=$((CLAIM_TRY + 1))
+-        CLAIM_JSON=$(gc bd show "$WORK_BEAD_ID" --json 2>/dev/null)
+-        CLAIMED_STATUS=$(printf '%s' "$CLAIM_JSON" | jq -r '.[0].status // empty' 2>/dev/null)
+-        CLAIMED_ASSIGNEE=$(printf '%s' "$CLAIM_JSON" | jq -r '.[0].assignee // empty' 2>/dev/null)
+-        [ "$CLAIMED_STATUS" = "in_progress" ] && [ "$CLAIMED_ASSIGNEE" = "$POLECAT_SESSION" ] && break
+-        [ "$CLAIM_TRY" -lt 3 ] &&
+-            gc bd update "$WORK_BEAD_ID" --status=in_progress --assignee="$POLECAT_SESSION" --set-metadata polecat_session="$POLECAT_SESSION" >/dev/null 2>&1
+-    done
+-    [ "$CLAIMED_STATUS" = "in_progress" ] && [ "$CLAIMED_ASSIGNEE" = "$POLECAT_SESSION" ] ||
+-        echo "WARN $WORK_BEAD_ID reads status=${CLAIMED_STATUS:-unreadable} assignee=${CLAIMED_ASSIGNEE:-none} after the claim; it may still be re-slung out from under you. Proceeding — the implementation is not blocked on this."
+-fi
+-# CLAIM_GUARD_END work-bead
+-```
+-
+-The skip condition names its two owners instead of testing "is there an
+-assignee at all". It used to be `[ -n "$CURRENT_ASSIGNEE" ] && [
+-"$CURRENT_ASSIGNEE" != "$POLECAT_SESSION" ]`, whose prose already claimed the
+-narrow intent — protect a refinery-owned or operator-escalated bead — while its
+-condition matched **every** assignee. Planned work normally arrives already
+-assigned to the crew seat that filed it, so the guard fired on the ordinary
+-case: the claim was skipped, the bead stayed `status=open` for the whole run,
+-and it sat in `gc bd ready` looking untouched — the exact window the claim
+-exists to close. The protection was therefore void for every crew-authored
+-bead and only ever fired on beads that were already unassigned. Observed on
+-gauntlet `gaunt-m58w` (assignee `gauntlet/crew.valkyrie`; two `mol-polecat-work`
+-molecules poured on one bead) and again live on `gcp-jxtc`, where the duplicate
+-carried its own `submit-and-exit` and came within one step of pushing a second
+-branch over two finished commits (gcp-cvbs).
+-
+-The invariant to hold onto: **a work bead being actively implemented must not
+-remain `status=open`**, because that is the only thing standing between a live
+-polecat and a second one dispatched on top of it. A guard that protects the
+-assignee field at the cost of that invariant protects nothing.
+-
+-Reading `gc.routed_to` is not the same as stamping it. The read is how the
+-escalation marker is recognised; nothing in this step writes or clears the key,
+-and the "Do NOT reach for `gc.routed_to`" note further down still stands as
+-written — it is about the write.
+-
+-`polecat_session` rides along with the assignee so the two can never disagree.
+-The resume re-verify uses `assignee == polecat_session` to tell "a polecat still holds this" from
+-"somebody else took it". A claim that set only the assignee would leave a
+-crashed predecessor's stamp in place and read as a completed handoff. The done
+-sequence's already-submitted guard does not need that comparison at all: it
+-tests the assignee against the refinery target directly, which excludes both a
+-predecessor session and any third party the bead was parked on (gcp-0pa4).
+-
+-Do NOT reach for `gc.routed_to` to achieve this. Pool dispatch leaves that key
+-blank on the work bead **on purpose** and carries the routing on the molecule
+-root, which is what lets `scale_check` see pool demand; stamping it here breaks
+-the spawn accounting instead of fixing the visibility.
+-
+-`submit-and-exit` is the single release point: the assignee goes straight from
+-this session to the refinery, so ownership is never ambiguous and the bead
+-never re-enters `gc bd ready` mid-flight. Two consequences follow from holding
+-the claim for the whole run, and both are load-bearing:
+-
+-- **If you crash, the bead does not drift back into the pool by itself.** It
+-  stays `in_progress` and assigned to a session that is never coming back —
+-  which is precisely the shape the witness's `recover-orphaned-beads` step
+-  hunts for: it salvages the worktree, then returns the bead to the pool.
+-  Before this claim that pass could not see the bead at all (it skips
+-  unassigned beads), so the only "recovery" was a duplicate sling.
+-- **`gc hook --claim` can now hand you back this work bead** instead of your
+-  next formula step. Its crash-recovery tier is
+-  `gc bd list --status in_progress --assignee=<you> --limit=1`, and at a step
+-  boundary the work bead is the only match — the step you just closed is gone
+-  and its successor is still stored `open`. The polecat startup claim block
+-  re-points at the molecule's next ready step whenever the hook returns a bead
+-  carrying no `gc.step_ref`; do not drop that guard, or the molecule stops
+-  advancing and the branch is never pushed. This is the same shape as gcp-tl8,
+-  where a refinery holding a work bead `in_progress` resumed it as its patrol
+-  wisp on every restart.
+-
+ **2. Ensure a safe per-bead artifact worktree exists.**
+ 
+ Task worktrees use the canonical `metadata.artifact_dir` key. The deprecated
+@@ -1129,24 +1007,6 @@ needs = ["self-review"]
+ description = """
+ Hand off your work and self-clean. You cease to exist after this step.
+ 
+-**Closing this step.** Every exit below closes this step before
+-`gc runtime drain-ack`, because drain-ack gives back every claim the session
+-still holds and a step left claimed is run again. The step is resolved in two
+-tiers, and each exit carries both:
+-
+-1. `gc hook current`, when the claim it names is an in-progress step whose
+-   `gc.step_ref` ends `.submit-and-exit` (upstream #490).
+-2. Otherwise, the one in-progress step held by `$BEADS_ACTOR` whose
+-   `gc.step_ref` ends `.submit-and-exit`. `gc hook current` reports only the
+-   bead `gc hook --claim` last served, and at a step boundary that is often the
+-   WORK bead workspace-setup holds `in_progress`. The startup claim block then
+-   re-points onto this step (`STEP_REPOINTED`) with a plain `--claim` update,
+-   which records the claim under `$BEADS_ACTOR` without moving the hook's
+-   stamp. gc before 1.5.0 has no `gc hook current` at all.
+-
+-No match, or more than one, refuses the ack and exits 1: closing a step picked
+-by guesswork can finish another molecule's.
+-
+ **0. Already-submitted guard (idempotent re-entry).**
+ 
+ A re-entered submit-and-exit must not re-write bead state. Step 6 sets the
+@@ -1175,10 +1035,9 @@ if [ -n "$SUBMITTED_TARGET" ] && [ -n "$SUBMITTED_REMOTE" ] &&
+    [ "$SUBMITTED_ASSIGNEE" = "$REFINERY_TARGET" ]; then
+     echo "ALREADY_SUBMITTED $WORK_BEAD_ID target=$SUBMITTED_TARGET branch=$SUBMITTED_BRANCH assignee=$SUBMITTED_ASSIGNEE"
+     echo "Handoff already completed. Closing this step and draining without re-writing bead state."
+-    STEP_BEAD_ID=$(gc hook current --id-only 2>/dev/null) || STEP_BEAD_ID=""  # drain-ack gives back every claim this session still holds, so close this step first
+-    [ -n "$STEP_BEAD_ID" ] && gc bd show "$STEP_BEAD_ID" --json 2>/dev/null | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null ||
+-        STEP_BEAD_ID=$([ -n "${BEADS_ACTOR:-}" ] && gc bd list --assignee="$BEADS_ACTOR" --status=in_progress --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null | jq -r '[.[] | select(.status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))) | .id] | if length == 1 then .[0] else empty end' 2>/dev/null)  # tier 2: this session's own step (see "Closing this step" above)
+-    [ -n "$STEP_BEAD_ID" ] || { echo "submit-and-exit: this session holds no single in-progress submit-and-exit step; not acknowledging drain" >&2; exit 1; }
++    STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
++    STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
++    printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
+     gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=pass --status=closed || exit 1
+     gc runtime drain-ack
+     exit 0
+@@ -1191,16 +1050,16 @@ proves nothing — a caller may set it before dispatch to choose the base branch
+ salvage push leaves behind (gcp-7bo9), which is not a handoff this step
+ performed.
+ 
+-The assignee mark is an IDENTITY test against `$REFINERY_TARGET`, never a `!=`
+-against this session's own identity. "Somebody who is not me" is satisfied by
+-every third party a work bead can end up on — an operator parking it on a crew
+-seat, a witness re-routing it, a reviewer taking it — and none of those is this
+-step's handoff. Read as evidence, they make a resuming polecat announce
+-ALREADY_SUBMITTED and drain while the refinery never receives the work and the
+-branch strands on origin unmerged (gcp-0pa4; observed live on winnow-zgr2y.8,
+-parked on `winnow/specialists.thomas`). The blast radius scales with parked
+-seats holding open beads, so the check has to name the one assignee that means
+-"handed off" rather than enumerate the ones that do not.
++The assignee mark is an IDENTITY test against `$REFINERY_TARGET`, never
++a "not this session" comparison. "Somebody who is not me" is satisfied by every third party a
++work bead can end up on — an operator parking it on a crew seat, a witness
++re-routing it, a reviewer taking it — and none of those is this step's handoff.
++Read as evidence, they make a resuming polecat announce ALREADY_SUBMITTED and
++drain while the refinery never receives the work and the branch strands on
++origin unmerged (gcp-0pa4; observed live on winnow-zgr2y.8, parked on
++`winnow/specialists.thomas`). The blast radius scales with parked seats holding
++open beads, so the check has to name the one assignee that means "handed off"
++rather than enumerate the ones that do not.
+ 
+ **1. Branch-shape gate (fails closed — non-negotiable).**
+ 
+@@ -1234,10 +1093,9 @@ if [ "$CURRENT_BRANCH" != "$EXPECTED_BRANCH" ]; then
+     echo "  - Re-run submit-and-exit"
+     echo ""
+     echo "Do NOT proceed past this gate."
+-    STEP_BEAD_ID=$(gc hook current --id-only 2>/dev/null) || STEP_BEAD_ID=""  # drain-ack gives back every claim this session still holds, so close this step first
+-    [ -n "$STEP_BEAD_ID" ] && gc bd show "$STEP_BEAD_ID" --json 2>/dev/null | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null ||
+-        STEP_BEAD_ID=$([ -n "${BEADS_ACTOR:-}" ] && gc bd list --assignee="$BEADS_ACTOR" --status=in_progress --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null | jq -r '[.[] | select(.status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))) | .id] | if length == 1 then .[0] else empty end' 2>/dev/null)  # tier 2: this session's own step (see "Closing this step" above)
+-    [ -n "$STEP_BEAD_ID" ] || { echo "submit-and-exit: this session holds no single in-progress submit-and-exit step; not acknowledging drain" >&2; exit 1; }
++    STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
++    STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
++    printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
+     gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=branch_shape_gate --status=closed || exit 1
+     gc runtime drain-ack
+     exit 1
+@@ -1353,10 +1211,9 @@ BODY
+       gc session nudge "$ESCALATE_TARGET" "POLECAT HANDOFF HALT ($HALT_REASON): $WORK_BEAD_ID on $EXPECTED_BRANCH — no handoff stamped; bead returned to the pool open and unassigned. Needs a coordinator decision." \
+         || echo "WARNING: could not nudge $ESCALATE_TARGET about $WORK_BEAD_ID; escalate by hand."
+     done
+-    STEP_BEAD_ID=$(gc hook current --id-only 2>/dev/null) || STEP_BEAD_ID=""  # drain-ack gives back every claim this session still holds, so close this step first
+-    [ -n "$STEP_BEAD_ID" ] && gc bd show "$STEP_BEAD_ID" --json 2>/dev/null | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null ||
+-        STEP_BEAD_ID=$([ -n "${BEADS_ACTOR:-}" ] && gc bd list --assignee="$BEADS_ACTOR" --status=in_progress --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null | jq -r '[.[] | select(.status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))) | .id] | if length == 1 then .[0] else empty end' 2>/dev/null)  # tier 2: this session's own step (see "Closing this step" above)
+-    [ -n "$STEP_BEAD_ID" ] || { echo "submit-and-exit: this session holds no single in-progress submit-and-exit step; not acknowledging drain" >&2; exit 1; }
++    STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
++    STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
++    printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
+     gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason="$HALT_REASON" --status=closed || exit 1
+     gc runtime drain-ack
+     exit 1
+@@ -1502,10 +1359,9 @@ Resolve: check the ledger is healthy, then record the decision as metadata —
+   gc bd update $WORK_BEAD_ID --set-metadata auto_push=false   # confirm the halt
+   gc bd update $WORK_BEAD_ID --set-metadata auto_push=true    # authorise the push
+ and re-sling. Use --set-metadata so branch and gc.routed_to survive."
+-  STEP_BEAD_ID=$(gc hook current --id-only 2>/dev/null) || STEP_BEAD_ID=""  # drain-ack gives back every claim this session still holds, so close this step first
+-  [ -n "$STEP_BEAD_ID" ] && gc bd show "$STEP_BEAD_ID" --json 2>/dev/null | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null ||
+-      STEP_BEAD_ID=$([ -n "${BEADS_ACTOR:-}" ] && gc bd list --assignee="$BEADS_ACTOR" --status=in_progress --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null | jq -r '[.[] | select(.status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))) | .id] | if length == 1 then .[0] else empty end' 2>/dev/null)  # tier 2: this session's own step (see "Closing this step" above)
+-  [ -n "$STEP_BEAD_ID" ] || { echo "submit-and-exit: this session holds no single in-progress submit-and-exit step; not acknowledging drain" >&2; exit 1; }
++  STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
++  STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
++  printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
+   gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=metadata_unreadable --status=closed || exit 1
+   gc runtime drain-ack
+   exit 0
+@@ -1524,10 +1380,9 @@ if [ "$AUTO_PUSH" = "false" ]; then
+     --set-metadata halt_reason=auto_push_false \
+     --set-metadata gc.routed_to="" \
+     --append-notes "Branch ready: auto_push=false (no push, no refinery handoff)"
+-  STEP_BEAD_ID=$(gc hook current --id-only 2>/dev/null) || STEP_BEAD_ID=""  # drain-ack gives back every claim this session still holds, so close this step first
+-  [ -n "$STEP_BEAD_ID" ] && gc bd show "$STEP_BEAD_ID" --json 2>/dev/null | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null ||
+-      STEP_BEAD_ID=$([ -n "${BEADS_ACTOR:-}" ] && gc bd list --assignee="$BEADS_ACTOR" --status=in_progress --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null | jq -r '[.[] | select(.status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))) | .id] | if length == 1 then .[0] else empty end' 2>/dev/null)  # tier 2: this session's own step (see "Closing this step" above)
+-  [ -n "$STEP_BEAD_ID" ] || { echo "submit-and-exit: this session holds no single in-progress submit-and-exit step; not acknowledging drain" >&2; exit 1; }
++  STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
++  STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
++  printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
+   gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=auto_push_false --status=closed || exit 1
+   gc runtime drain-ack
+   exit 0
+@@ -1632,10 +1487,9 @@ Resolve: read the rail, then record the decision as metadata —
+   gc bd update $WORK_BEAD_ID --set-metadata auto_push=false   # confirm the halt
+   gc bd update $WORK_BEAD_ID --set-metadata auto_push=true    # authorise the push
+ and re-sling. Use --set-metadata so branch and gc.routed_to survive."
+-    STEP_BEAD_ID=$(gc hook current --id-only 2>/dev/null) || STEP_BEAD_ID=""  # drain-ack gives back every claim this session still holds, so close this step first
+-    [ -n "$STEP_BEAD_ID" ] && gc bd show "$STEP_BEAD_ID" --json 2>/dev/null | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null ||
+-        STEP_BEAD_ID=$([ -n "${BEADS_ACTOR:-}" ] && gc bd list --assignee="$BEADS_ACTOR" --status=in_progress --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null | jq -r '[.[] | select(.status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))) | .id] | if length == 1 then .[0] else empty end' 2>/dev/null)  # tier 2: this session's own step (see "Closing this step" above)
+-    [ -n "$STEP_BEAD_ID" ] || { echo "submit-and-exit: this session holds no single in-progress submit-and-exit step; not acknowledging drain" >&2; exit 1; }
++    STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
++    STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
++    printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
+     gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=no_push_rail_unresolved --status=closed || exit 1
+     gc runtime drain-ack
+     exit 0
+@@ -1663,10 +1517,9 @@ if ! git show-ref --verify --quiet "refs/remotes/origin/{{base_branch}}"; then
+     --set-metadata gc.routed_to="" \
+     --append-notes "Branch ready: base branch {{base_branch}} does not exist on origin, so the refinery cannot merge it. Push the base branch, then re-run submit-and-exit."
+   gc mail send "${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness" -s "polecat halted: base_branch_local_only ($WORK_BEAD_ID)" -m "Work is committed on branch $BRANCH, but base branch {{base_branch}} does not exist on origin, so the refinery cannot merge it. Push the base branch, then re-run submit-and-exit for $WORK_BEAD_ID."
+-  STEP_BEAD_ID=$(gc hook current --id-only 2>/dev/null) || STEP_BEAD_ID=""  # drain-ack gives back every claim this session still holds, so close this step first
+-  [ -n "$STEP_BEAD_ID" ] && gc bd show "$STEP_BEAD_ID" --json 2>/dev/null | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null ||
+-      STEP_BEAD_ID=$([ -n "${BEADS_ACTOR:-}" ] && gc bd list --assignee="$BEADS_ACTOR" --status=in_progress --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null | jq -r '[.[] | select(.status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))) | .id] | if length == 1 then .[0] else empty end' 2>/dev/null)  # tier 2: this session's own step (see "Closing this step" above)
+-  [ -n "$STEP_BEAD_ID" ] || { echo "submit-and-exit: this session holds no single in-progress submit-and-exit step; not acknowledging drain" >&2; exit 1; }
++  STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
++  STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
++  printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
+   gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=base_branch_local_only --status=closed || exit 1
+   gc runtime drain-ack
+   exit 0
+@@ -1679,10 +1532,9 @@ if [ $PUSH_EXIT -ne 0 ]; then
+     echo "Aborting handoff — bead stays with polecat."
+     echo ""
+     echo "Diagnose the push failure (network, auth, force-needed?) and re-run submit-and-exit."
+-    STEP_BEAD_ID=$(gc hook current --id-only 2>/dev/null) || STEP_BEAD_ID=""  # drain-ack gives back every claim this session still holds, so close this step first
+-    [ -n "$STEP_BEAD_ID" ] && gc bd show "$STEP_BEAD_ID" --json 2>/dev/null | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null ||
+-        STEP_BEAD_ID=$([ -n "${BEADS_ACTOR:-}" ] && gc bd list --assignee="$BEADS_ACTOR" --status=in_progress --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null | jq -r '[.[] | select(.status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))) | .id] | if length == 1 then .[0] else empty end' 2>/dev/null)  # tier 2: this session's own step (see "Closing this step" above)
+-    [ -n "$STEP_BEAD_ID" ] || { echo "submit-and-exit: this session holds no single in-progress submit-and-exit step; not acknowledging drain" >&2; exit 1; }
++    STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
++    STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
++    printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
+     gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=push_failed --status=closed || exit 1
+     gc runtime drain-ack
+     exit 1
+@@ -1694,10 +1546,9 @@ if [ -z "$REMOTE_REF" ]; then
+     echo "PUSH VERIFICATION FAILED"
+     echo "  git push exited 0 but 'git ls-remote' returned no ref for '$CURRENT_BRANCH' on origin."
+     echo "  Branch is local-only. Aborting handoff."
+-    STEP_BEAD_ID=$(gc hook current --id-only 2>/dev/null) || STEP_BEAD_ID=""  # drain-ack gives back every claim this session still holds, so close this step first
+-    [ -n "$STEP_BEAD_ID" ] && gc bd show "$STEP_BEAD_ID" --json 2>/dev/null | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null ||
+-        STEP_BEAD_ID=$([ -n "${BEADS_ACTOR:-}" ] && gc bd list --assignee="$BEADS_ACTOR" --status=in_progress --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null | jq -r '[.[] | select(.status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))) | .id] | if length == 1 then .[0] else empty end' 2>/dev/null)  # tier 2: this session's own step (see "Closing this step" above)
+-    [ -n "$STEP_BEAD_ID" ] || { echo "submit-and-exit: this session holds no single in-progress submit-and-exit step; not acknowledging drain" >&2; exit 1; }
++    STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
++    STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
++    printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
+     gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=push_verify_failed --status=closed || exit 1
+     gc runtime drain-ack
+     exit 1
+@@ -1707,10 +1558,9 @@ if [ "$REMOTE_REF" != "$LOCAL_HEAD" ]; then
+     echo "  origin/$CURRENT_BRANCH = $REMOTE_REF"
+     echo "  local HEAD             = $LOCAL_HEAD"
+     echo "  Branch tip on origin does not match local HEAD. Aborting handoff."
+-    STEP_BEAD_ID=$(gc hook current --id-only 2>/dev/null) || STEP_BEAD_ID=""  # drain-ack gives back every claim this session still holds, so close this step first
+-    [ -n "$STEP_BEAD_ID" ] && gc bd show "$STEP_BEAD_ID" --json 2>/dev/null | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null ||
+-        STEP_BEAD_ID=$([ -n "${BEADS_ACTOR:-}" ] && gc bd list --assignee="$BEADS_ACTOR" --status=in_progress --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null | jq -r '[.[] | select(.status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))) | .id] | if length == 1 then .[0] else empty end' 2>/dev/null)  # tier 2: this session's own step (see "Closing this step" above)
+-    [ -n "$STEP_BEAD_ID" ] || { echo "submit-and-exit: this session holds no single in-progress submit-and-exit step; not acknowledging drain" >&2; exit 1; }
++    STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
++    STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
++    printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
+     gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=push_verify_failed --status=closed || exit 1
+     gc runtime drain-ack
+     exit 1
+@@ -1789,10 +1639,9 @@ Polecat submit-and-exit halted at the refinery handoff: gc.routed_to=human.
+ Branch is pushed and metadata.target is recorded. Assignee and routing left as
+ the escalation set them; a human decides whether this goes to the refinery.
+ HUMAN_HALT
+-    STEP_BEAD_ID=$(gc hook current --id-only 2>/dev/null) || STEP_BEAD_ID=""  # drain-ack gives back every claim this session still holds, so close this step first
+-    [ -n "$STEP_BEAD_ID" ] && gc bd show "$STEP_BEAD_ID" --json 2>/dev/null | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null ||
+-        STEP_BEAD_ID=$([ -n "${BEADS_ACTOR:-}" ] && gc bd list --assignee="$BEADS_ACTOR" --status=in_progress --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null | jq -r '[.[] | select(.status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))) | .id] | if length == 1 then .[0] else empty end' 2>/dev/null)  # tier 2: this session's own step (see "Closing this step" above)
+-    [ -n "$STEP_BEAD_ID" ] || { echo "submit-and-exit: this session holds no single in-progress submit-and-exit step; not acknowledging drain" >&2; exit 1; }
++    STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
++    STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
++    printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
+     gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=routed_to_human --status=closed || exit 1
+     gc runtime drain-ack
+     exit 0
+@@ -1813,10 +1662,8 @@ if [ "$(printf '%s' "$STAMP_JSON" | jq -r '.[0].id // empty' 2>/dev/null)" = "$W
+    [ -z "$(printf '%s' "$STAMP_JSON" | jq -r '.[0].metadata.first_submitted_at // empty' 2>/dev/null)" ]; then
+     HANDOFF_STAMP+=(--set-metadata first_submitted_at="$HANDOFF_AT")
+ fi
+-# A refused write is not a handoff. bd >= 1.3.0 refuses an --assignee write over
+-# another actor's in_progress claim, which is what this bead is when it is held
+-# under any other spelling than this session's actor. Stop before steps 7 and 8:
+-# they would drain the session with the branch pushed and the refinery never told.
++# A refused write is not a handoff. Stop before steps 7 and 8: they would drain
++# the session with the branch pushed and the refinery never told.
+ if ! gc bd update "$WORK_BEAD_ID" --status=open --assignee="$REFINERY_TARGET" --set-metadata gc.routed_to="" \
+     "${HANDOFF_STAMP[@]}"; then
+     echo "HANDOFF_FAILED $WORK_BEAD_ID was NOT handed to $REFINERY_TARGET: the update was refused."
+@@ -1857,12 +1704,6 @@ If step 6 prints `HANDOFF_FAILED`, stop there: do not run steps 7 and 8, do not
+ drain-ack, and escalate as it says. The write was refused, so the bead is still
+ held where it was and the refinery has not been told.
+ 
+-This write is also the ONE release of the claim `workspace-setup` took on the
+-work bead. The assignee moves this session -> refinery in a single update: it
+-never passes through unassigned, so there is no window in which a bead with a
+-pushed branch reappears in `gc bd ready` and gets re-slung to a second polecat
+-(gcp-5gir). Do not "release first, then reassign".
+-
+ The refinery will pick this up, rebase onto {{base_branch}}, run tests,
+ merge, and close the bead. If there's a conflict, the refinery puts the
+ bead back in the pool with `rejection_reason` metadata — a new polecat
+@@ -1883,10 +1724,9 @@ the work on its next poll.
+ 
+ **8. Signal reconciler and exit.**
+ ```bash
+-STEP_BEAD_ID=$(gc hook current --id-only 2>/dev/null) || STEP_BEAD_ID=""  # drain-ack gives back every claim this session still holds, so close this step first
+-[ -n "$STEP_BEAD_ID" ] && gc bd show "$STEP_BEAD_ID" --json 2>/dev/null | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null ||
+-    STEP_BEAD_ID=$([ -n "${BEADS_ACTOR:-}" ] && gc bd list --assignee="$BEADS_ACTOR" --status=in_progress --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null | jq -r '[.[] | select(.status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))) | .id] | if length == 1 then .[0] else empty end' 2>/dev/null)  # tier 2: this session's own step (see "Closing this step" above)
+-[ -n "$STEP_BEAD_ID" ] || { echo "submit-and-exit: this session holds no single in-progress submit-and-exit step; not acknowledging drain" >&2; exit 1; }
++STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
++STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
++printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
+ gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=pass --status=closed || exit 1
+ gc runtime drain-ack
+ exit
+diff --git a/gastown/template-fragments/approval-fallacy.template.md b/gastown/template-fragments/approval-fallacy.template.md
+index 7c8f8f2b..489d9731 100644
+--- a/gastown/template-fragments/approval-fallacy.template.md
++++ b/gastown/template-fragments/approval-fallacy.template.md
+@@ -83,9 +83,9 @@ done
+ # Only POSITIVE evidence counts: the bead is closed, or it is held by the
+ # REFINERY — the one assignee submit-and-exit's handoff actually produces. Every
+ # weaker test has been observed draining a session with the branch unpushed.
+-# "Not in_progress for me" is not evidence: workspace-setup holds the work bead
+-# in_progress for this session only from that step on, and never takes it from
+-# the refinery or an operator escalation. Nor is a bare "assigned to
++# "Not in_progress for me" is not evidence: the polecat never claims the work
++# bead (only the refinery handoff writes its status and assignee), so what it
++# reads says nothing about this session. Nor is a bare "assigned to
+ # somebody else", which is equally true of a resumed molecule finding the bead
+ # still held by its own PREVIOUS session (a restarted session usually claims
+ # under a new identity) and
+diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
+index c41017f7..466cd859 100755
+--- a/gastown/tests/test_gastown_pack_assets.sh
++++ b/gastown/tests/test_gastown_pack_assets.sh
+@@ -334,10 +334,11 @@ test_claim_verify_separates_read_failure_from_unassigned() {
+ test_claim_refuses_a_pour_onto_a_live_owner() {
+     # gcp-mjjg: gc's ReleaseIfCurrent returns an in-flight step bead to the pool
+     # without writing a bd event, so a duplicate pour is indistinguishable from
+-    # ordinary unclaimed work at claim time. The molecule's WORK bead carries no
+-    # gc.routed_to and so is never released — it is the only durable record of
+-    # who owns the molecule, and the guard must consult it before any work
+-    # begins. Behavioural coverage lives in test_polecat_live_owner_guard.sh;
++    # ordinary unclaimed work at claim time. The step's own polecat_session and
++    # its siblings' assignees survive that release, so they are the durable
++    # record of who last held the molecule, and the guard must consult them
++    # before any work begins (the WORK bead is never read; gcp-952j9).
++    # Behavioural coverage lives in test_polecat_live_owner_guard.sh;
+     # this pins the guard into the startup contract so it cannot be quietly
+     # dropped from the claim block.
+     local prompt="$GASTOWN/agents/polecat/prompt.template.md"
+@@ -353,8 +354,7 @@ test_claim_refuses_a_pour_onto_a_live_owner() {
+ 
+     # The guard runs BEFORE the step re-point and the polecat_session stamp:
+     # both mutate bead state, and a declining polecat must touch nothing. The
+-    # stamp is the write on the claimed bead; a resume's takeover of the WORK
+-    # bead inside the guard also names this session, after the decline paths.
++    # stamp is the write on the claimed bead.
+     local guard_line stamp_line
+     guard_line=$(grep -n '# GUARD_END live-owner' "$prompt" | head -1 | cut -d: -f1)
+     stamp_line=$(grep -n '"\$WORK_ID" --set-metadata polecat_session="\$EXPECTED_ASSIGNEE"' "$prompt" | head -1 | cut -d: -f1)
+@@ -1109,10 +1109,9 @@ PY
+ 
+     # The prompt-side guard could not run at all in the observed session:
+     # $GC_BEAD_ID was empty, so it never resolved a work bead. Both copies must
+-    # recover the convoy, and both must key on POSITIVE evidence — the work
+-    # bead is in_progress for this session only once workspace-setup claims it,
+-    # so "not in_progress for me" reports already-submitted on work that was
+-    # never submitted.
++    # recover the convoy, and both must key on POSITIVE evidence — the polecat
++    # never claims the work bead, so "not in_progress for me" reports
++    # already-submitted on work that was never submitted.
+     local guard
+     for guard in "$prompt" "$fragment"; do
+         grep -F 'CONVOY_ID="${GC_BEAD_ID:-}"' "$guard" >/dev/null ||
+@@ -1153,164 +1152,90 @@ PY
+     done
+ }
+ 
+-test_work_bead_is_claimed_for_the_whole_run() {
+-    # gcp-5gir: mol-polecat-work only ever claimed its own STEP beads, so the
+-    # WORK bead stayed open+unassigned from dispatch until the refinery handoff.
+-    # For the whole implementation window it was indistinguishable, in
+-    # `gc bd ready`, from a bead nobody had touched — and a second `gc sling` onto
+-    # it spawns a duplicate polecat whose later push supersedes the first,
+-    # discarding work that was already written and self-reviewed.
+-    local formula prompt fragment setup_block submit_block
++test_work_bead_is_never_claimed() {
++    # gcp-952j9 retired the work-bead claim (gcp-5gir / gcp-cvbs / 0060). The
++    # polecat holds only its STEP beads. Upstream's model: the work bead is
++    # served to no pool query while it is unassigned (the graph.v2 sling never
++    # stamps gc.routed_to on it) and `gc sling` refuses a second pour onto a live
++    # workflow, so only the step-6 refinery handoff writes its status and
++    # assignee. The claim was also the only reason `gc hook --claim` ever handed
++    # the work bead back, which is what forced STEP_REPOINTED, the
++    # `gc.step_ref` close fallback and the `--if-assignee` takeover. All of that
++    # stays gone.
++    local formula prompt fragment
+     formula="$GASTOWN/formulas/mol-polecat-work.toml"
+     prompt="$GASTOWN/agents/polecat/prompt.template.md"
+     fragment="$GASTOWN/template-fragments/approval-fallacy.template.md"
+ 
+     parse_toml "$formula"
+ 
+-    setup_block=$(python3 - "$formula" <<'PY'
++    # No step claims the work bead: no in_progress status, no --claim, and no
++    # --assignee other than the refinery handoff and the release back to the
++    # pool. A logical statement is a line plus its backslash continuations.
++    python3 - "$formula" <<'PY' || fail "a step of mol-polecat-work claims the WORK bead; only the refinery handoff may write its status and assignee"
++import re
+ import sys
+ import tomllib
+ 
+ data = tomllib.load(open(sys.argv[1], "rb"))
+-step = next(s for s in data["steps"] if s["id"] == "workspace-setup")
+-print(step["description"])
+-PY
+-)
+-    submit_block=$(python3 - "$formula" <<'PY'
+-import sys
+-import tomllib
+-
+-data = tomllib.load(open(sys.argv[1], "rb"))
+-step = next(s for s in data["steps"] if s["id"] == "submit-and-exit")
+-print(step["description"])
++bad = []
++for step in data["steps"]:
++    text = re.sub(r"\\\n\s*", " ", step["description"])
++    for stmt in re.findall(r'gc bd update "\$WORK_BEAD_ID"[^\n]*', text):
++        if "--status=in_progress" in stmt or "--claim" in stmt:
++            bad.append((step["id"], stmt))
++        for value in re.findall(r"--assignee=(\S+)", stmt):
++            if value not in ('""', '"$REFINERY_TARGET"'):
++                bad.append((step["id"], stmt))
++if bad:
++    for item in bad:
++        print(item, file=sys.stderr)
++    raise SystemExit(1)
+ PY
+-)
+ 
+-    # The claim itself. Status AND assignee: status alone leaves the witness's
+-    # orphan pass blind (it skips unassigned beads), assignee alone leaves the
+-    # bead in `gc bd ready`, which is the defect.
+-    [[ "$setup_block" == *'gc bd update "$WORK_BEAD_ID" --status=in_progress --assignee="$POLECAT_SESSION"'* ]] ||
+-        fail "workspace-setup must claim the WORK bead with both status=in_progress and an assignee"
+-
+-    # It has to happen before the worktree is built, not somewhere later: every
+-    # second the bead spends open+unassigned is a second another planner can
+-    # sling a duplicate polecat onto it.
+-    python3 - "$formula" <<'PY' || fail "the work-bead claim must land in step 1, before the worktree is created"
++    # The retired workarounds must not come back: the step re-point, the
++    # compare-and-set takeover, and the close fallback that tolerated a hook
++    # that named the work bead.
++    local file
++    for file in "$prompt" "$formula"; do
++        ! grep -F 'STEP_REPOINTED' "$file" >/dev/null ||
++            fail "$(basename "$file") re-points a work-bead hook result onto a step; the work bead is never claimed, so the hook never returns it"
++    done
++    ! grep -F -- '--if-assignee' "$prompt" "$formula" >/dev/null ||
++        fail "an --if-assignee takeover is back; there is no claim on the work bead to take over"
++    ! grep -F 'tier 2' "$formula" >/dev/null ||
++        fail "submit-and-exit regained its gc.step_ref close fallback"
++    ! grep -F 'gc hook current --id-only 2>/dev/null' "$formula" >/dev/null ||
++        fail "submit-and-exit tolerates an unreadable gc hook current; it must fail closed"
++    ! grep -F 'CLAIM_GUARD_BEGIN' "$formula" >/dev/null ||
++        fail "workspace-setup regained the work-bead claim block"
++
++    # What carries the handoff is still there: the single step-6 write that
++    # moves the bead to the refinery, and the done-sequence guards that tell a
++    # completed handoff by the refinery's identity.
++    python3 - "$formula" <<'PY' || fail "submit-and-exit must hand the work bead straight to the refinery"
+ import sys
+ import tomllib
+ 
+ data = tomllib.load(open(sys.argv[1], "rb"))
+-step = next(s for s in data["steps"] if s["id"] == "workspace-setup")
+-text = step["description"]
+-claim = text.index('gc bd update "$WORK_BEAD_ID" --status=in_progress')
+-if claim >= text.index("**2. Ensure a safe per-bead artifact worktree exists.**"):
+-    raise SystemExit(1)
+-PY
+-
+-    # A write that exits 0 is not a claim: `--status` on this bead has been seen
+-    # not to stick (gcp-s14g), and a status that stays `open` leaves it in
+-    # `gc bd ready` with the fix reading as applied.
+-    [[ "$setup_block" == *'CLAIMED_STATUS'* && "$setup_block" == *'CLAIMED_ASSIGNEE'* ]] ||
+-        fail "workspace-setup must read the work-bead claim back instead of trusting the write"
+-
+-    # The done sequence, the resume re-verify and the worktree reaper all read
+-    # `assignee == polecat_session` as "a polecat still holds this". Stamping
+-    # only the assignee leaves a crashed predecessor's tag behind, and the bead
+-    # reads as already handed to the refinery.
+-    [[ "$setup_block" == *'--assignee="$POLECAT_SESSION" --set-metadata polecat_session="$POLECAT_SESSION"'* ]] ||
+-        fail "the work-bead claim must stamp polecat_session together with the assignee"
+-
+-    # Never steal a bead the refinery or an operator escalation already owns —
+-    # and never mistake "any assignee" for that. gcp-cvbs: the guard used to
+-    # skip the claim for every non-empty assignee, which is the ordinary shape
+-    # of planned work (the crew seat that filed it), so the bead stayed open in
+-    # `gc bd ready` all run and a second molecule was poured on it. The skip
+-    # must name its two owners. Behaviour is covered end-to-end in
+-    # test_polecat_work_bead_claim_guard.sh; these pin the condition itself.
+-    [[ "$setup_block" == *'[ "$CURRENT_ASSIGNEE" = "$REFINERY_TARGET" ]'* ]] ||
+-        fail "the claim must identify a refinery-held bead by identity, not by 'somebody else holds it'"
+-    [[ "$setup_block" == *'[ "$CURRENT_ROUTED_TO" = "human" ]'* ]] ||
+-        fail "the claim must recognise the gc.routed_to=human operator escalation"
+-    [[ "$setup_block" != *'if [ -n "$CURRENT_ASSIGNEE" ] && [ "$CURRENT_ASSIGNEE" != "$POLECAT_SESSION" ]'* ]] ||
+-        fail "the claim skip is back to 'any assignee that is not me', which voids it on every crew-authored bead"
+-
+-    # The bead's own note: pool dispatch leaves gc.routed_to blank on the work
+-    # bead on purpose so scale_check can see pool demand. Stamping it here
+-    # breaks spawn accounting instead of fixing visibility. READING the key is
+-    # how the escalation above is recognised, so the ban is on the write.
+-    [[ "$setup_block" != *'set-metadata gc.routed_to'* ]] ||
+-        fail "the work-bead claim must not stamp gc.routed_to; routing lives on the molecule root"
+-    [[ "$setup_block" != *'unset-metadata gc.routed_to'* ]] ||
+-        fail "the work-bead claim must not clear gc.routed_to; submit-and-exit is the single release point"
+-
+-    # Release is a single assignee move, session -> refinery. A release that
+-    # passed through unassigned would re-open the very window this closes.
+-    [[ "$submit_block" == *'gc bd update "$WORK_BEAD_ID" --status=open --assignee="$REFINERY_TARGET"'* ]] ||
+-        fail "submit-and-exit must hand the work bead straight to the refinery"
+-
+-    # Holding the claim means `gc hook --claim`'s crash-recovery tier
+-    # (`gc bd list --status in_progress --assignee=<you> --limit=1`) can return the
+-    # WORK bead instead of the next formula step — at every step boundary, where
+-    # the successor step is still stored `open`. Without the re-point the
+-    # molecule stops advancing and the branch is never pushed (gcp-tl8's shape).
+-    grep -F 'gc.step_ref" // empty' "$prompt" >/dev/null ||
+-        fail "the startup claim block must detect a hook result that is not a formula step"
+-    grep -F 'STEP_REPOINTED' "$prompt" >/dev/null ||
+-        fail "the startup claim block must re-point at the molecule's next ready step"
+-
+-    # `gc bd ready` is blocker-aware but EXCLUDES in_progress, so on its own it
+-    # cannot see a step this session already claimed. The hook's recovery tier
+-    # matches the in-flight step AND the held work bead and returns either, so a
+-    # ready-only re-point silently finds nothing on the work-bead outcome — the
+-    # stall it exists to prevent. Resume the claimed step before falling back.
+-    python3 - "$prompt" <<'PY' || fail "the step re-point must look for an in_progress step bead before falling back to the blocker-aware gc bd ready query"
+-import sys
+-
+-text = open(sys.argv[1], encoding="utf-8").read()
+-block = text[text.index("bash <<'GC_CLAIM'"): text.index("GC_CLAIM\n```")]
+-inflight = block.index('--status=in_progress \\\n    --has-metadata-key gc.step_ref')
+-if inflight >= block.index("gc bd ready --assignee="):
+-    raise SystemExit(1)
+-PY
+-
+-    # The fallback must stay `gc bd ready`, not a bare `gc bd list` over open
+-    # steps: an `open` step whose predecessor has not closed is not runnable,
+-    # and jumping to it skips the step in between.
+-    [[ "$(grep -c -F 'gc bd ready --assignee=' "$prompt")" == "1" ]] ||
+-        fail "the step re-point's fallback must remain the single blocker-aware gc bd ready query"
+-    python3 - "$prompt" <<'PY' || fail "the step re-point must run before the polecat_session stamp, so the stamp lands on the bead actually being executed"
+-import sys
+-
+-text = open(sys.argv[1], encoding="utf-8").read()
+-block = text[text.index("bash <<'GC_CLAIM'"): text.index("GC_CLAIM\n```")]
+-if "STEP_REPOINTED" not in block:
++step = next(s for s in data["steps"] if s["id"] == "submit-and-exit")
++if 'gc bd update "$WORK_BEAD_ID" --status=open --assignee="$REFINERY_TARGET"' not in step["description"]:
+     raise SystemExit(1)
+-# Match the STAMP precisely, not any polecat_session write: the live-owner
+-# guard also writes that key when it restores a step to its owner, and when a
+-# resume takes the WORK bead over, and both legitimately precede the re-point.
+-# The stamp is the one that names THIS session on the bead being executed.
+-if block.index("STEP_REPOINTED") >= block.index('"$WORK_ID" --set-metadata polecat_session="$EXPECTED_ASSIGNEE"'):
++if "HANDOFF_FAILED" not in step["description"]:
+     raise SystemExit(1)
+ PY
+-
+-    # A resumed molecule finds its work bead held by its own PREVIOUS session
+-    # (pool restarts mint a new identity). Reading that as "handed off" drains
+-    # with the branch unpushed — the failure the guard exists to prevent. The
+-    # escape used to be an explicit `assignee != metadata.polecat_session`
+-    # exception; gcp-0pa4 replaced it with the positive
+-    # `assignee == $REFINERY_TARGET` test, which excludes a predecessor session
+-    # and every other non-refinery identity by construction. Pin the property,
+-    # not the mechanism: no polecat session identity is ever the refinery target.
+     local guard
+     for guard in "$prompt" "$fragment"; do
+         grep -F '[ "$WORK_ASSIGNEE" = "$REFINERY_TARGET" ]' "$guard" >/dev/null ||
+-            fail "$(basename "$guard") must not read a previous polecat session's own claim as a completed handoff"
++            fail "$(basename "$guard") must tell a completed handoff by the refinery's identity"
++        grep -F 'the polecat never claims the work' "$guard" >/dev/null ||
++            fail "$(basename "$guard") still describes a claimed work bead"
+     done
+ }
+ 
+ test_dog_assets_are_pack_local
+ test_retired_dog_formulas_are_not_reintroduced
+-test_work_bead_is_claimed_for_the_whole_run
++test_work_bead_is_never_claimed
+ test_submit_and_exit_cannot_be_replayed
+ test_polecat_home_teardown_has_an_owner
+ test_dolt_push_outage_detection_is_wired
+diff --git a/gastown/tests/test_polecat_artifact_dir.sh b/gastown/tests/test_polecat_artifact_dir.sh
+index 438630d2..f8ebc1bc 100755
+--- a/gastown/tests/test_polecat_artifact_dir.sh
++++ b/gastown/tests/test_polecat_artifact_dir.sh
+@@ -26,17 +26,10 @@ physical_mktemp_dir() {
+     (cd "$dir" && pwd -P)
+ }
+ 
+-# Step 1 of workspace-setup claims the work bead before it reads the artifact
+-# metadata, and stamps the session identity it finds in the environment. The
+-# workspace tests pin that identity so the expected call does not vary with
+-# whichever session runs the suite.
++# The workspace tests pin the session identity so the stubbed work bead does not
++# vary with whichever session runs the suite.
+ WORKSPACE_TEST_ACTOR=ac-test-polecat
+ 
+-workspace_claim_call() {
+-    printf '%s update ac-safe1 --status=in_progress --assignee=%s --set-metadata polecat_session=%s' \
+-        "$1" "$WORKSPACE_TEST_ACTOR" "$WORKSPACE_TEST_ACTOR"
+-}
+-
+ extract_validator() {
+     local output=$1
+     python3 - "$POLECAT_FORMULA" "$output" <<'PY'
+@@ -115,7 +108,7 @@ with formula_path.open("rb") as handle:
+ workspace = next(step for step in formula["steps"] if step["id"] == "workspace-setup")
+ blocks = re.findall(r"```bash\n(.*?)```", workspace["description"], re.DOTALL)
+ # Everything up to and including the block that adds the worktree. Counting
+-# blocks goes stale each time the step gains one (the work-bead claim did).
++# blocks goes stale each time the step gains or loses one.
+ creation = next((i for i, block in enumerate(blocks) if "worktree add" in block), None)
+ if creation is None:
+     raise SystemExit(f"workspace-setup has no worktree-creation block among {len(blocks)} bash blocks")
+@@ -140,7 +133,7 @@ init_repo() {
+ }
+ 
+ test_workspace_creation_uses_canonical_sibling() {
+-    local tmp rig remote city provider canonical setup calls bd_subcommand claim_call
++    local tmp rig remote city provider canonical setup calls bd_subcommand
+     tmp=$(physical_mktemp_dir)
+     trap 'rm -rf "$tmp"' RETURN
+     rig="$tmp/rig"
+@@ -151,7 +144,6 @@ test_workspace_creation_uses_canonical_sibling() {
+     setup="$tmp/workspace-create.sh"
+     calls="$tmp/gc-calls"
+     bd_subcommand=$(printf '%s%s' b d)
+-    claim_call=$(workspace_claim_call "$bd_subcommand")
+ 
+     init_repo "$rig"
+     git -C "$rig" branch -M main
+@@ -177,8 +169,7 @@ test_workspace_creation_uses_canonical_sibling() {
+                     return 0
+                     ;;
+                 "$bd_subcommand update ac-safe1 --unset-metadata handoff_stage" | \
+-                "$bd_subcommand update ac-safe1 --set-metadata base_ref="* | \
+-                "$claim_call")
++                "$bd_subcommand update ac-safe1 --set-metadata base_ref="*)
+                     return 0
+                     ;;
+                 "runtime drain-ack")
+@@ -619,9 +610,8 @@ test_validator_rejects_provider_and_unrelated_paths() {
+ }
+ 
+ test_workspace_metadata_reads_fail_closed_without_pipefail() {
+-    local mode tmp rig remote city provider canonical setup calls bd_subcommand claim_call
++    local mode tmp rig remote city provider canonical setup calls bd_subcommand
+     bd_subcommand=$(printf '%s%s' b d)
+-    claim_call=$(workspace_claim_call "$bd_subcommand")
+     for mode in command-failure malformed empty ambiguous; do
+         tmp=$(physical_mktemp_dir)
+         rig="$tmp/rig"
+@@ -663,12 +653,11 @@ test_workspace_metadata_reads_fail_closed_without_pipefail() {
+                     "runtime drain-ack")
+                         return 0
+                         ;;
+-                    # Step 1's stage-marker clear, base_ref record and work-bead
+-                    # claim run before the artifact metadata read by design;
+-                    # none names an artifact path.
++                    # Step 1's stage-marker clear and base_ref record run before
++                    # the artifact metadata read by design; neither names an
++                    # artifact path.
+                     "$bd_subcommand update ac-safe1 --unset-metadata handoff_stage" | \
+-                    "$bd_subcommand update ac-safe1 --set-metadata base_ref=refs/remotes/origin/main" | \
+-                    "$claim_call")
++                    "$bd_subcommand update ac-safe1 --set-metadata base_ref=refs/remotes/origin/main")
+                         return 0
+                         ;;
+                     "$bd_subcommand update "*)
+@@ -694,8 +683,7 @@ test_workspace_metadata_reads_fail_closed_without_pipefail() {
+             fail "metadata read mode $mode created a replacement artifact"
+         if grep "^${bd_subcommand} update " "$calls" |
+             grep -v -x -e "${bd_subcommand} update ac-safe1 --unset-metadata handoff_stage" \
+-                -e "${bd_subcommand} update ac-safe1 --set-metadata base_ref=refs/remotes/origin/main" \
+-                -e "$claim_call" |
++                -e "${bd_subcommand} update ac-safe1 --set-metadata base_ref=refs/remotes/origin/main" |
+             grep -q .; then
+             fail "metadata read mode $mode mutated work bead metadata"
+         fi
+@@ -704,7 +692,7 @@ test_workspace_metadata_reads_fail_closed_without_pipefail() {
+ }
+ 
+ test_workspace_collision_fails_closed_without_alternate() {
+-    local tmp rig remote city provider canonical setup calls bd_subcommand claim_call
++    local tmp rig remote city provider canonical setup calls bd_subcommand
+     tmp=$(physical_mktemp_dir)
+     trap 'rm -rf "$tmp"' RETURN
+     rig="$tmp/rig"
+@@ -715,7 +703,6 @@ test_workspace_collision_fails_closed_without_alternate() {
+     setup="$tmp/workspace-create.sh"
+     calls="$tmp/gc-calls"
+     bd_subcommand=$(printf '%s%s' b d)
+-    claim_call=$(workspace_claim_call "$bd_subcommand")
+ 
+     init_repo "$rig"
+     git -C "$rig" branch -M main
+@@ -744,11 +731,10 @@ test_workspace_collision_fails_closed_without_alternate() {
+                 "runtime drain-ack")
+                     return 0
+                     ;;
+-                # Step 1's stage-marker clear, base_ref record and work-bead
+-                # claim run before the artifact is touched, by design.
++                # Step 1's stage-marker clear and base_ref record run before the
++                # artifact is touched, by design.
+                 "$bd_subcommand update ac-safe1 --unset-metadata handoff_stage" | \
+-                "$bd_subcommand update ac-safe1 --set-metadata base_ref=refs/remotes/origin/main" | \
+-                "$claim_call")
++                "$bd_subcommand update ac-safe1 --set-metadata base_ref=refs/remotes/origin/main")
+                     return 0
+                     ;;
+                 "$bd_subcommand update "*)
+@@ -779,7 +765,7 @@ test_workspace_collision_fails_closed_without_alternate() {
+ }
+ 
+ test_workspace_rejects_redirected_artifact_root_before_creation() {
+-    local tmp rig remote city provider redirected setup calls bd_subcommand claim_call
++    local tmp rig remote city provider redirected setup calls bd_subcommand
+     tmp=$(physical_mktemp_dir)
+     trap 'rm -rf "$tmp"' RETURN
+     rig="$tmp/rig"
+@@ -790,7 +776,6 @@ test_workspace_rejects_redirected_artifact_root_before_creation() {
+     setup="$tmp/workspace-create.sh"
+     calls="$tmp/gc-calls"
+     bd_subcommand=$(printf '%s%s' b d)
+-    claim_call=$(workspace_claim_call "$bd_subcommand")
+ 
+     init_repo "$rig"
+     git -C "$rig" branch -M main
+@@ -819,11 +804,10 @@ test_workspace_rejects_redirected_artifact_root_before_creation() {
+                 "runtime drain-ack")
+                     return 0
+                     ;;
+-                # Step 1's stage-marker clear, base_ref record and work-bead
+-                # claim run before the artifact is touched, by design.
++                # Step 1's stage-marker clear and base_ref record run before the
++                # artifact is touched, by design.
+                 "$bd_subcommand update ac-safe1 --unset-metadata handoff_stage" | \
+-                "$bd_subcommand update ac-safe1 --set-metadata base_ref=refs/remotes/origin/main" | \
+-                "$claim_call")
++                "$bd_subcommand update ac-safe1 --set-metadata base_ref=refs/remotes/origin/main")
+                     return 0
+                     ;;
+                 "$bd_subcommand update "*)
+diff --git a/gastown/tests/test_polecat_live_owner_guard.sh b/gastown/tests/test_polecat_live_owner_guard.sh
+index a043fa65..b7e184b4 100755
+--- a/gastown/tests/test_polecat_live_owner_guard.sh
++++ b/gastown/tests/test_polecat_live_owner_guard.sh
+@@ -13,6 +13,11 @@
+ # against a stubbed `gc` and assert that the refusal is now mechanical: a live
+ # owner is declined and the step restored, a dead owner is not (that is the
+ # ordinary post-restart resume, and stalling it would stall the engine).
++#
++# The owner is the molecule's LAST HOLDER, never the WORK bead's assignee (the
++# polecat does not claim the work bead; gcp-952j9): the claimed step's own
++# polecat_session, else the most recently updated sibling step that names an
++# assignee. run_guard seeds that sibling from its `owner` argument.
+ set -euo pipefail
+ 
+ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+@@ -52,6 +57,7 @@ case "$1 $2" in
+             *) printf '[]' ;;
+         esac
+         ;;
++    "bd list") cat "$GC_LIST_JSON" ;; # gc-bd-argv-tail: case label matching the fake gc's argv tail
+     "convoy status") cat "$GC_CONVOY_JSON" ;;
+     "session list") cat "$GC_SESSIONS_JSON" ;;
+     "bd update") exit "${GC_UPDATE_EXIT:-0}" ;; # gc-bd-argv-tail: case label matching the fake gc's argv tail
+@@ -73,7 +79,12 @@ run_guard() {
+     local dir="$1" owner_assignee="$2" me="$3" step_ref="${4-mol-polecat-work.implement}"
+     local root_meta="${5-\"gc.root_bead_id\":\"winnow-5azcp\",}"
+     local claim_reason="${6-claimed}"
+-    local work_meta="${7-}"
++    # step_tag is the claimed step's own polecat_session; work_assignee seeds an
++    # assignee on the WORK bead, which the guard must never read.
++    local step_tag="${7-}" work_assignee="${8-}"
++    local tag_meta="" work_owner=""
++    [[ -z "$step_tag" ]] || tag_meta="\"polecat_session\":\"$step_tag\","
++    [[ -z "$work_assignee" ]] || work_owner="\"assignee\":\"$work_assignee\","
+ 
+     cat >"$dir/root.json" <<'JSON'
+ [{"id":"winnow-5azcp","status":"in_progress","metadata":{"gc.input_convoy_id":"winnow-0inqp"}}]
+@@ -82,7 +93,15 @@ JSON
+ {"children":[{"id":"winnow-pcpn6","status":"in_progress"}]}
+ JSON
+     cat >"$dir/work.json" <<JSON
+-[{"id":"winnow-pcpn6","status":"in_progress","assignee":"$owner_assignee","metadata":{${work_meta}"gc.session_id":"gc-8a4d"}}]
++[{"id":"winnow-pcpn6","status":"open",${work_owner}"metadata":{"gc.session_id":"gc-8a4d"}}]
++JSON
++    # The molecule's steps: an older sibling held by a long-gone session, the
++    # last holder named by owner_assignee, and the claimed step itself with a
++    # LATER stamp, so a guard that fails to exclude its own step picks us.
++    cat >"$dir/list.json" <<JSON
++[{"id":"winnow-sib0","status":"closed","assignee":"winnow/gastown.old","updated_at":"2026-09-07T19:00:00Z","metadata":{"gc.root_bead_id":"winnow-5azcp"}},
++ {"id":"winnow-sib1","status":"closed","assignee":"$owner_assignee","updated_at":"2026-09-07T20:30:00Z","metadata":{"gc.root_bead_id":"winnow-5azcp"}},
++ {"id":"winnow-iaroy","status":"in_progress","assignee":"$me","updated_at":"2026-09-07T20:40:00Z","metadata":{"gc.root_bead_id":"winnow-5azcp"}}]
+ JSON
+     cat >"$dir/guard-harness.sh" <<HARNESS
+ unset BEADS_ACTOR GC_ALIAS GC_SESSION_ID GC_SESSION_NAME GC_AGENT
+@@ -92,7 +111,7 @@ WORK_ID="winnow-iaroy"
+ EXPECTED_ASSIGNEE="$me"
+ STEP_REF="$step_ref"
+ CLAIM_REASON="$claim_reason"
+-SHOW_JSON='[{"id":"winnow-iaroy","status":"in_progress","assignee":"$me","metadata":{${root_meta}"gc.step_ref":"$step_ref"}}]'
++SHOW_JSON='[{"id":"winnow-iaroy","status":"in_progress","assignee":"$me","metadata":{${root_meta}${tag_meta}"gc.step_ref":"$step_ref"}}]'
+ GC_RIG="winnow"
+ HARNESS
+     cat "$dir/guard.sh" >>"$dir/guard-harness.sh"
+@@ -100,7 +119,7 @@ HARNESS
+ 
+     GC_CALLS="$dir/calls.log" \
+         GC_ROOT_BEAD="winnow-5azcp" GC_ROOT_JSON="$dir/root.json" \
+-        GC_WORK_BEAD="winnow-pcpn6" GC_WORK_JSON="$dir/work.json" \
++        GC_WORK_BEAD="winnow-pcpn6" GC_WORK_JSON="$dir/work.json" GC_LIST_JSON="$dir/list.json" \
+         GC_CONVOY_JSON="$dir/convoy.json" GC_SESSIONS_JSON="$dir/sessions.json" \
+         PATH="$dir/bin:$PATH" bash "$dir/guard-harness.sh"
+ }
+@@ -132,7 +151,7 @@ test_live_owner_is_declined_and_the_step_restored() {
+     live_sessions "$dir"
+ 
+     # The incident, exactly: nux/gc-psfm holds a clean claim on the implement
+-    # step while furiosa/gc-8a4d still holds the work bead and is active.
++    # step while furiosa/gc-8a4d last held the molecule and is active.
+     out=$(run_guard "$dir" "gastown__polecat-gc-8a4d" "gastown__polecat-gc-psfm")
+ 
+     grep -F 'CLAIM_DECLINED_LIVE_OWNER winnow-iaroy' <<<"$out" >/dev/null ||
+@@ -191,7 +210,7 @@ test_restore_takes_the_session_name_from_the_live_row() {
+ # session's own molecule. Upstream #360 (9f98ea4e) settled this for the claim:
+ # any of BEADS_ACTOR, GC_ALIAS, GC_SESSION_ID, GC_SESSION_NAME, GC_AGENT is us.
+ test_own_molecule_under_another_spelling_is_not_declined() {
+-    local dir out line
++    local dir out
+     dir=$(new_case)
+     live_sessions "$dir"
+ 
+@@ -206,11 +225,10 @@ test_own_molecule_under_another_spelling_is_not_declined() {
+         fail "the guard probed liveness for an owner that is one of this session's own identities"
+     ! grep -F -- '--assignee=gastown__polecat-gc-psfm' "$dir/calls.log" >/dev/null ||
+         fail "the guard restored the step as if to another owner"
+-    # bd checks writes against BEADS_ACTOR, so the bead moves to the spelling
+-    # this session acts under, or step 6's handoff is refused.
+-    line=$(takeover_line winnow/gastown.nux "$dir" gastown__polecat-gc-psfm)
+-    [[ -n "$line" ]] ||
+-        fail "the work bead was left under the old spelling of this session: $(cat "$dir/calls.log")"
++    # Nothing is written: the work bead is not ours to move, and the step is
++    # already ours.
++    ! grep -F 'bd update' "$dir/calls.log" >/dev/null || # gc-bd-argv-tail: stub call log, not an invocation
++        fail "the guard wrote to a bead for this session's own molecule: $(cat "$dir/calls.log")"
+ }
+ 
+ test_dead_owner_is_a_resume_and_proceeds() {
+@@ -233,66 +251,6 @@ JSON
+         fail "resume path wrote the dead owner back onto the step"
+ }
+ 
+-# bd >= 1.3.0 refuses a plain --assignee write over another actor's in_progress
+-# claim, and the WORK bead is held in_progress for the whole run (0060). A resume
+-# that leaves it under the dead owner therefore fails submit-and-exit's step-6
+-# handoff to the refinery with the branch already pushed, so the resume takes
+-# the bead over, as a compare-and-set on the owner it just found dead.
+-takeover_line() {
+-    grep -F -- "winnow-pcpn6 --assignee=$1" "$2/calls.log" | grep -F -- "--if-assignee $3" || true
+-}
+-
+-test_dead_owner_resume_takes_the_work_bead_over() {
+-    local dir out line
+-    dir=$(new_case)
+-    cat >"$dir/sessions.json" <<'JSON'
+-{"sessions":[{"id":"gc-psfm","name":"winnow/gastown.nux","session_name":"gastown__polecat-gc-psfm","state":"active","closed":false}]}
+-JSON
+-
+-    out=$(run_guard "$dir" "gastown__polecat-gc-8a4d" "gastown__polecat-gc-psfm")
+-
+-    grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null || fail "the resume did not proceed: $out"
+-    line=$(takeover_line gastown__polecat-gc-psfm "$dir" gastown__polecat-gc-8a4d)
+-    [[ -n "$line" ]] ||
+-        fail "the resume left the work bead under its dead owner, so step 6's handoff will be refused: $(cat "$dir/calls.log")"
+-    [[ "$line" == *"--set-metadata polecat_session=gastown__polecat-gc-psfm"* ]] ||
+-        fail "the takeover moved the assignee without polecat_session, which must ride along with it: $line"
+-}
+-
+-test_resume_never_takes_over_from_the_refinery_or_an_escalation() {
+-    local dir out
+-    # The refinery is not running, so it reads as a dead owner. Taking its bead
+-    # would pull a handed-off bead out of the merge queue; workspace-setup's
+-    # claim skips the same two owners.
+-    dir=$(new_case)
+-    printf '{"sessions":[]}' >"$dir/sessions.json"
+-    out=$(run_guard "$dir" "winnow/{{ .BindingPrefix }}refinery" "gastown__polecat-gc-psfm")
+-    grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null || fail "the resume did not proceed: $out"
+-    [[ -z "$(takeover_line gastown__polecat-gc-psfm "$dir" "winnow/{{ .BindingPrefix }}refinery")" ]] ||
+-        fail "the resume took a work bead over from the refinery"
+-
+-    dir=$(new_case)
+-    printf '{"sessions":[]}' >"$dir/sessions.json"
+-    out=$(run_guard "$dir" "winnow/crew.valkyrie" "gastown__polecat-gc-psfm" \
+-        "mol-polecat-work.implement" '"gc.root_bead_id":"winnow-5azcp",' "claimed" '"gc.routed_to":"human",')
+-    grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null || fail "the resume did not proceed: $out"
+-    [[ -z "$(takeover_line gastown__polecat-gc-psfm "$dir" winnow/crew.valkyrie)" ]] ||
+-        fail "the resume pulled a gc.routed_to=human bead out of its operator escalation"
+-}
+-
+-test_refused_takeover_warns_and_still_resumes() {
+-    local dir out
+-    dir=$(new_case)
+-    printf '{"sessions":[]}' >"$dir/sessions.json"
+-
+-    # 13 is bd's stale --if-assignee exit: the bead changed hands since the read.
+-    out=$(GC_UPDATE_EXIT=13 run_guard "$dir" "gastown__polecat-gc-8a4d" "gastown__polecat-gc-psfm")
+-
+-    grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null || fail "a refused takeover stalled the resume: $out"
+-    grep -F 'WARN could not take work bead winnow-pcpn6 over from gastown__polecat-gc-8a4d' <<<"$out" >/dev/null ||
+-        fail "a refused takeover passed silently: $out"
+-}
+-
+ test_closed_session_still_listed_is_not_live() {
+     local dir out
+     dir=$(new_case)
+@@ -356,21 +314,20 @@ test_unresolvable_molecule_proceeds_unguarded() {
+         fail "an unresolvable molecule blocked the engine: $out"
+ }
+ 
+-test_work_bead_claim_skips_the_guard() {
++test_non_step_claim_skips_the_guard() {
+     local dir out
+     dir=$(new_case)
+     live_sessions "$dir"
+ 
+-    # No gc.step_ref means the hook handed back the WORK bead itself, which
+-    # post-claim ownership verification has already proved is ours. There is no
+-    # foreign owner to find, and the convoy walk would be three wasted reads on
++    # No gc.step_ref means the claim is not a formula step, so there is no
++    # molecule to find a last holder in, and the lookup would be wasted reads on
+     # the hot startup path.
+     out=$(run_guard "$dir" "gastown__polecat-gc-8a4d" "gastown__polecat-gc-psfm" "")
+ 
+     grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null ||
+-        fail "a work-bead claim was blocked by the step guard: $out"
+-    ! grep -F 'convoy status' "$dir/calls.log" >/dev/null ||
+-        fail "the guard walked the convoy for a bead carrying no gc.step_ref"
++        fail "a claim carrying no gc.step_ref was blocked by the step guard: $out"
++    [[ ! -s "$dir/calls.log" ]] ||
++        fail "the guard read bead state for a claim carrying no gc.step_ref: $(cat "$dir/calls.log")"
+ }
+ 
+ test_preassigned_step_skips_the_walk_entirely() {
+@@ -406,11 +363,11 @@ test_unknown_claim_reason_still_checks() {
+ }
+ 
+ # gcp-qjkp: a crew, specialist or mayor seat is always live and never runs
+-# polecat steps. When one is still the work bead's assignee it is the slinger,
+-# not a worker, and declining would hand the step to a seat that will not run
+-# it. Only a live POLECAT or REFINERY owner is a worker.
++# polecat steps. When one is the molecule's last holder it is the slinger, not a
++# worker, and declining would hand the step to a seat that will not run it. Only
++# a live POLECAT or REFINERY owner is a worker.
+ test_live_crew_owner_is_the_slinger_and_proceeds() {
+-    local dir out line
++    local dir out
+     dir=$(new_case)
+     live_sessions "$dir"
+ 
+@@ -428,9 +385,66 @@ test_live_crew_owner_is_the_slinger_and_proceeds() {
+         fail "the guard nudged the witness about a crew slinger"
+     ! grep -F 'runtime drain-ack' "$dir/calls.log" >/dev/null ||
+         fail "the guard drained on a crew slinger"
+-    line=$(takeover_line winnow/gastown.nux "$dir" winnow/specialists.thomas)
+-    [[ -n "$line" ]] ||
+-        fail "the work bead was not taken over from the crew seat: $(cat "$dir/calls.log")"
++}
++
++# The WORK bead is unclaimed for the whole run, so with nobody on it the guard
++# must still find a duplicate pour: a live polecat last held the molecule.
++test_duplicate_pour_declines_with_the_work_bead_unclaimed() {
++    local dir out
++    dir=$(new_case)
++    live_sessions "$dir"
++
++    out=$(run_guard "$dir" "winnow/gastown.furiosa" "winnow/gastown.nux")
++
++    ! grep -F '"assignee"' "$dir/work.json" >/dev/null ||
++        fail "fixture error: the work bead should be unassigned"
++    grep -F 'CLAIM_DECLINED_LIVE_OWNER winnow-iaroy' <<<"$out" >/dev/null ||
++        fail "a duplicate pour was not declined with the work bead unclaimed: $out"
++    grep -F 'molecule winnow-5azcp was last held by winnow/gastown.furiosa' <<<"$out" >/dev/null ||
++        fail "decline did not name the molecule's last holder: $out"
++    ! grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null ||
++        fail "guard declined but still fell through to the work"
++}
++
++# A released step keeps its own polecat_session (ReleaseIfCurrent touches only
++# status and assignee), so that stamp names the holder before any sibling does.
++test_released_step_names_its_own_last_holder() {
++    local dir out
++    dir=$(new_case)
++    live_sessions "$dir"
++
++    # The siblings say the crew seat; the step's own stamp says furiosa. The
++    # stamp wins, and the sibling lookup is never made.
++    out=$(run_guard "$dir" "winnow/specialists.thomas" "winnow/gastown.nux" \
++        "mol-polecat-work.implement" '"gc.root_bead_id":"winnow-5azcp",' "claimed" \
++        "gastown__polecat-gc-8a4d")
++
++    grep -F 'CLAIM_DECLINED_LIVE_OWNER winnow-iaroy' <<<"$out" >/dev/null ||
++        fail "a released step did not name its own last holder: $out"
++    grep -F 'was last held by gastown__polecat-gc-8a4d' <<<"$out" >/dev/null ||
++        fail "decline named the sibling instead of the step's own stamp: $out"
++    ! grep -F -- '--metadata-field' "$dir/calls.log" >/dev/null ||
++        fail "the guard listed sibling steps although the step named its holder: $(cat "$dir/calls.log")"
++}
++
++# A crew seat on the WORK bead is the slinger's name, not a holder's. The guard
++# must not read it, so it neither declines on it nor takes it over.
++test_crew_assignee_on_the_work_bead_is_never_read() {
++    local dir out
++    dir=$(new_case)
++    live_sessions "$dir"
++
++    # The last holder is a dead polecat: an ordinary resume.
++    out=$(run_guard "$dir" "gastown__polecat-gc-dead" "winnow/gastown.nux" \
++        "mol-polecat-work.implement" '"gc.root_bead_id":"winnow-5azcp",' "claimed" \
++        "" "winnow/specialists.thomas")
++
++    grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null ||
++        fail "a crew assignee on the work bead stalled the resume: $out"
++    ! grep -F 'CLAIM_DECLINED_LIVE_OWNER' <<<"$out" >/dev/null ||
++        fail "a crew assignee on the work bead was read as the holder: $out"
++    ! grep -F 'winnow-pcpn6' "$dir/calls.log" >/dev/null ||
++        fail "the guard touched the work bead: $(cat "$dir/calls.log")"
+ }
+ 
+ test_live_refinery_owner_is_still_declined() {
+@@ -469,18 +483,18 @@ test_live_owner_is_declined_and_the_step_restored
+ test_restore_takes_the_session_name_from_the_live_row
+ test_dead_owner_is_a_resume_and_proceeds
+ test_own_molecule_under_another_spelling_is_not_declined
+-test_dead_owner_resume_takes_the_work_bead_over
+-test_resume_never_takes_over_from_the_refinery_or_an_escalation
+-test_refused_takeover_warns_and_still_resumes
+ test_closed_session_still_listed_is_not_live
+ test_own_molecule_proceeds_without_probing_liveness
+ test_unreadable_liveness_fails_closed
+ test_unresolvable_molecule_proceeds_unguarded
+-test_work_bead_claim_skips_the_guard
++test_non_step_claim_skips_the_guard
+ test_preassigned_step_skips_the_walk_entirely
+ test_unknown_claim_reason_still_checks
+ test_live_crew_owner_is_the_slinger_and_proceeds
+ test_live_refinery_owner_is_still_declined
+ test_live_owner_without_a_template_fails_closed
++test_duplicate_pour_declines_with_the_work_bead_unclaimed
++test_released_step_names_its_own_last_holder
++test_crew_assignee_on_the_work_bead_is_never_read
+ 
+ echo "polecat live-owner guard tests passed"
+diff --git a/gastown/tests/test_polecat_work_bead_claim_guard.sh b/gastown/tests/test_polecat_work_bead_claim_guard.sh
+deleted file mode 100755
+index ff2fd8f4..00000000
+--- a/gastown/tests/test_polecat_work_bead_claim_guard.sh
++++ /dev/null
+@@ -1,264 +0,0 @@
+-#!/usr/bin/env bash
+-# Executable reproduction of the duplicate dispatch in gcp-cvbs / gaunt-m58w.
+-#
+-# `mol-polecat-work`'s workspace-setup step claims the WORK bead so it stops
+-# sitting in `gc bd ready` looking untouched while a polecat is building on it.
+-# The guard in front of that claim was written to protect a refinery-owned or
+-# operator-escalated bead — but its condition was "any non-empty assignee", and
+-# planned work normally arrives already assigned to the crew seat that filed it.
+-# So on 2026-09-04 gauntlet's gaunt-m58w (assignee gauntlet/crew.valkyrie) kept
+-# status=open for the whole run and a SECOND mol-polecat-work molecule was
+-# poured on it; the same shape recurred live on gcp-jxtc on 2026-09-13, where
+-# the duplicate carried its own submit-and-exit and came within one step of
+-# pushing a second branch over two finished commits.
+-#
+-# These tests run the claim guard out of the formula against a stubbed `gc` and
+-# assert the narrowed rule mechanically: a crew-assigned bead IS claimed, and
+-# the claim is skipped only for the two owners this session must not displace —
+-# the refinery target, and a `gc.routed_to=human` operator escalation.
+-# Nearly every assertion greps for a literal shell snippet out of the formula,
+-# so single-quoted `$VAR` is the point, not an error.
+-# shellcheck disable=SC2016
+-set -euo pipefail
+-
+-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+-FORMULA="$ROOT/gastown/formulas/mol-polecat-work.toml"
+-
+-ME="gastown__polecat-gc-oiac"
+-RIG="gascity-packs"
+-REFINERY="$RIG/gastown.refinery"
+-CREW="$RIG/crew.valkyrie"
+-BEAD="gcp-cvbs"
+-
+-# The exact argv tails the claim hands to `gc`. They are grepped out of the fake
+-# gc's call log — data the stub recorded, never an invocation — so they are
+-# hoisted here where the drift guard's allowlist can pin them line by line.
+-CLAIM_CALL="bd update $BEAD --status=in_progress --assignee=$ME --set-metadata polecat_session=$ME" # gc-bd-argv-tail: expected argv tail, not an invocation
+-CLAIM_CALL_PREFIX="bd update $BEAD" # gc-bd-argv-tail: expected argv tail, not an invocation
+-CLAIM_STATUS_PREFIX="bd update $BEAD --status=in_progress" # gc-bd-argv-tail: expected argv tail, not an invocation
+-
+-fail() {
+-    echo "FAIL: $*" >&2
+-    exit 1
+-}
+-
+-# extract_guard pulls the guard verbatim out of the step description that ships,
+-# so a drifted or deleted guard fails here rather than passing against a stale
+-# copy. `{{binding_prefix}}` is the one render the formula engine would do; it
+-# is substituted so the refinery identity under test is the real one.
+-extract_guard() {
+-    local out="$1"
+-    python3 - "$FORMULA" <<'PY' >"$out"
+-import sys
+-import tomllib
+-
+-data = tomllib.load(open(sys.argv[1], "rb"))
+-step = next(s for s in data["steps"] if s["id"] == "workspace-setup")
+-text = step["description"]
+-begin = "# CLAIM_GUARD_BEGIN work-bead"
+-end = "# CLAIM_GUARD_END work-bead"
+-if begin not in text or end not in text:
+-    raise SystemExit("workspace-setup has no extractable work-bead claim guard")
+-body = text[text.index(begin): text.index(end) + len(end)]
+-sys.stdout.write(body.replace("{{binding_prefix}}", "gastown."))
+-PY
+-    [[ -s "$out" ]] || fail "could not extract the work-bead claim guard from $FORMULA"
+-    grep -F 'gc bd update "$WORK_BEAD_ID" --status=in_progress' "$out" >/dev/null ||
+-        fail "extracted guard does not contain the claim"
+-    bash -n "$out" || fail "extracted guard is not valid shell"
+-}
+-
+-# write_gc_stub answers only the reads the guard makes and records every call,
+-# so a test asserts on what the guard DID, not just on what it printed. The
+-# claim is stateful: once an update lands, subsequent reads report the claimed
+-# bead, which is what lets the guard's own readback loop settle.
+-write_gc_stub() {
+-    local bin="$1"
+-    mkdir -p "$bin"
+-    cat >"$bin/gc" <<'SH'
+-#!/usr/bin/env bash
+-printf '%s\n' "$*" >>"$GC_CALLS"
+-case "$1 $2" in
+-    "bd show") # gc-bd-argv-tail: case label matching the fake gc's argv tail
+-        if [ -f "$GC_CLAIMED_FLAG" ]; then cat "$GC_CLAIMED_JSON"; else cat "$GC_WORK_JSON"; fi
+-        ;;
+-    "bd update") # gc-bd-argv-tail: case label matching the fake gc's argv tail
+-        case "$*" in *--status=in_progress*) : >"$GC_CLAIMED_FLAG" ;; esac
+-        ;;
+-    *) ;;
+-esac
+-SH
+-    chmod +x "$bin/gc"
+-}
+-
+-new_case() {
+-    local dir
+-    dir=$(mktemp -d)
+-    mkdir -p "$dir/bin"
+-    write_gc_stub "$dir/bin"
+-    extract_guard "$dir/guard.sh"
+-    : >"$dir/calls.log"
+-    printf '%s' "$dir"
+-}
+-
+-# run_guard binds the one input workspace-setup has already derived
+-# ($WORK_BEAD_ID) and runs the guard as the formula would.
+-run_guard() {
+-    local dir="$1" assignee="$2" routed_to="$3" rig="${4-$RIG}"
+-
+-    cat >"$dir/work.json" <<JSON
+-[{"id":"$BEAD","status":"open","assignee":"$assignee","metadata":{"gc.routed_to":"$routed_to"}}]
+-JSON
+-    cat >"$dir/claimed.json" <<JSON
+-[{"id":"$BEAD","status":"in_progress","assignee":"$ME","metadata":{"gc.routed_to":"$routed_to","polecat_session":"$ME"}}]
+-JSON
+-    cat >"$dir/harness.sh" <<HARNESS
+-WORK_BEAD_ID="$BEAD"
+-GC_RIG="$rig"
+-BEADS_ACTOR="$ME"
+-HARNESS
+-    cat "$dir/guard.sh" >>"$dir/harness.sh"
+-
+-    GC_CALLS="$dir/calls.log" \
+-        GC_WORK_JSON="$dir/work.json" \
+-        GC_CLAIMED_JSON="$dir/claimed.json" \
+-        GC_CLAIMED_FLAG="$dir/claimed.flag" \
+-        PATH="$dir/bin:$PATH" bash "$dir/harness.sh"
+-}
+-
+-assert_claimed() {
+-    local dir="$1" why="$2"
+-    grep -F "$CLAIM_CALL" "$dir/calls.log" >/dev/null || fail "$why"
+-}
+-
+-assert_not_claimed() {
+-    local dir="$1" why="$2"
+-    ! grep -F "$CLAIM_CALL_PREFIX" "$dir/calls.log" >/dev/null || fail "$why"
+-}
+-
+-# The defect itself. gaunt-m58w was assigned to gauntlet/crew.valkyrie — the
+-# seat that authored it, neither the refinery nor an escalation — and the guard
+-# fired anyway, leaving the bead open for a second sling to land on.
+-test_crew_assigned_work_bead_is_claimed() {
+-    local dir out
+-    dir=$(new_case)
+-    out=$(run_guard "$dir" "$CREW" "")
+-
+-    assert_claimed "$dir" "a crew-assigned work bead was not claimed; it stays open in gc bd ready for a duplicate sling"
+-    grep -F "was assigned to $CREW" <<<"$out" >/dev/null ||
+-        fail "claiming over a foreign assignee left no trace in the transcript: $out"
+-    ! grep -F 'not yours to re-claim' <<<"$out" >/dev/null ||
+-        fail "the refinery/escalation skip path fired on a crew seat: $out"
+-}
+-
+-# The narrow intent the guard's prose always claimed: a bead the refinery is
+-# landing is not this session's to take back.
+-test_refinery_held_work_bead_is_left_alone() {
+-    local dir out
+-    dir=$(new_case)
+-    out=$(run_guard "$dir" "$REFINERY" "")
+-
+-    assert_not_claimed "$dir" "the claim stole a work bead the refinery owns"
+-    grep -F "is held by $REFINERY" <<<"$out" >/dev/null ||
+-        fail "skip path did not name the refinery holder: $out"
+-    grep -F 'not yours to re-claim' <<<"$out" >/dev/null ||
+-        fail "skip path did not explain itself: $out"
+-}
+-
+-# gc.routed_to=human is the operator escalation the refinery writes when it
+-# REFUSES to land a bead. submit-and-exit halts the handoff on that same marker
+-# (gcp-rz8a); the claim must not quietly pull the bead back out of it, even
+-# though the assignee left behind is an ordinary seat rather than the refinery.
+-test_operator_escalation_is_left_alone() {
+-    local dir out
+-    dir=$(new_case)
+-    out=$(run_guard "$dir" "$CREW" "human")
+-
+-    assert_not_claimed "$dir" "the claim pulled a gc.routed_to=human bead back out of its escalation"
+-    grep -F 'gc.routed_to=human' <<<"$out" >/dev/null ||
+-        fail "skip path did not name the escalation marker: $out"
+-}
+-
+-test_unassigned_work_bead_is_claimed() {
+-    local dir out
+-    dir=$(new_case)
+-    out=$(run_guard "$dir" "" "")
+-
+-    assert_claimed "$dir" "an unassigned work bead was not claimed"
+-    ! grep -F 'was assigned to' <<<"$out" >/dev/null ||
+-        fail "an unassigned bead was reported as a takeover: $out"
+-}
+-
+-# Re-entry after a crash or a re-run of the step: the bead already carries this
+-# session's name. Claiming again is an idempotent refresh, and must not be
+-# mistaken for someone else's bead.
+-test_own_claim_is_refreshed() {
+-    local dir out
+-    dir=$(new_case)
+-    out=$(run_guard "$dir" "$ME" "")
+-
+-    assert_claimed "$dir" "re-running workspace-setup did not refresh this session's own claim"
+-    ! grep -F 'not yours to re-claim' <<<"$out" >/dev/null ||
+-        fail "the guard refused to re-claim this session's own bead: $out"
+-}
+-
+-# `${GC_RIG:+$GC_RIG/}` — in an HQ-only city the refinery is a bare
+-# `gastown.refinery` with no rig prefix, and the skip must still recognise it.
+-# Getting this wrong strands beads outside the refinery pool (see the formula's
+-# note on the same expression in submit-and-exit).
+-test_refinery_is_recognised_without_a_rig_prefix() {
+-    local dir out
+-    dir=$(new_case)
+-    out=$(run_guard "$dir" "gastown.refinery" "" "")
+-
+-    assert_not_claimed "$dir" "an HQ-only city's unprefixed refinery holder was not recognised"
+-    grep -F 'is held by gastown.refinery' <<<"$out" >/dev/null ||
+-        fail "skip path did not name the unprefixed refinery holder: $out"
+-}
+-
+-# The claim is only real if the bead actually reads back claimed — `--status`
+-# on this bead has been observed not to stick (gcp-s14g), and a status that
+-# stays `open` leaves it in `gc bd ready`, which is the defect wearing the
+-# fix's clothes.
+-test_claim_is_read_back_and_settles() {
+-    local dir out
+-    dir=$(new_case)
+-    out=$(run_guard "$dir" "$CREW" "")
+-
+-    ! grep -F 'after the claim; it may still be re-slung' <<<"$out" >/dev/null ||
+-        fail "a claim the stub accepted still reported an unsettled readback: $out"
+-    [[ "$(grep -c -F "$CLAIM_STATUS_PREFIX" "$dir/calls.log")" == "1" ]] ||
+-        fail "the readback loop retried a claim that had already landed"
+-}
+-
+-# Pin the property, not just the behaviour: the skip has to be an IDENTITY test
+-# against named owners. "Somebody else's name is on it" is satisfied by every
+-# crew seat, which is the ordinary shape of planned work and was the defect.
+-test_skip_condition_names_its_owners() {
+-    local dir
+-    dir=$(new_case)
+-
+-    grep -F '[ "$CURRENT_ASSIGNEE" = "$REFINERY_TARGET" ]' "$dir/guard.sh" >/dev/null ||
+-        fail "the skip must test the assignee against the refinery target by identity"
+-    grep -F '[ "$CURRENT_ROUTED_TO" = "human" ]' "$dir/guard.sh" >/dev/null ||
+-        fail "the skip must recognise the gc.routed_to=human operator escalation"
+-    ! grep -F '[ -n "$CURRENT_ASSIGNEE" ] && [ "$CURRENT_ASSIGNEE" != "$POLECAT_SESSION" ]' \
+-        "$dir/guard.sh" >/dev/null ||
+-        fail "the skip is back to 'any assignee that is not me', which voids the claim on every crew-authored bead"
+-
+-    # Routing is READ here to spot the escalation; stamping it would break the
+-    # pool's spawn accounting (the formula says so directly).
+-    ! grep -F 'set-metadata gc.routed_to' "$dir/guard.sh" >/dev/null ||
+-        fail "the claim guard must not stamp gc.routed_to; routing lives on the molecule root"
+-}
+-
+-test_crew_assigned_work_bead_is_claimed
+-test_refinery_held_work_bead_is_left_alone
+-test_operator_escalation_is_left_alone
+-test_unassigned_work_bead_is_claimed
+-test_own_claim_is_refreshed
+-test_refinery_is_recognised_without_a_rig_prefix
+-test_claim_is_read_back_and_settles
+-test_skip_condition_names_its_owners
+-
+-echo "PASS: $(basename "$0")"
+diff --git a/scripts/gascity_pack_inference_gate.py b/scripts/gascity_pack_inference_gate.py
+index 70a6eb6d..c802136f 100644
+--- a/scripts/gascity_pack_inference_gate.py
++++ b/scripts/gascity_pack_inference_gate.py
+@@ -287,7 +287,7 @@ POLECAT_BRANCH_CONTENT_GATE_HALT_PATH = (
+     # claim the session still holds, and a step left claimed is run again.
+     # Anchored to the escalation loop's `done`, which occurs only in this gate,
+     # so the close cannot move ahead of the escalation and skip it.
+-    ("halt close after escalation", '    done\n    STEP_BEAD_ID=$(gc hook current --id-only 2>/dev/null) || STEP_BEAD_ID=""'),
++    ("halt close after escalation", "    done\n    STEP_BEAD_ID=$(gc hook current --id-only) || exit 1"),
+     # Anchored to this gate's own close, whose `gc.failure_reason="$HALT_REASON"`
+     # occurs only here. The checked window runs to the push, so it also spans
+     # the auto_push=false halt further down: a bare "gc runtime drain-ack"
+diff --git a/tests/test_gascity_pack_inference_gate.py b/tests/test_gascity_pack_inference_gate.py
+index 249b7a7c..fc1b6b91 100644
+--- a/tests/test_gascity_pack_inference_gate.py
++++ b/tests/test_gascity_pack_inference_gate.py
+@@ -1615,8 +1615,8 @@ def test_validate_polecat_branch_content_gate_rejects_gate_moved_after_the_push(
+         # without the close, and a close moved ahead of the loop breaks the
+         # same adjacency.
+         pytest.param(
+-            '    done\n    STEP_BEAD_ID=$(gc hook current --id-only 2>/dev/null) || STEP_BEAD_ID=""',
+-            '    done\n    true\n    STEP_BEAD_ID=$(gc hook current --id-only 2>/dev/null) || STEP_BEAD_ID=""',
++            "    done\n    STEP_BEAD_ID=$(gc hook current --id-only) || exit 1",
++            "    done\n    true\n    STEP_BEAD_ID=$(gc hook current --id-only) || exit 1",
+             "halt close after escalation",
+             id="statement-between-the-escalation-and-the-close",
+         ),
+diff --git a/tests/test_no_bare_bd_commands.py b/tests/test_no_bare_bd_commands.py
+index 22c4befe..9952513d 100644
+--- a/tests/test_no_bare_bd_commands.py
++++ b/tests/test_no_bare_bd_commands.py
+@@ -171,27 +171,20 @@ GC_BD_ARGV_TAIL_ALLOWLIST: dict[Path, set[str]] = {
+     },
+     Path("gastown/tests/test_polecat_live_owner_guard.sh"): {
+         '"bd show") # gc-bd-argv-tail: case label matching the fake gc\'s argv tail',
++        '"bd list") cat "$GC_LIST_JSON" ;;'
++        " # gc-bd-argv-tail: case label matching the fake gc's argv tail",
+         '"bd update") exit "${GC_UPDATE_EXIT:-0}" ;;'
+         " # gc-bd-argv-tail: case label matching the fake gc's argv tail",
+         "restore_call='bd update winnow-iaroy --assignee=gastown__polecat-gc-8a4d'"
+         " # gc-bd-argv-tail: expected argv tail, not an invocation",
+         "! grep -F 'bd update winnow-iaroy' \"$dir/calls.log\" >/dev/null ||"
+         " # gc-bd-argv-tail: stub call log, not an invocation",
++        "! grep -F 'bd update' \"$dir/calls.log\" >/dev/null ||"
++        " # gc-bd-argv-tail: stub call log, not an invocation",
+         "grep -F 'bd update winnow-iaroy"
+         " --assignee=winnow/{{ .BindingPrefix }}refinery' \"$dir/calls.log\" >/dev/null ||"
+         " # gc-bd-argv-tail: stub call log, not an invocation",
+     },
+-    Path("gastown/tests/test_polecat_work_bead_claim_guard.sh"): {
+-        '"bd show") # gc-bd-argv-tail: case label matching the fake gc\'s argv tail',
+-        '"bd update") # gc-bd-argv-tail: case label matching the fake gc\'s argv tail',
+-        'CLAIM_CALL="bd update $BEAD --status=in_progress --assignee=$ME'
+-        ' --set-metadata polecat_session=$ME"'
+-        " # gc-bd-argv-tail: expected argv tail, not an invocation",
+-        'CLAIM_CALL_PREFIX="bd update $BEAD"'
+-        " # gc-bd-argv-tail: expected argv tail, not an invocation",
+-        'CLAIM_STATUS_PREFIX="bd update $BEAD --status=in_progress"'
+-        " # gc-bd-argv-tail: expected argv tail, not an invocation",
+-    },
+     Path("gastown/tests/test_refinery_find_work.sh"): {
+         "# Stub `gc` implementing just enough of `bd list` to answer the shipped"
+         " query. # gc-bd-argv-tail: prose, not an invocation",
+diff --git a/tests/test_v2_drain_ack_closes_own_step.py b/tests/test_v2_drain_ack_closes_own_step.py
+index 0d342b01..eb92e64b 100644
+--- a/tests/test_v2_drain_ack_closes_own_step.py
++++ b/tests/test_v2_drain_ack_closes_own_step.py
+@@ -184,14 +184,11 @@ def test_checker_recognizes_the_guarded_close(block, ok):
+ 
+ 
+ # The checks above read the shape of each close. The ones below RUN every
+-# own-step close in mol-polecat-work's submit-and-exit against a fake `gc`,
+-# because the shape alone was satisfied by a close that could never fire there:
+-# the polecat startup block re-points onto a step with a plain
+-# `gc bd update <step> --claim`, which records the claim under BEADS_ACTOR but
+-# does not move the stamp `gc hook current` reads. The hook's crash-recovery
+-# tier serves the in_progress WORK bead at step boundaries and stamps THAT, so
+-# at submit-and-exit `gc hook current` names the work bead, the guard refused,
+-# and drain-ack never ran (gcp-fooz4 P1).
++# own-step close in mol-polecat-work's submit-and-exit against a fake `gc`.
++# The polecat never claims its WORK bead (gcp-952j9), so the hook's
++# crash-recovery tier has only the step to serve and `gc hook current` names
++# it. Upstream #490's guard closes exactly that step and refuses, without a
++# drain-ack, when the hook names anything else or cannot answer.
+ POLECAT_FORMULA = "gastown/formulas/mol-polecat-work.toml"
+ SUBMIT_STEP_REF = "mol-polecat-work.submit-and-exit"
+ ME = "winnow/gastown.furiosa"
+@@ -289,12 +286,12 @@ def bead(bead_id, status, assignee, step_ref=None):
+ 
+ 
+ def molecule(*extra):
+-    """A polecat at submit-and-exit: the WORK bead it holds in_progress for the
+-    whole run (0060), an earlier step it already closed, and its re-pointed
++    """A polecat at submit-and-exit: the WORK bead, open and unassigned because
++    the polecat never claims it, an earlier step it already closed, and its
+     submit-and-exit step. A sibling polecat holds its own submit-and-exit step,
+     so a resolve that is not scoped to this session has something to find."""
+     return [
+-        bead(WORK, "in_progress", ME),
++        bead(WORK, "open", ""),
+         bead("winnow-w1.s8", "closed", ME, "mol-polecat-work.self-review"),
+         bead(STEP, "in_progress", ME, SUBMIT_STEP_REF),
+         bead("winnow-w2.s9", "in_progress", "winnow/gastown.nux", SUBMIT_STEP_REF),
+@@ -334,22 +331,6 @@ def made(calls, *prefix):
+     return [call for call in calls if tuple(call[: len(prefix)]) == prefix]
+ 
+ 
+-@pytest.mark.parametrize("site", DRAIN_SITES, ids=DRAIN_SITE_IDS)
+-@pytest.mark.parametrize(
+-    "hook_current",
+-    [WORK, None],
+-    ids=["hook-names-the-work-bead", "hook-current-unavailable"],
+-)
+-def test_drain_ack_closes_a_step_the_hook_does_not_name(tmp_path, site, hook_current):
+-    result, calls, after = run_drain_site(tmp_path, site, molecule(), hook_current)
+-
+-    assert result.returncode == 0, result.stderr
+-    assert after[STEP]["status"] == "closed", "the re-pointed submit-and-exit step was left claimed"
+-    assert made(calls, "gc", "runtime", "drain-ack"), "drain-ack never ran"
+-    assert after[WORK]["status"] == "in_progress", "the WORK bead is never the polecat's to close"
+-    assert after["winnow-w2.s9"]["status"] == "in_progress", "closed another session's step"
+-
+-
+ @pytest.mark.parametrize("site", DRAIN_SITES, ids=DRAIN_SITE_IDS)
+ def test_drain_ack_keeps_closing_the_step_the_hook_names(tmp_path, site):
+     """Upstream #490's resolve still comes first and is still sufficient."""
+@@ -363,17 +344,16 @@ def test_drain_ack_keeps_closing_the_step_the_hook_names(tmp_path, site):
+ 
+ @pytest.mark.parametrize("site", DRAIN_SITES, ids=DRAIN_SITE_IDS)
+ @pytest.mark.parametrize(
+-    "beads,actor",
+-    [
+-        ([bead(WORK, "in_progress", ME), bead("winnow-w2.s9", "in_progress", "winnow/gastown.nux", SUBMIT_STEP_REF)], ME),
+-        (molecule(bead("winnow-w0.s9", "in_progress", ME, SUBMIT_STEP_REF)), ME),
+-        (molecule(), ""),
+-    ],
+-    ids=["no-own-step", "two-own-steps", "no-actor"],
++    "hook_current",
++    [WORK, None],
++    ids=["hook-names-the-work-bead", "hook-current-unavailable"],
+ )
+-def test_drain_ack_refuses_without_exactly_one_own_step(tmp_path, site, beads, actor):
+-    result, calls, after = run_drain_site(tmp_path, site, beads, WORK, actor=actor)
++def test_drain_ack_refuses_when_the_hook_does_not_name_this_step(tmp_path, site, hook_current):
++    result, calls, after = run_drain_site(tmp_path, site, molecule(), hook_current)
+ 
+     assert result.returncode == 1, result.stdout + result.stderr
+-    assert not made(calls, "gc", "runtime", "drain-ack"), "acked a drain with no step of ours to close"
+-    assert not made(calls, "gc", "bd", "update"), "closed a step it could not attribute to this session"
++    assert not made(calls, "gc", "runtime", "drain-ack"), "acked a drain without the hook naming this step"
++    assert not made(calls, "gc", "bd", "update"), "closed a bead the hook did not name"
++    assert not made(calls, "gc", "bd", "list"), "guessed a step instead of failing closed"
++    assert after[STEP]["status"] == "in_progress"
++    assert after[WORK]["status"] == "open", "the WORK bead is never the polecat's to touch"
+-- 
+2.54.0 (Apple Git-157)
+

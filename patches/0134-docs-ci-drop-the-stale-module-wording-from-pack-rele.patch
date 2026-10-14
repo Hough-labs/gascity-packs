@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sat, 10 Oct 2026 16:39:42 -0400
-Subject: [PATCH 134/158] docs(ci): drop the stale "module" wording from
+Subject: [PATCH 134/159] docs(ci): drop the stale "module" wording from
  pack-release-compatibility's gascity_ref (gcp-fooz4)
 
 gc is installed from the release archive, and `main` now means the

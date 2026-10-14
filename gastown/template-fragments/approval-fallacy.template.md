@@ -83,9 +83,9 @@ done
 # Only POSITIVE evidence counts: the bead is closed, or it is held by the
 # REFINERY — the one assignee submit-and-exit's handoff actually produces. Every
 # weaker test has been observed draining a session with the branch unpushed.
-# "Not in_progress for me" is not evidence: workspace-setup holds the work bead
-# in_progress for this session only from that step on, and never takes it from
-# the refinery or an operator escalation. Nor is a bare "assigned to
+# "Not in_progress for me" is not evidence: the polecat never claims the work
+# bead (only the refinery handoff writes its status and assignee), so what it
+# reads says nothing about this session. Nor is a bare "assigned to
 # somebody else", which is equally true of a resumed molecule finding the bead
 # still held by its own PREVIOUS session (a restarted session usually claims
 # under a new identity) and

@@ -171,26 +171,19 @@ GC_BD_ARGV_TAIL_ALLOWLIST: dict[Path, set[str]] = {
     },
     Path("gastown/tests/test_polecat_live_owner_guard.sh"): {
         '"bd show") # gc-bd-argv-tail: case label matching the fake gc\'s argv tail',
+        '"bd list") cat "$GC_LIST_JSON" ;;'
+        " # gc-bd-argv-tail: case label matching the fake gc's argv tail",
         '"bd update") exit "${GC_UPDATE_EXIT:-0}" ;;'
         " # gc-bd-argv-tail: case label matching the fake gc's argv tail",
         "restore_call='bd update winnow-iaroy --assignee=gastown__polecat-gc-8a4d'"
         " # gc-bd-argv-tail: expected argv tail, not an invocation",
         "! grep -F 'bd update winnow-iaroy' \"$dir/calls.log\" >/dev/null ||"
         " # gc-bd-argv-tail: stub call log, not an invocation",
+        "! grep -F 'bd update' \"$dir/calls.log\" >/dev/null ||"
+        " # gc-bd-argv-tail: stub call log, not an invocation",
         "grep -F 'bd update winnow-iaroy"
         " --assignee=winnow/{{ .BindingPrefix }}refinery' \"$dir/calls.log\" >/dev/null ||"
         " # gc-bd-argv-tail: stub call log, not an invocation",
-    },
-    Path("gastown/tests/test_polecat_work_bead_claim_guard.sh"): {
-        '"bd show") # gc-bd-argv-tail: case label matching the fake gc\'s argv tail',
-        '"bd update") # gc-bd-argv-tail: case label matching the fake gc\'s argv tail',
-        'CLAIM_CALL="bd update $BEAD --status=in_progress --assignee=$ME'
-        ' --set-metadata polecat_session=$ME"'
-        " # gc-bd-argv-tail: expected argv tail, not an invocation",
-        'CLAIM_CALL_PREFIX="bd update $BEAD"'
-        " # gc-bd-argv-tail: expected argv tail, not an invocation",
-        'CLAIM_STATUS_PREFIX="bd update $BEAD --status=in_progress"'
-        " # gc-bd-argv-tail: expected argv tail, not an invocation",
     },
     Path("gastown/tests/test_refinery_find_work.sh"): {
         "# Stub `gc` implementing just enough of `bd list` to answer the shipped"

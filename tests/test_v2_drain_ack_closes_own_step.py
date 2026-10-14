@@ -184,14 +184,11 @@ def test_checker_recognizes_the_guarded_close(block, ok):
 
 
 # The checks above read the shape of each close. The ones below RUN every
-# own-step close in mol-polecat-work's submit-and-exit against a fake `gc`,
-# because the shape alone was satisfied by a close that could never fire there:
-# the polecat startup block re-points onto a step with a plain
-# `gc bd update <step> --claim`, which records the claim under BEADS_ACTOR but
-# does not move the stamp `gc hook current` reads. The hook's crash-recovery
-# tier serves the in_progress WORK bead at step boundaries and stamps THAT, so
-# at submit-and-exit `gc hook current` names the work bead, the guard refused,
-# and drain-ack never ran (gcp-fooz4 P1).
+# own-step close in mol-polecat-work's submit-and-exit against a fake `gc`.
+# The polecat never claims its WORK bead (gcp-952j9), so the hook's
+# crash-recovery tier has only the step to serve and `gc hook current` names
+# it. Upstream #490's guard closes exactly that step and refuses, without a
+# drain-ack, when the hook names anything else or cannot answer.
 POLECAT_FORMULA = "gastown/formulas/mol-polecat-work.toml"
 SUBMIT_STEP_REF = "mol-polecat-work.submit-and-exit"
 ME = "winnow/gastown.furiosa"
@@ -289,12 +286,12 @@ def bead(bead_id, status, assignee, step_ref=None):
 
 
 def molecule(*extra):
-    """A polecat at submit-and-exit: the WORK bead it holds in_progress for the
-    whole run (0060), an earlier step it already closed, and its re-pointed
+    """A polecat at submit-and-exit: the WORK bead, open and unassigned because
+    the polecat never claims it, an earlier step it already closed, and its
     submit-and-exit step. A sibling polecat holds its own submit-and-exit step,
     so a resolve that is not scoped to this session has something to find."""
     return [
-        bead(WORK, "in_progress", ME),
+        bead(WORK, "open", ""),
         bead("winnow-w1.s8", "closed", ME, "mol-polecat-work.self-review"),
         bead(STEP, "in_progress", ME, SUBMIT_STEP_REF),
         bead("winnow-w2.s9", "in_progress", "winnow/gastown.nux", SUBMIT_STEP_REF),
@@ -335,22 +332,6 @@ def made(calls, *prefix):
 
 
 @pytest.mark.parametrize("site", DRAIN_SITES, ids=DRAIN_SITE_IDS)
-@pytest.mark.parametrize(
-    "hook_current",
-    [WORK, None],
-    ids=["hook-names-the-work-bead", "hook-current-unavailable"],
-)
-def test_drain_ack_closes_a_step_the_hook_does_not_name(tmp_path, site, hook_current):
-    result, calls, after = run_drain_site(tmp_path, site, molecule(), hook_current)
-
-    assert result.returncode == 0, result.stderr
-    assert after[STEP]["status"] == "closed", "the re-pointed submit-and-exit step was left claimed"
-    assert made(calls, "gc", "runtime", "drain-ack"), "drain-ack never ran"
-    assert after[WORK]["status"] == "in_progress", "the WORK bead is never the polecat's to close"
-    assert after["winnow-w2.s9"]["status"] == "in_progress", "closed another session's step"
-
-
-@pytest.mark.parametrize("site", DRAIN_SITES, ids=DRAIN_SITE_IDS)
 def test_drain_ack_keeps_closing_the_step_the_hook_names(tmp_path, site):
     """Upstream #490's resolve still comes first and is still sufficient."""
     result, calls, after = run_drain_site(tmp_path, site, molecule(), STEP)
@@ -363,17 +344,16 @@ def test_drain_ack_keeps_closing_the_step_the_hook_names(tmp_path, site):
 
 @pytest.mark.parametrize("site", DRAIN_SITES, ids=DRAIN_SITE_IDS)
 @pytest.mark.parametrize(
-    "beads,actor",
-    [
-        ([bead(WORK, "in_progress", ME), bead("winnow-w2.s9", "in_progress", "winnow/gastown.nux", SUBMIT_STEP_REF)], ME),
-        (molecule(bead("winnow-w0.s9", "in_progress", ME, SUBMIT_STEP_REF)), ME),
-        (molecule(), ""),
-    ],
-    ids=["no-own-step", "two-own-steps", "no-actor"],
+    "hook_current",
+    [WORK, None],
+    ids=["hook-names-the-work-bead", "hook-current-unavailable"],
 )
-def test_drain_ack_refuses_without_exactly_one_own_step(tmp_path, site, beads, actor):
-    result, calls, after = run_drain_site(tmp_path, site, beads, WORK, actor=actor)
+def test_drain_ack_refuses_when_the_hook_does_not_name_this_step(tmp_path, site, hook_current):
+    result, calls, after = run_drain_site(tmp_path, site, molecule(), hook_current)
 
     assert result.returncode == 1, result.stdout + result.stderr
-    assert not made(calls, "gc", "runtime", "drain-ack"), "acked a drain with no step of ours to close"
-    assert not made(calls, "gc", "bd", "update"), "closed a step it could not attribute to this session"
+    assert not made(calls, "gc", "runtime", "drain-ack"), "acked a drain without the hook naming this step"
+    assert not made(calls, "gc", "bd", "update"), "closed a bead the hook did not name"
+    assert not made(calls, "gc", "bd", "list"), "guessed a step instead of failing closed"
+    assert after[STEP]["status"] == "in_progress"
+    assert after[WORK]["status"] == "open", "the WORK bead is never the polecat's to touch"

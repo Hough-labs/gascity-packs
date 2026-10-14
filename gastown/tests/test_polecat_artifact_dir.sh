@@ -26,16 +26,9 @@ physical_mktemp_dir() {
     (cd "$dir" && pwd -P)
 }
 
-# Step 1 of workspace-setup claims the work bead before it reads the artifact
-# metadata, and stamps the session identity it finds in the environment. The
-# workspace tests pin that identity so the expected call does not vary with
-# whichever session runs the suite.
+# The workspace tests pin the session identity so the stubbed work bead does not
+# vary with whichever session runs the suite.
 WORKSPACE_TEST_ACTOR=ac-test-polecat
-
-workspace_claim_call() {
-    printf '%s update ac-safe1 --status=in_progress --assignee=%s --set-metadata polecat_session=%s' \
-        "$1" "$WORKSPACE_TEST_ACTOR" "$WORKSPACE_TEST_ACTOR"
-}
 
 extract_validator() {
     local output=$1
@@ -115,7 +108,7 @@ with formula_path.open("rb") as handle:
 workspace = next(step for step in formula["steps"] if step["id"] == "workspace-setup")
 blocks = re.findall(r"```bash\n(.*?)```", workspace["description"], re.DOTALL)
 # Everything up to and including the block that adds the worktree. Counting
-# blocks goes stale each time the step gains one (the work-bead claim did).
+# blocks goes stale each time the step gains or loses one.
 creation = next((i for i, block in enumerate(blocks) if "worktree add" in block), None)
 if creation is None:
     raise SystemExit(f"workspace-setup has no worktree-creation block among {len(blocks)} bash blocks")
@@ -140,7 +133,7 @@ init_repo() {
 }
 
 test_workspace_creation_uses_canonical_sibling() {
-    local tmp rig remote city provider canonical setup calls bd_subcommand claim_call
+    local tmp rig remote city provider canonical setup calls bd_subcommand
     tmp=$(physical_mktemp_dir)
     trap 'rm -rf "$tmp"' RETURN
     rig="$tmp/rig"
@@ -151,7 +144,6 @@ test_workspace_creation_uses_canonical_sibling() {
     setup="$tmp/workspace-create.sh"
     calls="$tmp/gc-calls"
     bd_subcommand=$(printf '%s%s' b d)
-    claim_call=$(workspace_claim_call "$bd_subcommand")
 
     init_repo "$rig"
     git -C "$rig" branch -M main
@@ -177,8 +169,7 @@ test_workspace_creation_uses_canonical_sibling() {
                     return 0
                     ;;
                 "$bd_subcommand update ac-safe1 --unset-metadata handoff_stage" | \
-                "$bd_subcommand update ac-safe1 --set-metadata base_ref="* | \
-                "$claim_call")
+                "$bd_subcommand update ac-safe1 --set-metadata base_ref="*)
                     return 0
                     ;;
                 "runtime drain-ack")
@@ -619,9 +610,8 @@ test_validator_rejects_provider_and_unrelated_paths() {
 }
 
 test_workspace_metadata_reads_fail_closed_without_pipefail() {
-    local mode tmp rig remote city provider canonical setup calls bd_subcommand claim_call
+    local mode tmp rig remote city provider canonical setup calls bd_subcommand
     bd_subcommand=$(printf '%s%s' b d)
-    claim_call=$(workspace_claim_call "$bd_subcommand")
     for mode in command-failure malformed empty ambiguous; do
         tmp=$(physical_mktemp_dir)
         rig="$tmp/rig"
@@ -663,12 +653,11 @@ test_workspace_metadata_reads_fail_closed_without_pipefail() {
                     "runtime drain-ack")
                         return 0
                         ;;
-                    # Step 1's stage-marker clear, base_ref record and work-bead
-                    # claim run before the artifact metadata read by design;
-                    # none names an artifact path.
+                    # Step 1's stage-marker clear and base_ref record run before
+                    # the artifact metadata read by design; neither names an
+                    # artifact path.
                     "$bd_subcommand update ac-safe1 --unset-metadata handoff_stage" | \
-                    "$bd_subcommand update ac-safe1 --set-metadata base_ref=refs/remotes/origin/main" | \
-                    "$claim_call")
+                    "$bd_subcommand update ac-safe1 --set-metadata base_ref=refs/remotes/origin/main")
                         return 0
                         ;;
                     "$bd_subcommand update "*)
@@ -694,8 +683,7 @@ test_workspace_metadata_reads_fail_closed_without_pipefail() {
             fail "metadata read mode $mode created a replacement artifact"
         if grep "^${bd_subcommand} update " "$calls" |
             grep -v -x -e "${bd_subcommand} update ac-safe1 --unset-metadata handoff_stage" \
-                -e "${bd_subcommand} update ac-safe1 --set-metadata base_ref=refs/remotes/origin/main" \
-                -e "$claim_call" |
+                -e "${bd_subcommand} update ac-safe1 --set-metadata base_ref=refs/remotes/origin/main" |
             grep -q .; then
             fail "metadata read mode $mode mutated work bead metadata"
         fi
@@ -704,7 +692,7 @@ test_workspace_metadata_reads_fail_closed_without_pipefail() {
 }
 
 test_workspace_collision_fails_closed_without_alternate() {
-    local tmp rig remote city provider canonical setup calls bd_subcommand claim_call
+    local tmp rig remote city provider canonical setup calls bd_subcommand
     tmp=$(physical_mktemp_dir)
     trap 'rm -rf "$tmp"' RETURN
     rig="$tmp/rig"
@@ -715,7 +703,6 @@ test_workspace_collision_fails_closed_without_alternate() {
     setup="$tmp/workspace-create.sh"
     calls="$tmp/gc-calls"
     bd_subcommand=$(printf '%s%s' b d)
-    claim_call=$(workspace_claim_call "$bd_subcommand")
 
     init_repo "$rig"
     git -C "$rig" branch -M main
@@ -744,11 +731,10 @@ test_workspace_collision_fails_closed_without_alternate() {
                 "runtime drain-ack")
                     return 0
                     ;;
-                # Step 1's stage-marker clear, base_ref record and work-bead
-                # claim run before the artifact is touched, by design.
+                # Step 1's stage-marker clear and base_ref record run before the
+                # artifact is touched, by design.
                 "$bd_subcommand update ac-safe1 --unset-metadata handoff_stage" | \
-                "$bd_subcommand update ac-safe1 --set-metadata base_ref=refs/remotes/origin/main" | \
-                "$claim_call")
+                "$bd_subcommand update ac-safe1 --set-metadata base_ref=refs/remotes/origin/main")
                     return 0
                     ;;
                 "$bd_subcommand update "*)
@@ -779,7 +765,7 @@ test_workspace_collision_fails_closed_without_alternate() {
 }
 
 test_workspace_rejects_redirected_artifact_root_before_creation() {
-    local tmp rig remote city provider redirected setup calls bd_subcommand claim_call
+    local tmp rig remote city provider redirected setup calls bd_subcommand
     tmp=$(physical_mktemp_dir)
     trap 'rm -rf "$tmp"' RETURN
     rig="$tmp/rig"
@@ -790,7 +776,6 @@ test_workspace_rejects_redirected_artifact_root_before_creation() {
     setup="$tmp/workspace-create.sh"
     calls="$tmp/gc-calls"
     bd_subcommand=$(printf '%s%s' b d)
-    claim_call=$(workspace_claim_call "$bd_subcommand")
 
     init_repo "$rig"
     git -C "$rig" branch -M main
@@ -819,11 +804,10 @@ test_workspace_rejects_redirected_artifact_root_before_creation() {
                 "runtime drain-ack")
                     return 0
                     ;;
-                # Step 1's stage-marker clear, base_ref record and work-bead
-                # claim run before the artifact is touched, by design.
+                # Step 1's stage-marker clear and base_ref record run before the
+                # artifact is touched, by design.
                 "$bd_subcommand update ac-safe1 --unset-metadata handoff_stage" | \
-                "$bd_subcommand update ac-safe1 --set-metadata base_ref=refs/remotes/origin/main" | \
-                "$claim_call")
+                "$bd_subcommand update ac-safe1 --set-metadata base_ref=refs/remotes/origin/main")
                     return 0
                     ;;
                 "$bd_subcommand update "*)
