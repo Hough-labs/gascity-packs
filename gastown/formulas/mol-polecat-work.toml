@@ -105,10 +105,14 @@ substituting a different base, because silently falling back to the
 repo default is how a rig pinned to an integration branch got polecats
 branched off main (gas-e6r).
 
-When the base exists in both places, the local copy must not be ahead of
-origin: a base that has advanced only locally is not the base the
-refinery will merge against, and branching from either side silently
-picks a different fork point. Ancestry-check instead of guessing.
+When the base exists in both places, the local copy must not carry
+local-only commits: a base that has advanced only locally is not the base
+the refinery will merge against, and branching from either side silently
+picks a different fork point. Ancestry-check, then count the commits the
+local copy holds that no remote ref does, instead of guessing. A local
+copy that is merely stale — behind a force-pushed origin, with every
+commit still on some remote branch — holds nothing that would be lost, so
+the step branches from origin rather than halting the pool.
 
 Both arms name fully-qualified refs. Git resolves `refs/tags/<name>`
 before `refs/heads/<name>`, so a bare branch name lets a same-named tag
@@ -122,17 +126,22 @@ base selection of its own; keep the two halves in step, or they will
 disagree about what "the base" means.
 
 ```bash
+# GUARD_BEGIN base-resolve
 BASE_REMOTE="refs/remotes/origin/{{base_branch}}"
 BASE_LOCAL="refs/heads/{{base_branch}}"
 WITNESS_TARGET="${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness"
 if git show-ref --verify --quiet "$BASE_REMOTE"; then
     if git show-ref --verify --quiet "$BASE_LOCAL" && ! git merge-base --is-ancestor "$BASE_LOCAL" "$BASE_REMOTE"; then
-        echo "STOP: local {{base_branch}} is ahead of, or diverged from, the copy on origin."
-        echo "Reconcile or push {{base_branch}} first; do not branch from a stale base."
-        gc bd update "$WORK_BEAD_ID" --set-metadata halt_reason=base_branch_diverged
-        gc mail send "$WITNESS_TARGET" -s "polecat halted: base_branch_diverged ($WORK_BEAD_ID)" -m "Local {{base_branch}} is not an ancestor of the copy on origin; $WORK_BEAD_ID cannot pick a fork point. Reconcile the branch."
-        gc runtime drain-ack
-        exit 1
+        LOCAL_ONLY=$(git rev-list --count "$BASE_LOCAL" --not --remotes) || LOCAL_ONLY=err
+        if [ "$LOCAL_ONLY" != "0" ]; then
+            echo "STOP: local {{base_branch}} has local-only commits that are not on origin or any other remote branch."
+            echo "Reconcile or push {{base_branch}} first; do not branch from a stale base."
+            gc bd update "$WORK_BEAD_ID" --set-metadata halt_reason=base_branch_diverged
+            gc mail send "$WITNESS_TARGET" -s "polecat halted: base_branch_diverged ($WORK_BEAD_ID)" -m "Local {{base_branch}} has local-only commits (count: $LOCAL_ONLY) that are not an ancestor of the copy on origin and are on no remote branch; $WORK_BEAD_ID cannot pick a fork point. Reconcile the branch."
+            gc runtime drain-ack
+            exit 1
+        fi
+        echo "note: local {{base_branch}} is stale (0 commits off-remote); branching from origin"
     fi
     BASE_REF="$BASE_REMOTE"    # preferred: freshly fetched, no local drift
 elif git show-ref --verify --quiet "$BASE_LOCAL"; then
@@ -147,6 +156,7 @@ else
     exit 1
 fi
 gc bd update "$WORK_BEAD_ID" --set-metadata base_ref="$BASE_REF"
+# GUARD_END base-resolve
 ```
 
 The STOP arms stamp `halt_reason` and mail the witness on the way out —

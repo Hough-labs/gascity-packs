@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sat, 10 Oct 2026 16:40:31 -0400
-Subject: [PATCH 135/155] fix(ci): route a digit-leading commit SHA to the
+Subject: [PATCH 135/156] fix(ci): route a digit-leading commit SHA to the
  go-install fallback (gcp-fooz4)
 
 The bare-version case `[0-9]*)` matched any ref starting with a decimal
