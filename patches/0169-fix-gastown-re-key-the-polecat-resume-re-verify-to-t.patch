@@ -1,0 +1,574 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 15 Oct 2026 05:15:46 -0400
+Subject: [PATCH 169/169] fix(gastown): re-key the polecat resume re-verify to
+ the step the session holds (gcp-o1nij)
+
+The resume re-verify in the polecat prompt drained every healthy resumed
+session, and did so even before gcp-952j9. It started from $GC_BEAD_ID, which
+gc exports only to convergence condition scripts and never into a session
+shell, so `gc convoy status ""` failed and the block printed
+RESUME_INDETERMINATE. Where GC_BEAD_ID was set it then required the WORK bead's
+assignee to be this session; since gcp-952j9 nothing assigns the work bead to
+the polecat, so it printed OWNERSHIP_LOST. It failed safe (the pool re-serves
+the released step) but wasted a session every time.
+
+The block now verifies the STEP this session last claimed. `gc hook current
+--id-only` reads the stamp every `gc hook --claim` writes onto the session's own
+bead, and that bead survives `gc runtime request-restart`. The step must be
+in_progress and assigned to one of the session's five identities, using a copy
+of claim_assignee_is_ours restated from the GC_CLAIM block. When GC_BEAD_ID does
+name a convoy, the step's molecule must have been poured on it. It never reads
+the work bead or metadata.polecat_session, and never writes. A closed step or
+no readable claim is RESUME_INDETERMINATE (nothing was taken from this session);
+a released step or one held by another session is OWNERSHIP_LOST.
+
+The new suite test_polecat_resume_reverify.sh extracts the block verbatim from
+the prompt, runs it against a stubbed gc with a stubbed sleep (no wall-clock
+dependence), and pins the two claim_assignee_is_ours copies byte-identical.
+Against the old block, the healthy-resume case fails with RESUME_INDETERMINATE
+and the unassigned-work-bead case fails with OWNERSHIP_LOST.
+
+Out of scope, kept as today: a session with no current claim drains instead of
+re-running the startup claim. No upstream PR (ruling item 11, gcp-bdgg1).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ gastown/agents/polecat/prompt.template.md     |  94 +++-
+ gastown/tests/test_polecat_resume_reverify.sh | 401 ++++++++++++++++++
+ 2 files changed, 474 insertions(+), 21 deletions(-)
+ create mode 100755 gastown/tests/test_polecat_resume_reverify.sh
+
+diff --git a/gastown/agents/polecat/prompt.template.md b/gastown/agents/polecat/prompt.template.md
+index 86b681a4..8812c0b5 100644
+--- a/gastown/agents/polecat/prompt.template.md
++++ b/gastown/agents/polecat/prompt.template.md
+@@ -448,7 +448,7 @@ fi
+ # GUARD_END live-owner
+ 
+ # Ownership confirmed.
+-# Stamp a stable session identity so the churn-watcher and the resume re-verify
++# Stamp a stable session identity so the churn-watcher and the live-owner guard
+ # can key on metadata.polecat_session.
+ gc bd update "$WORK_ID" --set-metadata polecat_session="$EXPECTED_ASSIGNEE" \
+   || echo "WARN metadata stamp failed for $WORK_ID; churn-watcher/resume lose session keying (proceeding — the claim is valid)"
+@@ -487,37 +487,89 @@ handing it the step would strand the molecule. The guard prints a `WARN` naming
+ the seat and proceeds.
+ 
+ **Resume / crash re-verify (FIRST action on restart).** A restart is a new
+-session, and usually a new claim identity: gc 1.4.x and an unaliased gc 1.5.0
+-pool session claim under a fresh one, while a gc 1.5.0 namepool polecat claims
+-under its alias, a chair the pool hands to whichever session sits in it next.
+-If you wake into a session that context says was already
+-mid-work on a claimed bead, your FIRST action — before touching code — is to
+-re-check ownership against THIS session's identity:
+-
+-`$GC_BEAD_ID` is the convoy, not the work bead — derive the child work bead
+-first (exactly as the done sequence does), then verify THAT bead's ownership:
++conversation, not always a new session: `gc runtime request-restart` keeps this
++session's bead, its identities and its claims, while a session that died is
++closed and its claims go back to the pool. If you wake into a session that
++context says was already mid-work on a claimed bead, your FIRST action — before
++touching code — is to re-check that THIS session still holds the step it was
++running.
++
++Verify the STEP, not the work bead. The polecat never claims the work bead, so
++its assignee is empty for the whole run and says nothing about this session,
++and `$GC_BEAD_ID` is not exported into a session shell.
++`gc hook current --id-only` names the step this session last claimed; the block
++requires it to be `in_progress` and assigned to one of this session's
++identities, and, when `$GC_BEAD_ID` does name a convoy, poured on that convoy:
+ 
+ ```bash
++# GUARD_BEGIN resume-reverify
+ EXPECTED_ASSIGNEE="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
+-CONVOY_STATUS=$(gc convoy status "$GC_BEAD_ID" --json)
+-WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
+-if [ -z "$WORK_BEAD_ID" ]; then
+-  echo "RESUME_INDETERMINATE convoy $GC_BEAD_ID has no single child work bead; re-claim instead of guessing."
++# The claim block's identity set, restated because each block is its own shell.
++claim_assignee_is_ours() {
++  for _own in "${BEADS_ACTOR:-}" "${GC_ALIAS:-}" "${GC_SESSION_ID:-}" "${GC_SESSION_NAME:-}" "${GC_AGENT:-}"; do
++    if [ -n "$_own" ] && [ "$1" = "$_own" ]; then
++      return 0
++    fi
++  done
++  return 1
++}
++# `gc hook --claim` stamps each claim onto this session's own bead, and a
++# restart keeps that bead, so the stamp still names the step after a restart.
++STEP_ID=""
++STEP_JSON=""
++RESUME_TRY=0
++while [ "$RESUME_TRY" -lt 3 ]; do
++  RESUME_TRY=$((RESUME_TRY + 1))
++  STEP_ID=$(gc hook current --id-only 2>/dev/null)
++  if [ -n "$STEP_ID" ]; then
++    STEP_JSON=$(gc bd show "$STEP_ID" --json 2>/dev/null)
++    if [ "$(printf '%s' "$STEP_JSON" | jq -r '.[0].id // empty' 2>/dev/null)" = "$STEP_ID" ]; then
++      break
++    fi
++  fi
++  STEP_JSON=""
++  if [ "$RESUME_TRY" -lt 3 ]; then
++    sleep "$RESUME_TRY"
++  fi
++done
++if [ -z "$STEP_JSON" ]; then
++  echo "RESUME_INDETERMINATE no readable step claim for this session (step=${STEP_ID:-none}); re-claim instead of guessing."
++  gc runtime drain-ack
++  exit 0
++fi
++STEP_STATUS=$(printf '%s' "$STEP_JSON" | jq -r '.[0].status // empty')
++STEP_ASSIGNEE=$(printf '%s' "$STEP_JSON" | jq -r '.[0].assignee // empty')
++STEP_ROOT=$(printf '%s' "$STEP_JSON" | jq -r '.[0].metadata."gc.root_bead_id" // empty')
++if [ "$STEP_STATUS" = "closed" ]; then
++  echo "RESUME_INDETERMINATE step $STEP_ID is already closed, so this session holds no live step; re-claim instead of guessing."
+   gc runtime drain-ack
+   exit 0
+ fi
+-WORK_JSON=$(gc bd show "$WORK_BEAD_ID" --json)
+-ASSIGNEE=$(printf '%s' "$WORK_JSON" | jq -r '.[0].assignee // empty')
+-SESSION_TAG=$(printf '%s' "$WORK_JSON" | jq -r '.[0].metadata.polecat_session // empty')
+-if [ "$ASSIGNEE" != "$EXPECTED_ASSIGNEE" ] || { [ -n "$SESSION_TAG" ] && [ "$SESSION_TAG" != "$EXPECTED_ASSIGNEE" ]; }; then
+-  echo "OWNERSHIP_LOST $WORK_BEAD_ID assignee=$ASSIGNEE session=$SESSION_TAG, not $EXPECTED_ASSIGNEE. Stopping."
++if [ "$STEP_STATUS" != "in_progress" ] || ! claim_assignee_is_ours "$STEP_ASSIGNEE"; then
++  echo "OWNERSHIP_LOST $STEP_ID assignee=$STEP_ASSIGNEE status=$STEP_STATUS, not $EXPECTED_ASSIGNEE. Stopping."
+   gc runtime drain-ack
+   exit 0
+ fi
++if [ -n "${GC_BEAD_ID:-}" ]; then
++  STEP_CONVOY=""
++  if [ -n "$STEP_ROOT" ]; then
++    STEP_CONVOY=$(gc bd show "$STEP_ROOT" --json 2>/dev/null |
++      jq -r '.[0].metadata."gc.input_convoy_id" // .[0].metadata."gc.var.convoy_id" // empty' 2>/dev/null)
++  fi
++  if [ "$STEP_CONVOY" != "$GC_BEAD_ID" ]; then
++    echo "RESUME_INDETERMINATE step $STEP_ID is in molecule ${STEP_ROOT:-none} (convoy ${STEP_CONVOY:-unknown}), not convoy $GC_BEAD_ID; re-claim instead of guessing."
++    gc runtime drain-ack
++    exit 0
++  fi
++fi
++echo "RESUME_VERIFIED $STEP_ID molecule=${STEP_ROOT:-none} assignee=$STEP_ASSIGNEE"
++# GUARD_END resume-reverify
+ ```
+ 
+-If ownership was lost, another agent owns the work now — STOP and drain. Do not
+-race it.
++`OWNERSHIP_LOST` and `RESUME_INDETERMINATE` have already drain-acked — stop and
++exit. `OWNERSHIP_LOST` means another session holds the step now (or it was
++released back to the pool): do not race it. Only `RESUME_VERIFIED` lets you
++continue, on the step it names.
+ 
+ **Claim -> verify ownership -> read formula steps -> follow in order -> claim next step or drain.**
+ 
+diff --git a/gastown/tests/test_polecat_resume_reverify.sh b/gastown/tests/test_polecat_resume_reverify.sh
+new file mode 100755
+index 00000000..a451cadc
+--- /dev/null
++++ b/gastown/tests/test_polecat_resume_reverify.sh
+@@ -0,0 +1,401 @@
++#!/usr/bin/env bash
++# Executable reproduction of gcp-o1nij: the polecat prompt's resume re-verify
++# drained every healthy resumed session.
++#
++# The old block started from `$GC_BEAD_ID`, which gc exports only to
++# convergence condition scripts and never into a session shell, so
++# `gc convoy status ""` failed and the block printed RESUME_INDETERMINATE. Where
++# GC_BEAD_ID was set it then required the WORK bead's assignee to be this
++# session, and since gcp-952j9 nothing assigns the work bead to the polecat, so
++# it printed OWNERSHIP_LOST. Either way the session drained.
++#
++# These tests run the re-verify block out of the polecat prompt against a
++# stubbed `gc`. The block now keys on the STEP this session last claimed
++# (`gc hook current --id-only`), which gc stamps onto the session's own bead on
++# every claim and keeps across `gc runtime request-restart`. It never reads the
++# work bead, never reads metadata.polecat_session, and never writes.
++#
++# No test depends on wall-clock time: `sleep` is a stub that logs its argument.
++set -euo pipefail
++
++ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
++PROMPT="$ROOT/gastown/agents/polecat/prompt.template.md"
++
++TMPROOT=$(mktemp -d)
++trap 'rm -rf "$TMPROOT"' EXIT
++
++fail() {
++    echo "FAIL: $*" >&2
++    exit 1
++}
++
++# extract_guard pulls a guard verbatim out of the prompt template, so the code
++# under test is the code that ships. A drifted or deleted guard fails here
++# rather than passing against a stale copy.
++extract_guard() {
++    local name="$1" out="$2"
++    [[ "$(grep -c "^# GUARD_BEGIN $name\$" "$PROMPT")" == 1 ]] ||
++        fail "expected exactly one '# GUARD_BEGIN $name' in $PROMPT"
++    [[ "$(grep -c "^# GUARD_END $name\$" "$PROMPT")" == 1 ]] ||
++        fail "expected exactly one '# GUARD_END $name' in $PROMPT"
++    awk -v b="# GUARD_BEGIN $name" -v e="# GUARD_END $name" '$0 == b {f=1} $0 == e {f=0} f' "$PROMPT" >"$out"
++    [[ -s "$out" ]] || fail "could not extract the $name guard from $PROMPT"
++    bash -n "$out" || fail "extracted $name guard is not valid shell"
++}
++
++# write_gc_stub answers only the reads the block makes and journals every call,
++# so a test can assert on what the block did, not just on what it printed.
++#   gc hook current --id-only   prints $GC_STUB_CURRENT, or exits 1 when unset
++#   gc bd show <id> --json      serves $GC_STUB_BEADS/<id>.json, else an empty list
++#   gc convoy status <id>       serves $GC_STUB_BEADS/convoy.json (the OLD block's read)
++#   gc runtime drain-ack        journalled only
++write_gc_stub() {
++    local bin="$1"
++    mkdir -p "$bin"
++    cat >"$bin/gc" <<'SH'
++#!/usr/bin/env bash
++printf '%s\n' "$*" >>"$GC_STUB_CALLS"
++case "${1:-}" in
++hook)
++    case "${2:-}" in
++    current)
++        [ -n "${GC_STUB_CURRENT:-}" ] || exit 1
++        printf '%s\n' "$GC_STUB_CURRENT"
++        ;;
++    esac
++    ;;
++bd)
++    case "${2:-}" in
++    show)
++        if [ -f "$GC_STUB_BEADS/${3:-}.json" ]; then
++            cat "$GC_STUB_BEADS/${3:-}.json"
++        else
++            printf '[]'
++        fi
++        ;;
++    esac
++    ;;
++convoy)
++    case "${2:-}" in
++    status)
++        [ -f "$GC_STUB_BEADS/convoy.json" ] && cat "$GC_STUB_BEADS/convoy.json"
++        ;;
++    esac
++    ;;
++runtime) ;;
++esac
++exit 0
++SH
++    chmod +x "$bin/gc"
++    # The block backs off between reads. The stub logs the argument and returns
++    # at once, so the back-off schedule is asserted without waiting for it.
++    cat >"$bin/sleep" <<'SH'
++#!/usr/bin/env bash
++printf '%s\n' "$1" >>"$GC_STUB_SLEEPS"
++SH
++    chmod +x "$bin/sleep"
++}
++
++new_case() {
++    local dir
++    dir=$(mktemp -d "$TMPROOT/case.XXXXXX")
++    mkdir -p "$dir/bin" "$dir/beads"
++    write_gc_stub "$dir/bin"
++    extract_guard resume-reverify "$dir/guard.sh"
++    : >"$dir/calls.log"
++    : >"$dir/sleeps.log"
++    printf '%s' "$dir"
++}
++
++# step_json writes the step bead: step_json <dir> <id> <status> <assignee> [root]
++step_json() {
++    local dir="$1" id="$2" status="$3" assignee="$4" root="${5-gcp-root}"
++    local owner="" root_meta=""
++    [[ -z "$assignee" ]] || owner="\"assignee\":\"$assignee\","
++    [[ -z "$root" ]] || root_meta="\"gc.root_bead_id\":\"$root\","
++    cat >"$dir/beads/$id.json" <<JSON
++[{"id":"$id","status":"$status",${owner}"metadata":{${root_meta}"gc.step_ref":"mol-polecat-work.implement"}}]
++JSON
++}
++
++# root_json writes the molecule root: root_json <dir> <id> <metadata-key> <convoy>
++root_json() {
++    local dir="$1" id="$2" key="$3" convoy="$4"
++    cat >"$dir/beads/$id.json" <<JSON
++[{"id":"$id","status":"open","metadata":{"$key":"$convoy"}}]
++JSON
++}
++
++# run_reverify executes the block with the session's identity bound, then echoes
++# RESUME_PROCEEDED. A drain exits before that marker, so its absence is the
++# assertion that the polecat never reached the work. The identity variables are
++# reset so the test runner's own cannot leak in: BEADS_ACTOR is the session
++# under test and SELF_IDS may add its other spellings as assignments. GC_BEAD_ID
++# is bound only when the case passes one, as it is unset in a real session shell.
++run_reverify() {
++    local dir="$1" me="$2" current="${3-}" convoy="${4-}"
++    {
++        echo 'unset BEADS_ACTOR GC_ALIAS GC_SESSION_ID GC_SESSION_NAME GC_AGENT GC_BEAD_ID'
++        echo "BEADS_ACTOR=\"$me\""
++        echo "${SELF_IDS:-}"
++        [[ -z "$convoy" ]] || echo "GC_BEAD_ID=\"$convoy\""
++        cat "$dir/guard.sh"
++        echo 'echo RESUME_PROCEEDED'
++    } >"$dir/harness.sh"
++
++    GC_STUB_CALLS="$dir/calls.log" GC_STUB_SLEEPS="$dir/sleeps.log" GC_STUB_BEADS="$dir/beads" \
++        GC_STUB_CURRENT="$current" PATH="$dir/bin:$PATH" bash "$dir/harness.sh"
++}
++
++drained() { grep -F 'runtime drain-ack' "$1/calls.log" >/dev/null; }
++
++test_resumed_session_holding_its_step_proceeds() {
++    local dir out
++    dir=$(new_case)
++    step_json "$dir" gcp-step in_progress gastown__polecat-gc-psfm
++
++    # GC_BEAD_ID is unset, as it is in every real session shell.
++    out=$(run_reverify "$dir" gastown__polecat-gc-psfm gcp-step)
++
++    grep -F 'RESUME_VERIFIED gcp-step molecule=gcp-root assignee=gastown__polecat-gc-psfm' <<<"$out" >/dev/null ||
++        fail "a healthy resumed session was not verified: $out"
++    grep -F 'RESUME_PROCEEDED' <<<"$out" >/dev/null ||
++        fail "a verified session did not continue: $out"
++    ! drained "$dir" || fail "a healthy resumed session was drained"
++    ! grep -F 'convoy status' "$dir/calls.log" >/dev/null ||
++        fail "the re-verify asked for a convoy it has no id for: $(cat "$dir/calls.log")"
++}
++
++# The WORK bead is unclaimed for the whole run, so nothing the block concludes
++# may depend on it: not its assignee, not whether it can be found.
++test_resume_proceeds_with_the_work_bead_unassigned() {
++    local dir out
++    dir=$(new_case)
++    step_json "$dir" gcp-step in_progress winnow/gastown.nux
++    root_json "$dir" gcp-root gc.input_convoy_id gcp-convoy
++    cat >"$dir/beads/gcp-work.json" <<'JSON'
++[{"id":"gcp-work","status":"open","metadata":{"polecat_session":"gastown__polecat-gc-old"}}]
++JSON
++    cat >"$dir/beads/convoy.json" <<'JSON'
++{"children":[{"id":"gcp-work","status":"open"}]}
++JSON
++
++    # GC_BEAD_ID is set here, so the block also checks the molecule's convoy.
++    out=$(run_reverify "$dir" winnow/gastown.nux gcp-step gcp-convoy)
++
++    grep -F 'RESUME_VERIFIED gcp-step' <<<"$out" >/dev/null ||
++        fail "an unassigned work bead stopped a healthy resume: $out"
++    ! grep -F 'OWNERSHIP_LOST' <<<"$out" >/dev/null ||
++        fail "the re-verify judged the session by the work bead: $out"
++    ! grep -F 'gcp-work' "$dir/calls.log" >/dev/null ||
++        fail "the re-verify read the work bead: $(cat "$dir/calls.log")"
++    ! grep -F 'convoy status' "$dir/calls.log" >/dev/null ||
++        fail "the re-verify derived the work bead from the convoy: $(cat "$dir/calls.log")"
++}
++
++# One session, several spellings: gc 1.4.x claims under the runtime session
++# name, a gc 1.5.0 namepool polecat acts under its alias. The identity set is
++# the same one the claim block uses, so a step recorded under another spelling
++# of THIS session is still ours.
++test_step_held_under_another_spelling_of_this_session_proceeds() {
++    local dir out
++    dir=$(new_case)
++    step_json "$dir" gcp-step in_progress gastown__polecat-gc-psfm
++
++    out=$(SELF_IDS="GC_ALIAS=winnow/gastown.nux GC_SESSION_ID=gc-psfm GC_SESSION_NAME=gastown__polecat-gc-psfm GC_AGENT=winnow/gastown.nux" \
++        run_reverify "$dir" winnow/gastown.nux gcp-step)
++
++    grep -F 'RESUME_VERIFIED gcp-step' <<<"$out" >/dev/null ||
++        fail "a step held under this session's runtime name was lost: $out"
++    ! drained "$dir" || fail "the session was drained over a spelling of its own identity"
++
++    # Each of the five names counts, and a name that is not ours does not.
++    dir=$(new_case)
++    step_json "$dir" gcp-step in_progress gc-psfm
++    out=$(SELF_IDS="GC_SESSION_ID=gc-psfm" run_reverify "$dir" winnow/gastown.nux gcp-step)
++    grep -F 'RESUME_VERIFIED gcp-step' <<<"$out" >/dev/null ||
++        fail "a step held under this session's bead id was lost: $out"
++    dir=$(new_case)
++    step_json "$dir" gcp-step in_progress winnow/gastown.furiosa
++    out=$(SELF_IDS="GC_AGENT=winnow/gastown.nux" run_reverify "$dir" winnow/gastown.nux gcp-step)
++    grep -F 'OWNERSHIP_LOST gcp-step' <<<"$out" >/dev/null ||
++        fail "a step held by another session was verified: $out"
++}
++
++test_step_taken_by_another_session_is_ownership_lost() {
++    local dir out
++    dir=$(new_case)
++    step_json "$dir" gcp-step in_progress gastown__polecat-gc-8a4d
++
++    out=$(run_reverify "$dir" gastown__polecat-gc-psfm gcp-step)
++
++    grep -F 'OWNERSHIP_LOST gcp-step assignee=gastown__polecat-gc-8a4d status=in_progress' <<<"$out" >/dev/null ||
++        fail "a step taken by another session was not reported lost: $out"
++    ! grep -F 'RESUME_PROCEEDED' <<<"$out" >/dev/null ||
++        fail "the session kept working a step another session holds"
++    drained "$dir" || fail "a session that lost its step did not drain"
++}
++
++# A release puts the step back in the pool: status open, assignee cleared. The
++# stamp still names it, but this session no longer holds it.
++test_released_step_is_ownership_lost() {
++    local dir out
++    dir=$(new_case)
++    step_json "$dir" gcp-step open ""
++
++    out=$(run_reverify "$dir" gastown__polecat-gc-psfm gcp-step)
++
++    grep -F 'OWNERSHIP_LOST gcp-step assignee= status=open' <<<"$out" >/dev/null ||
++        fail "a released step was not reported lost: $out"
++    ! grep -F 'RESUME_PROCEEDED' <<<"$out" >/dev/null ||
++        fail "the session kept working a step that went back to the pool"
++    drained "$dir" || fail "a session holding a released step did not drain"
++}
++
++# No stamped claim: three reads, with the back-off between them but not after
++# the last, then drain. The sleep log is the schedule.
++test_no_current_claim_is_indeterminate() {
++    local dir out sleeps
++    dir=$(new_case)
++
++    out=$(run_reverify "$dir" gastown__polecat-gc-psfm "")
++
++    grep -F 'RESUME_INDETERMINATE no readable step claim for this session (step=none)' <<<"$out" >/dev/null ||
++        fail "a session with no current claim was not indeterminate: $out"
++    ! grep -F 'RESUME_PROCEEDED' <<<"$out" >/dev/null ||
++        fail "a session with no current claim kept going"
++    drained "$dir" || fail "a session with no current claim did not drain"
++    sleeps=$(paste -sd, - <"$dir/sleeps.log")
++    [[ "$sleeps" == "1,2" ]] ||
++        fail "expected the back-off to read exactly 1,2, got '$sleeps'"
++}
++
++test_unreadable_step_is_indeterminate() {
++    local dir out sleeps
++    dir=$(new_case)
++    # The stamp names a step, but the read comes back empty every time.
++
++    out=$(run_reverify "$dir" gastown__polecat-gc-psfm gcp-step)
++
++    grep -F 'RESUME_INDETERMINATE no readable step claim for this session (step=gcp-step)' <<<"$out" >/dev/null ||
++        fail "an unreadable step was not indeterminate: $out"
++    ! grep -F 'OWNERSHIP_LOST' <<<"$out" >/dev/null ||
++        fail "an unreadable step was reported as lost: $out"
++    drained "$dir" || fail "a session with an unreadable step did not drain"
++    sleeps=$(paste -sd, - <"$dir/sleeps.log")
++    [[ "$sleeps" == "1,2" ]] ||
++        fail "expected the back-off to read exactly 1,2, got '$sleeps'"
++}
++
++# A closed step took nothing from this session: the molecule moved on, or the
++# step was closed under it. It holds no live step, which is not a loss.
++test_closed_step_is_indeterminate_not_lost() {
++    local dir out
++    dir=$(new_case)
++    step_json "$dir" gcp-step closed gastown__polecat-gc-psfm
++
++    out=$(run_reverify "$dir" gastown__polecat-gc-psfm gcp-step)
++
++    grep -F 'RESUME_INDETERMINATE step gcp-step is already closed' <<<"$out" >/dev/null ||
++        fail "a closed step was not indeterminate: $out"
++    ! grep -F 'OWNERSHIP_LOST' <<<"$out" >/dev/null ||
++        fail "a closed step was reported as lost: $out"
++    drained "$dir" || fail "a session holding a closed step did not drain"
++}
++
++test_step_in_another_convoy_is_indeterminate() {
++    local dir out
++    dir=$(new_case)
++    step_json "$dir" gcp-step in_progress gastown__polecat-gc-psfm
++    root_json "$dir" gcp-root gc.input_convoy_id gcp-convoy-b
++
++    out=$(run_reverify "$dir" gastown__polecat-gc-psfm gcp-step gcp-convoy-a)
++
++    grep -F 'RESUME_INDETERMINATE step gcp-step is in molecule gcp-root (convoy gcp-convoy-b), not convoy gcp-convoy-a' <<<"$out" >/dev/null ||
++        fail "a step poured on another convoy was not indeterminate: $out"
++    ! grep -F 'RESUME_PROCEEDED' <<<"$out" >/dev/null ||
++        fail "the session kept working a step from another convoy"
++    drained "$dir" || fail "a session holding another convoy's step did not drain"
++
++    # The convoy may be recorded under gc.var.convoy_id instead.
++    dir=$(new_case)
++    step_json "$dir" gcp-step in_progress gastown__polecat-gc-psfm
++    root_json "$dir" gcp-root gc.var.convoy_id gcp-convoy-a
++    out=$(run_reverify "$dir" gastown__polecat-gc-psfm gcp-step gcp-convoy-a)
++    grep -F 'RESUME_VERIFIED gcp-step' <<<"$out" >/dev/null ||
++        fail "a convoy recorded as gc.var.convoy_id was not matched: $out"
++
++    # An unreadable molecule root cannot confirm the convoy, so it does not pass.
++    dir=$(new_case)
++    step_json "$dir" gcp-step in_progress gastown__polecat-gc-psfm
++    out=$(run_reverify "$dir" gastown__polecat-gc-psfm gcp-step gcp-convoy-a)
++    grep -F 'RESUME_INDETERMINATE step gcp-step is in molecule gcp-root (convoy unknown)' <<<"$out" >/dev/null ||
++        fail "an unreadable molecule root was taken as a match: $out"
++
++    # With GC_BEAD_ID unset the convoy is not checked, and the root is not read.
++    dir=$(new_case)
++    step_json "$dir" gcp-step in_progress gastown__polecat-gc-psfm
++    out=$(run_reverify "$dir" gastown__polecat-gc-psfm gcp-step)
++    ! grep -F 'show gcp-root' "$dir/calls.log" >/dev/null ||
++        fail "the molecule root was read with no GC_BEAD_ID to compare it to: $(cat "$dir/calls.log")"
++}
++
++# The block only reads. Every outcome is run, and none may touch a bead.
++test_reverify_writes_nothing() {
++    local dir
++    for scenario in proceed lost released none unreadable closed other_convoy; do
++        dir=$(new_case)
++        case "$scenario" in
++        proceed) step_json "$dir" gcp-step in_progress me; run_reverify "$dir" me gcp-step >/dev/null ;;
++        lost) step_json "$dir" gcp-step in_progress someone-else; run_reverify "$dir" me gcp-step >/dev/null ;;
++        released) step_json "$dir" gcp-step open ""; run_reverify "$dir" me gcp-step >/dev/null ;;
++        none) run_reverify "$dir" me "" >/dev/null ;;
++        unreadable) run_reverify "$dir" me gcp-step >/dev/null ;;
++        closed) step_json "$dir" gcp-step closed me; run_reverify "$dir" me gcp-step >/dev/null ;;
++        other_convoy)
++            step_json "$dir" gcp-step in_progress me
++            root_json "$dir" gcp-root gc.input_convoy_id gcp-convoy-b
++            run_reverify "$dir" me gcp-step gcp-convoy-a >/dev/null
++            ;;
++        esac
++        [[ -s "$dir/calls.log" ]] || fail "$scenario: the block made no gc calls, so the check proves nothing"
++        ! grep -E '^bd (update|close|create|note)( |$)' "$dir/calls.log" >/dev/null ||
++            fail "$scenario: the re-verify wrote to a bead: $(cat "$dir/calls.log")"
++        ! grep -E '(^| )(update|close|create|note)( |$)' "$dir/calls.log" >/dev/null ||
++            fail "$scenario: the re-verify made a write call: $(cat "$dir/calls.log")"
++    done
++}
++
++# The re-verify restates claim_assignee_is_ours because each prompt block runs
++# as its own shell and cannot share the claim block's copy. Two copies drift, so
++# pin them byte-identical: a name added to one and not the other would make the
++# claim and the resume disagree about whose step this is.
++test_identity_set_matches_the_live_owner_guard() {
++    local dir claim_fn resume_fn
++    dir=$(new_case)
++    extract_guard live-owner "$dir/live-owner.sh"
++    claim_fn="$dir/claim-fn.sh"
++    resume_fn="$dir/resume-fn.sh"
++    awk '/^claim_assignee_is_ours\(\) \{$/ {f=1} f {print} f && /^}$/ {exit}' "$dir/live-owner.sh" >"$claim_fn"
++    awk '/^claim_assignee_is_ours\(\) \{$/ {f=1} f {print} f && /^}$/ {exit}' "$dir/guard.sh" >"$resume_fn"
++    [[ -s "$claim_fn" ]] || fail "could not extract claim_assignee_is_ours from the GC_CLAIM block"
++    [[ -s "$resume_fn" ]] || fail "could not extract claim_assignee_is_ours from the resume-reverify block"
++    [[ "$(grep -c 'GC_ALIAS' "$claim_fn")" -ge 1 ]] ||
++        fail "the extracted GC_CLAIM copy does not hold the identity set"
++    diff "$claim_fn" "$resume_fn" ||
++        fail "claim_assignee_is_ours differs between the GC_CLAIM block and the resume-reverify block"
++}
++
++test_resumed_session_holding_its_step_proceeds
++test_resume_proceeds_with_the_work_bead_unassigned
++test_step_held_under_another_spelling_of_this_session_proceeds
++test_step_taken_by_another_session_is_ownership_lost
++test_released_step_is_ownership_lost
++test_no_current_claim_is_indeterminate
++test_unreadable_step_is_indeterminate
++test_closed_step_is_indeterminate_not_lost
++test_step_in_another_convoy_is_indeterminate
++test_reverify_writes_nothing
++test_identity_set_matches_the_live_owner_guard
++
++echo "polecat resume re-verify tests passed"
+-- 
+2.54.0 (Apple Git-157)
+

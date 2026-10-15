@@ -448,7 +448,7 @@ fi
 # GUARD_END live-owner
 
 # Ownership confirmed.
-# Stamp a stable session identity so the churn-watcher and the resume re-verify
+# Stamp a stable session identity so the churn-watcher and the live-owner guard
 # can key on metadata.polecat_session.
 gc bd update "$WORK_ID" --set-metadata polecat_session="$EXPECTED_ASSIGNEE" \
   || echo "WARN metadata stamp failed for $WORK_ID; churn-watcher/resume lose session keying (proceeding — the claim is valid)"
@@ -487,37 +487,89 @@ handing it the step would strand the molecule. The guard prints a `WARN` naming
 the seat and proceeds.
 
 **Resume / crash re-verify (FIRST action on restart).** A restart is a new
-session, and usually a new claim identity: gc 1.4.x and an unaliased gc 1.5.0
-pool session claim under a fresh one, while a gc 1.5.0 namepool polecat claims
-under its alias, a chair the pool hands to whichever session sits in it next.
-If you wake into a session that context says was already
-mid-work on a claimed bead, your FIRST action — before touching code — is to
-re-check ownership against THIS session's identity:
+conversation, not always a new session: `gc runtime request-restart` keeps this
+session's bead, its identities and its claims, while a session that died is
+closed and its claims go back to the pool. If you wake into a session that
+context says was already mid-work on a claimed bead, your FIRST action — before
+touching code — is to re-check that THIS session still holds the step it was
+running.
 
-`$GC_BEAD_ID` is the convoy, not the work bead — derive the child work bead
-first (exactly as the done sequence does), then verify THAT bead's ownership:
+Verify the STEP, not the work bead. The polecat never claims the work bead, so
+its assignee is empty for the whole run and says nothing about this session,
+and `$GC_BEAD_ID` is not exported into a session shell.
+`gc hook current --id-only` names the step this session last claimed; the block
+requires it to be `in_progress` and assigned to one of this session's
+identities, and, when `$GC_BEAD_ID` does name a convoy, poured on that convoy:
 
 ```bash
+# GUARD_BEGIN resume-reverify
 EXPECTED_ASSIGNEE="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
-CONVOY_STATUS=$(gc convoy status "$GC_BEAD_ID" --json)
-WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
-if [ -z "$WORK_BEAD_ID" ]; then
-  echo "RESUME_INDETERMINATE convoy $GC_BEAD_ID has no single child work bead; re-claim instead of guessing."
+# The claim block's identity set, restated because each block is its own shell.
+claim_assignee_is_ours() {
+  for _own in "${BEADS_ACTOR:-}" "${GC_ALIAS:-}" "${GC_SESSION_ID:-}" "${GC_SESSION_NAME:-}" "${GC_AGENT:-}"; do
+    if [ -n "$_own" ] && [ "$1" = "$_own" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+# `gc hook --claim` stamps each claim onto this session's own bead, and a
+# restart keeps that bead, so the stamp still names the step after a restart.
+STEP_ID=""
+STEP_JSON=""
+RESUME_TRY=0
+while [ "$RESUME_TRY" -lt 3 ]; do
+  RESUME_TRY=$((RESUME_TRY + 1))
+  STEP_ID=$(gc hook current --id-only 2>/dev/null)
+  if [ -n "$STEP_ID" ]; then
+    STEP_JSON=$(gc bd show "$STEP_ID" --json 2>/dev/null)
+    if [ "$(printf '%s' "$STEP_JSON" | jq -r '.[0].id // empty' 2>/dev/null)" = "$STEP_ID" ]; then
+      break
+    fi
+  fi
+  STEP_JSON=""
+  if [ "$RESUME_TRY" -lt 3 ]; then
+    sleep "$RESUME_TRY"
+  fi
+done
+if [ -z "$STEP_JSON" ]; then
+  echo "RESUME_INDETERMINATE no readable step claim for this session (step=${STEP_ID:-none}); re-claim instead of guessing."
   gc runtime drain-ack
   exit 0
 fi
-WORK_JSON=$(gc bd show "$WORK_BEAD_ID" --json)
-ASSIGNEE=$(printf '%s' "$WORK_JSON" | jq -r '.[0].assignee // empty')
-SESSION_TAG=$(printf '%s' "$WORK_JSON" | jq -r '.[0].metadata.polecat_session // empty')
-if [ "$ASSIGNEE" != "$EXPECTED_ASSIGNEE" ] || { [ -n "$SESSION_TAG" ] && [ "$SESSION_TAG" != "$EXPECTED_ASSIGNEE" ]; }; then
-  echo "OWNERSHIP_LOST $WORK_BEAD_ID assignee=$ASSIGNEE session=$SESSION_TAG, not $EXPECTED_ASSIGNEE. Stopping."
+STEP_STATUS=$(printf '%s' "$STEP_JSON" | jq -r '.[0].status // empty')
+STEP_ASSIGNEE=$(printf '%s' "$STEP_JSON" | jq -r '.[0].assignee // empty')
+STEP_ROOT=$(printf '%s' "$STEP_JSON" | jq -r '.[0].metadata."gc.root_bead_id" // empty')
+if [ "$STEP_STATUS" = "closed" ]; then
+  echo "RESUME_INDETERMINATE step $STEP_ID is already closed, so this session holds no live step; re-claim instead of guessing."
   gc runtime drain-ack
   exit 0
 fi
+if [ "$STEP_STATUS" != "in_progress" ] || ! claim_assignee_is_ours "$STEP_ASSIGNEE"; then
+  echo "OWNERSHIP_LOST $STEP_ID assignee=$STEP_ASSIGNEE status=$STEP_STATUS, not $EXPECTED_ASSIGNEE. Stopping."
+  gc runtime drain-ack
+  exit 0
+fi
+if [ -n "${GC_BEAD_ID:-}" ]; then
+  STEP_CONVOY=""
+  if [ -n "$STEP_ROOT" ]; then
+    STEP_CONVOY=$(gc bd show "$STEP_ROOT" --json 2>/dev/null |
+      jq -r '.[0].metadata."gc.input_convoy_id" // .[0].metadata."gc.var.convoy_id" // empty' 2>/dev/null)
+  fi
+  if [ "$STEP_CONVOY" != "$GC_BEAD_ID" ]; then
+    echo "RESUME_INDETERMINATE step $STEP_ID is in molecule ${STEP_ROOT:-none} (convoy ${STEP_CONVOY:-unknown}), not convoy $GC_BEAD_ID; re-claim instead of guessing."
+    gc runtime drain-ack
+    exit 0
+  fi
+fi
+echo "RESUME_VERIFIED $STEP_ID molecule=${STEP_ROOT:-none} assignee=$STEP_ASSIGNEE"
+# GUARD_END resume-reverify
 ```
 
-If ownership was lost, another agent owns the work now — STOP and drain. Do not
-race it.
+`OWNERSHIP_LOST` and `RESUME_INDETERMINATE` have already drain-acked — stop and
+exit. `OWNERSHIP_LOST` means another session holds the step now (or it was
+released back to the pool): do not race it. Only `RESUME_VERIFIED` lets you
+continue, on the step it names.
 
 **Claim -> verify ownership -> read formula steps -> follow in order -> claim next step or drain.**
 
