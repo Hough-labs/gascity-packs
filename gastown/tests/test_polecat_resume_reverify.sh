@@ -9,17 +9,19 @@
 # session, and since gcp-952j9 nothing assigns the work bead to the polecat, so
 # it printed OWNERSHIP_LOST. Either way the session drained.
 #
-# These tests run the re-verify block out of the polecat prompt against a
-# stubbed `gc`. The block now keys on the STEP this session last claimed
-# (`gc hook current --id-only`), which gc stamps onto the session's own bead on
-# every claim and keeps across `gc runtime request-restart`. It never reads the
-# work bead, never reads metadata.polecat_session, and never writes.
+# These tests run the re-verify out of assets/scripts/polecat-resume-verify.sh
+# (gcp-wmcj9: it was a prompt fence the model retyped) against a stubbed `gc`.
+# The check keys on the STEP this session last claimed (`gc hook current
+# --id-only`), which gc stamps onto the session's own bead on every claim and
+# keeps across `gc runtime request-restart`. It never reads the work bead, never
+# reads metadata.polecat_session, and never writes.
 #
 # No test depends on wall-clock time: `sleep` is a stub that logs its argument.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 PROMPT="$ROOT/gastown/agents/polecat/prompt.template.md"
+RESUME_SH="$ROOT/gastown/assets/scripts/polecat-resume-verify.sh"
 CLAIM_SH="$ROOT/gastown/assets/scripts/polecat-claim.sh"
 
 TMPROOT=$(mktemp -d)
@@ -30,7 +32,7 @@ fail() {
     exit 1
 }
 
-# extract_guard pulls a guard verbatim out of <file> (the prompt template or the
+# extract_guard pulls a guard verbatim out of <file> (the resume script or the
 # claim script), so the code under test is the code that ships. A drifted or
 # deleted guard fails here rather than passing against a stale copy.
 extract_guard() {
@@ -102,7 +104,7 @@ new_case() {
     dir=$(mktemp -d "$TMPROOT/case.XXXXXX")
     mkdir -p "$dir/bin" "$dir/beads"
     write_gc_stub "$dir/bin"
-    extract_guard resume-reverify "$dir/guard.sh" "$PROMPT"
+    extract_guard resume-reverify "$dir/guard.sh" "$RESUME_SH"
     : >"$dir/calls.log"
     : >"$dir/sleeps.log"
     printf '%s' "$dir"
@@ -367,9 +369,9 @@ test_reverify_writes_nothing() {
     done
 }
 
-# The re-verify restates claim_assignee_is_ours because each prompt block runs
-# as its own shell and cannot share the claim block's copy. Two copies drift, so
-# pin them byte-identical: a name added to one and not the other would make the
+# polecat-resume-verify.sh restates claim_assignee_is_ours because it runs as its
+# own process and cannot share polecat-claim.sh's copy. Two copies drift, so pin
+# them byte-identical: a name added to one and not the other would make the
 # claim and the resume disagree about whose step this is.
 test_identity_set_matches_the_live_owner_guard() {
     local dir claim_fn resume_fn
@@ -380,11 +382,91 @@ test_identity_set_matches_the_live_owner_guard() {
     awk '/^claim_assignee_is_ours\(\) \{$/ {f=1} f {print} f && /^}$/ {exit}' "$dir/live-owner.sh" >"$claim_fn"
     awk '/^claim_assignee_is_ours\(\) \{$/ {f=1} f {print} f && /^}$/ {exit}' "$dir/guard.sh" >"$resume_fn"
     [[ -s "$claim_fn" ]] || fail "could not extract claim_assignee_is_ours from polecat-claim.sh"
-    [[ -s "$resume_fn" ]] || fail "could not extract claim_assignee_is_ours from the resume-reverify block"
+    [[ -s "$resume_fn" ]] || fail "could not extract claim_assignee_is_ours from polecat-resume-verify.sh"
     [[ "$(grep -c 'GC_ALIAS' "$claim_fn")" -ge 1 ]] ||
         fail "the extracted polecat-claim.sh copy does not hold the identity set"
     diff "$claim_fn" "$resume_fn" ||
-        fail "claim_assignee_is_ours differs between polecat-claim.sh and the resume-reverify block"
+        fail "claim_assignee_is_ours differs between polecat-claim.sh and polecat-resume-verify.sh"
+}
+
+# The cases above run the guard text inline, so a drain `exit`s the harness
+# before RESUME_PROCEEDED. The prompt does not do that: it runs the file as a
+# child (`bash "$RESUME_SH"`). Run it that way once per outcome, so the file as
+# shipped (its shebang, its mode, its exit status) is what is under test, and a
+# drain is told by its token and its drain-ack call.
+run_script() {
+    local dir="$1" me="$2" current="${3-}"
+    (
+        unset BEADS_ACTOR GC_ALIAS GC_SESSION_ID GC_SESSION_NAME GC_AGENT GC_BEAD_ID
+        export BEADS_ACTOR="$me"
+        GC_STUB_CALLS="$dir/calls.log" GC_STUB_SLEEPS="$dir/sleeps.log" GC_STUB_BEADS="$dir/beads" \
+            GC_STUB_CURRENT="$current" PATH="$dir/bin:$PATH" bash "$RESUME_SH"
+    )
+}
+
+test_the_shipped_script_runs_as_a_child_process() {
+    local dir out
+    [[ -x "$RESUME_SH" ]] || fail "polecat-resume-verify.sh must be executable"
+
+    dir=$(new_case)
+    step_json "$dir" gcp-step in_progress me
+    out=$(run_script "$dir" me gcp-step) || fail "a verified resume must exit 0, got $?"
+    [[ "$out" == 'RESUME_VERIFIED gcp-step molecule=gcp-root assignee=me' ]] ||
+        fail "the script printed something other than the one RESUME_VERIFIED line: $out"
+    ! drained "$dir" || fail "a verified resume drained"
+
+    dir=$(new_case)
+    step_json "$dir" gcp-step in_progress someone-else
+    out=$(run_script "$dir" me gcp-step) || fail "a lost step must still exit 0, got $?"
+    [[ "$out" == 'OWNERSHIP_LOST gcp-step assignee=someone-else status=in_progress, not me. Stopping.' ]] ||
+        fail "the script printed something other than the one OWNERSHIP_LOST line: $out"
+    drained "$dir" || fail "a lost step did not drain"
+
+    dir=$(new_case)
+    out=$(run_script "$dir" me "") || fail "an indeterminate resume must still exit 0, got $?"
+    grep -F 'RESUME_INDETERMINATE no readable step claim' <<<"$out" >/dev/null ||
+        fail "no stamped claim was not indeterminate: $out"
+    drained "$dir" || fail "an indeterminate resume did not drain"
+}
+
+# prompt_stub renders the call the prompt carries, with {{ .ConfigDir }} bound
+# to <configdir>. It is lifted from the prompt, so a changed stub is the one run.
+prompt_stub() {
+    local cfg="$1"
+    awk '/^RESUME_SH="\{\{ \.ConfigDir \}\}/ {f=1} f {print} f && /^fi$/ {exit}' "$PROMPT" |
+        sed "s#{{ .ConfigDir }}#$cfg#"
+}
+
+# The prompt locates the script through {{ .ConfigDir }}. When that renders to a
+# directory without it (a gc older than v1.5.0 renders ""), the call prints the
+# step's own INDETERMINATE token and drains, so the session re-claims rather than
+# carrying on unverified. Pointed at the real pack dir it reaches the script.
+test_prompt_stub_runs_the_script_and_fails_closed_without_it() {
+    local dir out missing
+    dir=$(new_case)
+    prompt_stub "$ROOT/gastown" >"$dir/stub-real.sh"
+    [[ -s "$dir/stub-real.sh" ]] || fail "could not lift the resume call out of the prompt"
+    step_json "$dir" gcp-step in_progress me
+    out=$(
+        unset BEADS_ACTOR GC_ALIAS GC_SESSION_ID GC_SESSION_NAME GC_AGENT GC_BEAD_ID
+        BEADS_ACTOR=me GC_STUB_CALLS="$dir/calls.log" GC_STUB_SLEEPS="$dir/sleeps.log" \
+            GC_STUB_BEADS="$dir/beads" GC_STUB_CURRENT=gcp-step PATH="$dir/bin:$PATH" bash "$dir/stub-real.sh"
+    )
+    [[ "$out" == 'RESUME_VERIFIED gcp-step molecule=gcp-root assignee=me' ]] ||
+        fail "the prompt's call did not reach the script under the real pack dir: $out"
+
+    dir=$(new_case)
+    missing="$dir/no-such-pack"
+    prompt_stub "$missing" >"$dir/stub-missing.sh"
+    out=$(
+        unset BEADS_ACTOR GC_ALIAS GC_SESSION_ID GC_SESSION_NAME GC_AGENT GC_BEAD_ID
+        BEADS_ACTOR=me GC_STUB_CALLS="$dir/calls.log" GC_STUB_SLEEPS="$dir/sleeps.log" \
+            GC_STUB_BEADS="$dir/beads" GC_STUB_CURRENT=gcp-step PATH="$dir/bin:$PATH" bash "$dir/stub-missing.sh"
+    )
+    [[ "$out" == "RESUME_INDETERMINATE resume script not found at '$missing/assets/scripts/polecat-resume-verify.sh'; re-claim instead of guessing." ]] ||
+        fail "a missing script was not reported with the step's own token: $out"
+    [[ "$(cat "$dir/calls.log")" == 'runtime drain-ack' ]] ||
+        fail "a missing script must do nothing but drain, calls: $(cat "$dir/calls.log")"
 }
 
 test_resumed_session_holding_its_step_proceeds
@@ -398,5 +480,7 @@ test_closed_step_is_indeterminate_not_lost
 test_step_in_another_convoy_is_indeterminate
 test_reverify_writes_nothing
 test_identity_set_matches_the_live_owner_guard
+test_the_shipped_script_runs_as_a_child_process
+test_prompt_stub_runs_the_script_and_fails_closed_without_it
 
 echo "polecat resume re-verify tests passed"

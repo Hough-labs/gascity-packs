@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sat, 10 Oct 2026 16:35:48 -0400
-Subject: [PATCH 139/179] fix(polecat): test live-owner ownership against the
+Subject: [PATCH 139/180] fix(polecat): test live-owner ownership against the
  session's identity set (gcp-fooz4)
 
 0085 decided "the work bead is someone else's" with one string compare,

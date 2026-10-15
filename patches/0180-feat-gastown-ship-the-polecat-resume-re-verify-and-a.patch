@@ -1,0 +1,1276 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 15 Oct 2026 15:33:04 -0400
+Subject: [PATCH 180/180] feat(gastown): ship the polecat resume re-verify and
+ already-submitted guard as pack executables (gcp-wmcj9)
+
+The two remaining large fences in the polecat prompt (the 64-line resume /
+crash re-verify and the 70-line FINAL REMINDER already-submitted guard, plus
+its rendered duplicate in approval-fallacy.template.md) were retyped by the
+model every session. They now run as pack executables, the way gcp-zzb0 ships
+GC_CLAIM, shrinking the rendered polecat prompt from 38,526 to 30,451 bytes.
+
+polecat-resume-verify.sh takes no arguments and prints exactly one of
+RESUME_VERIFIED, OWNERSHIP_LOST, RESUME_INDETERMINATE. polecat-already-
+submitted.sh takes the binding prefix as its one required argument (it was a
+{{ .BindingPrefix }} substitution inside the fence) and prints
+ALREADY_SUBMITTED then drain-acks only on positive evidence. Prompt and
+fragment keep a short stub in the polecat-claim.sh form: a -f check on the
+script under {{ .ConfigDir }}. A missing resume script fails closed
+(RESUME_INDETERMINATE plus drain-ack); a missing already-submitted script does
+not drain and falls through to submit-and-exit, since no evidence means submit.
+claim_assignee_is_ours stays a copy, not a shared library, to keep the
+race-critical claim path free of a locate-the-library failure; the drift test
+pins the copies byte-identical.
+
+Behaviour is identical to the old fences (the fragment echo gains a
+"submit-and-exit already ran;" suffix shared by both callers). Tests that
+extracted or pinned fence text now read the scripts; new
+test_polecat_already_submitted.sh covers 11 behavioural cases.
+
+Validation: applied from the seat-verified artifact (sha256 a19330de...);
+test_polecat_resume_reverify, test_polecat_already_submitted,
+test_gastown_pack_assets, test_polecat_claim and test_polecat_live_owner_guard
+are run before handoff.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ gastown/agents/polecat/prompt.template.md     | 141 +------
+ .../scripts/polecat-already-submitted.sh      | 103 +++++
+ .../assets/scripts/polecat-resume-verify.sh   |  89 +++++
+ .../approval-fallacy.template.md              |  74 +---
+ gastown/tests/test_gastown_pack_assets.sh     | 159 +++++---
+ .../tests/test_polecat_already_submitted.sh   | 372 ++++++++++++++++++
+ gastown/tests/test_polecat_resume_reverify.sh | 108 ++++-
+ 7 files changed, 792 insertions(+), 254 deletions(-)
+ create mode 100755 gastown/assets/scripts/polecat-already-submitted.sh
+ create mode 100755 gastown/assets/scripts/polecat-resume-verify.sh
+ create mode 100755 gastown/tests/test_polecat_already_submitted.sh
+
+diff --git a/gastown/agents/polecat/prompt.template.md b/gastown/agents/polecat/prompt.template.md
+index 904646be..b57f09d5 100644
+--- a/gastown/agents/polecat/prompt.template.md
++++ b/gastown/agents/polecat/prompt.template.md
+@@ -246,70 +246,17 @@ requires it to be `in_progress` and assigned to one of this session's
+ identities, and, when `$GC_BEAD_ID` does name a convoy, poured on that convoy:
+ 
+ ```bash
+-# GUARD_BEGIN resume-reverify
+-EXPECTED_ASSIGNEE="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
+-# The claim block's identity set, restated because each block is its own shell.
+-claim_assignee_is_ours() {
+-  for _own in "${BEADS_ACTOR:-}" "${GC_ALIAS:-}" "${GC_SESSION_ID:-}" "${GC_SESSION_NAME:-}" "${GC_AGENT:-}"; do
+-    if [ -n "$_own" ] && [ "$1" = "$_own" ]; then
+-      return 0
+-    fi
+-  done
+-  return 1
+-}
+-# `gc hook --claim` stamps each claim onto this session's own bead, and a
+-# restart keeps that bead, so the stamp still names the step after a restart.
+-STEP_ID=""
+-STEP_JSON=""
+-RESUME_TRY=0
+-while [ "$RESUME_TRY" -lt 3 ]; do
+-  RESUME_TRY=$((RESUME_TRY + 1))
+-  STEP_ID=$(gc hook current --id-only 2>/dev/null)
+-  if [ -n "$STEP_ID" ]; then
+-    STEP_JSON=$(gc bd show "$STEP_ID" --json 2>/dev/null)
+-    if [ "$(printf '%s' "$STEP_JSON" | jq -r '.[0].id // empty' 2>/dev/null)" = "$STEP_ID" ]; then
+-      break
+-    fi
+-  fi
+-  STEP_JSON=""
+-  if [ "$RESUME_TRY" -lt 3 ]; then
+-    sleep "$RESUME_TRY"
+-  fi
+-done
+-if [ -z "$STEP_JSON" ]; then
+-  echo "RESUME_INDETERMINATE no readable step claim for this session (step=${STEP_ID:-none}); re-claim instead of guessing."
+-  gc runtime drain-ack
+-  exit 0
+-fi
+-STEP_STATUS=$(printf '%s' "$STEP_JSON" | jq -r '.[0].status // empty')
+-STEP_ASSIGNEE=$(printf '%s' "$STEP_JSON" | jq -r '.[0].assignee // empty')
+-STEP_ROOT=$(printf '%s' "$STEP_JSON" | jq -r '.[0].metadata."gc.root_bead_id" // empty')
+-if [ "$STEP_STATUS" = "closed" ]; then
+-  echo "RESUME_INDETERMINATE step $STEP_ID is already closed, so this session holds no live step; re-claim instead of guessing."
+-  gc runtime drain-ack
+-  exit 0
+-fi
+-if [ "$STEP_STATUS" != "in_progress" ] || ! claim_assignee_is_ours "$STEP_ASSIGNEE"; then
+-  echo "OWNERSHIP_LOST $STEP_ID assignee=$STEP_ASSIGNEE status=$STEP_STATUS, not $EXPECTED_ASSIGNEE. Stopping."
++RESUME_SH="{{ .ConfigDir }}/assets/scripts/polecat-resume-verify.sh"
++if [ -f "$RESUME_SH" ]; then
++  bash "$RESUME_SH"
++else
++  echo "RESUME_INDETERMINATE resume script not found at '$RESUME_SH'; re-claim instead of guessing."
+   gc runtime drain-ack
+-  exit 0
+-fi
+-if [ -n "${GC_BEAD_ID:-}" ]; then
+-  STEP_CONVOY=""
+-  if [ -n "$STEP_ROOT" ]; then
+-    STEP_CONVOY=$(gc bd show "$STEP_ROOT" --json 2>/dev/null |
+-      jq -r '.[0].metadata."gc.input_convoy_id" // .[0].metadata."gc.var.convoy_id" // empty' 2>/dev/null)
+-  fi
+-  if [ "$STEP_CONVOY" != "$GC_BEAD_ID" ]; then
+-    echo "RESUME_INDETERMINATE step $STEP_ID is in molecule ${STEP_ROOT:-none} (convoy ${STEP_CONVOY:-unknown}), not convoy $GC_BEAD_ID; re-claim instead of guessing."
+-    gc runtime drain-ack
+-    exit 0
+-  fi
+ fi
+-echo "RESUME_VERIFIED $STEP_ID molecule=${STEP_ROOT:-none} assignee=$STEP_ASSIGNEE"
+-# GUARD_END resume-reverify
+ ```
+ 
++The re-verify lives in this pack's assets/scripts/polecat-resume-verify.sh; run it, do not retype or read it first.
++
+ `OWNERSHIP_LOST` and `RESUME_INDETERMINATE` have already drain-acked — stop and
+ exit. `OWNERSHIP_LOST` means another session holds the step now (or it was
+ released back to the pool): do not race it. Only `RESUME_VERIFIED` lets you
+@@ -421,76 +368,16 @@ step bead you are holding. Only positive evidence — the work bead closed, or
+ handed to the refinery — means submit-and-exit already ran. Otherwise run it:
+ 
+ ```bash
+-EXPECTED_ASSIGNEE="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
+-# The handoff submit-and-exit performs is `assignee = REFINERY_TARGET`, so that
+-# exact value is what counts as proof it ran. Same expression the formula writes.
+-REFINERY_TARGET="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}refinery"
+-# `$GC_BEAD_ID` is not always exported — it was empty in gcp-rz8a's session, so
+-# this guard could not run at all. Recover the convoy from the molecule root of
+-# the step bead this session is holding rather than skipping the check. The
+-# status filter is `open,in_progress`: a claimed step bead carries this
+-# session's assignee, but its status depends on what claimed it — gc 1.4.x's
+-# `gc hook --claim` leaves it `open`, gc 1.5.0's promotes it to `in_progress`,
+-# and a `--claim` update always does. Either status alone can match nothing, and
+-# then the recovery silently yields no convoy.
+-CONVOY_ID="${GC_BEAD_ID:-}"
+-if [ -z "$CONVOY_ID" ]; then
+-  ROOT_BEAD_ID=$(gc bd list --assignee="$EXPECTED_ASSIGNEE" --status=open,in_progress \
+-    --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null |
+-    jq -r '[.[] | .metadata."gc.root_bead_id" // empty] | .[0] // empty' 2>/dev/null)
+-  if [ -n "$ROOT_BEAD_ID" ]; then
+-    CONVOY_ID=$(gc bd show "$ROOT_BEAD_ID" --json 2>/dev/null |
+-      jq -r '.[0].metadata."gc.input_convoy_id" // .[0].metadata."gc.var.convoy_id" // empty' 2>/dev/null)
+-  fi
+-fi
+-# Read the convoy + work bead with retry — same unreadable-is-not-terminal
+-# discipline as the claim block above. An unreadable state (empty JSON, a convoy
+-# blip, or 0/>=2 children so WORK_BEAD_ID is empty) is NOT proof that
+-# submit-and-exit already ran.
+-WORK_BEAD_ID=""
+-WORK_STATUS=""
+-WORK_ASSIGNEE=""
+-READ_OK=0
+-READ_TRY=0
+-while [ "$READ_TRY" -lt 3 ]; do
+-  READ_TRY=$((READ_TRY + 1))
+-  CONVOY_STATUS=$(gc convoy status "$CONVOY_ID" --json 2>/dev/null)
+-  WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end' 2>/dev/null)
+-  if [ -n "$WORK_BEAD_ID" ]; then
+-    WORK_JSON=$(gc bd show "$WORK_BEAD_ID" --json 2>/dev/null)
+-    SHOW_CODE=$?
+-    WORK_STATUS=$(printf '%s' "$WORK_JSON" | jq -r '.[0].status // empty' 2>/dev/null)
+-    WORK_ASSIGNEE=$(printf '%s' "$WORK_JSON" | jq -r '.[0].assignee // empty' 2>/dev/null)
+-    if [ "$SHOW_CODE" -eq 0 ] && [ -n "$WORK_STATUS" ]; then
+-      READ_OK=1
+-      break
+-    fi
+-  fi
+-  sleep 1
+-done
+-# Only POSITIVE evidence counts: the bead is closed, or it is held by the
+-# REFINERY — the one assignee submit-and-exit's handoff actually produces. Every
+-# weaker test has been observed draining a session with the branch unpushed.
+-# "Not in_progress for me" is not evidence: the polecat never claims the work
+-# bead (only the refinery handoff writes its status and assignee), so what it
+-# reads says nothing about this session. Nor is a bare "assigned to
+-# somebody else", which is equally true of a resumed molecule finding the bead
+-# still held by its own PREVIOUS session (a restarted session usually claims
+-# under a new identity) and
+-# of any third party a bead can be parked on — an operator moving it to a crew
+-# seat, a reviewer taking it. Name the refinery rather than enumerate the
+-# identities that are not it.
+-if [ "$READ_OK" -eq 1 ] && { [ "$WORK_STATUS" = "closed" ] ||
+-     [ "$WORK_ASSIGNEE" = "$REFINERY_TARGET" ]; }; then
+-  echo "ALREADY_SUBMITTED $WORK_BEAD_ID status=$WORK_STATUS assignee=$WORK_ASSIGNEE — submit-and-exit already ran; draining."
+-  gc runtime drain-ack
+-  exit
++SUBMITTED_SH="{{ .ConfigDir }}/assets/scripts/polecat-already-submitted.sh"
++if [ -f "$SUBMITTED_SH" ]; then
++  bash "$SUBMITTED_SH" "{{ .BindingPrefix }}"
++else
++  echo "SUBMITTED_GUARD_MISSING already-submitted script not found at '$SUBMITTED_SH'; no evidence the handoff ran, so run submit-and-exit."
+ fi
+-# No positive evidence, or unreadable after retries: DO NOT assume
+-# already-submitted — fall through and run submit-and-exit. A stranded
+-# in_progress bead with an unpushed branch is the worse outcome.
+ ```
+ 
++The check lives in this pack's assets/scripts/polecat-already-submitted.sh; run it, do not retype or read it first. If it prints `ALREADY_SUBMITTED` it has already drain-acked: stop and exit. Anything else is no evidence that the handoff ran: run submit-and-exit.
++
+ The push gate lives inside submit-and-exit; the "No Idle Polecats" fragment
+ above covers it. It fails closed: `auto_push=false` (or `no`/`0`, any case)
+ halts at branch-ready, an ABSENT `auto_push` on a bead whose prose asserts a
+diff --git a/gastown/assets/scripts/polecat-already-submitted.sh b/gastown/assets/scripts/polecat-already-submitted.sh
+new file mode 100755
+index 00000000..eb791fc1
+--- /dev/null
++++ b/gastown/assets/scripts/polecat-already-submitted.sh
+@@ -0,0 +1,103 @@
++#!/usr/bin/env bash
++# polecat-already-submitted.sh — has submit-and-exit already run? (gcp-wmcj9)
++#
++# Usage:  bash polecat-already-submitted.sh <binding-prefix>
++#
++# <binding-prefix> is the pack's binding prefix with its trailing dot
++# ("gastown."), or "" for an unbound pack. It is required even when empty: a
++# missing one would name the wrong refinery, and the check below would then never
++# recognise a handoff the refinery holds.
++#
++# Env read: BEADS_ACTOR GC_SESSION_NAME GC_SESSION_ID GC_AGENT GC_RIG GC_BEAD_ID
++#
++# Outcome contract: it drains only on POSITIVE evidence, and otherwise stays
++# silent so the caller goes on to run submit-and-exit.
++#   ALREADY_SUBMITTED <work-bead> status=<s> assignee=<a> ...
++#                         the work bead is closed or held by the refinery;
++#                         drain-acked, and the exit status is drain-ack's
++#   (no output, exit 0)   no positive evidence, or unreadable after the retries:
++#                         run submit-and-exit
++#   SUBMITTED_GUARD_USAGE ...
++#                         wrong argument count; exit 2, nothing read, no drain
++# It only reads: no bead is written.
++#
++# Everything between the already-submitted:begin and already-submitted:end
++# markers is the fence that used to be typed into the polecat prompt, once in
++# the "No Idle Polecats" fragment and once under FINAL REMINDER. Both now call
++# this script.
++if [ "$#" -ne 1 ]; then
++  echo "SUBMITTED_GUARD_USAGE polecat-already-submitted.sh takes exactly one argument, the binding prefix (got $#)"
++  exit 2
++fi
++BINDING_PREFIX="$1"
++
++# --- already-submitted:begin ---
++EXPECTED_ASSIGNEE="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
++# The handoff submit-and-exit performs is `assignee = REFINERY_TARGET`, so that
++# exact value is what counts as proof it ran. Same expression the formula writes.
++REFINERY_TARGET="${GC_RIG:+$GC_RIG/}${BINDING_PREFIX}refinery"
++# `$GC_BEAD_ID` is not always exported — it was empty in gcp-rz8a's session, so
++# this guard could not run at all. Recover the convoy from the molecule root of
++# the step bead this session is holding rather than skipping the check. The
++# status filter is `open,in_progress`: a claimed step bead carries this
++# session's assignee, but its status depends on what claimed it — gc 1.4.x's
++# `gc hook --claim` leaves it `open`, gc 1.5.0's promotes it to `in_progress`,
++# and a `--claim` update always does. Either status alone can match nothing, and
++# then the recovery silently yields no convoy.
++CONVOY_ID="${GC_BEAD_ID:-}"
++if [ -z "$CONVOY_ID" ]; then
++  ROOT_BEAD_ID=$(gc bd list --assignee="$EXPECTED_ASSIGNEE" --status=open,in_progress \
++    --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null |
++    jq -r '[.[] | .metadata."gc.root_bead_id" // empty] | .[0] // empty' 2>/dev/null)
++  if [ -n "$ROOT_BEAD_ID" ]; then
++    CONVOY_ID=$(gc bd show "$ROOT_BEAD_ID" --json 2>/dev/null |
++      jq -r '.[0].metadata."gc.input_convoy_id" // .[0].metadata."gc.var.convoy_id" // empty' 2>/dev/null)
++  fi
++fi
++# Read the convoy + work bead with retry — same unreadable-is-not-terminal
++# discipline as the claim block. An unreadable state (empty JSON, a convoy blip,
++# or 0/>=2 children so WORK_BEAD_ID is empty) is NOT proof that submit-and-exit
++# already ran.
++WORK_BEAD_ID=""
++WORK_STATUS=""
++WORK_ASSIGNEE=""
++READ_OK=0
++READ_TRY=0
++while [ "$READ_TRY" -lt 3 ]; do
++  READ_TRY=$((READ_TRY + 1))
++  CONVOY_STATUS=$(gc convoy status "$CONVOY_ID" --json 2>/dev/null)
++  WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end' 2>/dev/null)
++  if [ -n "$WORK_BEAD_ID" ]; then
++    WORK_JSON=$(gc bd show "$WORK_BEAD_ID" --json 2>/dev/null)
++    SHOW_CODE=$?
++    WORK_STATUS=$(printf '%s' "$WORK_JSON" | jq -r '.[0].status // empty' 2>/dev/null)
++    WORK_ASSIGNEE=$(printf '%s' "$WORK_JSON" | jq -r '.[0].assignee // empty' 2>/dev/null)
++    if [ "$SHOW_CODE" -eq 0 ] && [ -n "$WORK_STATUS" ]; then
++      READ_OK=1
++      break
++    fi
++  fi
++  sleep 1
++done
++# Only POSITIVE evidence counts: the bead is closed, or it is held by the
++# REFINERY — the one assignee submit-and-exit's handoff actually produces. Every
++# weaker test has been observed draining a session with the branch unpushed.
++# "Not in_progress for me" is not evidence: the polecat never claims the work
++# bead (only the refinery handoff writes its status and assignee), so what it
++# reads says nothing about this session. Nor is a bare "assigned to
++# somebody else", which is equally true of a resumed molecule finding the bead
++# still held by its own PREVIOUS session (a restarted session usually claims
++# under a new identity) and
++# of any third party a bead can be parked on — an operator moving it to a crew
++# seat, a reviewer taking it. Name the refinery rather than enumerate the
++# identities that are not it.
++if [ "$READ_OK" -eq 1 ] && { [ "$WORK_STATUS" = "closed" ] ||
++     [ "$WORK_ASSIGNEE" = "$REFINERY_TARGET" ]; }; then
++  echo "ALREADY_SUBMITTED $WORK_BEAD_ID status=$WORK_STATUS assignee=$WORK_ASSIGNEE — submit-and-exit already ran; draining."
++  gc runtime drain-ack
++  exit
++fi
++# No positive evidence, or unreadable after retries: DO NOT assume
++# already-submitted — fall through and run submit-and-exit. A stranded
++# in_progress bead with an unpushed branch is the worse outcome.
++# --- already-submitted:end ---
+diff --git a/gastown/assets/scripts/polecat-resume-verify.sh b/gastown/assets/scripts/polecat-resume-verify.sh
+new file mode 100755
+index 00000000..8659f214
+--- /dev/null
++++ b/gastown/assets/scripts/polecat-resume-verify.sh
+@@ -0,0 +1,89 @@
++#!/usr/bin/env bash
++# polecat-resume-verify.sh — the polecat's first action on a restart: re-check
++# that THIS session still holds the step it was running (gcp-wmcj9).
++#
++# Usage:  bash polecat-resume-verify.sh
++#
++# It takes no argument and carries no template value: the check needs nothing
++# the prompt renders. Extra arguments are ignored.
++#
++# Env read: BEADS_ACTOR GC_SESSION_NAME GC_SESSION_ID GC_AGENT GC_ALIAS GC_BEAD_ID
++#   GC_BEAD_ID is the convoy the molecule was poured on. gc does not export it
++#   into a session shell, so it is usually empty and the convoy is then not
++#   checked.
++#
++# Outcome contract: it always exits 0 and prints exactly one of
++#   RESUME_VERIFIED <step> molecule=<root> assignee=<assignee>
++#                         this session holds the step; continue on it
++#   OWNERSHIP_LOST ...    another session holds the step, or it went back to
++#                         the pool; drain-acked
++#   RESUME_INDETERMINATE ...
++#                         no readable claim, a closed step, or a step poured
++#                         on another convoy; drain-acked, re-claim
++# It only reads: no bead is written.
++#
++# Everything from the GUARD_BEGIN line to the end of the file is the fence that
++# used to be typed into the polecat prompt; tests extract the guard from here,
++# so keep its sentinels in place.
++# GUARD_BEGIN resume-reverify
++EXPECTED_ASSIGNEE="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
++# The claim block's identity set, restated because each block is its own shell.
++claim_assignee_is_ours() {
++  for _own in "${BEADS_ACTOR:-}" "${GC_ALIAS:-}" "${GC_SESSION_ID:-}" "${GC_SESSION_NAME:-}" "${GC_AGENT:-}"; do
++    if [ -n "$_own" ] && [ "$1" = "$_own" ]; then
++      return 0
++    fi
++  done
++  return 1
++}
++# `gc hook --claim` stamps each claim onto this session's own bead, and a
++# restart keeps that bead, so the stamp still names the step after a restart.
++STEP_ID=""
++STEP_JSON=""
++RESUME_TRY=0
++while [ "$RESUME_TRY" -lt 3 ]; do
++  RESUME_TRY=$((RESUME_TRY + 1))
++  STEP_ID=$(gc hook current --id-only 2>/dev/null)
++  if [ -n "$STEP_ID" ]; then
++    STEP_JSON=$(gc bd show "$STEP_ID" --json 2>/dev/null)
++    if [ "$(printf '%s' "$STEP_JSON" | jq -r '.[0].id // empty' 2>/dev/null)" = "$STEP_ID" ]; then
++      break
++    fi
++  fi
++  STEP_JSON=""
++  if [ "$RESUME_TRY" -lt 3 ]; then
++    sleep "$RESUME_TRY"
++  fi
++done
++if [ -z "$STEP_JSON" ]; then
++  echo "RESUME_INDETERMINATE no readable step claim for this session (step=${STEP_ID:-none}); re-claim instead of guessing."
++  gc runtime drain-ack
++  exit 0
++fi
++STEP_STATUS=$(printf '%s' "$STEP_JSON" | jq -r '.[0].status // empty')
++STEP_ASSIGNEE=$(printf '%s' "$STEP_JSON" | jq -r '.[0].assignee // empty')
++STEP_ROOT=$(printf '%s' "$STEP_JSON" | jq -r '.[0].metadata."gc.root_bead_id" // empty')
++if [ "$STEP_STATUS" = "closed" ]; then
++  echo "RESUME_INDETERMINATE step $STEP_ID is already closed, so this session holds no live step; re-claim instead of guessing."
++  gc runtime drain-ack
++  exit 0
++fi
++if [ "$STEP_STATUS" != "in_progress" ] || ! claim_assignee_is_ours "$STEP_ASSIGNEE"; then
++  echo "OWNERSHIP_LOST $STEP_ID assignee=$STEP_ASSIGNEE status=$STEP_STATUS, not $EXPECTED_ASSIGNEE. Stopping."
++  gc runtime drain-ack
++  exit 0
++fi
++if [ -n "${GC_BEAD_ID:-}" ]; then
++  STEP_CONVOY=""
++  if [ -n "$STEP_ROOT" ]; then
++    STEP_CONVOY=$(gc bd show "$STEP_ROOT" --json 2>/dev/null |
++      jq -r '.[0].metadata."gc.input_convoy_id" // .[0].metadata."gc.var.convoy_id" // empty' 2>/dev/null)
++  fi
++  if [ "$STEP_CONVOY" != "$GC_BEAD_ID" ]; then
++    echo "RESUME_INDETERMINATE step $STEP_ID is in molecule ${STEP_ROOT:-none} (convoy ${STEP_CONVOY:-unknown}), not convoy $GC_BEAD_ID; re-claim instead of guessing."
++    gc runtime drain-ack
++    exit 0
++  fi
++fi
++echo "RESUME_VERIFIED $STEP_ID molecule=${STEP_ROOT:-none} assignee=$STEP_ASSIGNEE"
++# GUARD_END resume-reverify
+diff --git a/gastown/template-fragments/approval-fallacy.template.md b/gastown/template-fragments/approval-fallacy.template.md
+index 489d9731..28328db4 100644
+--- a/gastown/template-fragments/approval-fallacy.template.md
++++ b/gastown/template-fragments/approval-fallacy.template.md
+@@ -33,76 +33,16 @@ Only positive evidence — the work bead closed, or handed to the refinery —
+ means submit-and-exit already reassigned it. Otherwise run it:
+ 
+ ```bash
+-EXPECTED_ASSIGNEE="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
+-# The handoff submit-and-exit performs is `assignee = REFINERY_TARGET`, so that
+-# exact value is what counts as proof it ran. Same expression the formula writes.
+-REFINERY_TARGET="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}refinery"
+-# `$GC_BEAD_ID` is not always exported — it was empty in gcp-rz8a's session, so
+-# this guard could not run at all. Recover the convoy from the molecule root of
+-# the step bead this session is holding rather than skipping the check. The
+-# status filter is `open,in_progress`: a claimed step bead carries this
+-# session's assignee, but its status depends on what claimed it — gc 1.4.x's
+-# `gc hook --claim` leaves it `open`, gc 1.5.0's promotes it to `in_progress`,
+-# and a `--claim` update always does. Either status alone can match nothing, and
+-# then the recovery silently yields no convoy.
+-CONVOY_ID="${GC_BEAD_ID:-}"
+-if [ -z "$CONVOY_ID" ]; then
+-  ROOT_BEAD_ID=$(gc bd list --assignee="$EXPECTED_ASSIGNEE" --status=open,in_progress \
+-    --has-metadata-key gc.step_ref --include-infra --limit=0 --json 2>/dev/null |
+-    jq -r '[.[] | .metadata."gc.root_bead_id" // empty] | .[0] // empty' 2>/dev/null)
+-  if [ -n "$ROOT_BEAD_ID" ]; then
+-    CONVOY_ID=$(gc bd show "$ROOT_BEAD_ID" --json 2>/dev/null |
+-      jq -r '.[0].metadata."gc.input_convoy_id" // .[0].metadata."gc.var.convoy_id" // empty' 2>/dev/null)
+-  fi
++SUBMITTED_SH="{{ .ConfigDir }}/assets/scripts/polecat-already-submitted.sh"
++if [ -f "$SUBMITTED_SH" ]; then
++  bash "$SUBMITTED_SH" "{{ .BindingPrefix }}"
++else
++  echo "SUBMITTED_GUARD_MISSING already-submitted script not found at '$SUBMITTED_SH'; no evidence the handoff ran, so run submit-and-exit."
+ fi
+-# Read the convoy + work bead with retry — same unreadable-is-not-terminal
+-# discipline as the claim block. An unreadable state (empty JSON, a convoy blip,
+-# or 0/>=2 children so WORK_BEAD_ID is empty) is NOT proof that submit-and-exit
+-# already ran.
+-WORK_BEAD_ID=""
+-WORK_STATUS=""
+-WORK_ASSIGNEE=""
+-READ_OK=0
+-READ_TRY=0
+-while [ "$READ_TRY" -lt 3 ]; do
+-  READ_TRY=$((READ_TRY + 1))
+-  CONVOY_STATUS=$(gc convoy status "$CONVOY_ID" --json 2>/dev/null)
+-  WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end' 2>/dev/null)
+-  if [ -n "$WORK_BEAD_ID" ]; then
+-    WORK_JSON=$(gc bd show "$WORK_BEAD_ID" --json 2>/dev/null)
+-    SHOW_CODE=$?
+-    WORK_STATUS=$(printf '%s' "$WORK_JSON" | jq -r '.[0].status // empty' 2>/dev/null)
+-    WORK_ASSIGNEE=$(printf '%s' "$WORK_JSON" | jq -r '.[0].assignee // empty' 2>/dev/null)
+-    if [ "$SHOW_CODE" -eq 0 ] && [ -n "$WORK_STATUS" ]; then
+-      READ_OK=1
+-      break
+-    fi
+-  fi
+-  sleep 1
+-done
+-# Only POSITIVE evidence counts: the bead is closed, or it is held by the
+-# REFINERY — the one assignee submit-and-exit's handoff actually produces. Every
+-# weaker test has been observed draining a session with the branch unpushed.
+-# "Not in_progress for me" is not evidence: the polecat never claims the work
+-# bead (only the refinery handoff writes its status and assignee), so what it
+-# reads says nothing about this session. Nor is a bare "assigned to
+-# somebody else", which is equally true of a resumed molecule finding the bead
+-# still held by its own PREVIOUS session (a restarted session usually claims
+-# under a new identity) and
+-# of any third party a bead can be parked on — an operator moving it to a crew
+-# seat, a reviewer taking it. Name the refinery rather than enumerate the
+-# identities that are not it.
+-if [ "$READ_OK" -eq 1 ] && { [ "$WORK_STATUS" = "closed" ] ||
+-     [ "$WORK_ASSIGNEE" = "$REFINERY_TARGET" ]; }; then
+-  echo "ALREADY_SUBMITTED $WORK_BEAD_ID status=$WORK_STATUS assignee=$WORK_ASSIGNEE — draining."
+-  gc runtime drain-ack
+-  exit
+-fi
+-# No positive evidence, or unreadable after retries: DO NOT assume
+-# already-submitted — fall through and run submit-and-exit. A stranded
+-# in_progress bead with an unpushed branch is the worse outcome.
+ ```
+ 
++The check lives in this pack's assets/scripts/polecat-already-submitted.sh; run it, do not retype or read it first. If it prints `ALREADY_SUBMITTED` it has already drain-acked: stop and exit. Anything else is no evidence that the handoff ran: run submit-and-exit.
++
+ The push gate is handled inside submit-and-exit itself, and it fails closed:
+ `auto_push=false` halts at branch-ready (no push, no refinery handoff); an
+ ABSENT `auto_push` on a bead whose DESCRIPTION or NOTES assert a no-push rail
+diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
+index 2a9d11bc..484a7635 100755
+--- a/gastown/tests/test_gastown_pack_assets.sh
++++ b/gastown/tests/test_gastown_pack_assets.sh
+@@ -420,6 +420,68 @@ test_polecat_claim_ships_as_a_script_not_a_heredoc() {
+         fail "polecat-claim.sh must use the binding prefix for the restamp, the worker check and the witness nudge"
+ }
+ 
++test_polecat_guard_scripts_ship_as_scripts_not_fences() {
++    # gcp-wmcj9: the resume re-verify (64 lines) and the already-submitted check
++    # (70 lines, once in the prompt and once in the "No Idle Polecats" fragment)
++    # were fences the model retyped. They ship as two scripts the prompt calls.
++    # Behavioural coverage lives in test_polecat_resume_reverify.sh and
++    # test_polecat_already_submitted.sh; this pins the seam between the callers
++    # and the scripts.
++    local prompt fragment resume submitted file stub
++    prompt="$GASTOWN/agents/polecat/prompt.template.md"
++    fragment="$GASTOWN/template-fragments/approval-fallacy.template.md"
++    resume="$GASTOWN/assets/scripts/polecat-resume-verify.sh"
++    submitted="$GASTOWN/assets/scripts/polecat-already-submitted.sh"
++
++    for file in "$resume" "$submitted"; do
++        [[ -x "$file" ]] || fail "$(basename "$file") must be executable"
++        [[ "$(head -1 "$file")" == '#!/usr/bin/env bash' ]] ||
++            fail "$(basename "$file") must start with a bash shebang"
++        bash -n "$file" || fail "$(basename "$file") is not valid shell"
++        ! grep -v '^ *#' "$file" | grep -F '{{' >/dev/null ||
++            fail "$(basename "$file") carries a template value; it is not rendered"
++    done
++
++    # The resume call: located through {{ .ConfigDir }}, run, no fence left behind.
++    [[ "$(grep -cF 'RESUME_SH="{{ .ConfigDir }}/assets/scripts/polecat-resume-verify.sh"' "$prompt")" == 1 ]] ||
++        fail "the prompt must locate the resume script through {{ .ConfigDir }}"
++    [[ "$(grep -cF 'bash "$RESUME_SH"' "$prompt")" == 1 ]] ||
++        fail "the prompt must run the resume script"
++    ! grep -E 'GUARD_BEGIN resume-reverify|GUARD_END resume-reverify|claim_assignee_is_ours|RESUME_TRY' "$prompt" >/dev/null ||
++        fail "the prompt inlines the resume re-verify again"
++    grep -F '# GUARD_BEGIN resume-reverify' "$resume" >/dev/null &&
++        grep -F '# GUARD_END resume-reverify' "$resume" >/dev/null ||
++        fail "polecat-resume-verify.sh lost the sentinels the tests extract its guard by"
++    stub=$(awk '/^RESUME_SH="/ {f=1} f {print} f && /^fi$/ {exit}' "$prompt")
++    [[ "$stub" == *'RESUME_INDETERMINATE resume script not found'* && "$stub" == *'gc runtime drain-ack'* ]] ||
++        fail "a missing resume script must print RESUME_INDETERMINATE and drain, not carry on unverified"
++
++    # The already-submitted call, once in the prompt (FINAL REMINDER) and once in
++    # the fragment: each passes the binding prefix and carries no copy of the check.
++    for file in "$prompt" "$fragment"; do
++        [[ "$(grep -cF 'SUBMITTED_SH="{{ .ConfigDir }}/assets/scripts/polecat-already-submitted.sh"' "$file")" == 1 ]] ||
++            fail "$(basename "$file") must locate the already-submitted script through {{ .ConfigDir }}"
++        [[ "$(grep -cF 'bash "$SUBMITTED_SH" "{{ .BindingPrefix }}"' "$file")" == 1 ]] ||
++            fail "$(basename "$file") must run the already-submitted script with the binding prefix"
++        ! grep -E 'READ_OK|WORK_ASSIGNEE|ROOT_BEAD_ID|REFINERY_TARGET=' "$file" >/dev/null ||
++            fail "$(basename "$file") inlines the already-submitted check again"
++        # No evidence is not a reason to drain: a missing script goes on to
++        # submit-and-exit, whose own step 0 guard is the second brake.
++        stub=$(awk '/^SUBMITTED_SH="/ {f=1} f {print} f && /^fi$/ {exit}' "$file")
++        [[ "$stub" == *'SUBMITTED_GUARD_MISSING'* ]] ||
++            fail "$(basename "$file") must say so when the already-submitted script is missing"
++        [[ "$stub" != *'drain-ack'* ]] ||
++            fail "$(basename "$file") drains on a missing already-submitted script; no evidence is not a handoff"
++    done
++
++    # The script takes the prefix as its one argument and stops without a drain
++    # when it is missing; nothing in it is a template value.
++    grep -F 'SUBMITTED_GUARD_USAGE polecat-already-submitted.sh takes exactly one argument' "$submitted" >/dev/null ||
++        fail "polecat-already-submitted.sh must reject a call without exactly one argument"
++    [[ "$(grep -cF '${BINDING_PREFIX}' "$submitted")" == 1 ]] ||
++        fail "polecat-already-submitted.sh must use the binding prefix once, to name the refinery"
++}
++
+ test_review_leg_contract_forbids_synthetic_mutation() {
+     local formula prompt
+     formula="$GASTOWN/formulas/mol-review-leg.toml"
+@@ -1083,10 +1145,8 @@ test_dolt_push_outage_detection_is_wired() {
+ }
+ 
+ test_submit_and_exit_cannot_be_replayed() {
+-    local formula prompt fragment submit_block script script_text
++    local formula submit_block script script_text
+     formula="$GASTOWN/formulas/mol-polecat-work.toml"
+-    prompt="$GASTOWN/agents/polecat/prompt.template.md"
+-    fragment="$GASTOWN/template-fragments/approval-fallacy.template.md"
+     # The push gate and the refinery handoff run as this script (gcp-nc8wg).
+     script="$GASTOWN/assets/scripts/polecat-submit.sh"
+ 
+@@ -1182,26 +1242,29 @@ if guard.index("REFINERY_TARGET=") >= guard.index('[ "$SUBMITTED_ASSIGNEE" = "$R
+ PY
+ 
+     # The prompt-side guard could not run at all in the observed session:
+-    # $GC_BEAD_ID was empty, so it never resolved a work bead. Both copies must
+-    # recover the convoy, and both must key on POSITIVE evidence — the polecat
+-    # never claims the work bead, so "not in_progress for me" reports
+-    # already-submitted on work that was never submitted.
+-    local guard
+-    for guard in "$prompt" "$fragment"; do
+-        grep -F 'CONVOY_ID="${GC_BEAD_ID:-}"' "$guard" >/dev/null ||
+-            fail "$(basename "$guard") must not read the convoy straight from \$GC_BEAD_ID; it is not always exported"
+-        grep -F 'gc.root_bead_id' "$guard" >/dev/null ||
+-            fail "$(basename "$guard") must recover the convoy from the step bead's molecule root"
+-        # Scoped to the convoy-recovery query itself. This used to be a
+-        # file-wide `! grep -- '--status=in_progress '`, which conflated two
+-        # different lookups: the startup claim block legitimately resolves an
+-        # in-flight, hook-claimed step with in_progress ALONE (adding `open`
+-        # there would let it jump to a step whose predecessor has not closed).
+-        # The invariant that actually matters is local to this query — the step
+-        # bead it recovers the convoy from is stored `open` by gc 1.4.x's hook
+-        # and `in_progress` by gc 1.5.0's, so either status alone can match
+-        # nothing and the recovery silently yields no convoy.
+-        python3 - "$guard" <<'PY' || fail "$(basename "$guard") must recover the convoy's held step bead with --status=open,in_progress; a claimed step bead is stored open or in_progress depending on the gc that claimed it"
++    # $GC_BEAD_ID was empty, so it never resolved a work bead. It must recover the
++    # convoy, and it must key on POSITIVE evidence — the polecat never claims the
++    # work bead, so "not in_progress for me" reports already-submitted on work
++    # that was never submitted. It used to be one fence, copied into the prompt and
++    # into the "No Idle Polecats" fragment; it is now one script that both call
++    # (gcp-wmcj9), so these pins read the script, and
++    # test_polecat_guard_scripts_ship_as_scripts_not_fences pins the two callers.
++    local guard="$GASTOWN/assets/scripts/polecat-already-submitted.sh"
++    [[ -f "$guard" ]] || fail "polecat-already-submitted.sh is missing: $guard"
++    grep -F 'CONVOY_ID="${GC_BEAD_ID:-}"' "$guard" >/dev/null ||
++        fail "$(basename "$guard") must not read the convoy straight from \$GC_BEAD_ID; it is not always exported"
++    grep -F 'gc.root_bead_id' "$guard" >/dev/null ||
++        fail "$(basename "$guard") must recover the convoy from the step bead's molecule root"
++    # Scoped to the convoy-recovery query itself. This used to be a
++    # file-wide `! grep -- '--status=in_progress '`, which conflated two
++    # different lookups: the startup claim block legitimately resolves an
++    # in-flight, hook-claimed step with in_progress ALONE (adding `open`
++    # there would let it jump to a step whose predecessor has not closed).
++    # The invariant that actually matters is local to this query — the step
++    # bead it recovers the convoy from is stored `open` by gc 1.4.x's hook
++    # and `in_progress` by gc 1.5.0's, so either status alone can match
++    # nothing and the recovery silently yields no convoy.
++    python3 - "$guard" <<'PY' || fail "$(basename "$guard") must recover the convoy's held step bead with --status=open,in_progress; a claimed step bead is stored open or in_progress depending on the gc that claimed it"
+ import sys
+ 
+ text = open(sys.argv[1], encoding="utf-8").read()
+@@ -1210,20 +1273,19 @@ query = text[start:text.index("CONVOY_ID=$(gc bd show", start)]
+ if "--status=open,in_progress" not in query:
+     raise SystemExit(1)
+ PY
+-        ! grep -F '[ "$WORK_STATUS" != "in_progress" ]' "$guard" >/dev/null ||
+-            fail "$(basename "$guard") must not treat an unassigned work bead as already submitted"
+-        grep -F '[ "$WORK_STATUS" = "closed" ]' "$guard" >/dev/null ||
+-            fail "$(basename "$guard") must require positive evidence (closed, or held by the refinery)"
+-
+-        # The same gcp-0pa4 defect as the formula guard, in the copy an agent
+-        # actually has in context when it decides whether to drain.
+-        grep -F 'REFINERY_TARGET="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}refinery"' "$guard" >/dev/null ||
+-            fail "$(basename "$guard") must resolve the refinery target the same way the handoff writes it"
+-        grep -F '[ "$WORK_ASSIGNEE" = "$REFINERY_TARGET" ]' "$guard" >/dev/null ||
+-            fail "$(basename "$guard") must require the work bead to be held by the refinery before draining"
+-        ! grep -F '[ "$WORK_ASSIGNEE" != "$EXPECTED_ASSIGNEE" ]' "$guard" >/dev/null ||
+-            fail "$(basename "$guard") reads any third-party assignee as a completed handoff (gcp-0pa4)"
+-    done
++    ! grep -F '[ "$WORK_STATUS" != "in_progress" ]' "$guard" >/dev/null ||
++        fail "$(basename "$guard") must not treat an unassigned work bead as already submitted"
++    grep -F '[ "$WORK_STATUS" = "closed" ]' "$guard" >/dev/null ||
++        fail "$(basename "$guard") must require positive evidence (closed, or held by the refinery)"
++
++    # The same gcp-0pa4 defect as the formula guard, in the copy an agent
++    # actually has in context when it decides whether to drain.
++    grep -F 'REFINERY_TARGET="${GC_RIG:+$GC_RIG/}${BINDING_PREFIX}refinery"' "$guard" >/dev/null ||
++        fail "$(basename "$guard") must resolve the refinery target the same way the handoff writes it"
++    grep -F '[ "$WORK_ASSIGNEE" = "$REFINERY_TARGET" ]' "$guard" >/dev/null ||
++        fail "$(basename "$guard") must require the work bead to be held by the refinery before draining"
++    ! grep -F '[ "$WORK_ASSIGNEE" != "$EXPECTED_ASSIGNEE" ]' "$guard" >/dev/null ||
++        fail "$(basename "$guard") reads any third-party assignee as a completed handoff (gcp-0pa4)"
+ }
+ 
+ test_work_bead_is_never_claimed() {
+@@ -1236,11 +1298,14 @@ test_work_bead_is_never_claimed() {
+     # the work bead back, which is what forced STEP_REPOINTED, the
+     # `gc.step_ref` close fallback and the `--if-assignee` takeover. All of that
+     # stays gone.
+-    local formula prompt claim fragment submit
++    local formula prompt claim submitted resume submit
+     formula="$GASTOWN/formulas/mol-polecat-work.toml"
+     prompt="$GASTOWN/agents/polecat/prompt.template.md"
+     claim="$GASTOWN/assets/scripts/polecat-claim.sh"
+-    fragment="$GASTOWN/template-fragments/approval-fallacy.template.md"
++    # The already-submitted check and the resume re-verify moved out of the
++    # prompt and the "No Idle Polecats" fragment into these scripts (gcp-wmcj9).
++    submitted="$GASTOWN/assets/scripts/polecat-already-submitted.sh"
++    resume="$GASTOWN/assets/scripts/polecat-resume-verify.sh"
+     # The push gate and the refinery handoff moved out of the formula into this
+     # script (gcp-nc8wg), so it is scanned like a step.
+     submit="$GASTOWN/assets/scripts/polecat-submit.sh"
+@@ -1279,11 +1344,11 @@ PY
+     # polecat-submit.sh carries the push gate and handoff halts that used to be
+     # in the formula (gcp-nc8wg), so every negative pin on submit-and-exit's
+     # shell reads it too.
+-    for file in "$prompt" "$claim" "$formula" "$submit"; do
++    for file in "$prompt" "$claim" "$formula" "$submit" "$submitted" "$resume"; do
+         ! grep -F 'STEP_REPOINTED' "$file" >/dev/null ||
+             fail "$(basename "$file") re-points a work-bead hook result onto a step; the work bead is never claimed, so the hook never returns it"
+     done
+-    ! grep -F -- '--if-assignee' "$prompt" "$claim" "$formula" "$submit" >/dev/null ||
++    ! grep -F -- '--if-assignee' "$prompt" "$claim" "$formula" "$submit" "$submitted" "$resume" >/dev/null ||
+         fail "an --if-assignee takeover is back; there is no claim on the work bead to take over"
+     ! grep -F 'tier 2' "$formula" "$submit" >/dev/null ||
+         fail "submit-and-exit regained its gc.step_ref close fallback"
+@@ -1311,13 +1376,10 @@ if 'bash "$PS" reassign' not in step["description"]:
+ if "HANDOFF_FAILED" not in step["description"] or "HANDOFF_FAILED" not in script:
+     raise SystemExit(1)
+ PY
+-    local guard
+-    for guard in "$prompt" "$fragment"; do
+-        grep -F '[ "$WORK_ASSIGNEE" = "$REFINERY_TARGET" ]' "$guard" >/dev/null ||
+-            fail "$(basename "$guard") must tell a completed handoff by the refinery's identity"
+-        grep -F 'the polecat never claims the work' "$guard" >/dev/null ||
+-            fail "$(basename "$guard") still describes a claimed work bead"
+-    done
++    grep -F '[ "$WORK_ASSIGNEE" = "$REFINERY_TARGET" ]' "$submitted" >/dev/null ||
++        fail "$(basename "$submitted") must tell a completed handoff by the refinery's identity"
++    grep -F 'the polecat never claims the work' "$submitted" >/dev/null ||
++        fail "$(basename "$submitted") still describes a claimed work bead"
+ }
+ 
+ # The patrol formulas end an idle turn with `IDLE:` and tell the agent what
+@@ -1468,6 +1530,7 @@ test_claim_verify_separates_read_failure_from_unassigned
+ test_claim_refuses_a_pour_onto_a_live_owner
+ test_claim_decline_writes_nothing_on_any_bead
+ test_polecat_claim_ships_as_a_script_not_a_heredoc
++test_polecat_guard_scripts_ship_as_scripts_not_fences
+ test_review_leg_contract_forbids_synthetic_mutation
+ test_prime_prompts_are_city_generic_and_compact
+ test_operational_awareness_step0_fails_closed
+diff --git a/gastown/tests/test_polecat_already_submitted.sh b/gastown/tests/test_polecat_already_submitted.sh
+new file mode 100755
+index 00000000..1073994b
+--- /dev/null
++++ b/gastown/tests/test_polecat_already_submitted.sh
+@@ -0,0 +1,372 @@
++#!/usr/bin/env bash
++# Tests for gastown/assets/scripts/polecat-already-submitted.sh, the polecat's
++# "did submit-and-exit already run?" check.
++#
++# The check was a 70-line fence the model retyped, once in the "No Idle
++# Polecats" fragment and once under FINAL REMINDER (gcp-wmcj9). It ships as one
++# script both call. Until then nothing ran it: the suites only grepped its text.
++# These tests run the real script against a stubbed `gc` and a stubbed `sleep`,
++# and assert the whole of stdout, the exit status and the exact call log, so a
++# changed retry count, refinery name or evidence test fails here. The last two
++# tests run the call the prompt and the fragment carry, lifted out of them.
++#
++# No test depends on wall-clock time: `sleep` is a stub that logs its argument
++# and returns at once, and stdin is /dev/null.
++#
++# Every case sets its environment inside a subshell on purpose, so nothing leaks
++# from one case into the next.
++# shellcheck disable=SC2030,SC2031
++set -euo pipefail
++
++ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
++SUBMITTED_SH="$ROOT/gastown/assets/scripts/polecat-already-submitted.sh"
++PROMPT="$ROOT/gastown/agents/polecat/prompt.template.md"
++FRAGMENT="$ROOT/gastown/template-fragments/approval-fallacy.template.md"
++
++TMPROOT=$(mktemp -d)
++trap 'rm -rf "$TMPROOT"' EXIT
++
++# fail names the test that called it, so a red run says which case broke.
++fail() {
++    local fn name=""
++    for fn in "${FUNCNAME[@]}"; do
++        case "$fn" in test_*) name=$fn; break ;; esac
++    done
++    echo "FAIL${name:+ $name}: $*" >&2
++    exit 1
++}
++
++ME=gastown__polecat-gc-psfm
++REFINERY=winnow/gastown.refinery
++ONE_CHILD='{"children":[{"id":"w-1"}]}'
++
++# write_stubs answers only the reads the check makes and journals every call to
++# $FX/calls.log. Each read serves $FX/<name>, or $FX/<name>.<N> for the Nth call,
++# with $FX/<name>[.<N>].code as the exit status. gc runtime drain-ack serves only
++# an exit status, from $FX/drain.code.
++write_stubs() {
++    local bin="$1"
++    mkdir -p "$bin"
++    cat >"$bin/gc" <<'SH'
++#!/usr/bin/env bash
++printf 'gc %s\n' "$*" >>"$FX/calls.log"
++next() { # <name>: serve name.N for the Nth call, falling back to name
++    local n c
++    n=$(($(cat "$FX/$1.n" 2>/dev/null || echo 0) + 1))
++    echo "$n" >"$FX/$1.n"
++    if [ -e "$FX/$1.$n" ]; then cat "$FX/$1.$n"; else cat "$FX/$1" 2>/dev/null; fi
++    c="$FX/$1.$n.code"
++    [ -e "$c" ] || c="$FX/$1.code"
++    return "$(cat "$c" 2>/dev/null || echo 0)"
++}
++case "$1:$2" in
++    convoy:status) next convoy; exit $? ;;
++    bd:show) next "show-$3"; exit $? ;;
++    bd:list) next list; exit $? ;;
++    runtime:drain-ack) exit "$(cat "$FX/drain.code" 2>/dev/null || echo 0)" ;;
++    *) exit 0 ;;
++esac
++SH
++    cat >"$bin/sleep" <<'SH'
++#!/usr/bin/env bash
++printf 'sleep %s\n' "$*" >>"$FX/calls.log"
++SH
++    chmod +x "$bin/gc" "$bin/sleep"
++}
++
++new_case() {
++    local dir
++    dir=$(mktemp -d "$TMPROOT/case.XXXXXX")
++    write_stubs "$dir/bin"
++    : >"$dir/calls.log"
++    printf '%s' "$dir"
++}
++
++# run_guard <dir> [args...] runs the script as the polecat does, under a clean
++# identity (GC_RIG=winnow, BEADS_ACTOR=$ME, GC_BEAD_ID=gcp-convoy) that a case
++# may override through $dir/env. With no args it passes the prefix "gastown.";
++# the single arg --none passes no argument at all. The exit status lands in
++# $dir/rc, the output in $dir/out.
++run_guard() {
++    local dir="$1" rc=0
++    shift
++    [ "$#" -gt 0 ] || set -- "gastown."
++    [ "$*" != "--none" ] || set --
++    (
++        export FX="$dir" PATH="$dir/bin:$PATH"
++        unset BEADS_ACTOR GC_ALIAS GC_SESSION_ID GC_SESSION_NAME GC_AGENT GC_RIG GC_BEAD_ID
++        export GC_RIG=winnow BEADS_ACTOR=$ME GC_BEAD_ID=gcp-convoy
++        # shellcheck disable=SC1091
++        [ -f "$dir/env" ] && . "$dir/env"
++        bash "$SUBMITTED_SH" "$@" </dev/null >"$dir/out" 2>"$dir/err"
++    ) || rc=$?
++    echo "$rc" >"$dir/rc"
++}
++
++assert_rc() { [ "$(cat "$1/rc")" = "$2" ] || fail "want exit $2, got $(cat "$1/rc"): $(cat "$1/out" "$1/err")"; }
++
++assert_stdout() {
++    local dir="$1"
++    cat >"$dir/want.out"
++    diff -u "$dir/want.out" "$dir/out" || fail "stdout differs (diff above)"
++}
++
++assert_calls() {
++    local dir="$1"
++    cat >"$dir/want.calls"
++    diff -u "$dir/want.calls" "$dir/calls.log" || fail "the gc/sleep call log differs (diff above)"
++}
++
++# work <dir> <status> [assignee] writes the work bead the check reads.
++work() {
++    local dir="$1" status="$2" assignee="${3-}" owner=""
++    [ -z "$assignee" ] || owner=',"assignee":"'$assignee'"'
++    printf '[{"id":"w-1","status":"%s"%s}]' "$status" "$owner" >"$dir/show-w-1"
++    printf '%s' "$ONE_CHILD" >"$dir/convoy"
++}
++
++# The three calls of a clean read: the convoy, the work bead, then the drain.
++READ_CALLS='gc convoy status gcp-convoy --json
++gc bd show w-1 --json'
++
++test_a_closed_work_bead_is_already_submitted() {
++    local dir
++    dir=$(new_case)
++    work "$dir" closed
++    run_guard "$dir"
++    assert_rc "$dir" 0
++    assert_stdout "$dir" <<'EOF'
++ALREADY_SUBMITTED w-1 status=closed assignee= — submit-and-exit already ran; draining.
++EOF
++    assert_calls "$dir" <<EOF
++$READ_CALLS
++gc runtime drain-ack
++EOF
++}
++
++test_a_work_bead_held_by_the_refinery_is_already_submitted() {
++    local dir
++    dir=$(new_case)
++    work "$dir" open "$REFINERY"
++    run_guard "$dir"
++    assert_rc "$dir" 0
++    assert_stdout "$dir" <<EOF
++ALREADY_SUBMITTED w-1 status=open assignee=$REFINERY — submit-and-exit already ran; draining.
++EOF
++    assert_calls "$dir" <<EOF
++$READ_CALLS
++gc runtime drain-ack
++EOF
++}
++
++# The refinery is named from the rig and the binding prefix, the way the
++# handoff writes it. An unbound pack has no prefix, so its refinery is
++# winnow/refinery; the same bead is not a handoff under a bound prefix.
++test_the_refinery_is_named_from_the_rig_and_the_binding_prefix() {
++    local dir
++    dir=$(new_case)
++    work "$dir" open winnow/refinery
++    run_guard "$dir" ""
++    assert_rc "$dir" 0
++    grep -F 'ALREADY_SUBMITTED w-1 status=open assignee=winnow/refinery' "$dir/out" >/dev/null ||
++        fail "an unbound pack's refinery was not recognised: $(cat "$dir/out")"
++
++    dir=$(new_case)
++    work "$dir" open winnow/refinery
++    run_guard "$dir" "gastown."
++    assert_rc "$dir" 0
++    [ ! -s "$dir/out" ] || fail "a bead held by another refinery name counted as handed off: $(cat "$dir/out")"
++    ! grep -F 'drain-ack' "$dir/calls.log" >/dev/null || fail "drained on the wrong refinery name"
++
++    # With no rig the target carries no rig part.
++    dir=$(new_case)
++    work "$dir" open gastown.refinery
++    echo 'unset GC_RIG' >"$dir/env"
++    run_guard "$dir"
++    grep -F 'ALREADY_SUBMITTED w-1 status=open assignee=gastown.refinery' "$dir/out" >/dev/null ||
++        fail "a rig-less refinery was not recognised: $(cat "$dir/out")"
++}
++
++# gcp-0pa4: a third party holding the bead (a crew seat, a reviewer, this
++# session's own previous identity) is not evidence the handoff ran. Neither is
++# an unassigned bead, nor an in_progress one: the polecat never claims it.
++test_no_positive_evidence_goes_on_to_submit_and_exit() {
++    local dir state
++    for state in "in_progress winnow/specialists.thomas" "in_progress $ME" "open " "in_progress "; do
++        dir=$(new_case)
++        # shellcheck disable=SC2086
++        work "$dir" $state
++        run_guard "$dir"
++        assert_rc "$dir" 0
++        [ ! -s "$dir/out" ] || fail "'$state' printed something: $(cat "$dir/out")"
++        assert_calls "$dir" <<EOF
++$READ_CALLS
++EOF
++    done
++}
++
++# Unreadable is not terminal and is not proof either: three reads, a back-off
++# after each, then on to submit-and-exit with nothing printed and no drain.
++test_an_unreadable_state_is_retried_and_then_not_taken_as_proof() {
++    local dir
++    dir=$(new_case)
++    run_guard "$dir"
++    assert_rc "$dir" 0
++    [ ! -s "$dir/out" ] || fail "an unreadable convoy printed something: $(cat "$dir/out")"
++    assert_calls "$dir" <<'EOF'
++gc convoy status gcp-convoy --json
++sleep 1
++gc convoy status gcp-convoy --json
++sleep 1
++gc convoy status gcp-convoy --json
++sleep 1
++EOF
++
++    # A bead the read fails on is unreadable even when its text says refinery.
++    dir=$(new_case)
++    work "$dir" open "$REFINERY"
++    echo 1 >"$dir/show-w-1.code"
++    run_guard "$dir"
++    assert_rc "$dir" 0
++    [ ! -s "$dir/out" ] || fail "a failed read of the work bead counted as evidence: $(cat "$dir/out")"
++    ! grep -F 'drain-ack' "$dir/calls.log" >/dev/null || fail "drained on a failed read"
++
++    # Two children do not name one work bead.
++    dir=$(new_case)
++    work "$dir" closed
++    printf '{"children":[{"id":"w-1"},{"id":"w-2"}]}' >"$dir/convoy"
++    run_guard "$dir"
++    [ ! -s "$dir/out" ] || fail "an ambiguous convoy printed something: $(cat "$dir/out")"
++    ! grep -F 'gc bd show' "$dir/calls.log" >/dev/null || fail "read a work bead out of an ambiguous convoy"
++}
++
++test_a_read_that_recovers_on_retry_is_taken() {
++    local dir
++    dir=$(new_case)
++    work "$dir" closed
++    : >"$dir/convoy.1"
++    run_guard "$dir"
++    assert_rc "$dir" 0
++    assert_stdout "$dir" <<'EOF'
++ALREADY_SUBMITTED w-1 status=closed assignee= — submit-and-exit already ran; draining.
++EOF
++    assert_calls "$dir" <<EOF
++gc convoy status gcp-convoy --json
++sleep 1
++$READ_CALLS
++gc runtime drain-ack
++EOF
++}
++
++# $GC_BEAD_ID is not always exported. The convoy is then recovered from the step
++# bead this session holds, found with BOTH statuses a claimed step can carry.
++test_the_convoy_is_recovered_from_the_held_step_when_gc_bead_id_is_unset() {
++    local dir key
++    for key in gc.input_convoy_id gc.var.convoy_id; do
++        dir=$(new_case)
++        work "$dir" closed
++        echo 'unset GC_BEAD_ID' >"$dir/env"
++        printf '[{"id":"w-step","metadata":{"gc.step_ref":"s","gc.root_bead_id":"w-root"}}]' >"$dir/list"
++        printf '[{"id":"w-root","metadata":{"%s":"gcp-convoy"}}]' "$key" >"$dir/show-w-root"
++        run_guard "$dir"
++        assert_rc "$dir" 0
++        grep -F 'ALREADY_SUBMITTED w-1 status=closed' "$dir/out" >/dev/null ||
++            fail "$key: the convoy was not recovered: $(cat "$dir/out")"
++        assert_calls "$dir" <<EOF
++gc bd list --assignee=$ME --status=open,in_progress --has-metadata-key gc.step_ref --include-infra --limit=0 --json
++gc bd show w-root --json
++$READ_CALLS
++gc runtime drain-ack
++EOF
++    done
++}
++
++# The exit after the drain is a bare `exit`, so the script ends with the status
++# of `gc runtime drain-ack`.
++test_the_exit_status_is_the_drain_acks() {
++    local dir
++    dir=$(new_case)
++    work "$dir" closed
++    echo 3 >"$dir/drain.code"
++    run_guard "$dir"
++    assert_rc "$dir" 3
++    grep -F 'ALREADY_SUBMITTED w-1' "$dir/out" >/dev/null || fail "no ALREADY_SUBMITTED line: $(cat "$dir/out")"
++}
++
++# The prefix is required even when empty. A wrong argument count stops the call
++# with exit 2 before anything is read, and does not drain: no evidence is not a
++# reason to drain a session with its branch unpushed.
++test_the_binding_prefix_argument_is_required() {
++    local dir args
++    for args in "--none" "a b"; do
++        dir=$(new_case)
++        work "$dir" closed
++        # shellcheck disable=SC2086
++        run_guard "$dir" $args
++        assert_rc "$dir" 2
++        grep -F 'SUBMITTED_GUARD_USAGE polecat-already-submitted.sh takes exactly one argument' "$dir/out" >/dev/null ||
++            fail "no usage line for args '$args': $(cat "$dir/out")"
++        [ ! -s "$dir/calls.log" ] || fail "a bad call read or drained: $(cat "$dir/calls.log")"
++    done
++}
++
++# stub_of <file> <var> <configdir> lifts the call a caller carries (from
++# <var>= to the closing fi) and binds its template values. A changed stub in the
++# prompt or the fragment is the one run here.
++stub_of() {
++    awk -v v="^$2=" '$0 ~ v {f=1} f {print} f && /^fi$/ {exit}' "$1" |
++        sed -e "s#{{ .ConfigDir }}#$3#" -e 's#{{ .BindingPrefix }}#gastown.#'
++}
++
++test_the_prompt_and_the_fragment_run_the_script() {
++    local dir file
++    for file in "$PROMPT" "$FRAGMENT"; do
++        dir=$(new_case)
++        work "$dir" closed
++        stub_of "$file" SUBMITTED_SH "$ROOT/gastown" >"$dir/stub.sh"
++        [ -s "$dir/stub.sh" ] || fail "could not lift the call out of $(basename "$file")"
++        (
++            export FX="$dir" PATH="$dir/bin:$PATH"
++            unset BEADS_ACTOR GC_ALIAS GC_SESSION_ID GC_SESSION_NAME GC_AGENT GC_RIG GC_BEAD_ID
++            export GC_RIG=winnow BEADS_ACTOR=$ME GC_BEAD_ID=gcp-convoy
++            bash "$dir/stub.sh" </dev/null >"$dir/out" 2>"$dir/err"
++        ) || fail "$(basename "$file"): the call exited non-zero: $(cat "$dir/out" "$dir/err")"
++        grep -F 'ALREADY_SUBMITTED w-1 status=closed' "$dir/out" >/dev/null ||
++            fail "$(basename "$file"): the call did not reach the script under the real pack dir: $(cat "$dir/out")"
++        grep -F 'gc runtime drain-ack' "$dir/calls.log" >/dev/null ||
++            fail "$(basename "$file"): a closed work bead did not drain"
++    done
++}
++
++# With {{ .ConfigDir }} rendering to a directory that lacks the script (a gc
++# older than v1.5.0 renders ""), the call says so and does NOT drain: no
++# evidence the handoff ran means run submit-and-exit, whose own step 0 guard is
++# the second brake against a double submit.
++test_a_missing_script_says_so_and_does_not_drain() {
++    local dir file
++    for file in "$PROMPT" "$FRAGMENT"; do
++        dir=$(new_case)
++        stub_of "$file" SUBMITTED_SH "$dir/no-such-pack" >"$dir/stub.sh"
++        (
++            export FX="$dir" PATH="$dir/bin:$PATH"
++            bash "$dir/stub.sh" </dev/null >"$dir/out" 2>"$dir/err"
++        ) || fail "$(basename "$file"): a missing script must not fail the call: $(cat "$dir/out" "$dir/err")"
++        [ "$(cat "$dir/out")" = "SUBMITTED_GUARD_MISSING already-submitted script not found at '$dir/no-such-pack/assets/scripts/polecat-already-submitted.sh'; no evidence the handoff ran, so run submit-and-exit." ] ||
++            fail "$(basename "$file"): wrong output for a missing script: $(cat "$dir/out")"
++        [ ! -s "$dir/calls.log" ] || fail "$(basename "$file"): a missing script ran gc: $(cat "$dir/calls.log")"
++    done
++}
++
++test_a_closed_work_bead_is_already_submitted
++test_a_work_bead_held_by_the_refinery_is_already_submitted
++test_the_refinery_is_named_from_the_rig_and_the_binding_prefix
++test_no_positive_evidence_goes_on_to_submit_and_exit
++test_an_unreadable_state_is_retried_and_then_not_taken_as_proof
++test_a_read_that_recovers_on_retry_is_taken
++test_the_convoy_is_recovered_from_the_held_step_when_gc_bead_id_is_unset
++test_the_exit_status_is_the_drain_acks
++test_the_binding_prefix_argument_is_required
++test_the_prompt_and_the_fragment_run_the_script
++test_a_missing_script_says_so_and_does_not_drain
++
++echo "polecat already-submitted guard tests passed"
+diff --git a/gastown/tests/test_polecat_resume_reverify.sh b/gastown/tests/test_polecat_resume_reverify.sh
+index b7f9679f..32ef1052 100755
+--- a/gastown/tests/test_polecat_resume_reverify.sh
++++ b/gastown/tests/test_polecat_resume_reverify.sh
+@@ -9,17 +9,19 @@
+ # session, and since gcp-952j9 nothing assigns the work bead to the polecat, so
+ # it printed OWNERSHIP_LOST. Either way the session drained.
+ #
+-# These tests run the re-verify block out of the polecat prompt against a
+-# stubbed `gc`. The block now keys on the STEP this session last claimed
+-# (`gc hook current --id-only`), which gc stamps onto the session's own bead on
+-# every claim and keeps across `gc runtime request-restart`. It never reads the
+-# work bead, never reads metadata.polecat_session, and never writes.
++# These tests run the re-verify out of assets/scripts/polecat-resume-verify.sh
++# (gcp-wmcj9: it was a prompt fence the model retyped) against a stubbed `gc`.
++# The check keys on the STEP this session last claimed (`gc hook current
++# --id-only`), which gc stamps onto the session's own bead on every claim and
++# keeps across `gc runtime request-restart`. It never reads the work bead, never
++# reads metadata.polecat_session, and never writes.
+ #
+ # No test depends on wall-clock time: `sleep` is a stub that logs its argument.
+ set -euo pipefail
+ 
+ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+ PROMPT="$ROOT/gastown/agents/polecat/prompt.template.md"
++RESUME_SH="$ROOT/gastown/assets/scripts/polecat-resume-verify.sh"
+ CLAIM_SH="$ROOT/gastown/assets/scripts/polecat-claim.sh"
+ 
+ TMPROOT=$(mktemp -d)
+@@ -30,7 +32,7 @@ fail() {
+     exit 1
+ }
+ 
+-# extract_guard pulls a guard verbatim out of <file> (the prompt template or the
++# extract_guard pulls a guard verbatim out of <file> (the resume script or the
+ # claim script), so the code under test is the code that ships. A drifted or
+ # deleted guard fails here rather than passing against a stale copy.
+ extract_guard() {
+@@ -102,7 +104,7 @@ new_case() {
+     dir=$(mktemp -d "$TMPROOT/case.XXXXXX")
+     mkdir -p "$dir/bin" "$dir/beads"
+     write_gc_stub "$dir/bin"
+-    extract_guard resume-reverify "$dir/guard.sh" "$PROMPT"
++    extract_guard resume-reverify "$dir/guard.sh" "$RESUME_SH"
+     : >"$dir/calls.log"
+     : >"$dir/sleeps.log"
+     printf '%s' "$dir"
+@@ -367,9 +369,9 @@ test_reverify_writes_nothing() {
+     done
+ }
+ 
+-# The re-verify restates claim_assignee_is_ours because each prompt block runs
+-# as its own shell and cannot share the claim block's copy. Two copies drift, so
+-# pin them byte-identical: a name added to one and not the other would make the
++# polecat-resume-verify.sh restates claim_assignee_is_ours because it runs as its
++# own process and cannot share polecat-claim.sh's copy. Two copies drift, so pin
++# them byte-identical: a name added to one and not the other would make the
+ # claim and the resume disagree about whose step this is.
+ test_identity_set_matches_the_live_owner_guard() {
+     local dir claim_fn resume_fn
+@@ -380,11 +382,91 @@ test_identity_set_matches_the_live_owner_guard() {
+     awk '/^claim_assignee_is_ours\(\) \{$/ {f=1} f {print} f && /^}$/ {exit}' "$dir/live-owner.sh" >"$claim_fn"
+     awk '/^claim_assignee_is_ours\(\) \{$/ {f=1} f {print} f && /^}$/ {exit}' "$dir/guard.sh" >"$resume_fn"
+     [[ -s "$claim_fn" ]] || fail "could not extract claim_assignee_is_ours from polecat-claim.sh"
+-    [[ -s "$resume_fn" ]] || fail "could not extract claim_assignee_is_ours from the resume-reverify block"
++    [[ -s "$resume_fn" ]] || fail "could not extract claim_assignee_is_ours from polecat-resume-verify.sh"
+     [[ "$(grep -c 'GC_ALIAS' "$claim_fn")" -ge 1 ]] ||
+         fail "the extracted polecat-claim.sh copy does not hold the identity set"
+     diff "$claim_fn" "$resume_fn" ||
+-        fail "claim_assignee_is_ours differs between polecat-claim.sh and the resume-reverify block"
++        fail "claim_assignee_is_ours differs between polecat-claim.sh and polecat-resume-verify.sh"
++}
++
++# The cases above run the guard text inline, so a drain `exit`s the harness
++# before RESUME_PROCEEDED. The prompt does not do that: it runs the file as a
++# child (`bash "$RESUME_SH"`). Run it that way once per outcome, so the file as
++# shipped (its shebang, its mode, its exit status) is what is under test, and a
++# drain is told by its token and its drain-ack call.
++run_script() {
++    local dir="$1" me="$2" current="${3-}"
++    (
++        unset BEADS_ACTOR GC_ALIAS GC_SESSION_ID GC_SESSION_NAME GC_AGENT GC_BEAD_ID
++        export BEADS_ACTOR="$me"
++        GC_STUB_CALLS="$dir/calls.log" GC_STUB_SLEEPS="$dir/sleeps.log" GC_STUB_BEADS="$dir/beads" \
++            GC_STUB_CURRENT="$current" PATH="$dir/bin:$PATH" bash "$RESUME_SH"
++    )
++}
++
++test_the_shipped_script_runs_as_a_child_process() {
++    local dir out
++    [[ -x "$RESUME_SH" ]] || fail "polecat-resume-verify.sh must be executable"
++
++    dir=$(new_case)
++    step_json "$dir" gcp-step in_progress me
++    out=$(run_script "$dir" me gcp-step) || fail "a verified resume must exit 0, got $?"
++    [[ "$out" == 'RESUME_VERIFIED gcp-step molecule=gcp-root assignee=me' ]] ||
++        fail "the script printed something other than the one RESUME_VERIFIED line: $out"
++    ! drained "$dir" || fail "a verified resume drained"
++
++    dir=$(new_case)
++    step_json "$dir" gcp-step in_progress someone-else
++    out=$(run_script "$dir" me gcp-step) || fail "a lost step must still exit 0, got $?"
++    [[ "$out" == 'OWNERSHIP_LOST gcp-step assignee=someone-else status=in_progress, not me. Stopping.' ]] ||
++        fail "the script printed something other than the one OWNERSHIP_LOST line: $out"
++    drained "$dir" || fail "a lost step did not drain"
++
++    dir=$(new_case)
++    out=$(run_script "$dir" me "") || fail "an indeterminate resume must still exit 0, got $?"
++    grep -F 'RESUME_INDETERMINATE no readable step claim' <<<"$out" >/dev/null ||
++        fail "no stamped claim was not indeterminate: $out"
++    drained "$dir" || fail "an indeterminate resume did not drain"
++}
++
++# prompt_stub renders the call the prompt carries, with {{ .ConfigDir }} bound
++# to <configdir>. It is lifted from the prompt, so a changed stub is the one run.
++prompt_stub() {
++    local cfg="$1"
++    awk '/^RESUME_SH="\{\{ \.ConfigDir \}\}/ {f=1} f {print} f && /^fi$/ {exit}' "$PROMPT" |
++        sed "s#{{ .ConfigDir }}#$cfg#"
++}
++
++# The prompt locates the script through {{ .ConfigDir }}. When that renders to a
++# directory without it (a gc older than v1.5.0 renders ""), the call prints the
++# step's own INDETERMINATE token and drains, so the session re-claims rather than
++# carrying on unverified. Pointed at the real pack dir it reaches the script.
++test_prompt_stub_runs_the_script_and_fails_closed_without_it() {
++    local dir out missing
++    dir=$(new_case)
++    prompt_stub "$ROOT/gastown" >"$dir/stub-real.sh"
++    [[ -s "$dir/stub-real.sh" ]] || fail "could not lift the resume call out of the prompt"
++    step_json "$dir" gcp-step in_progress me
++    out=$(
++        unset BEADS_ACTOR GC_ALIAS GC_SESSION_ID GC_SESSION_NAME GC_AGENT GC_BEAD_ID
++        BEADS_ACTOR=me GC_STUB_CALLS="$dir/calls.log" GC_STUB_SLEEPS="$dir/sleeps.log" \
++            GC_STUB_BEADS="$dir/beads" GC_STUB_CURRENT=gcp-step PATH="$dir/bin:$PATH" bash "$dir/stub-real.sh"
++    )
++    [[ "$out" == 'RESUME_VERIFIED gcp-step molecule=gcp-root assignee=me' ]] ||
++        fail "the prompt's call did not reach the script under the real pack dir: $out"
++
++    dir=$(new_case)
++    missing="$dir/no-such-pack"
++    prompt_stub "$missing" >"$dir/stub-missing.sh"
++    out=$(
++        unset BEADS_ACTOR GC_ALIAS GC_SESSION_ID GC_SESSION_NAME GC_AGENT GC_BEAD_ID
++        BEADS_ACTOR=me GC_STUB_CALLS="$dir/calls.log" GC_STUB_SLEEPS="$dir/sleeps.log" \
++            GC_STUB_BEADS="$dir/beads" GC_STUB_CURRENT=gcp-step PATH="$dir/bin:$PATH" bash "$dir/stub-missing.sh"
++    )
++    [[ "$out" == "RESUME_INDETERMINATE resume script not found at '$missing/assets/scripts/polecat-resume-verify.sh'; re-claim instead of guessing." ]] ||
++        fail "a missing script was not reported with the step's own token: $out"
++    [[ "$(cat "$dir/calls.log")" == 'runtime drain-ack' ]] ||
++        fail "a missing script must do nothing but drain, calls: $(cat "$dir/calls.log")"
+ }
+ 
+ test_resumed_session_holding_its_step_proceeds
+@@ -398,5 +480,7 @@ test_closed_step_is_indeterminate_not_lost
+ test_step_in_another_convoy_is_indeterminate
+ test_reverify_writes_nothing
+ test_identity_set_matches_the_live_owner_guard
++test_the_shipped_script_runs_as_a_child_process
++test_prompt_stub_runs_the_script_and_fails_closed_without_it
+ 
+ echo "polecat resume re-verify tests passed"
+-- 
+2.54.0 (Apple Git-157)
+

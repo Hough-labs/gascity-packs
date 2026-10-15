@@ -420,6 +420,68 @@ test_polecat_claim_ships_as_a_script_not_a_heredoc() {
         fail "polecat-claim.sh must use the binding prefix for the restamp, the worker check and the witness nudge"
 }
 
+test_polecat_guard_scripts_ship_as_scripts_not_fences() {
+    # gcp-wmcj9: the resume re-verify (64 lines) and the already-submitted check
+    # (70 lines, once in the prompt and once in the "No Idle Polecats" fragment)
+    # were fences the model retyped. They ship as two scripts the prompt calls.
+    # Behavioural coverage lives in test_polecat_resume_reverify.sh and
+    # test_polecat_already_submitted.sh; this pins the seam between the callers
+    # and the scripts.
+    local prompt fragment resume submitted file stub
+    prompt="$GASTOWN/agents/polecat/prompt.template.md"
+    fragment="$GASTOWN/template-fragments/approval-fallacy.template.md"
+    resume="$GASTOWN/assets/scripts/polecat-resume-verify.sh"
+    submitted="$GASTOWN/assets/scripts/polecat-already-submitted.sh"
+
+    for file in "$resume" "$submitted"; do
+        [[ -x "$file" ]] || fail "$(basename "$file") must be executable"
+        [[ "$(head -1 "$file")" == '#!/usr/bin/env bash' ]] ||
+            fail "$(basename "$file") must start with a bash shebang"
+        bash -n "$file" || fail "$(basename "$file") is not valid shell"
+        ! grep -v '^ *#' "$file" | grep -F '{{' >/dev/null ||
+            fail "$(basename "$file") carries a template value; it is not rendered"
+    done
+
+    # The resume call: located through {{ .ConfigDir }}, run, no fence left behind.
+    [[ "$(grep -cF 'RESUME_SH="{{ .ConfigDir }}/assets/scripts/polecat-resume-verify.sh"' "$prompt")" == 1 ]] ||
+        fail "the prompt must locate the resume script through {{ .ConfigDir }}"
+    [[ "$(grep -cF 'bash "$RESUME_SH"' "$prompt")" == 1 ]] ||
+        fail "the prompt must run the resume script"
+    ! grep -E 'GUARD_BEGIN resume-reverify|GUARD_END resume-reverify|claim_assignee_is_ours|RESUME_TRY' "$prompt" >/dev/null ||
+        fail "the prompt inlines the resume re-verify again"
+    grep -F '# GUARD_BEGIN resume-reverify' "$resume" >/dev/null &&
+        grep -F '# GUARD_END resume-reverify' "$resume" >/dev/null ||
+        fail "polecat-resume-verify.sh lost the sentinels the tests extract its guard by"
+    stub=$(awk '/^RESUME_SH="/ {f=1} f {print} f && /^fi$/ {exit}' "$prompt")
+    [[ "$stub" == *'RESUME_INDETERMINATE resume script not found'* && "$stub" == *'gc runtime drain-ack'* ]] ||
+        fail "a missing resume script must print RESUME_INDETERMINATE and drain, not carry on unverified"
+
+    # The already-submitted call, once in the prompt (FINAL REMINDER) and once in
+    # the fragment: each passes the binding prefix and carries no copy of the check.
+    for file in "$prompt" "$fragment"; do
+        [[ "$(grep -cF 'SUBMITTED_SH="{{ .ConfigDir }}/assets/scripts/polecat-already-submitted.sh"' "$file")" == 1 ]] ||
+            fail "$(basename "$file") must locate the already-submitted script through {{ .ConfigDir }}"
+        [[ "$(grep -cF 'bash "$SUBMITTED_SH" "{{ .BindingPrefix }}"' "$file")" == 1 ]] ||
+            fail "$(basename "$file") must run the already-submitted script with the binding prefix"
+        ! grep -E 'READ_OK|WORK_ASSIGNEE|ROOT_BEAD_ID|REFINERY_TARGET=' "$file" >/dev/null ||
+            fail "$(basename "$file") inlines the already-submitted check again"
+        # No evidence is not a reason to drain: a missing script goes on to
+        # submit-and-exit, whose own step 0 guard is the second brake.
+        stub=$(awk '/^SUBMITTED_SH="/ {f=1} f {print} f && /^fi$/ {exit}' "$file")
+        [[ "$stub" == *'SUBMITTED_GUARD_MISSING'* ]] ||
+            fail "$(basename "$file") must say so when the already-submitted script is missing"
+        [[ "$stub" != *'drain-ack'* ]] ||
+            fail "$(basename "$file") drains on a missing already-submitted script; no evidence is not a handoff"
+    done
+
+    # The script takes the prefix as its one argument and stops without a drain
+    # when it is missing; nothing in it is a template value.
+    grep -F 'SUBMITTED_GUARD_USAGE polecat-already-submitted.sh takes exactly one argument' "$submitted" >/dev/null ||
+        fail "polecat-already-submitted.sh must reject a call without exactly one argument"
+    [[ "$(grep -cF '${BINDING_PREFIX}' "$submitted")" == 1 ]] ||
+        fail "polecat-already-submitted.sh must use the binding prefix once, to name the refinery"
+}
+
 test_review_leg_contract_forbids_synthetic_mutation() {
     local formula prompt
     formula="$GASTOWN/formulas/mol-review-leg.toml"
@@ -1083,10 +1145,8 @@ test_dolt_push_outage_detection_is_wired() {
 }
 
 test_submit_and_exit_cannot_be_replayed() {
-    local formula prompt fragment submit_block script script_text
+    local formula submit_block script script_text
     formula="$GASTOWN/formulas/mol-polecat-work.toml"
-    prompt="$GASTOWN/agents/polecat/prompt.template.md"
-    fragment="$GASTOWN/template-fragments/approval-fallacy.template.md"
     # The push gate and the refinery handoff run as this script (gcp-nc8wg).
     script="$GASTOWN/assets/scripts/polecat-submit.sh"
 
@@ -1182,26 +1242,29 @@ if guard.index("REFINERY_TARGET=") >= guard.index('[ "$SUBMITTED_ASSIGNEE" = "$R
 PY
 
     # The prompt-side guard could not run at all in the observed session:
-    # $GC_BEAD_ID was empty, so it never resolved a work bead. Both copies must
-    # recover the convoy, and both must key on POSITIVE evidence — the polecat
-    # never claims the work bead, so "not in_progress for me" reports
-    # already-submitted on work that was never submitted.
-    local guard
-    for guard in "$prompt" "$fragment"; do
-        grep -F 'CONVOY_ID="${GC_BEAD_ID:-}"' "$guard" >/dev/null ||
-            fail "$(basename "$guard") must not read the convoy straight from \$GC_BEAD_ID; it is not always exported"
-        grep -F 'gc.root_bead_id' "$guard" >/dev/null ||
-            fail "$(basename "$guard") must recover the convoy from the step bead's molecule root"
-        # Scoped to the convoy-recovery query itself. This used to be a
-        # file-wide `! grep -- '--status=in_progress '`, which conflated two
-        # different lookups: the startup claim block legitimately resolves an
-        # in-flight, hook-claimed step with in_progress ALONE (adding `open`
-        # there would let it jump to a step whose predecessor has not closed).
-        # The invariant that actually matters is local to this query — the step
-        # bead it recovers the convoy from is stored `open` by gc 1.4.x's hook
-        # and `in_progress` by gc 1.5.0's, so either status alone can match
-        # nothing and the recovery silently yields no convoy.
-        python3 - "$guard" <<'PY' || fail "$(basename "$guard") must recover the convoy's held step bead with --status=open,in_progress; a claimed step bead is stored open or in_progress depending on the gc that claimed it"
+    # $GC_BEAD_ID was empty, so it never resolved a work bead. It must recover the
+    # convoy, and it must key on POSITIVE evidence — the polecat never claims the
+    # work bead, so "not in_progress for me" reports already-submitted on work
+    # that was never submitted. It used to be one fence, copied into the prompt and
+    # into the "No Idle Polecats" fragment; it is now one script that both call
+    # (gcp-wmcj9), so these pins read the script, and
+    # test_polecat_guard_scripts_ship_as_scripts_not_fences pins the two callers.
+    local guard="$GASTOWN/assets/scripts/polecat-already-submitted.sh"
+    [[ -f "$guard" ]] || fail "polecat-already-submitted.sh is missing: $guard"
+    grep -F 'CONVOY_ID="${GC_BEAD_ID:-}"' "$guard" >/dev/null ||
+        fail "$(basename "$guard") must not read the convoy straight from \$GC_BEAD_ID; it is not always exported"
+    grep -F 'gc.root_bead_id' "$guard" >/dev/null ||
+        fail "$(basename "$guard") must recover the convoy from the step bead's molecule root"
+    # Scoped to the convoy-recovery query itself. This used to be a
+    # file-wide `! grep -- '--status=in_progress '`, which conflated two
+    # different lookups: the startup claim block legitimately resolves an
+    # in-flight, hook-claimed step with in_progress ALONE (adding `open`
+    # there would let it jump to a step whose predecessor has not closed).
+    # The invariant that actually matters is local to this query — the step
+    # bead it recovers the convoy from is stored `open` by gc 1.4.x's hook
+    # and `in_progress` by gc 1.5.0's, so either status alone can match
+    # nothing and the recovery silently yields no convoy.
+    python3 - "$guard" <<'PY' || fail "$(basename "$guard") must recover the convoy's held step bead with --status=open,in_progress; a claimed step bead is stored open or in_progress depending on the gc that claimed it"
 import sys
 
 text = open(sys.argv[1], encoding="utf-8").read()
@@ -1210,20 +1273,19 @@ query = text[start:text.index("CONVOY_ID=$(gc bd show", start)]
 if "--status=open,in_progress" not in query:
     raise SystemExit(1)
 PY
-        ! grep -F '[ "$WORK_STATUS" != "in_progress" ]' "$guard" >/dev/null ||
-            fail "$(basename "$guard") must not treat an unassigned work bead as already submitted"
-        grep -F '[ "$WORK_STATUS" = "closed" ]' "$guard" >/dev/null ||
-            fail "$(basename "$guard") must require positive evidence (closed, or held by the refinery)"
+    ! grep -F '[ "$WORK_STATUS" != "in_progress" ]' "$guard" >/dev/null ||
+        fail "$(basename "$guard") must not treat an unassigned work bead as already submitted"
+    grep -F '[ "$WORK_STATUS" = "closed" ]' "$guard" >/dev/null ||
+        fail "$(basename "$guard") must require positive evidence (closed, or held by the refinery)"
 
-        # The same gcp-0pa4 defect as the formula guard, in the copy an agent
-        # actually has in context when it decides whether to drain.
-        grep -F 'REFINERY_TARGET="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}refinery"' "$guard" >/dev/null ||
-            fail "$(basename "$guard") must resolve the refinery target the same way the handoff writes it"
-        grep -F '[ "$WORK_ASSIGNEE" = "$REFINERY_TARGET" ]' "$guard" >/dev/null ||
-            fail "$(basename "$guard") must require the work bead to be held by the refinery before draining"
-        ! grep -F '[ "$WORK_ASSIGNEE" != "$EXPECTED_ASSIGNEE" ]' "$guard" >/dev/null ||
-            fail "$(basename "$guard") reads any third-party assignee as a completed handoff (gcp-0pa4)"
-    done
+    # The same gcp-0pa4 defect as the formula guard, in the copy an agent
+    # actually has in context when it decides whether to drain.
+    grep -F 'REFINERY_TARGET="${GC_RIG:+$GC_RIG/}${BINDING_PREFIX}refinery"' "$guard" >/dev/null ||
+        fail "$(basename "$guard") must resolve the refinery target the same way the handoff writes it"
+    grep -F '[ "$WORK_ASSIGNEE" = "$REFINERY_TARGET" ]' "$guard" >/dev/null ||
+        fail "$(basename "$guard") must require the work bead to be held by the refinery before draining"
+    ! grep -F '[ "$WORK_ASSIGNEE" != "$EXPECTED_ASSIGNEE" ]' "$guard" >/dev/null ||
+        fail "$(basename "$guard") reads any third-party assignee as a completed handoff (gcp-0pa4)"
 }
 
 test_work_bead_is_never_claimed() {
@@ -1236,11 +1298,14 @@ test_work_bead_is_never_claimed() {
     # the work bead back, which is what forced STEP_REPOINTED, the
     # `gc.step_ref` close fallback and the `--if-assignee` takeover. All of that
     # stays gone.
-    local formula prompt claim fragment submit
+    local formula prompt claim submitted resume submit
     formula="$GASTOWN/formulas/mol-polecat-work.toml"
     prompt="$GASTOWN/agents/polecat/prompt.template.md"
     claim="$GASTOWN/assets/scripts/polecat-claim.sh"
-    fragment="$GASTOWN/template-fragments/approval-fallacy.template.md"
+    # The already-submitted check and the resume re-verify moved out of the
+    # prompt and the "No Idle Polecats" fragment into these scripts (gcp-wmcj9).
+    submitted="$GASTOWN/assets/scripts/polecat-already-submitted.sh"
+    resume="$GASTOWN/assets/scripts/polecat-resume-verify.sh"
     # The push gate and the refinery handoff moved out of the formula into this
     # script (gcp-nc8wg), so it is scanned like a step.
     submit="$GASTOWN/assets/scripts/polecat-submit.sh"
@@ -1279,11 +1344,11 @@ PY
     # polecat-submit.sh carries the push gate and handoff halts that used to be
     # in the formula (gcp-nc8wg), so every negative pin on submit-and-exit's
     # shell reads it too.
-    for file in "$prompt" "$claim" "$formula" "$submit"; do
+    for file in "$prompt" "$claim" "$formula" "$submit" "$submitted" "$resume"; do
         ! grep -F 'STEP_REPOINTED' "$file" >/dev/null ||
             fail "$(basename "$file") re-points a work-bead hook result onto a step; the work bead is never claimed, so the hook never returns it"
     done
-    ! grep -F -- '--if-assignee' "$prompt" "$claim" "$formula" "$submit" >/dev/null ||
+    ! grep -F -- '--if-assignee' "$prompt" "$claim" "$formula" "$submit" "$submitted" "$resume" >/dev/null ||
         fail "an --if-assignee takeover is back; there is no claim on the work bead to take over"
     ! grep -F 'tier 2' "$formula" "$submit" >/dev/null ||
         fail "submit-and-exit regained its gc.step_ref close fallback"
@@ -1311,13 +1376,10 @@ if 'bash "$PS" reassign' not in step["description"]:
 if "HANDOFF_FAILED" not in step["description"] or "HANDOFF_FAILED" not in script:
     raise SystemExit(1)
 PY
-    local guard
-    for guard in "$prompt" "$fragment"; do
-        grep -F '[ "$WORK_ASSIGNEE" = "$REFINERY_TARGET" ]' "$guard" >/dev/null ||
-            fail "$(basename "$guard") must tell a completed handoff by the refinery's identity"
-        grep -F 'the polecat never claims the work' "$guard" >/dev/null ||
-            fail "$(basename "$guard") still describes a claimed work bead"
-    done
+    grep -F '[ "$WORK_ASSIGNEE" = "$REFINERY_TARGET" ]' "$submitted" >/dev/null ||
+        fail "$(basename "$submitted") must tell a completed handoff by the refinery's identity"
+    grep -F 'the polecat never claims the work' "$submitted" >/dev/null ||
+        fail "$(basename "$submitted") still describes a claimed work bead"
 }
 
 # The patrol formulas end an idle turn with `IDLE:` and tell the agent what
@@ -1468,6 +1530,7 @@ test_claim_verify_separates_read_failure_from_unassigned
 test_claim_refuses_a_pour_onto_a_live_owner
 test_claim_decline_writes_nothing_on_any_bead
 test_polecat_claim_ships_as_a_script_not_a_heredoc
+test_polecat_guard_scripts_ship_as_scripts_not_fences
 test_review_leg_contract_forbids_synthetic_mutation
 test_prime_prompts_are_city_generic_and_compact
 test_operational_awareness_step0_fails_closed

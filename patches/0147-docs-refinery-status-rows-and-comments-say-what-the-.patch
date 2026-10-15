@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sat, 10 Oct 2026 16:55:48 -0400
-Subject: [PATCH 147/179] docs(refinery): status rows and comments say what the
+Subject: [PATCH 147/180] docs(refinery): status rows and comments say what the
  merge lane now does (gcp-fooz4)
 
 No behaviour change.
