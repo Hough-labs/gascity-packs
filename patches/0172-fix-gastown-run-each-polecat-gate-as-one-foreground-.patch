@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 15 Oct 2026 08:33:18 -0400
-Subject: [PATCH 172/177] fix(gastown): run each polecat gate as one foreground
+Subject: [PATCH 172/178] fix(gastown): run each polecat gate as one foreground
  call, not a background poll (gcp-ypugs)
 
 A polecat spent 17-25 model calls on each gate step (preflight 18.7-24.7,

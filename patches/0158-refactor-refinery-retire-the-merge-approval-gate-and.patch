@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Tue, 13 Oct 2026 22:12:40 -0400
-Subject: [PATCH 158/177] refactor(refinery): retire the merge approval gate
+Subject: [PATCH 158/178] refactor(refinery): retire the merge approval gate
  and keep the origin-scoped PR repo (gcp-648nn)
 
 Hunter ruled to retire the fork's gc-native merge approval gate (option A,

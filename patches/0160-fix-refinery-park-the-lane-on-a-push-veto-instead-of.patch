@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Tue, 13 Oct 2026 23:35:06 -0400
-Subject: [PATCH 160/177] fix(refinery): park the lane on a push veto instead
+Subject: [PATCH 160/178] fix(refinery): park the lane on a push veto instead
  of draining with assigned work (gcp-ubv2)
 
 When the target branch is red, the rig's pre-push gate refuses every merge's

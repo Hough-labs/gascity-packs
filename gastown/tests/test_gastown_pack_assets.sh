@@ -843,6 +843,18 @@ test_prime_prompts_are_city_generic_and_compact() {
         fail "operational awareness must require configured and probed endpoint evidence"
     grep -F 'endpoint is unknown and stop' "$awareness" >/dev/null ||
         fail "operational awareness must fail closed when endpoint discovery fails"
+    # gcp-eqt3d: the fragment is injected into every role card of every city, so
+    # an example lifted from one city's `gc doctor` output or one measurement
+    # run teaches that city's rig names, ports and load as if they were the
+    # schema. These are the literals that were there; the teaching they carried
+    # (an inheriting rig, an externally pinned rig, a measured headroom) is
+    # kept with placeholders.
+    local literal
+    for literal in 'rig:gascity-packs' 'rig:winnow' '127.0.0.1:3307' '127.0.0.1:51160' \
+        '96s on this city' '6-database city' 'load ~20-37'; do
+        ! grep -F -- "$literal" "$awareness" >/dev/null ||
+            fail "operational awareness must stay city-generic; it still carries the city-specific literal '$literal'"
+    done
     grep -F 'run_bounded() {' "$awareness" >/dev/null ||
         fail "operational awareness should define a portable diagnostic timeout helper"
     # Steps 1 and 4 dial the resolved endpoint directly, not through `gc`:
@@ -1336,6 +1348,110 @@ $hits"
     done
 }
 
+# gcp-eqt3d: the fragment says "If endpoint discovery fails, report that the
+# endpoint is unknown and stop; never fall back to any default endpoint", and
+# step 0 is the only place that rule can be executed. It used to hardcode the
+# managed host and carry on with an empty or "null" host/port when
+# dolt-state.json or the scope's config could not be read, so every later step
+# dialled `--host 127.0.0.1 --port ` (or `--port null`): a probe of nothing,
+# presented as a measurement of the scope under investigation. Extract the
+# shipped step and run it, because a content grep cannot see that the guard
+# fires, only that it was typed.
+test_operational_awareness_step0_fails_closed() {
+    local awareness block city scope out rc
+    awareness="$GASTOWN/template-fragments/operational-awareness.template.md"
+    command -v jq >/dev/null 2>&1 || fail "jq is required (step 0 of the shipped bundle uses it)"
+
+    STEP0_TMP=$(mktemp -d)
+    trap 'rm -rf "$STEP0_TMP"' EXIT
+    city="$STEP0_TMP/city"
+    scope="$STEP0_TMP/scope"
+    block="$STEP0_TMP/step0.sh"
+    mkdir -p "$city/.gc/runtime/packs/dolt" "$scope/.beads"
+
+    # The block is the lines from the step 0 header up to (not including) the
+    # step 1 header. Its one template action is the city root, rendered here to
+    # the temp city; any other action would be an unrendered literal.
+    sed -n '/^# 0\. Resolve the endpoint/,/^# 1\. Capture/p' "$awareness" |
+        sed '$d' |
+        sed "s|{{ \.CityRoot }}|$city|g" >"$block"
+    [[ -s "$block" ]] ||
+        fail "step 0 not found between '# 0. Resolve the endpoint' and '# 1. Capture'"
+    grep -F 'DOLT_PORT' "$block" >/dev/null ||
+        fail "step 0 extraction came back without the endpoint resolution"
+    ! grep -F '# 1. Capture' "$block" >/dev/null ||
+        fail "step 0 extraction overshot its '# 1. Capture' anchor"
+    ! grep -F '{{' "$block" >/dev/null ||
+        fail "step 0 carries a template action the test does not render: $(grep -F '{{' "$block")"
+
+    # step0_run <env assignments...>: run the block from the scope dir the way
+    # an agent's one-shot Bash call does. rc and merged output come back in
+    # $rc and $out; a second run SOURCES it in a shell that must outlive it.
+    step0_run() {
+        rc=0
+        out=$(cd "$scope" && env "$@" bash "$block" 2>&1) || rc=$?
+    }
+    expect_stop() {
+        local label="$1" src
+        [[ "$rc" -ne 0 ]] ||
+            fail "step 0 ($label) must stop with a non-zero status, got 0: $out"
+        [[ "$out" == *'endpoint is unknown'* ]] ||
+            fail "step 0 ($label) must print 'endpoint is unknown': $out"
+        [[ "$out" != *probing* ]] ||
+            fail "step 0 ($label) went on to probe an endpoint it did not resolve: $out"
+        # An agent that sources the block must keep its shell: return, not exit.
+        src=$(cd "$scope" && bash -c 'source "$1"; echo SHELL-SURVIVED' _ "$block" 2>&1) || true
+        [[ "$src" == *'endpoint is unknown'* && "$src" == *SHELL-SURVIVED* && "$src" != *probing* ]] ||
+            fail "step 0 ($label) must stop a sourced block without killing the shell: $src"
+    }
+
+    # (a) managed_city, no dolt-state.json.
+    printf 'gc.endpoint_origin: managed_city\n' >"$scope/.beads/config.yaml"
+    rm -f "$city/.gc/runtime/packs/dolt/dolt-state.json"
+    step0_run
+    expect_stop "managed_city, no dolt-state.json"
+
+    # (a') dolt-state.json readable but carrying no port: jq prints the literal
+    # string null, which is not an empty string and used to sail through.
+    printf '{"running":true}\n' >"$city/.gc/runtime/packs/dolt/dolt-state.json"
+    step0_run
+    expect_stop "managed_city, dolt-state.json without a port"
+
+    # (b) explicit with a host and no port, and the mirror image.
+    printf 'gc.endpoint_origin: explicit\ndolt.host: 10.0.0.5\n' >"$scope/.beads/config.yaml"
+    step0_run
+    expect_stop "explicit, dolt.host only"
+    printf 'gc.endpoint_origin: explicit\ndolt.port: 3306\n' >"$scope/.beads/config.yaml"
+    step0_run
+    expect_stop "explicit, dolt.port only"
+
+    # (d) the scope's config unreadable: the origin is then unknown, and an
+    # unknown origin must not be read as "the managed server" (that is a default
+    # endpoint). A value left in the shell by an earlier run against another
+    # scope must not stand in for the one this run failed to resolve either.
+    printf '{"port":51160}\n' >"$city/.gc/runtime/packs/dolt/dolt-state.json"
+    rm -f "$scope/.beads/config.yaml"
+    step0_run DOLT_HOST=10.9.9.9 DOLT_PORT=9999
+    expect_stop "no .beads/config.yaml, stale DOLT_HOST/DOLT_PORT in the environment"
+
+    # (c) the resolved cases still go through, with the endpoint they resolved.
+    printf 'gc.endpoint_origin: managed_city\n' >"$scope/.beads/config.yaml"
+    step0_run
+    [[ "$rc" -eq 0 ]] || fail "step 0 (managed_city with a port) must succeed, rc=$rc: $out"
+    [[ "$out" == *'probing managed_city endpoint 127.0.0.1:51160'* ]] ||
+        fail "step 0 must probe the port dolt-state.json names for managed_city: $out"
+    [[ "$out" != *'endpoint is unknown'* ]] ||
+        fail "step 0 resolved an endpoint and still called it unknown: $out"
+    printf 'gc.endpoint_origin: inherited_city\n' >"$scope/.beads/config.yaml"
+    step0_run
+    [[ "$rc" -eq 0 && "$out" == *'probing inherited_city endpoint 127.0.0.1:51160'* ]] ||
+        fail "step 0 (inherited_city) must resolve the managed server's port, rc=$rc: $out"
+    printf 'gc.endpoint_origin: explicit\ndolt.host: 10.0.0.5\ndolt.port: 3306\n' >"$scope/.beads/config.yaml"
+    step0_run
+    [[ "$rc" -eq 0 && "$out" == *'probing explicit endpoint 10.0.0.5:3306'* ]] ||
+        fail "step 0 (explicit) must resolve the pinned host:port from the scope config, rc=$rc: $out"
+}
+
 test_dog_assets_are_pack_local
 test_retired_dog_formulas_are_not_reintroduced
 test_work_bead_is_never_claimed
@@ -1354,6 +1470,7 @@ test_claim_decline_writes_nothing_on_any_bead
 test_polecat_claim_ships_as_a_script_not_a_heredoc
 test_review_leg_contract_forbids_synthetic_mutation
 test_prime_prompts_are_city_generic_and_compact
+test_operational_awareness_step0_fails_closed
 test_witness_wisp_queries_pin_include_infra
 test_witness_handoff_recovery_is_guarded_and_fail_closed
 test_boot_wisp_queries_pin_include_infra

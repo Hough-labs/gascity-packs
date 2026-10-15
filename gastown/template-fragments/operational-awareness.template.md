@@ -96,9 +96,9 @@ busy city) — give it room rather than assuming it hung.
 gc doctor --json \
   | jq -r '.. | objects | select((.name? // "") | test("dolt-server"))
            | "\(.name) | \(.status) | \(.message)"'
-# dolt-server                   | ok | reachable on 127.0.0.1:51160
-# rig:gascity-packs:dolt-server | ok | inherits city dolt endpoint
-# rig:winnow:dolt-server        | ok | reachable on 127.0.0.1:3307
+# dolt-server                       | ok | reachable on 127.0.0.1:<managed-port>
+# rig:<inheriting-rig>:dolt-server  | ok | inherits city dolt endpoint
+# rig:<pinned-rig>:dolt-server      | ok | reachable on <host>:<external-port>
 ```
 
 Two distinct servers, one of them holding exactly one rig's beads, is a normal
@@ -190,15 +190,35 @@ ts=$(date +%s)
 # 0. Resolve the endpoint for the scope you are investigating and probe THAT
 #    server — this is the resolution the endpoint-origin table above
 #    describes, applied rather than assumed. Run from the rig (or city)
-#    directory whose beads you are chasing.
+#    directory whose beads you are chasing, and run this step with every step
+#    below it as ONE command: the variables it sets are what they dial.
+#    It fails closed. A host or port it cannot resolve, or an origin it cannot
+#    read, leaves the endpoint unknown, and an unknown endpoint ends the run
+#    here; there is no default endpoint to fall back to.
 CFG=.beads/config.yaml
+# Cleared first, so a value left in this shell by an earlier run against another
+# scope cannot stand in for an endpoint this run failed to resolve.
+DOLT_HOST=
+DOLT_PORT=
 ORIGIN=$(grep -E '^[[:space:]]*gc\.endpoint_origin:' "$CFG" | head -1 | sed 's/.*: *//')
-if [ "$ORIGIN" = "explicit" ]; then
-  DOLT_HOST=$(grep -E '^[[:space:]]*dolt\.host:' "$CFG" | head -1 | sed 's/.*: *//')
-  DOLT_PORT=$(grep -E '^[[:space:]]*dolt\.port:' "$CFG" | head -1 | sed 's/.*: *//')
-else
-  DOLT_HOST=127.0.0.1
-  DOLT_PORT=$(jq -r '.port' {{ .CityRoot }}/.gc/runtime/packs/dolt/dolt-state.json)
+case "$ORIGIN" in
+  explicit)
+    DOLT_HOST=$(grep -E '^[[:space:]]*dolt\.host:' "$CFG" | head -1 | sed 's/.*: *//')
+    DOLT_PORT=$(grep -E '^[[:space:]]*dolt\.port:' "$CFG" | head -1 | sed 's/.*: *//')
+    ;;
+  managed_city|inherited_city)
+    # The managed server listens on 127.0.0.1; only its port varies, so the
+    # host is claimed only once dolt-state.json has given a port.
+    DOLT_PORT=$(jq -r '.port' {{ .CityRoot }}/.gc/runtime/packs/dolt/dolt-state.json)
+    case "$DOLT_PORT" in ''|null) ;; *) DOLT_HOST=127.0.0.1 ;; esac
+    ;;
+esac
+if [ -z "$DOLT_HOST" ] || [ "$DOLT_HOST" = null ] || [ -z "$DOLT_PORT" ] || [ "$DOLT_PORT" = null ]; then
+  printf 'diagnostic: endpoint is unknown for scope %s (gc.endpoint_origin: %s, host: %s, port: %s); report that and stop. Run no later step, and do not fall back to any default endpoint.\n' \
+    "$PWD" "${ORIGIN:-unreadable}" "${DOLT_HOST:-unresolved}" "${DOLT_PORT:-unresolved}" >&2
+  # `return` ends a sourced block and leaves the sourcing shell alive; run as
+  # a one-shot command there is nothing to return from, and `exit` ends it.
+  return 1 2>/dev/null || exit 1
 fi
 echo "probing ${ORIGIN:-unknown} endpoint ${DOLT_HOST}:${DOLT_PORT}"
 # Dolt 2.x has no `sql-client` subcommand: the connection flags are GLOBAL and
@@ -209,7 +229,7 @@ echo "probing ${ORIGIN:-unknown} endpoint ${DOLT_HOST}:${DOLT_PORT}"
 # 1. Capture live process state via SQL (non-fatal — Dolt keeps running).
 #    SHOW FULL PROCESSLIST lists active connections, the query each is
 #    running, and time-in-state. Straight at the endpoint it costs 0.10-0.31s
-#    (measured, load ~20-37), so a 10s wall is ~30x headroom: if this one
+#    (measured under load), so a 10s wall is ~30x headroom: if this one
 #    fires, the server genuinely is not answering.
 run_bounded 10 dolt --host "$DOLT_HOST" --port "$DOLT_PORT" \
       --user "${DOLT_USER:-root}" --password "${DOLT_PASSWORD:-}" --no-tls \
@@ -231,7 +251,7 @@ cat /tmp/dolt-hang-$ts-logs.log
 
 # 3. Capture the structured health snapshot — the one managed-server view with
 #    no direct-SQL equivalent, since it knows which databases the city expects.
-#    Measured 8.2-24.3s on a 6-database city at load ~20-37 (it bounds each
+#    Measured 8.2-24.3s on a multi-database city under load (it bounds each
 #    per-database probe internally with `run_bounded 5`, then pays gc's startup
 #    on top). 60s is ~2.5x that worst case; if it fires, treat it as evidence
 #    the data plane is wedged and escalate.
@@ -262,7 +282,7 @@ cat /tmp/dolt-hang-$ts-status.log
 
 # 5. Probe every rig's OWN endpoint, including externally-pinned ones the steps
 #    above only cover when you happen to be standing in that rig. gc doctor
-#    walks every rig and is slow — measured 96s on this city, and it grows with
+#    walks every rig and is slow — measured ~100s on one city, and it grows with
 #    rig count, so 600s is ~6x headroom. Treat a timeout here as a finding, not
 #    as permission to skip the step.
 run_bounded 600 gc doctor --json > /tmp/dolt-hang-$ts-doctor.json 2>&1
