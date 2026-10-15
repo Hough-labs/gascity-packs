@@ -366,6 +366,29 @@ test_claim_refuses_a_pour_onto_a_live_owner() {
         fail "the prose listing drain-acked claim outcomes must name CLAIM_DECLINED_LIVE_OWNER"
 }
 
+test_claim_decline_writes_nothing_on_any_bead() {
+    # gcp-ajv1y (INTERIM; root cause gcp-uxpfb): a polecat that declined a
+    # duplicate pour left a freelance report on the WORK bead, and the owner's
+    # submit gate read that report as a publishing rail and halted finished work.
+    # The submit scan stays fail-closed, so the source is cut instead: on every
+    # drain-acked claim outcome the polecat writes nothing on any bead. This
+    # pins that sentence directly under the outcome list, and pins the claim
+    # script itself to no note or comment writes.
+    local prompt="$GASTOWN/agents/polecat/prompt.template.md"
+    local claim="$GASTOWN/assets/scripts/polecat-claim.sh"
+    local list_line pin_line
+
+    list_line=$(grep -nF 'it has already drain-acked — stop and exit.' "$prompt" | head -1 | cut -d: -f1) || true
+    pin_line=$(grep -nF 'Write nothing on any bead yourself before you exit' "$prompt" | head -1 | cut -d: -f1) || true
+    [[ -n "$pin_line" ]] ||
+        fail "the drain-acked claim outcomes must tell the polecat to write nothing on any bead"
+    [[ -n "$list_line" && "$pin_line" -eq $((list_line + 1)) ]] ||
+        fail "the write-nothing sentence must directly follow the drain-acked outcome list"
+    if grep -nE '\b(note|comment|comments)\b|--(append-)?notes' "$claim"; then
+        fail "the claim script must not write a note or comment on any bead"
+    fi
+}
+
 test_polecat_claim_ships_as_a_script_not_a_heredoc() {
     # gcp-zzb0: the claim was a 267-line heredoc the model retyped as one Bash
     # call at the start of every session. It ships as a script the prompt calls,
@@ -1308,6 +1331,7 @@ test_composition_is_documented
 test_polecat_startup_uses_standard_hook_claim
 test_claim_verify_separates_read_failure_from_unassigned
 test_claim_refuses_a_pour_onto_a_live_owner
+test_claim_decline_writes_nothing_on_any_bead
 test_polecat_claim_ships_as_a_script_not_a_heredoc
 test_review_leg_contract_forbids_synthetic_mutation
 test_prime_prompts_are_city_generic_and_compact

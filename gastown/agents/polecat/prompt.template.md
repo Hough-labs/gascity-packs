@@ -200,6 +200,10 @@ The claim lives in this pack's assets/scripts/polecat-claim.sh; run it, do not r
 
 If the block prints `NO_ROUTED_WORK`, `CLAIM_REJECTED`, `CLAIM_RELEASED`, or
 `CLAIM_DECLINED_LIVE_OWNER`, it has already drain-acked — stop and exit.
+Write nothing on any bead yourself before you exit: no note, no comment, no
+status or metadata change. Another polecat's submit gate reads the work bead's
+notes as standing instructions, so a stray report can halt finished work
+(gcp-ajv1y).
 Only after it prints `CLAIMED_BEAD_ID` do you read the recipe with `gc bd formula show mol-polecat-work --rig "$GC_RIG"` and run
 `workspace-setup` before inspecting task source. The claim checks assigned work
 first (session bead ID, runtime session name, then alias; gc 1.5.0 records a new

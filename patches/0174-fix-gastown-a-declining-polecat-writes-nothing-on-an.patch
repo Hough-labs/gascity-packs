@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 15 Oct 2026 10:03:02 -0400
+Subject: [PATCH 174/174] fix(gastown): a declining polecat writes nothing on
+ any bead (gcp-ajv1y)
+
+A polecat that declined a duplicate pour (CLAIM_DECLINED_LIVE_OWNER) wrote a
+freelance report on the WORK bead. The owning polecat's submit gate scans the
+bead's description and notes for a publishing rail, read that report as one,
+and halted finished work at branch-ready: about 15 minutes plus a full
+molecule re-pour (winnow, 2026-10-15).
+
+Per the mayor's ruling the RAIL_HIT scan stays fail-closed and unchanged;
+narrowing it can fail open on real rails, and bd notes carry no per-entry
+author to attribute by. This is the INTERIM fix, which cuts the source: the
+claim-outcome prose now tells the polecat to write nothing on any bead before
+it exits on a drain-acked outcome. The polecat-claim.sh script already writes
+no note or comment on any path, so only the prompt changes.
+
+A pin test, test_claim_decline_writes_nothing_on_any_bead, holds the sentence
+directly under the outcome list and holds polecat-claim.sh to no note or
+comment writes. Root cause (attributing rails by author) is tracked in
+gcp-uxpfb.
+
+Validation: bash gastown/tests/test_gastown_pack_assets.sh, plus the three
+mutations in the bead's AC3, run at self-review.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ gastown/agents/polecat/prompt.template.md |  4 ++++
+ gastown/tests/test_gastown_pack_assets.sh | 24 +++++++++++++++++++++++
+ 2 files changed, 28 insertions(+)
+
+diff --git a/gastown/agents/polecat/prompt.template.md b/gastown/agents/polecat/prompt.template.md
+index da3cb823..904646be 100644
+--- a/gastown/agents/polecat/prompt.template.md
++++ b/gastown/agents/polecat/prompt.template.md
+@@ -200,6 +200,10 @@ The claim lives in this pack's assets/scripts/polecat-claim.sh; run it, do not r
+ 
+ If the block prints `NO_ROUTED_WORK`, `CLAIM_REJECTED`, `CLAIM_RELEASED`, or
+ `CLAIM_DECLINED_LIVE_OWNER`, it has already drain-acked — stop and exit.
++Write nothing on any bead yourself before you exit: no note, no comment, no
++status or metadata change. Another polecat's submit gate reads the work bead's
++notes as standing instructions, so a stray report can halt finished work
++(gcp-ajv1y).
+ Only after it prints `CLAIMED_BEAD_ID` do you read the recipe with `gc bd formula show mol-polecat-work --rig "$GC_RIG"` and run
+ `workspace-setup` before inspecting task source. The claim checks assigned work
+ first (session bead ID, runtime session name, then alias; gc 1.5.0 records a new
+diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
+index b82f5f41..65e92a29 100755
+--- a/gastown/tests/test_gastown_pack_assets.sh
++++ b/gastown/tests/test_gastown_pack_assets.sh
+@@ -366,6 +366,29 @@ test_claim_refuses_a_pour_onto_a_live_owner() {
+         fail "the prose listing drain-acked claim outcomes must name CLAIM_DECLINED_LIVE_OWNER"
+ }
+ 
++test_claim_decline_writes_nothing_on_any_bead() {
++    # gcp-ajv1y (INTERIM; root cause gcp-uxpfb): a polecat that declined a
++    # duplicate pour left a freelance report on the WORK bead, and the owner's
++    # submit gate read that report as a publishing rail and halted finished work.
++    # The submit scan stays fail-closed, so the source is cut instead: on every
++    # drain-acked claim outcome the polecat writes nothing on any bead. This
++    # pins that sentence directly under the outcome list, and pins the claim
++    # script itself to no note or comment writes.
++    local prompt="$GASTOWN/agents/polecat/prompt.template.md"
++    local claim="$GASTOWN/assets/scripts/polecat-claim.sh"
++    local list_line pin_line
++
++    list_line=$(grep -nF 'it has already drain-acked — stop and exit.' "$prompt" | head -1 | cut -d: -f1) || true
++    pin_line=$(grep -nF 'Write nothing on any bead yourself before you exit' "$prompt" | head -1 | cut -d: -f1) || true
++    [[ -n "$pin_line" ]] ||
++        fail "the drain-acked claim outcomes must tell the polecat to write nothing on any bead"
++    [[ -n "$list_line" && "$pin_line" -eq $((list_line + 1)) ]] ||
++        fail "the write-nothing sentence must directly follow the drain-acked outcome list"
++    if grep -nE '\b(note|comment|comments)\b|--(append-)?notes' "$claim"; then
++        fail "the claim script must not write a note or comment on any bead"
++    fi
++}
++
+ test_polecat_claim_ships_as_a_script_not_a_heredoc() {
+     # gcp-zzb0: the claim was a 267-line heredoc the model retyped as one Bash
+     # call at the start of every session. It ships as a script the prompt calls,
+@@ -1308,6 +1331,7 @@ test_composition_is_documented
+ test_polecat_startup_uses_standard_hook_claim
+ test_claim_verify_separates_read_failure_from_unassigned
+ test_claim_refuses_a_pour_onto_a_live_owner
++test_claim_decline_writes_nothing_on_any_bead
+ test_polecat_claim_ships_as_a_script_not_a_heredoc
+ test_review_leg_contract_forbids_synthetic_mutation
+ test_prime_prompts_are_city_generic_and_compact
+-- 
+2.54.0 (Apple Git-157)
+
