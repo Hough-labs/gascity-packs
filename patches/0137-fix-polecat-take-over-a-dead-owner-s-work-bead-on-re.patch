@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sat, 10 Oct 2026 16:32:17 -0400
-Subject: [PATCH 137/164] fix(polecat): take over a dead owner's work bead on
+Subject: [PATCH 137/165] fix(polecat): take over a dead owner's work bead on
  resume and check the refinery handoff (gcp-fooz4)
 
 bd >= 1.3.0 (live on the host) refuses a plain --assignee write over

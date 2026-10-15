@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Wed, 14 Oct 2026 17:09:31 -0400
-Subject: [PATCH 163/164] fix(gastown): stop promising a session_sleep restart
+Subject: [PATCH 163/165] fix(gastown): stop promising a session_sleep restart
  gc forbids on the IDLE exits (gcp-hnhg)
 
 The deacon, witness and refinery patrol formulas end an idle turn with

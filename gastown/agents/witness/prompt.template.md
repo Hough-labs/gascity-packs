@@ -89,8 +89,8 @@ beads sit assigned forever unless the witness recovers them.
 
 **Detection:** Follow the `mol-witness-patrol` `recover-orphaned-beads` step.
 It is the source of truth for orphan classification. Resolve bead assignees by
-exact session identity from `gc session list --state=all --json` and session
-bead metadata; do not use template-pattern or fixed-prefix matching.
+exact session identity from gc session list --state=all --json alone;
+do not use template-pattern or fixed-prefix matching.
 
 **Recovery follows the canonical chain.** Read `metadata.artifact_dir` and
 `metadata.branch` from the bead — polecats record both early in branch-setup.

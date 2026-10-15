@@ -1,0 +1,229 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 15 Oct 2026 01:26:48 -0400
+Subject: [PATCH 165/165] fix(gastown): drop the dead session-bead liveness leg
+ and score a zero-row roster as unconfirmed (gcp-dfmw)
+
+recover-orphaned-beads built its liveness map from two reads. The second,
+`gc bd list --type=session --label=gc:session ...`, returns zero rows in every
+context: session beads resolve by `gc bd show <id>` but cannot be enumerated by
+`gc bd list` from the rig or HQ ledger, and a real session bead carries no
+configured_named_identity, so even a working list would resolve nothing. The
+leg contributed nothing, and a later change that surfaces stderr from that
+redirect would hand jq non-JSON, zero the map and disable recovery city-wide.
+
+Separately, the guard scored a blind read as CONFIRMED absent: it returned
+unusable only when MAP_COUNT==0 with SESSION_COUNT>0, so a roster read that
+succeeds with `{"sessions":[]}` built an empty map and every assignee read as
+absent. The witness running this recipe is itself a session, so a zero-row
+roster is a blind read, not an empty city.
+
+This removes the session-bead query, its temp file, the jq reduce and the
+prose that described two legs (formula and witness prompt), states that the
+roster is the only liveness source, and makes build_liveness_map return 1 on
+SESSION_COUNT==0. The FAIL-SAFE block gets a "zero rows" arm, guarded on a
+successful query so a failed read still reports "could not be built". The
+"FAIL-SAFE: empty liveness map" text is kept: the inference gate pins it.
+
+The session-bead test fixture goes with the leg, and
+test_zero_row_source_is_unconfirmed_not_absent covers the new rule. It fails
+on the unchanged formula ("expected STILL_ORPHANED=false, got 'true'") and
+fails again with the SESSION_COUNT guard deleted.
+
+Not changed: the polecat_session / null-assignee fallback (superseded by
+gcp-952j9), gcp-4k6o, Step 2a, Step 3, 3a and 3b.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ gastown/agents/witness/prompt.template.md     |  4 +-
+ gastown/formulas/mol-witness-patrol.toml      | 41 +++++++++++--------
+ ...test_mol_witness_patrol_orphan_recovery.sh | 19 ++++-----
+ 3 files changed, 33 insertions(+), 31 deletions(-)
+
+diff --git a/gastown/agents/witness/prompt.template.md b/gastown/agents/witness/prompt.template.md
+index 0b5c82e3..335a0b67 100644
+--- a/gastown/agents/witness/prompt.template.md
++++ b/gastown/agents/witness/prompt.template.md
+@@ -89,8 +89,8 @@ beads sit assigned forever unless the witness recovers them.
+ 
+ **Detection:** Follow the `mol-witness-patrol` `recover-orphaned-beads` step.
+ It is the source of truth for orphan classification. Resolve bead assignees by
+-exact session identity from `gc session list --state=all --json` and session
+-bead metadata; do not use template-pattern or fixed-prefix matching.
++exact session identity from gc session list --state=all --json alone;
++do not use template-pattern or fixed-prefix matching.
+ 
+ **Recovery follows the canonical chain.** Read `metadata.artifact_dir` and
+ `metadata.branch` from the bead — polecats record both early in branch-setup.
+diff --git a/gastown/formulas/mol-witness-patrol.toml b/gastown/formulas/mol-witness-patrol.toml
+index 279de764..7404bba3 100644
+--- a/gastown/formulas/mol-witness-patrol.toml
++++ b/gastown/formulas/mol-witness-patrol.toml
+@@ -177,7 +177,6 @@ assignees use the shape `<rig>/{{binding_prefix}}<polecat-suffix>`.
+ Get the full session roster for liveness checks:
+ ```bash
+ gc session list --state=all --json
+-gc bd list --type=session --label=gc:session --include-infra --include-gates --all --json --limit=0
+ ```
+ 
+ For each bead with an assignee, check **session-ID liveness** — NOT
+@@ -205,12 +204,12 @@ a NEW session with a different ID — the old one never comes back.
+      `session_name`, `alias`, and `agent_name` — the exact identifier forms
+      an assignee may take.
+ 
+-   Stream both JSON blobs through temp files, never `--argjson` on argv: on a
++   Stream the roster JSON through a temp file, never `--argjson` on argv: on a
+    busy city the session `command` fields are large and overflow ARG_MAX
+    (`argument list too long: jq`). Build the map through this function rather
+    than inline — Step 2a re-runs it per orphan candidate, and a single
+    definition is what stops the pre-destruction re-check from drifting away
+-   from this classification: same two legs, same identifier forms, same
++   from this classification: same roster read, same identifier forms, same
+    last-write-wins tie-break on duplicate identifiers.
+    ```bash
+    build_liveness_map() {
+@@ -223,17 +222,15 @@ a NEW session with a different ID — the old one never comes back.
+      MAP_BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+      LIVENESS_MAP='{}'; MAP_COUNT=0; SESSION_COUNT=0; MAP_QUERY_RC=0
+ 
+-     SESSIONS_FILE=$(mktemp); SESSION_BEADS_FILE=$(mktemp)
++     SESSIONS_FILE=$(mktemp)
+      gc session list --state=all --json > "$SESSIONS_FILE" || MAP_QUERY_RC=1
+-     gc bd list --type=session --label=gc:session --include-infra --include-gates --all --json --limit=0 > "$SESSION_BEADS_FILE" || MAP_QUERY_RC=1
+-     # Exit 0 with NO output is a broken read, not an empty roster: both
+-     # queries print a JSON value even when nothing matches. Read as `{}` it
+-     # would make every assignee absent.
++     # Exit 0 with NO output is a broken read, not an empty roster: the query
++     # prints a JSON value even when nothing matches. Read as `{}` it would
++     # make every assignee absent.
+      [ -s "$SESSIONS_FILE" ] || MAP_QUERY_RC=1
+-     [ -s "$SESSION_BEADS_FILE" ] || MAP_QUERY_RC=1
+ 
+      if [ "$MAP_QUERY_RC" -eq 0 ]; then
+-       LIVENESS_MAP=$(jq -n --slurpfile sessions "$SESSIONS_FILE" --slurpfile session_beads "$SESSION_BEADS_FILE" '
++       LIVENESS_MAP=$(jq -n --slurpfile sessions "$SESSIONS_FILE" '
+          # A key can sit on several rows: under gc v1.5.0 a namepool alias is a
+          # reused chair that closed sessions keep. A closed row must never
+          # overwrite a live one for the same key, or row order decides liveness.
+@@ -244,24 +241,25 @@ a NEW session with a different ID — the old one never comes back.
+                else $m + {($key): $new}
+                end
+            end;
+-         (reduce ($sessions[0].sessions // [])[] as $s ({};
++         reduce ($sessions[0].sessions // [])[] as $s ({};
+              add(.; $s.id;         $s.state; ($s.closed // false))
+            | add(.; $s.name;       $s.state; ($s.closed // false))
+            | add(.; $s.session_name; $s.state; ($s.closed // false))
+            | add(.; $s.alias;      $s.state; ($s.closed // false))
+            | add(.; $s.agent_name; $s.state; ($s.closed // false))
+-         )) as $from_sessions
+-         | reduce ($session_beads[0] // [])[] as $b ($from_sessions;
+-             add(.; $b.metadata.configured_named_identity; $b.metadata.state; ($b.status == "closed")))') || MAP_QUERY_RC=1
++         )') || MAP_QUERY_RC=1
+        SESSION_COUNT=$(jq -r '(.sessions // []) | length' "$SESSIONS_FILE" 2>/dev/null || echo 0)
+        MAP_COUNT=$(printf '%s' "$LIVENESS_MAP" | jq -r 'length' 2>/dev/null || echo 0)
+      fi
+-     rm -f "$SESSIONS_FILE" "$SESSION_BEADS_FILE"
++     rm -f "$SESSIONS_FILE"
+ 
+      # Non-zero means "could not verify liveness" — it never means "nobody is
+      # alive". Callers must read it as a reason to leave beads alone, never as
+      # a licence to orphan them.
+      if [ "$MAP_QUERY_RC" -ne 0 ]; then return 1; fi
++     # A roster read that succeeds with zero rows is blind: the witness running
++     # this is itself a session.
++     if [ "${SESSION_COUNT:-0}" -eq 0 ]; then return 1; fi
+      if [ "${MAP_COUNT:-0}" -eq 0 ] && [ "${SESSION_COUNT:-0}" -gt 0 ]; then return 1; fi
+      return 0
+    }
+@@ -275,6 +273,11 @@ a NEW session with a different ID — the old one never comes back.
+    CYCLE_MAP_BUILT_AT="$MAP_BUILT_AT"
+    ```
+ 
++   The session roster is the ONLY liveness source. Session beads resolve by
++   `gc bd show <id>`, but `gc bd list` cannot enumerate them in any context,
++   and a real session bead carries no named-identity metadata. A
++   bead-backed source does not exist today; adding one is a new bead.
++
+    `CYCLE_MAP_BUILT_AT` is the instant this cycle's first snapshot was
+    *started* — anything the map cannot know about was touched at or after it.
+    A bead whose own `updated_at` is not strictly older than that watermark was
+@@ -282,8 +285,8 @@ a NEW session with a different ID — the old one never comes back.
+    may already be stale. Step 2a uses that to skip such a bead before anything
+    acts on it.
+ 
+-   **Fail safe — never orphan on an unusable map.** If either query failed, or
+-   the map is empty while sessions exist, the schema has drifted again (the
++   **Fail safe — never orphan on an unusable map.** If the roster query failed,
++   returned zero rows, or the map is empty while sessions exist, the schema has drifted again (the
+    exact failure in gc-3tn8g). An empty or unbuilt map resolves every assignee
+    to `absent` and would false-orphan live agents. ABORT recovery this cycle —
+    do NOT classify any bead as orphaned — escalate, then continue to
+@@ -292,8 +295,10 @@ a NEW session with a different ID — the old one never comes back.
+    if [ "${MAP_BUILD_RC:-1}" -ne 0 ]; then
+      if [ "${MAP_COUNT:-0}" -eq 0 ] && [ "${SESSION_COUNT:-0}" -gt 0 ]; then
+        echo "FAIL-SAFE: empty liveness map with $SESSION_COUNT live sessions — skipping orphan recovery (treat all assignees as live)."
++     elif [ "${MAP_QUERY_RC:-1}" -eq 0 ] && [ "${SESSION_COUNT:-0}" -eq 0 ]; then
++       echo "FAIL-SAFE: session roster returned zero rows — a blind read, not an empty city — skipping orphan recovery (treat all assignees as live)."
+      else
+-       echo "FAIL-SAFE: liveness map could not be built (gc session list / gc bd list did not both succeed) — skipping orphan recovery (treat all assignees as live)."
++       echo "FAIL-SAFE: liveness map could not be built (gc session list did not succeed) — skipping orphan recovery (treat all assignees as live)."
+      fi
+      gc mail send mayor/ -s "WITNESS: orphan-recovery disabled — liveness map unusable" -m "Could not build a usable assignee->state map (build rc=$MAP_BUILD_RC, map entries=$MAP_COUNT, live sessions=$SESSION_COUNT). Either a query failed or the gc session list --json schema drifted again (gc-3tn8g); skipping orphan recovery this cycle to avoid false-orphaning live agents. Re-check the recover-orphaned-beads liveness recipe."
+      # Skip the rest of this step; proceed to check-refinery.
+diff --git a/gastown/tests/test_mol_witness_patrol_orphan_recovery.sh b/gastown/tests/test_mol_witness_patrol_orphan_recovery.sh
+index dc5d162f..c8e152f3 100755
+--- a/gastown/tests/test_mol_witness_patrol_orphan_recovery.sh
++++ b/gastown/tests/test_mol_witness_patrol_orphan_recovery.sh
+@@ -78,7 +78,6 @@ case "$invocation" in
+         if [ -n "${GC_STUB_FAIL_SESSION_LIST:-}" ]; then exit 1; fi
+         cat "$GC_SESSIONS_JSON"
+         ;;
+-    *"gc bd list"*) cat "$GC_SESSION_BEADS_JSON" ;;
+     *"gc bd show"*)
+         if [ -n "${GC_STUB_FAIL_BD_SHOW:-}" ]; then exit 1; fi
+         cat "$GC_BEAD_JSON"
+@@ -93,9 +92,7 @@ SH
+ write_gc_stub
+ export PATH="$BIN:$PATH"
+ export GC_SESSIONS_JSON="$tmp/sessions.json"
+-export GC_SESSION_BEADS_JSON="$tmp/session-beads.json"
+ export GC_BEAD_JSON="$tmp/bead.json"
+-printf '[]' >"$GC_SESSION_BEADS_JSON"
+ 
+ command -v jq >/dev/null || fail "jq is required (the recipe under test uses it)"
+ 
+@@ -207,14 +204,14 @@ test_empty_roster_output_skips() {
+     assert_verdict false "an empty roster read that exited 0"
+ }
+ 
+-test_empty_session_bead_output_skips() {
+-    # Same rule for the session-bead half of the map: `gc bd list --json`
+-    # prints `[]` when nothing matches, so no output at all is a broken read.
+-    set_roster "$ROSTER_LIVE"
+-    : >"$GC_SESSION_BEADS_JSON"
++test_zero_row_source_is_unconfirmed_not_absent() {
++    # A roster read that SUCCEEDS with zero rows is blind, not an empty city:
++    # the witness running this recipe is itself a session, so a healthy roster
++    # always holds at least one row. Read as "nobody alive" it would make every
++    # assignee absent and the recovery would force-remove live worktrees.
++    set_roster '{"sessions":[]}'
+     run_verdict "pool-gone" "pool-gone" OLD
+-    printf '[]' >"$GC_SESSION_BEADS_JSON"
+-    assert_verdict false "an empty session-bead read that exited 0"
++    assert_verdict false "a roster read that returned zero rows"
+ }
+ 
+ test_reused_alias_with_a_live_holder_is_not_orphaned() {
+@@ -502,7 +499,7 @@ test_live_assignee_is_not_orphaned
+ test_unusable_liveness_map_skips_instead_of_orphaning
+ test_empty_map_with_live_sessions_skips
+ test_empty_roster_output_skips
+-test_empty_session_bead_output_skips
++test_zero_row_source_is_unconfirmed_not_absent
+ test_reused_alias_with_a_live_holder_is_not_orphaned
+ test_missing_assignee_skips
+ test_unreadable_bead_skips
+-- 
+2.54.0 (Apple Git-157)
+

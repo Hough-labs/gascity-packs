@@ -78,7 +78,6 @@ case "$invocation" in
         if [ -n "${GC_STUB_FAIL_SESSION_LIST:-}" ]; then exit 1; fi
         cat "$GC_SESSIONS_JSON"
         ;;
-    *"gc bd list"*) cat "$GC_SESSION_BEADS_JSON" ;;
     *"gc bd show"*)
         if [ -n "${GC_STUB_FAIL_BD_SHOW:-}" ]; then exit 1; fi
         cat "$GC_BEAD_JSON"
@@ -93,9 +92,7 @@ SH
 write_gc_stub
 export PATH="$BIN:$PATH"
 export GC_SESSIONS_JSON="$tmp/sessions.json"
-export GC_SESSION_BEADS_JSON="$tmp/session-beads.json"
 export GC_BEAD_JSON="$tmp/bead.json"
-printf '[]' >"$GC_SESSION_BEADS_JSON"
 
 command -v jq >/dev/null || fail "jq is required (the recipe under test uses it)"
 
@@ -207,14 +204,14 @@ test_empty_roster_output_skips() {
     assert_verdict false "an empty roster read that exited 0"
 }
 
-test_empty_session_bead_output_skips() {
-    # Same rule for the session-bead half of the map: `gc bd list --json`
-    # prints `[]` when nothing matches, so no output at all is a broken read.
-    set_roster "$ROSTER_LIVE"
-    : >"$GC_SESSION_BEADS_JSON"
+test_zero_row_source_is_unconfirmed_not_absent() {
+    # A roster read that SUCCEEDS with zero rows is blind, not an empty city:
+    # the witness running this recipe is itself a session, so a healthy roster
+    # always holds at least one row. Read as "nobody alive" it would make every
+    # assignee absent and the recovery would force-remove live worktrees.
+    set_roster '{"sessions":[]}'
     run_verdict "pool-gone" "pool-gone" OLD
-    printf '[]' >"$GC_SESSION_BEADS_JSON"
-    assert_verdict false "an empty session-bead read that exited 0"
+    assert_verdict false "a roster read that returned zero rows"
 }
 
 test_reused_alias_with_a_live_holder_is_not_orphaned() {
@@ -502,7 +499,7 @@ test_live_assignee_is_not_orphaned
 test_unusable_liveness_map_skips_instead_of_orphaning
 test_empty_map_with_live_sessions_skips
 test_empty_roster_output_skips
-test_empty_session_bead_output_skips
+test_zero_row_source_is_unconfirmed_not_absent
 test_reused_alias_with_a_live_holder_is_not_orphaned
 test_missing_assignee_skips
 test_unreadable_bead_skips
