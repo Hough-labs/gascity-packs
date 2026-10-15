@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Tue, 13 Oct 2026 16:11:16 -0400
-Subject: [PATCH 151/167] fix(polecat): a live crew owner on the work bead is
+Subject: [PATCH 151/168] fix(polecat): a live crew owner on the work bead is
  the slinger, not a worker (gcp-qjkp)
 
 The live-owner guard (gcp-mjjg, e739a413) declined on ANY live assignee of the

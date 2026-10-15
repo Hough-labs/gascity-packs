@@ -1,0 +1,904 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 15 Oct 2026 04:31:32 -0400
+Subject: [PATCH 168/168] fix(gastown): a lost fast-forward race re-enters the
+ rebase step instead of re-rebasing in place (gcp-xs3eq)
+
+merge_ff_push retried a lost race in place: on a failed ff-merge, or a push
+rejected because the target moved, it checked out temp, re-rebased it onto the
+new tip and pushed again (up to three attempts, from patches/0013, carried by
+0056/0095/0097/0104/0144). The tree it landed was therefore not the tree
+run-tests ran on. A temp that carried merges (the #374 skip-rebase arm) was
+flattened by that re-rebase, and the landed tip was not the tested temp.
+Upstream #374 is explicit that re-materializing replaces the tested tree, so a
+lost race has to be a step re-entry.
+
+merge_ff_push is now ONE attempt. A lost race calls the new
+merge_ff_push_lost_race notice and returns 6, touching neither temp nor the
+bead. The lane already drops temp on exit and the step's `*)` arm drains, so
+the next patrol re-selects the still-assigned bead, the rebase step rebuilds
+temp and run-tests runs again before any push. Status 6 is re-used (its
+meaning is now "lost the race") and status 3, which nothing can return any
+more, is retired from the script header, result_summary, the formula status
+table and the batch lane header. Statuses 0, 2, 5 and 7 are unchanged, as is
+the push-rejection classification: a moved target is a lost race (6), a target
+that stood still is a veto (7).
+
+Tests: the in-place-retry cases are replaced by cases that pin the new
+contract. test_lost_race_stops_for_a_rebase_reentry and
+test_lost_race_leaves_a_merge_topology_temp_unflattened (new) assert status 6,
+the racing commit left on origin, temp byte-identical to what the tests saw.
+The moving-target, script status 6, lane and batch land cases assert exactly
+one push attempt and the drain. The conflicting re-rebase cases (push status 3,
+script status 3, batch dropped-commit and re-rebase-conflict) are retired with
+the code they covered; the batch suite goes from 22 to 20 cases.
+
+Cost, accepted by the mayor ruling (gcp-bdgg1): one extra patrol and test run
+per lost race. patches/ is regenerated with `make patches` in this commit.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../assets/scripts/refinery/merge-batch.sh    |  25 +-
+ gastown/assets/scripts/refinery/merge-push.sh | 237 ++++++++----------
+ gastown/formulas/mol-refinery-patrol.toml     |   5 +-
+ gastown/tests/test_refinery_merge_batch.sh    | 103 ++------
+ gastown/tests/test_refinery_merge_lanes.sh    |  35 +--
+ gastown/tests/test_refinery_merge_push.sh     | 165 ++++++------
+ 6 files changed, 236 insertions(+), 334 deletions(-)
+
+diff --git a/gastown/assets/scripts/refinery/merge-batch.sh b/gastown/assets/scripts/refinery/merge-batch.sh
+index 3860cbfa..eb950a41 100755
+--- a/gastown/assets/scripts/refinery/merge-batch.sh
++++ b/gastown/assets/scripts/refinery/merge-batch.sh
+@@ -63,24 +63,23 @@
+ #
+ # land    Land the stacked batch with ONE fast-forward push and close each member
+ #         against ITS OWN landed commit. It reads the manifest stack wrote and
+-#         runs merge-push.sh's merge_ff_push on `temp`, so the retry loop and the
+-#         statuses are the lane's: 0 landed, 2 hard stop, 3 the re-rebase
+-#         conflicted, 5 no-op, 6 retries exhausted, 7 the remote refused. Any of
+-#         2/3/5/6/7 from the push writes nothing but the artifact proof below and
+-#         leaves the manifest where it is.
++#         runs merge-push.sh's merge_ff_push on `temp`, so the statuses are the
++#         lane's: 0 landed, 2 hard stop, 5 no-op, 6 lost the race (nothing
++#         written; the next patrol re-selects, re-stacks and re-tests), 7 the
++#         remote refused. Any of 2/5/6/7 from the push writes nothing but the
++#         artifact proof below and leaves the manifest where it is.
+ #         Before the push, every member gets the task-artifact proof the patrol's
+ #         rebase step records for the head (upstream #245): artifact_source_sha
+ #         and artifact_cleanup_state=pending (mb_capture_artifact_proof). A member
+ #         whose proof cannot be recorded stops land with 2 before anything lands.
+ #         After a landing, member i's commit is found in the LANDED stack, not in
+-#         the manifest, because a retry re-rebases temp and so rewrites every
+-#         sha: with L the landed tip and offset_i the commit count of the members
+-#         behind member i, member i's tip is L~offset_i, and it is trusted only
+-#         when its patch-id equals the one stack recorded. A member that fails
+-#         that check, or whose bead write or close fails, is LEFT OPEN with its
+-#         branch kept, never given the batch tip or another member's commit, and
+-#         never rolled back: the merge-state gate closes it as already merged on
+-#         a later patrol. No member's source branch is ever deleted: it is the
++#         the manifest: with L the landed tip and offset_i the commit count of
++#         the members behind member i, member i's tip is L~offset_i, and it is
++#         trusted only when its patch-id equals the one stack recorded. A member
++#         that fails that check, or whose bead write or close fails, is LEFT
++#         OPEN with its branch kept, never given the batch tip or another
++#         member's commit, and never rolled back: the merge-state gate closes it
++#         as already merged on a later patrol. No member's source branch is ever deleted: it is the
+ #         task artifact's recovery copy. After each member's close, its
+ #         task-artifact cleanup runs; one that does not converge is handled as
+ #         merge-push.sh's direct_cleanup handles it: the member stays closed, its
+diff --git a/gastown/assets/scripts/refinery/merge-push.sh b/gastown/assets/scripts/refinery/merge-push.sh
+index b952ba60..975967a6 100755
+--- a/gastown/assets/scripts/refinery/merge-push.sh
++++ b/gastown/assets/scripts/refinery/merge-push.sh
+@@ -64,9 +64,8 @@
+ #       merge-state gate closes it as already merged), and in mr when
+ #       --force-with-lease failed (temp is dropped; the next patrol's rebase step
+ #       re-runs its ancestry decision on the moved branch).
+-#    3  the re-rebase onto the moved target conflicted
+ #    5  the ff-merge was a no-op; nothing landed
+-#    6  retries exhausted; the target moved under every attempt
++#    6  lost the race: the target moved after the tests ran; nothing landed, temp dropped; the next patrol rebuilds and re-tests it
+ #    7  the remote refused the push while the target stood still; the line
+ #       `merge-ff-push: REFUSED target=<T> sha=<S>` names the target and the
+ #       tip it stood at, and lane-wedge.sh mark reads it to park the lane
+@@ -215,9 +214,8 @@ result_summary() {
+     0) echo "work bead closed" ;;
+     1) echo "usage or config error; nothing touched" ;;
+     2) echo "hard stop; do not mutate bead state" ;;
+-    3) echo "re-rebase onto the moved target conflicted" ;;
+     5) echo "ff-merge was a no-op; nothing landed" ;;
+-    6) echo "retries exhausted; the target moved under every attempt" ;;
++    6) echo "lost the race; the target moved after the tests ran; nothing landed" ;;
+     7) echo "push refused while the target stood still" ;;
+     8) echo "false completion halted; mayor and witness nudged" ;;
+     9) echo "invalid existing_pr blocked; mayor mailed" ;;
+@@ -497,13 +495,14 @@ lookup_pr_info() {
+ # Land `temp` on $TARGET and prove it landed. Reads BRANCH, TARGET; sets
+ # TEMP_SHA, MERGED_SHA, MERGED_SHORT on success.
+ #
++# ONE attempt: a lost race is a step re-entry, never an in-place re-rebase (gcp-xs3eq; upstream #374).
+ # Exit status:
+ #   0 = landed and verified (MERGED_SHA is $TEMP_SHA, reachable on the target)
+ #   2 = hard stop; do not mutate bead state
+-#   3 = the re-rebase onto the new tip conflicted
+ #   5 = no-op: origin/$TARGET already contains temp; nothing to land here
+-#   6 = retries exhausted while losing the race (measured: the target moved
+-#       under every attempt)
++#   6 = lost the race: the target moved after the tests ran; nothing landed.
++#       temp is dropped and the next patrol's rebase step rebuilds it, so
++#       run-tests runs again before any push
+ #   7 = the remote REFUSED the push while $TARGET stood still — a push-gate
+ #       veto, a receive hook, or permissions. Not a race; retrying cannot help.
+ #       Prints `merge-ff-push: REFUSED target=$TARGET sha=$BEFORE_SHA` just
+@@ -519,11 +518,13 @@ merge_ff_push_cleanup_wt() {
+   mfp_parent=""
+ }
+ 
++merge_ff_push_lost_race() {
++  echo "merge-ff-push: LOST RACE: origin/$TARGET moved after the tests ran; nothing landed. STOP. Do not mutate bead state. temp is not re-rebased in place: the lane drops it, the next patrol's rebase step rebuilds it from origin/$BRANCH, and run-tests runs again before any push."
++}
++
+ merge_ff_push() {
+   mfp_wt=""
+   mfp_parent=""
+-  mfp_max=3
+-  mfp_attempt=0
+   # Wait budget for the merge push, and for nothing else in this patrol. The
+   # rig's pre-push gate (scripts/gate-slot-run) reads PUSH_GATE_MAX_WAIT_SECONDS
+   # and defaults it to 0 — a NON-BLOCKING slot acquire that vetoes the push
+@@ -536,142 +537,116 @@ merge_ff_push() {
+   # what to look at, not the refusal status below.
+   mfp_push_wait="${REFINERY_PUSH_GATE_MAX_WAIT_SECONDS:-3000}"
+ 
+-  while [ "$mfp_attempt" -lt "$mfp_max" ]; do
+-    mfp_attempt=$((mfp_attempt + 1))
+-
+-    if ! git fetch origin "+refs/heads/${TARGET}:refs/remotes/origin/${TARGET}"; then
+-      echo "merge-ff-push: fetch of $TARGET failed on attempt $mfp_attempt; cannot establish the pre-merge tip."
+-      return 2
+-    fi
+-    # BEFORE_SHA is resolved once and then used as the worktree base, so the
+-    # advance check below compares against the commit the merge was really
+-    # performed on rather than re-reading a ref that may have moved since.
+-    if ! BEFORE_SHA=$(git rev-parse "origin/$TARGET"); then
+-      echo "merge-ff-push: could not resolve origin/$TARGET."
+-      return 2
+-    fi
+-    if ! TEMP_SHA=$(git rev-parse temp); then
+-      echo "merge-ff-push: could not resolve the rebased temp branch."
+-      return 2
+-    fi
+-
+-    if ! mfp_parent=$(mktemp -d "${TMPDIR:-/tmp}/gascity-refinery-merge.XXXXXX"); then
+-      echo "merge-ff-push: could not create a scratch directory for the merge worktree."
+-      return 2
+-    fi
+-    mfp_wt="$mfp_parent/target"
+-    if ! git worktree add --detach "$mfp_wt" "$BEFORE_SHA" >/dev/null 2>&1; then
+-      echo "merge-ff-push: could not create the merge worktree at $BEFORE_SHA."
+-      merge_ff_push_cleanup_wt
+-      return 2
+-    fi
++  if ! git fetch origin "+refs/heads/${TARGET}:refs/remotes/origin/${TARGET}"; then
++    echo "merge-ff-push: fetch of $TARGET failed; cannot establish the pre-merge tip."
++    return 2
++  fi
++  # BEFORE_SHA is resolved once and then used as the worktree base, so the
++  # advance check below compares against the commit the merge was really
++  # performed on rather than re-reading a ref that may have moved since.
++  if ! BEFORE_SHA=$(git rev-parse "origin/$TARGET"); then
++    echo "merge-ff-push: could not resolve origin/$TARGET."
++    return 2
++  fi
++  if ! TEMP_SHA=$(git rev-parse temp); then
++    echo "merge-ff-push: could not resolve the rebased temp branch."
++    return 2
++  fi
+ 
+-    # Explicit status check. Do NOT reintroduce a `set -e` dependency here:
+-    # this is the branch that reported a false merge when set -e did not
+-    # propagate through the execution harness.
+-    git -C "$mfp_wt" merge --ff-only "$TEMP_SHA"
+-    mfp_merge_status=$?
+-    if [ "$mfp_merge_status" -ne 0 ]; then
+-      merge_ff_push_cleanup_wt
+-      echo "merge-ff-push: ff-merge of $TEMP_SHA onto $BEFORE_SHA failed (status $mfp_merge_status) — origin/$TARGET moved under this patrol."
+-      if [ "$mfp_attempt" -ge "$mfp_max" ]; then
+-        break
+-      fi
+-      if ! git checkout temp >/dev/null 2>&1; then
+-        echo "merge-ff-push: could not check out temp to re-rebase it."
+-        return 2
+-      fi
+-      if ! git rebase "$BEFORE_SHA"; then
+-        git rebase --abort >/dev/null 2>&1 || true
+-        echo "merge-ff-push: re-rebase of temp onto $BEFORE_SHA conflicted; aborted. Nothing landed. STOP: the lane drops temp on its way out, so the next patrol rebuilds it from origin/$BRANCH in the rebase step and runs the tests again; if the conflict stands, the rebase step's conflict path rejects the branch back to the pool."
+-        return 3
+-      fi
+-      echo "merge-ff-push: re-rebased temp onto $BEFORE_SHA; retrying (attempt $mfp_attempt of $mfp_max used)."
+-      continue
+-    fi
++  if ! mfp_parent=$(mktemp -d "${TMPDIR:-/tmp}/gascity-refinery-merge.XXXXXX"); then
++    echo "merge-ff-push: could not create a scratch directory for the merge worktree."
++    return 2
++  fi
++  mfp_wt="$mfp_parent/target"
++  if ! git worktree add --detach "$mfp_wt" "$BEFORE_SHA" >/dev/null 2>&1; then
++    echo "merge-ff-push: could not create the merge worktree at $BEFORE_SHA."
++    merge_ff_push_cleanup_wt
++    return 2
++  fi
+ 
+-    MERGED_SHA=$(git -C "$mfp_wt" rev-parse HEAD)
+-    MERGED_SHORT=$(git -C "$mfp_wt" rev-parse --short HEAD)
++  # Explicit status check. Do NOT reintroduce a `set -e` dependency here:
++  # this is the branch that reported a false merge when set -e did not
++  # propagate through the execution harness.
++  git -C "$mfp_wt" merge --ff-only "$TEMP_SHA"
++  mfp_merge_status=$?
++  if [ "$mfp_merge_status" -ne 0 ]; then
++    merge_ff_push_cleanup_wt
++    echo "merge-ff-push: ff-merge of $TEMP_SHA onto $BEFORE_SHA failed (status $mfp_merge_status) — origin/$TARGET moved under this patrol."
++    merge_ff_push_lost_race
++    return 6
++  fi
+ 
+-    # An "Already up to date" ff-merge leaves HEAD at the target tip. Reporting
+-    # that as merged is precisely the target-tip-for-branch-tip mislabel; the
+-    # already-merged gate resolves this case from origin/$BRANCH instead.
+-    if [ "$MERGED_SHA" = "$BEFORE_SHA" ]; then
+-      merge_ff_push_cleanup_wt
+-      echo "merge-ff-push: ff-merge was a no-op — origin/$TARGET ($BEFORE_SHA) already contains temp. Nothing to land; not recording a merge."
+-      return 5
+-    fi
+-    # ff-only either fast-forwards HEAD to TEMP_SHA or leaves it alone, so this
+-    # cannot fire. Asserted anyway: it is the invariant that keeps merged_sha
+-    # the commit that carried the bead.
+-    if [ "$MERGED_SHA" != "$TEMP_SHA" ]; then
+-      merge_ff_push_cleanup_wt
+-      echo "merge-ff-push: ff-merge left HEAD at $MERGED_SHA, not the branch tip $TEMP_SHA. Refusing to record a merge."
+-      return 2
+-    fi
++  MERGED_SHA=$(git -C "$mfp_wt" rev-parse HEAD)
++  MERGED_SHORT=$(git -C "$mfp_wt" rev-parse --short HEAD)
+ 
+-    PUSH_GATE_MAX_WAIT_SECONDS="$mfp_push_wait" git -C "$mfp_wt" push origin "HEAD:$TARGET"
+-    mfp_push_status=$?
++  # An "Already up to date" ff-merge leaves HEAD at the target tip. Reporting
++  # that as merged is precisely the target-tip-for-branch-tip mislabel; the
++  # already-merged gate resolves this case from origin/$BRANCH instead.
++  if [ "$MERGED_SHA" = "$BEFORE_SHA" ]; then
+     merge_ff_push_cleanup_wt
+-    if [ "$mfp_push_status" -ne 0 ]; then
+-      # MEASURE the cause; do not assert it. A rejection is either "the target
+-      # advanced under us" — retryable, re-rebase and go again — or "the remote
+-      # refused this push" (gate veto, receive hook, permissions), which no
+-      # number of retries can fix and which every retry pays for in gate load:
+-      # each attempt relaunches the pre-push hook and queues for another slot.
+-      # The verification below already draws exactly this comparison against the
+-      # freshly fetched tip; the rejection path never learned it, so every veto
+-      # was reported as movement and then retried three times (gcp-ileo).
+-      if ! git fetch origin "+refs/heads/${TARGET}:refs/remotes/origin/${TARGET}"; then
+-        echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status) and the follow-up fetch failed, so the cause cannot be measured. STOP. Do not mutate bead state."
+-        return 2
+-      fi
+-      if ! mfp_reject_sha=$(git rev-parse "origin/$TARGET"); then
+-        echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status) and origin/$TARGET could not be resolved, so the cause cannot be measured. STOP. Do not mutate bead state."
+-        return 2
+-      fi
+-      if [ "$mfp_reject_sha" = "$BEFORE_SHA" ]; then
+-        echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status) and origin/$TARGET is STILL $BEFORE_SHA — the target did not move, so the remote refused this push (push-gate veto, receive hook, or permissions). This is not a race; retrying re-runs the pre-push gate and cannot succeed. STOP. Do not mutate bead state."
+-        echo "merge-ff-push: REFUSED target=$TARGET sha=$BEFORE_SHA"
+-        return 7
+-      fi
+-      echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status); origin/$TARGET moved $BEFORE_SHA -> $mfp_reject_sha, so the target really did advance between the fetch and the push."
+-      if [ "$mfp_attempt" -ge "$mfp_max" ]; then
+-        break
+-      fi
+-      continue
+-    fi
++    echo "merge-ff-push: ff-merge was a no-op — origin/$TARGET ($BEFORE_SHA) already contains temp. Nothing to land; not recording a merge."
++    return 5
++  fi
++  # ff-only either fast-forwards HEAD to TEMP_SHA or leaves it alone, so this
++  # cannot fire. Asserted anyway: it is the invariant that keeps merged_sha
++  # the commit that carried the bead.
++  if [ "$MERGED_SHA" != "$TEMP_SHA" ]; then
++    merge_ff_push_cleanup_wt
++    echo "merge-ff-push: ff-merge left HEAD at $MERGED_SHA, not the branch tip $TEMP_SHA. Refusing to record a merge."
++    return 2
++  fi
+ 
+-    # Re-fetch and verify against the FRESH tip. The pre-push snapshot proves
+-    # nothing: a no-op push also exits 0.
++  PUSH_GATE_MAX_WAIT_SECONDS="$mfp_push_wait" git -C "$mfp_wt" push origin "HEAD:$TARGET"
++  mfp_push_status=$?
++  merge_ff_push_cleanup_wt
++  if [ "$mfp_push_status" -ne 0 ]; then
++    # MEASURE the cause; do not assert it. A rejection is either "the target
++    # advanced under us" — a lost race, a step re-entry (6) — or "the remote
++    # refused this push" (gate veto, receive hook, permissions), which no retry
++    # can fix and which every retry pays for in gate load: each attempt
++    # relaunches the pre-push hook and queues for another slot. The comparison
++    # below draws exactly that line against the freshly fetched tip: a moved
++    # target is a lost race (6), a target that stood still is a veto (7)
++    # (gcp-ileo).
+     if ! git fetch origin "+refs/heads/${TARGET}:refs/remotes/origin/${TARGET}"; then
+-      echo "merge-ff-push: post-push fetch of $TARGET failed; the merge cannot be verified. STOP. Do not mutate bead state."
++      echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status) and the follow-up fetch failed, so the cause cannot be measured. STOP. Do not mutate bead state."
+       return 2
+     fi
+-    if ! AFTER_SHA=$(git rev-parse "origin/$TARGET"); then
+-      echo "merge-ff-push: could not resolve origin/$TARGET after the push; the merge cannot be verified."
++    if ! mfp_reject_sha=$(git rev-parse "origin/$TARGET"); then
++      echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status) and origin/$TARGET could not be resolved, so the cause cannot be measured. STOP. Do not mutate bead state."
+       return 2
+     fi
+-    if [ "$AFTER_SHA" = "$BEFORE_SHA" ]; then
+-      echo "merge-ff-push: origin/$TARGET did not advance — still $BEFORE_SHA after a push that exited 0. STOP. Do not mutate bead state."
+-      return 2
+-    fi
+-    if ! git merge-base --is-ancestor "$TEMP_SHA" "$AFTER_SHA"; then
+-      echo "merge-ff-push: origin/$TARGET advanced to $AFTER_SHA but $TEMP_SHA is not reachable from it — the target moved for some other reason. STOP. Do not mutate bead state."
+-      return 2
++    if [ "$mfp_reject_sha" = "$BEFORE_SHA" ]; then
++      echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status) and origin/$TARGET is STILL $BEFORE_SHA — the target did not move, so the remote refused this push (push-gate veto, receive hook, or permissions). This is not a race; retrying re-runs the pre-push gate and cannot succeed. STOP. Do not mutate bead state."
++      echo "merge-ff-push: REFUSED target=$TARGET sha=$BEFORE_SHA"
++      return 7
+     fi
++    echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status); origin/$TARGET moved $BEFORE_SHA -> $mfp_reject_sha, so the target really did advance between the fetch and the push."
++    merge_ff_push_lost_race
++    return 6
++  fi
+ 
+-    echo "merge-ff-push: landed $BRANCH on $TARGET at $MERGED_SHA (target advanced $BEFORE_SHA -> $AFTER_SHA)."
+-    return 0
+-  done
++  # Re-fetch and verify against the FRESH tip. The pre-push snapshot proves
++  # nothing: a no-op push also exits 0.
++  if ! git fetch origin "+refs/heads/${TARGET}:refs/remotes/origin/${TARGET}"; then
++    echo "merge-ff-push: post-push fetch of $TARGET failed; the merge cannot be verified. STOP. Do not mutate bead state."
++    return 2
++  fi
++  if ! AFTER_SHA=$(git rev-parse "origin/$TARGET"); then
++    echo "merge-ff-push: could not resolve origin/$TARGET after the push; the merge cannot be verified."
++    return 2
++  fi
++  if [ "$AFTER_SHA" = "$BEFORE_SHA" ]; then
++    echo "merge-ff-push: origin/$TARGET did not advance — still $BEFORE_SHA after a push that exited 0. STOP. Do not mutate bead state."
++    return 2
++  fi
++  if ! git merge-base --is-ancestor "$TEMP_SHA" "$AFTER_SHA"; then
++    echo "merge-ff-push: origin/$TARGET advanced to $AFTER_SHA but $TEMP_SHA is not reachable from it — the target moved for some other reason. STOP. Do not mutate bead state."
++    return 2
++  fi
+ 
+-  # Only reachable after an attempt MEASURED the target moving — either the
+-  # ff-merge failed because origin/$TARGET had advanced, or the push was
+-  # rejected and the re-read tip differed from the one merged onto. A veto
+-  # against a stationary target returns 7 above and never reaches here, so this
+-  # message no longer steers the reader toward retrying harder (gcp-ileo).
+-  echo "merge-ff-push: could not land $BRANCH on $TARGET in $mfp_max attempts; the target moved under every attempt. STOP. Do not mutate bead state."
+-  return 6
++  echo "merge-ff-push: landed $BRANCH on $TARGET at $MERGED_SHA (target advanced $BEFORE_SHA -> $AFTER_SHA)."
++  return 0
+ }
+ # --- lanes ------------------------------------------------------------------
+ #
+diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
+index 8df09b51..c879615d 100644
+--- a/gastown/formulas/mol-refinery-patrol.toml
++++ b/gastown/formulas/mol-refinery-patrol.toml
+@@ -1722,9 +1722,8 @@ What each status means, and what this step does about it:
+ | 0 | Handed off: the work bead is closed and its task-artifact cleanup completed (landed direct, or closed as already merged), or, for mr, the pull request is recorded pending and the bead is blocked until `gc gastown pr-merge-reconcile` verifies the merge on a later patrol. A closed bead whose cleanup did not converge is status 2, not 0. | Continue to patrol-summary. The script already ran its cleanup; do not run another. |
+ | 1 | Usage or config error; nothing was touched. | STOP and drain. Read the output above the RESULT line. |
+ | 2 | Hard stop; do not mutate bead state. Also returned when a merge landed but recording it on the bead failed: the next patrol's merge-state gate closes it as already merged. Also returned when the bead closed but its task-artifact cleanup did not converge: its `pending` or `blocked` state stays on the bead, find-work's sweep retries a `pending` one, and a `blocked` one is never retried and waits for review. In mr, also returned when `--force-with-lease` failed because the PR branch moved: the script dropped `temp`, and the next patrol's rebase step re-runs its ancestry decision on the moved branch. Upstream re-enters the rebase step in the same patrol instead; this fork drains the session. | STOP and drain. |
+-| 3 | The re-rebase onto the moved target conflicted. | STOP and drain. |
+ | 5 | The ff-merge was a no-op; nothing landed. | STOP and drain. |
+-| 6 | Retries exhausted; the target moved under every attempt. | STOP and drain. |
++| 6 | Lost the race: the target moved after the tests ran. Nothing landed and temp is dropped; the next patrol's rebase step rebuilds it and run-tests runs again before any push (a step re-entry, as upstream #374 requires). | STOP and drain. |
+ | 7 | The remote refused the push while the target stood still. | Continue to patrol-summary; if the marker was not written, STOP and drain. See below. |
+ | 8 | False completion halted: the bead is blocked and the mayor and witness were nudged. | STOP and drain. |
+ | 9 | Invalid `existing_pr` blocked: the bead is blocked and the mayor was mailed. | The block above pours the next wisp, assigns it, burns this one and drains. |
+@@ -1733,7 +1732,7 @@ What each status means, and what this step does about it:
+ 
+ With a batch (a manifest of 2+ members) the block ran `merge-batch.sh land`
+ instead, and its last output line is `merge-batch: RESULT <status> landed=<ids>
+-left-open=<ids>`. Its statuses 0, 1, 2, 3, 5, 6 and 7 mean what the table says and
++left-open=<ids>`. Its statuses 0, 1, 2, 5, 6 and 7 mean what the table says and
+ this step does what the table says; `land` never returns 9 or 11. `land`
+ records each member's task-artifact proof before its push, as the rebase step
+ does for the head, keeps every member's source branch, and runs each member's
+diff --git a/gastown/tests/test_refinery_merge_batch.sh b/gastown/tests/test_refinery_merge_batch.sh
+index 5e20fb13..fdedbcc4 100755
+--- a/gastown/tests/test_refinery_merge_batch.sh
++++ b/gastown/tests/test_refinery_merge_batch.sh
+@@ -36,7 +36,7 @@
+ # in. SCRIPT may point at another copy of merge-batch.sh; it finds merge-push.sh
+ # beside itself, so stage a copy as a pack tree.
+ #
+-# The suite fails unless all 22 cases ran.
++# The suite fails unless all 20 cases ran.
+ set -uo pipefail
+ 
+ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+@@ -44,7 +44,7 @@ PACK_DIR="$ROOT/gastown"
+ SCRIPT="${SCRIPT:-$PACK_DIR/assets/scripts/refinery/merge-batch.sh}"
+ PUSH_SCRIPT="$(dirname "$SCRIPT")/merge-push.sh"
+ CLEANUP_SCRIPT="$ROOT/gastown/assets/scripts/task-artifact-cleanup.sh"
+-EXPECTED_CASES=22
++EXPECTED_CASES=20
+ 
+ AGENT=testrig/gastown.refinery
+ TARGET_NAME=integration
+@@ -933,31 +933,26 @@ case_land_green() {
+     end_case
+ }
+ 
+-case_land_target_moved_once() {
+-    new_case land-target-moved-once
++case_land_target_moved_drains_for_reentry() {
++    new_case land-target-moved-drains-for-reentry
+     stack_three
+     move_target elsewhere.txt
+-    local i sha
++    local moved before
++    moved=$(origin_tip)
++    before=$(snapshot_beads_sans_proof)
+     run_batch land --head gcp-h1
+-    assert_eq "land exits 0 after one re-rebase" 0 "$(last_rc)"
+-    for i in 0 1 2; do
+-        sha=$(bead_meta "gcp-h$((i + 1))" merged_sha)
+-        assert_eq "member $((i + 1))'s merged_sha has its stacked patch-id" \
+-            "$(saved ".members[$i].patch_id")" "$(patch_id_of "$sha")"
+-        [ "$sha" != "$(saved ".members[$i].tip")" ] ||
+-            fail "member $((i + 1))'s merged_sha is its pre-move tip: the landed stack was not re-read"
+-        git -C "$REFINERY" merge-base --is-ancestor "$sha" origin/integration ||
+-            fail "member $((i + 1))'s merged_sha is not on origin/integration"
+-        assert_eq "member $((i + 1)) is closed" closed "$(bead_field "gcp-h$((i + 1))" status)"
+-        assert_member_cleaned "gcp-h$((i + 1))"
+-    done
+-    git -C "$REFINERY" cat-file -e "origin/integration:elsewhere.txt" 2>/dev/null ||
+-        fail "origin/integration lost the commit that moved in"
++    assert_eq "land exits 6 after a moved target" 6 "$(last_rc)"
++    assert_eq "the last stdout line is the RESULT line" "merge-batch: RESULT 6 landed= left-open=" "$(last_line)"
++    assert_eq "origin/integration" "$moved" "$(origin_tip)"
++    assert_only_proof_written "land status 6 after a moved target" "$before"
++    [ -f "$(manifest_path)" ] || fail "the manifest was not left in place"
++    assert_no_temp "land status 6 after a moved target"
++    grep -qF 'merge-ff-push: LOST RACE: ' "$T/out" || fail "land did not report the lost race"
+     end_case
+ }
+ 
+-case_land_retries_exhausted() {
+-    new_case land-retries-exhausted
++case_land_push_race_drains_for_reentry() {
++    new_case land-push-race-drains-for-reentry
+     stack_three
+     # One racing commit per push attempt, built BEFORE the hook is armed, each a
+     # fast-forward of the last. The hook moves integration to the next one and
+@@ -990,11 +985,11 @@ HOOK
+     before=$(snapshot_beads_sans_proof)
+ 
+     run_batch land --head gcp-h1
+-    assert_eq "land exits 6 when the target moved under every attempt" 6 "$(last_rc)"
++    assert_eq "land exits 6 when the target moved under the push" 6 "$(last_rc)"
+     assert_eq "the last stdout line is the RESULT line" "merge-batch: RESULT 6 landed= left-open=" "$(last_line)"
+     assert_only_proof_written "land status 6" "$before"
+-    [ "$(wc -l <"$T/push-attempts" | tr -d ' ')" -gt 1 ] ||
+-        fail "harness bug: the hook saw fewer than two pushes, so nothing raced"
++    assert_eq "push attempts" 1 "$(wc -l <"$T/push-attempts" | tr -d ' ')"
++    assert_eq "origin/integration" "$(sed -n 1p "$T/chain")" "$(origin_tip)"
+     assert_no_temp "land status 6"
+     end_case
+ }
+@@ -1066,60 +1061,6 @@ case_land_left_open_recovery() {
+     end_case
+ }
+ 
+-case_land_dropped_commit() {
+-    new_case land-dropped-commit
+-    stack_three
+-    # Member 3's patch reaches the target by another route, so land's re-rebase
+-    # drops member 3's commit and every offset behind the landed tip shifts.
+-    land_by_patch_id gcp-h3
+-    local before tip i sha
+-    before=$(snapshot_beads_sans_proof)
+-    tip=$(origin_tip)
+-
+-    run_batch land --head gcp-h1
+-    assert_eq "land exits 2 when the mapping refuses a member" 2 "$(last_rc)"
+-    [ "$(origin_tip)" != "$tip" ] || fail "origin/integration did not advance"
+-    for i in 0 1 2; do
+-        sha=$(bead_meta "gcp-h$((i + 1))" merged_sha)
+-        [ "$sha" = "<unset>" ] && continue
+-        assert_eq "gcp-h$((i + 1))'s merged_sha has its own stacked patch-id" \
+-            "$(saved ".members[$i].patch_id")" "$(patch_id_of "$sha")"
+-    done
+-    assert_only_proof_written "every member refused" "$before"
+-    assert_eq "the last stdout line names every refused member" \
+-        "merge-batch: RESULT 2 landed= left-open=gcp-h1,gcp-h2,gcp-h3" "$(last_line)"
+-    for i in 1 2 3; do
+-        [ -n "$(branch_on_origin "gcp-h$i")" ] || fail "origin/polecat/gcp-h$i was deleted though the member is open"
+-    done
+-    assert_no_temp "land status 2 with every member refused"
+-    end_case
+-}
+-
+-case_land_rerebase_conflict() {
+-    new_case land-rerebase-conflict
+-    stack_three
+-    # Another bead lands a different member 2 file: land's re-rebase onto the
+-    # moved target cannot apply member 2's commit.
+-    git_q -C "$SEED" pull origin integration
+-    echo "someone else's f2" >"$SEED/f2.txt"
+-    git_q -C "$SEED" add f2.txt
+-    git_q -C "$SEED" commit -m "feat: a concurrent bead writes f2.txt"
+-    git_q -C "$SEED" push origin HEAD:integration
+-    local before tip
+-    before=$(snapshot_beads_sans_proof)
+-    tip=$(origin_tip)
+-
+-    run_batch land --head gcp-h1
+-    assert_eq "land exits 3 when the re-rebase conflicts" 3 "$(last_rc)"
+-    assert_eq "the last stdout line is the RESULT line" "merge-batch: RESULT 3 landed= left-open=" "$(last_line)"
+-    assert_eq "origin/integration is unchanged" "$tip" "$(origin_tip)"
+-    assert_only_proof_written "land status 3" "$before"
+-    [ ! -d "$(git -C "$REFINERY" rev-parse --absolute-git-dir)/rebase-merge" ] ||
+-        fail "a rebase was left in flight"
+-    assert_no_temp "land status 3"
+-    end_case
+-}
+-
+ case_land_noop() {
+     new_case land-noop
+     stack_three
+@@ -1362,12 +1303,10 @@ case_stack_degrade
+ case_invariants
+ case_extraction
+ case_land_green
+-case_land_target_moved_once
+-case_land_retries_exhausted
++case_land_target_moved_drains_for_reentry
++case_land_push_race_drains_for_reentry
+ case_land_refused
+ case_land_left_open_recovery
+-case_land_dropped_commit
+-case_land_rerebase_conflict
+ case_land_noop
+ case_land_cleanup_blocked
+ case_land_guards
+diff --git a/gastown/tests/test_refinery_merge_lanes.sh b/gastown/tests/test_refinery_merge_lanes.sh
+index 6004347b..f4446cbf 100644
+--- a/gastown/tests/test_refinery_merge_lanes.sh
++++ b/gastown/tests/test_refinery_merge_lanes.sh
+@@ -756,9 +756,9 @@ test_lane_direct_false_completion_halts() {
+     end_case
+ }
+ 
+-test_lane_direct_lost_race_then_lands() {
+-    local racer racing merged
+-    new_case direct_lost_race_then_lands
++test_lane_direct_lost_race_drains_for_reentry() {
++    local racer racing
++    new_case direct_lost_race_drains_for_reentry
+     build_rig unmerged
+     write_bead
+     # A racing commit that fast-forwards the target, parked on another ref
+@@ -770,12 +770,15 @@ test_lane_direct_lost_race_then_lands() {
+     git_q -C "$racer" commit -m "chore: bump the deploy overlay"
+     git_q -C "$racer" push origin HEAD:refs/heads/racing
+     racing=$(git -C "$racer" rev-parse HEAD)
+-    # The first push is refused and the target advances under it; later
+-    # pushes go through. A receive hook runs inside git's object quarantine,
+-    # which forbids ref updates, so the advance steps outside it.
++    # The first push is refused and the target advances under it. That is a
++    # lost race: the lane makes no second attempt, it drains so the next patrol
++    # rebuilds temp and re-runs the tests. A receive hook runs inside git's
++    # object quarantine, which forbids ref updates, so the advance steps
++    # outside it.
+     cat >"$ORIGIN/hooks/pre-receive" <<HOOK
+ #!/bin/sh
+ unset GIT_QUARANTINE_PATH GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
++echo x >>"$T/push-attempts"
+ if [ ! -e "$T/raced" ]; then
+     : >"$T/raced"
+     git --git-dir="$ORIGIN" update-ref refs/heads/integration $racing
+@@ -787,17 +790,15 @@ HOOK
+     chmod +x "$ORIGIN/hooks/pre-receive"
+     run_lane
+     expect_lane direct
+-    expect_status 0
++    output_has 'merge-push: status 6\. STOP' || fail "the step did not stop on merge-push status 6"
++    expect_status 1
++    expect_drained
+     [ -e "$T/raced" ] || fail "harness bug: the race hook never fired"
+-    merged=$(meta merged_sha)
+-    expect "merge_result" "$(meta merge_result)" merged
+-    git --git-dir="$ORIGIN" merge-base --is-ancestor "$merged" refs/heads/integration 2>/dev/null ||
+-        fail "merged_sha $merged is not reachable from origin/integration"
+-    git --git-dir="$ORIGIN" merge-base --is-ancestor "$racing" refs/heads/integration 2>/dev/null ||
+-        fail "the racing commit $racing was clobbered"
+-    expect "origin/integration" "$(origin_tip)" "$merged"
+-    expect "status" "$(bead status)" closed
+-    expect "close reason" "$(bead close_reason)" "Merged to $TARGET_NAME at $(short_sha "$merged")"
++    expect "push attempts" "$(wc -l <"$T/push-attempts" | tr -d ' ')" 1
++    expect "origin/integration" "$(origin_tip)" "$racing"
++    expect_no_merge_metadata
++    expect_not_closed
++    output_has 'merge-ff-push: LOST RACE: ' || fail "the lane did not report the lost race"
+     end_case
+ }
+ 
+@@ -1302,7 +1303,7 @@ run_all_cases() {
+     test_lane_direct_already_merged_ancestor
+     test_lane_direct_already_merged_patch_id
+     test_lane_direct_false_completion_halts
+-    test_lane_direct_lost_race_then_lands
++    test_lane_direct_lost_race_drains_for_reentry
+     test_lane_direct_push_veto_status_7
+     test_lane_mr_creates_pr_via_gh
+     test_lane_mr_reuses_existing_pr
+diff --git a/gastown/tests/test_refinery_merge_push.sh b/gastown/tests/test_refinery_merge_push.sh
+index bad46f3e..cb74dccc 100755
+--- a/gastown/tests/test_refinery_merge_push.sh
++++ b/gastown/tests/test_refinery_merge_push.sh
+@@ -24,9 +24,16 @@
+ # The second known bad record (winnow-rp57: merged_sha named a different bead's
+ # commit while its own work landed elsewhere) shares one shape with the first —
+ # bookkeeping recording a target TIP rather than the commit that carried the
+-# bead. test_lost_race_rerebases_and_lands_this_branch pins the other half:
+-# after a lost race the reported sha must be this branch's tip, never the
+-# racing commit that moved the target.
++# bead. test_lost_race_stops_for_a_rebase_reentry pins the other half: after a
++# lost race nothing is reported as merged at all, so the racing commit that moved
++# the target can never be mistaken for this branch's tip.
++#
++# A lost race is a step re-entry, never an in-place re-rebase (gcp-xs3eq; upstream
++# #374): the lane stops with status 6 and leaves the target alone, and the next
++# patrol rebuilds temp and runs the tests again before any push. An in-place
++# re-rebase landed a tree run-tests never saw, which
++# test_lost_race_leaves_a_merge_topology_temp_unflattened pins for a temp that
++# carries a merge.
+ #
+ # A later defect (gcp-ileo, twin gascity-mfac) sat in the same block's rejection
+ # path: it ATTRIBUTED every push rejection to target movement without re-reading
+@@ -34,10 +41,11 @@
+ # three times, each retry relaunching the pre-push hook and re-queueing for a
+ # test-mac slot it could never win. The cause must be measured, not asserted, so
+ # the two rejection shapes are separated here — test_vetoed_push_stops_without_retrying
+-# (target stationary: one attempt, distinct status) and
+-# test_rejected_push_with_a_moving_target_still_retries (target really moving:
+-# keep retrying) — and test_push_carries_an_explicit_gate_wait_budget pins the
+-# budget that keeps the refinery queueing for a slot rather than refused one.
++# (target stationary: one attempt, status 7) and
++# test_rejected_push_with_a_moving_target_stops_for_a_rebase_reentry (target
++# really moving: one attempt, status 6, a step re-entry) — and
++# test_push_carries_an_explicit_gate_wait_budget pins the budget that keeps the
++# refinery queueing for a slot rather than refused one.
+ set -uo pipefail
+ 
+ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+@@ -151,60 +159,57 @@ test_clean_ff_lands_and_reports_the_branch_tip() {
+     rm -rf "$tmp"
+ }
+ 
+-test_lost_race_rerebases_and_lands_this_branch() {
++test_lost_race_stops_for_a_rebase_reentry() {
+     # The reported case: origin/dev moved between the rebase and the merge, so
+-    # the ff-merge fails. The lane must re-rebase and land, and the sha it
+-    # reports must be THIS branch's commit — not the racing commit that moved
+-    # the target, which is the mislabel winnow-rp57 recorded.
+-    local tmp got racing after merged
++    # the ff-merge fails. A lost race is a step re-entry, never an in-place
++    # re-rebase: the lane lands nothing, leaves temp as the tests saw it, and
++    # stops with 6 so the next patrol rebuilds temp and runs the tests again.
++    local tmp got racing temp_before
+     tmp=$(mktemp -d)
+     make_rig "$tmp"
++    temp_before=$(git -C "$WORK" rev-parse temp)
+     racing=$(race_the_target "$tmp")
+ 
+-    got=$(run_merge 2>/dev/null)
+-    after=$(origin_tip)
+-    merged=$(merged_of "$got")
++    got=$(run_merge 2>"$tmp/merge.err")
+ 
+-    [ "$(status_of "$got")" = "0" ] ||
+-        fail "lost race returned $(status_of "$got"), want 0 (re-rebase and retry, never fall through)"
+-    [ "$merged" != "$racing" ] ||
+-        fail "lost race reported the racing commit $racing as merged_sha — a target tip, not this bead's commit"
+-    [ "$merged" = "$(temp_of "$got")" ] ||
+-        fail "lost race reported merged_sha $merged, want the post-rebase branch tip $(temp_of "$got")"
+-    [ "$after" = "$merged" ] ||
+-        fail "lost race left origin/dev at $after, want the merged sha $merged"
+-    git --git-dir="$ORIGIN" merge-base --is-ancestor "$racing" "$after" ||
+-        fail "lost race clobbered the racing commit $racing instead of rebasing onto it"
++    [ "$(status_of "$got")" = "6" ] ||
++        fail "lost race returned $(status_of "$got"), want 6 (a lost race is a step re-entry, never an in-place re-rebase)"
++    [ "$(origin_tip)" = "$racing" ] ||
++        fail "lost race left origin/dev at $(origin_tip), want the racing commit $racing untouched"
++    [ "$(git -C "$WORK" rev-parse temp)" = "$temp_before" ] ||
++        fail "lost race moved temp from $temp_before to $(git -C "$WORK" rev-parse temp) — temp must stay the tree the tests ran on"
++    grep -qF 'merge-ff-push: LOST RACE: origin/dev moved after the tests ran; nothing landed.' "$tmp/merge.err" ||
++        fail "lost race did not report itself: $(tr '\n' ' ' <"$tmp/merge.err")"
+     rm -rf "$tmp"
+ }
+ 
+-test_failed_ff_with_conflicting_rebase_pushes_nothing() {
+-    # The winnow-ksyp shape with no mechanical way out: the ff-merge fails and
+-    # the re-rebase conflicts. The old lane reported merged here. Nothing may be
+-    # pushed and the status must be non-zero.
+-    local tmp got before after
++test_lost_race_leaves_a_merge_topology_temp_unflattened() {
++    # The demo (ana/rc/demo-retry-flatten.sh) shape: a temp that carries a merge,
++    # which the skip-rebase arm leaves as it is. The old in-place re-rebase
++    # flattened it and landed a tree run-tests never saw. Now the lost race must
++    # leave the merge exactly as built.
++    local tmp got racing temp_before
+     tmp=$(mktemp -d)
+     make_rig "$tmp"
+-    # The racer touches the same file the branch does, so the re-rebase cannot
+-    # apply mechanically.
+-    echo conflicting >"$WORK/feature.txt"
+-    git_q -C "$WORK" add feature.txt
+-    git_q -C "$WORK" commit --amend -m "feat: the work this bead carried"
+-    local racer="$tmp/racer"
+-    git_q clone "$ORIGIN" "$racer"
+-    echo "other side" >"$racer/feature.txt"
+-    git_q -C "$racer" add feature.txt
+-    git_q -C "$racer" commit -m "feat: someone else touched the same file"
+-    git_q -C "$racer" push origin dev
+-    before=$(origin_tip)
++    git_q -C "$WORK" checkout -b side dev
++    echo side >"$WORK/side.txt"
++    git_q -C "$WORK" add side.txt
++    git_q -C "$WORK" commit -m "feat: the side line"
++    git_q -C "$WORK" checkout temp
++    git_q -C "$WORK" merge --no-ff side -m "merge: join the side line"
++    [ "$(git -C "$WORK" rev-list --merges --count dev..temp)" = "1" ] ||
++        fail "harness bug: temp should carry exactly one merge over dev"
++    temp_before=$(git -C "$WORK" rev-parse temp)
++    racing=$(race_the_target "$tmp")
+ 
+     got=$(run_merge 2>/dev/null)
+-    after=$(origin_tip)
+ 
+-    [ "$(status_of "$got")" = "3" ] ||
+-        fail "conflicting re-rebase returned $(status_of "$got"), want 3"
+-    [ "$after" = "$before" ] ||
+-        fail "conflicting re-rebase moved origin/dev from $before to $after — nothing may be pushed"
++    [ "$(status_of "$got")" = "6" ] ||
++        fail "lost race on a merge-topology temp returned $(status_of "$got"), want 6"
++    [ "$(origin_tip)" = "$racing" ] ||
++        fail "lost race on a merge-topology temp left origin/dev at $(origin_tip), want the racing commit $racing"
++    [ "$(git -C "$WORK" rev-parse temp)" = "$temp_before" ] ||
++        fail "lost race on a merge-topology temp rewrote temp from $temp_before to $(git -C "$WORK" rev-parse temp)"
+     rm -rf "$tmp"
+ }
+ 
+@@ -316,14 +321,16 @@ HOOK
+     rm -rf "$tmp"
+ }
+ 
+-test_rejected_push_with_a_moving_target_still_retries() {
++test_rejected_push_with_a_moving_target_stops_for_a_rebase_reentry() {
+     # The other half of the same measurement: the push is rejected AND the
+-    # target really does advance each time. That is the racing-pusher case the
+-    # retry bound exists for, so the lane must keep retrying and must exhaust
+-    # into status 6 — which now means what it says.
+-    local tmp got attempts n
++    # target really does advance. That is a lost race, so the lane makes ONE
++    # attempt and stops with 6 (a step re-entry); the next patrol rebuilds temp
++    # and re-runs the tests. Re-rebasing in place and pushing again would land a
++    # tree run-tests never saw.
++    local tmp got attempts n temp_before
+     tmp=$(mktemp -d)
+     make_rig "$tmp"
++    temp_before=$(git -C "$WORK" rev-parse temp)
+     # Build the racing chain BEFORE the hook is armed, so pushing it does not
+     # trip the hook. Every commit is a fast-forward of dev, so each update-ref
+     # below is the advance a real racing pusher would produce.
+@@ -341,7 +348,7 @@ test_rejected_push_with_a_moving_target_still_retries() {
+     git_q -C "$racer" push origin HEAD:refs/heads/racing
+ 
+     # Reject the incoming push, but move dev on the way out: the rejection now
+-    # has a measurable cause, and re-rebasing is the way through it. A receive
++    # has a measurable cause, and the lost race is the way through it. A receive
+     # hook runs inside git's object quarantine, which forbids ref updates, so
+     # the racing advance has to step outside it.
+     cat >"$ORIGIN/hooks/pre-receive" <<HOOK
+@@ -363,13 +370,13 @@ HOOK
+     attempts=$(wc -l <"$tmp/push-attempts" | tr -d ' ')
+ 
+     [ "$(status_of "$got")" = "6" ] ||
+-        fail "a rejected push against a target that kept moving returned $(status_of "$got"), want 6 (retries exhausted)"
+-    [ "$attempts" -gt 1 ] ||
+-        fail "a measurably racing target was pushed $attempts time(s), want more than 1 — the retry bound exists for this case"
+-    # The hook advances dev to chain entry n on push n, so the tip pins how many
+-    # advances the lane actually saw — not just that something moved.
+-    [ "$(origin_tip)" = "$(sed -n "${attempts}p" "$tmp/chain")" ] ||
+-        fail "harness bug: after $attempts rejected push(es) dev should sit at racing commit #$attempts, found $(origin_tip)"
++        fail "a rejected push against a target that moved returned $(status_of "$got"), want 6 (lost race)"
++    [ "$attempts" = "1" ] ||
++        fail "a rejected push against a moving target was pushed $attempts time(s), want 1 — a lost race is a step re-entry, not a retry"
++    [ "$(origin_tip)" = "$(sed -n 1p "$tmp/chain")" ] ||
++        fail "harness bug: after one rejected push dev should sit at racing commit #1, found $(origin_tip)"
++    [ "$(git -C "$WORK" rev-parse temp)" = "$temp_before" ] ||
++        fail "a lost race moved temp from $temp_before to $(git -C "$WORK" rev-parse temp)"
+     rm -rf "$tmp"
+ }
+ 
+@@ -635,28 +642,7 @@ test_script_status_2_after_a_landing_it_could_not_record_drops_temp() {
+     rm -rf "$tmp"
+ }
+ 
+-test_script_status_3_conflicting_rerebase_drops_temp() {
+-    # test_failed_ff_with_conflicting_rebase_pushes_nothing's rig.
+-    local tmp racer
+-    tmp=$(mktemp -d)
+-    make_rig "$tmp"
+-    echo conflicting >"$WORK/feature.txt"
+-    git_q -C "$WORK" add feature.txt
+-    git_q -C "$WORK" commit --amend -m "feat: the work this bead carried"
+-    racer="$tmp/racer"
+-    git_q clone "$ORIGIN" "$racer"
+-    echo "other side" >"$racer/feature.txt"
+-    git_q -C "$racer" add feature.txt
+-    git_q -C "$racer" commit -m "feat: someone else touched the same file"
+-    git_q -C "$racer" push origin dev
+-    finish_script_rig "$tmp"
+-    expect_stop_drops_temp "$tmp" "a re-rebase that conflicted" 3 "$(run_script "$tmp")"
+-    [ ! -d "$WORK/.git/rebase-merge" ] && [ ! -d "$WORK/.git/rebase-apply" ] ||
+-        fail "a re-rebase was left in flight"
+-    rm -rf "$tmp"
+-}
+-
+-test_script_status_6_retries_exhausted_drops_temp() {
++test_script_status_6_lost_race_drops_temp() {
+     local tmp racer n
+     tmp=$(mktemp -d)
+     script_rig "$tmp"
+@@ -684,7 +670,11 @@ echo "push refused by the test (race \$n)" >&2
+ exit 1
+ HOOK
+     chmod +x "$ORIGIN/hooks/pre-receive"
+-    expect_stop_drops_temp "$tmp" "a target that moved under every attempt" 6 "$(run_script "$tmp")"
++    expect_stop_drops_temp "$tmp" "a lost race" 6 "$(run_script "$tmp")"
++    [ "$(wc -l <"$tmp/push-attempts" | tr -d ' ')" = "1" ] ||
++        fail "a lost race pushed $(wc -l <"$tmp/push-attempts" | tr -d ' ') times, want 1"
++    grep -q '^merge-push: RESULT 6 gcp-mp: lost the race' "$tmp/script.out" ||
++        fail "a lost race did not print the status 6 RESULT line: $(tail -n 1 "$tmp/script.out")"
+     rm -rf "$tmp"
+ }
+ 
+@@ -745,21 +735,20 @@ export BLOCK
+ 
+ test_block_does_not_rely_on_set_e
+ test_clean_ff_lands_and_reports_the_branch_tip
+-test_lost_race_rerebases_and_lands_this_branch
+-test_failed_ff_with_conflicting_rebase_pushes_nothing
++test_lost_race_stops_for_a_rebase_reentry
++test_lost_race_leaves_a_merge_topology_temp_unflattened
+ test_push_that_does_not_advance_the_target_is_refused
+ test_target_advanced_by_someone_else_is_refused
+ test_noop_ff_does_not_report_a_merge
+ test_vetoed_push_stops_without_retrying
+-test_rejected_push_with_a_moving_target_still_retries
++test_rejected_push_with_a_moving_target_stops_for_a_rebase_reentry
+ test_push_carries_an_explicit_gate_wait_budget
+ test_cleanup_removes_emptied_parent
+ test_cleanup_leaks_parent_loudly_when_worktree_remove_fails
+ test_script_landing_drops_temp
+ test_script_status_2_after_a_push_that_did_not_advance_drops_temp
+ test_script_status_2_after_a_landing_it_could_not_record_drops_temp
+-test_script_status_3_conflicting_rerebase_drops_temp
+-test_script_status_6_retries_exhausted_drops_temp
++test_script_status_6_lost_race_drops_temp
+ test_script_status_7_refused_push_drops_temp
+ test_script_status_8_false_completion_drops_temp
+ test_script_status_1_usage_error_touches_nothing
+-- 
+2.54.0 (Apple Git-157)
+

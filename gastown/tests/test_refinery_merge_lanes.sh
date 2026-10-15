@@ -756,9 +756,9 @@ test_lane_direct_false_completion_halts() {
     end_case
 }
 
-test_lane_direct_lost_race_then_lands() {
-    local racer racing merged
-    new_case direct_lost_race_then_lands
+test_lane_direct_lost_race_drains_for_reentry() {
+    local racer racing
+    new_case direct_lost_race_drains_for_reentry
     build_rig unmerged
     write_bead
     # A racing commit that fast-forwards the target, parked on another ref
@@ -770,12 +770,15 @@ test_lane_direct_lost_race_then_lands() {
     git_q -C "$racer" commit -m "chore: bump the deploy overlay"
     git_q -C "$racer" push origin HEAD:refs/heads/racing
     racing=$(git -C "$racer" rev-parse HEAD)
-    # The first push is refused and the target advances under it; later
-    # pushes go through. A receive hook runs inside git's object quarantine,
-    # which forbids ref updates, so the advance steps outside it.
+    # The first push is refused and the target advances under it. That is a
+    # lost race: the lane makes no second attempt, it drains so the next patrol
+    # rebuilds temp and re-runs the tests. A receive hook runs inside git's
+    # object quarantine, which forbids ref updates, so the advance steps
+    # outside it.
     cat >"$ORIGIN/hooks/pre-receive" <<HOOK
 #!/bin/sh
 unset GIT_QUARANTINE_PATH GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+echo x >>"$T/push-attempts"
 if [ ! -e "$T/raced" ]; then
     : >"$T/raced"
     git --git-dir="$ORIGIN" update-ref refs/heads/integration $racing
@@ -787,17 +790,15 @@ HOOK
     chmod +x "$ORIGIN/hooks/pre-receive"
     run_lane
     expect_lane direct
-    expect_status 0
+    output_has 'merge-push: status 6\. STOP' || fail "the step did not stop on merge-push status 6"
+    expect_status 1
+    expect_drained
     [ -e "$T/raced" ] || fail "harness bug: the race hook never fired"
-    merged=$(meta merged_sha)
-    expect "merge_result" "$(meta merge_result)" merged
-    git --git-dir="$ORIGIN" merge-base --is-ancestor "$merged" refs/heads/integration 2>/dev/null ||
-        fail "merged_sha $merged is not reachable from origin/integration"
-    git --git-dir="$ORIGIN" merge-base --is-ancestor "$racing" refs/heads/integration 2>/dev/null ||
-        fail "the racing commit $racing was clobbered"
-    expect "origin/integration" "$(origin_tip)" "$merged"
-    expect "status" "$(bead status)" closed
-    expect "close reason" "$(bead close_reason)" "Merged to $TARGET_NAME at $(short_sha "$merged")"
+    expect "push attempts" "$(wc -l <"$T/push-attempts" | tr -d ' ')" 1
+    expect "origin/integration" "$(origin_tip)" "$racing"
+    expect_no_merge_metadata
+    expect_not_closed
+    output_has 'merge-ff-push: LOST RACE: ' || fail "the lane did not report the lost race"
     end_case
 }
 
@@ -1302,7 +1303,7 @@ run_all_cases() {
     test_lane_direct_already_merged_ancestor
     test_lane_direct_already_merged_patch_id
     test_lane_direct_false_completion_halts
-    test_lane_direct_lost_race_then_lands
+    test_lane_direct_lost_race_drains_for_reentry
     test_lane_direct_push_veto_status_7
     test_lane_mr_creates_pr_via_gh
     test_lane_mr_reuses_existing_pr

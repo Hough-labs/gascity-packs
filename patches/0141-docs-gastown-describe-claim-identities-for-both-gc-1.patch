@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sat, 10 Oct 2026 16:49:52 -0400
-Subject: [PATCH 141/167] docs(gastown): describe claim identities for both gc
+Subject: [PATCH 141/168] docs(gastown): describe claim identities for both gc
  1.4.x and 1.5.0 (gcp-fooz4)
 
 P5 follow-up, prose only. Several passages described claim identities as gc

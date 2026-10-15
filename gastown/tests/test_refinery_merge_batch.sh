@@ -36,7 +36,7 @@
 # in. SCRIPT may point at another copy of merge-batch.sh; it finds merge-push.sh
 # beside itself, so stage a copy as a pack tree.
 #
-# The suite fails unless all 22 cases ran.
+# The suite fails unless all 20 cases ran.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -44,7 +44,7 @@ PACK_DIR="$ROOT/gastown"
 SCRIPT="${SCRIPT:-$PACK_DIR/assets/scripts/refinery/merge-batch.sh}"
 PUSH_SCRIPT="$(dirname "$SCRIPT")/merge-push.sh"
 CLEANUP_SCRIPT="$ROOT/gastown/assets/scripts/task-artifact-cleanup.sh"
-EXPECTED_CASES=22
+EXPECTED_CASES=20
 
 AGENT=testrig/gastown.refinery
 TARGET_NAME=integration
@@ -933,31 +933,26 @@ case_land_green() {
     end_case
 }
 
-case_land_target_moved_once() {
-    new_case land-target-moved-once
+case_land_target_moved_drains_for_reentry() {
+    new_case land-target-moved-drains-for-reentry
     stack_three
     move_target elsewhere.txt
-    local i sha
+    local moved before
+    moved=$(origin_tip)
+    before=$(snapshot_beads_sans_proof)
     run_batch land --head gcp-h1
-    assert_eq "land exits 0 after one re-rebase" 0 "$(last_rc)"
-    for i in 0 1 2; do
-        sha=$(bead_meta "gcp-h$((i + 1))" merged_sha)
-        assert_eq "member $((i + 1))'s merged_sha has its stacked patch-id" \
-            "$(saved ".members[$i].patch_id")" "$(patch_id_of "$sha")"
-        [ "$sha" != "$(saved ".members[$i].tip")" ] ||
-            fail "member $((i + 1))'s merged_sha is its pre-move tip: the landed stack was not re-read"
-        git -C "$REFINERY" merge-base --is-ancestor "$sha" origin/integration ||
-            fail "member $((i + 1))'s merged_sha is not on origin/integration"
-        assert_eq "member $((i + 1)) is closed" closed "$(bead_field "gcp-h$((i + 1))" status)"
-        assert_member_cleaned "gcp-h$((i + 1))"
-    done
-    git -C "$REFINERY" cat-file -e "origin/integration:elsewhere.txt" 2>/dev/null ||
-        fail "origin/integration lost the commit that moved in"
+    assert_eq "land exits 6 after a moved target" 6 "$(last_rc)"
+    assert_eq "the last stdout line is the RESULT line" "merge-batch: RESULT 6 landed= left-open=" "$(last_line)"
+    assert_eq "origin/integration" "$moved" "$(origin_tip)"
+    assert_only_proof_written "land status 6 after a moved target" "$before"
+    [ -f "$(manifest_path)" ] || fail "the manifest was not left in place"
+    assert_no_temp "land status 6 after a moved target"
+    grep -qF 'merge-ff-push: LOST RACE: ' "$T/out" || fail "land did not report the lost race"
     end_case
 }
 
-case_land_retries_exhausted() {
-    new_case land-retries-exhausted
+case_land_push_race_drains_for_reentry() {
+    new_case land-push-race-drains-for-reentry
     stack_three
     # One racing commit per push attempt, built BEFORE the hook is armed, each a
     # fast-forward of the last. The hook moves integration to the next one and
@@ -990,11 +985,11 @@ HOOK
     before=$(snapshot_beads_sans_proof)
 
     run_batch land --head gcp-h1
-    assert_eq "land exits 6 when the target moved under every attempt" 6 "$(last_rc)"
+    assert_eq "land exits 6 when the target moved under the push" 6 "$(last_rc)"
     assert_eq "the last stdout line is the RESULT line" "merge-batch: RESULT 6 landed= left-open=" "$(last_line)"
     assert_only_proof_written "land status 6" "$before"
-    [ "$(wc -l <"$T/push-attempts" | tr -d ' ')" -gt 1 ] ||
-        fail "harness bug: the hook saw fewer than two pushes, so nothing raced"
+    assert_eq "push attempts" 1 "$(wc -l <"$T/push-attempts" | tr -d ' ')"
+    assert_eq "origin/integration" "$(sed -n 1p "$T/chain")" "$(origin_tip)"
     assert_no_temp "land status 6"
     end_case
 }
@@ -1063,60 +1058,6 @@ case_land_left_open_recovery() {
         "$(saved '.members[1].patch_id')" "$(patch_id_of "$(bead_meta gcp-h2 merged_sha)")"
     # The proof land recorded is what the single-bead lane's cleanup proves against.
     assert_member_cleaned gcp-h2
-    end_case
-}
-
-case_land_dropped_commit() {
-    new_case land-dropped-commit
-    stack_three
-    # Member 3's patch reaches the target by another route, so land's re-rebase
-    # drops member 3's commit and every offset behind the landed tip shifts.
-    land_by_patch_id gcp-h3
-    local before tip i sha
-    before=$(snapshot_beads_sans_proof)
-    tip=$(origin_tip)
-
-    run_batch land --head gcp-h1
-    assert_eq "land exits 2 when the mapping refuses a member" 2 "$(last_rc)"
-    [ "$(origin_tip)" != "$tip" ] || fail "origin/integration did not advance"
-    for i in 0 1 2; do
-        sha=$(bead_meta "gcp-h$((i + 1))" merged_sha)
-        [ "$sha" = "<unset>" ] && continue
-        assert_eq "gcp-h$((i + 1))'s merged_sha has its own stacked patch-id" \
-            "$(saved ".members[$i].patch_id")" "$(patch_id_of "$sha")"
-    done
-    assert_only_proof_written "every member refused" "$before"
-    assert_eq "the last stdout line names every refused member" \
-        "merge-batch: RESULT 2 landed= left-open=gcp-h1,gcp-h2,gcp-h3" "$(last_line)"
-    for i in 1 2 3; do
-        [ -n "$(branch_on_origin "gcp-h$i")" ] || fail "origin/polecat/gcp-h$i was deleted though the member is open"
-    done
-    assert_no_temp "land status 2 with every member refused"
-    end_case
-}
-
-case_land_rerebase_conflict() {
-    new_case land-rerebase-conflict
-    stack_three
-    # Another bead lands a different member 2 file: land's re-rebase onto the
-    # moved target cannot apply member 2's commit.
-    git_q -C "$SEED" pull origin integration
-    echo "someone else's f2" >"$SEED/f2.txt"
-    git_q -C "$SEED" add f2.txt
-    git_q -C "$SEED" commit -m "feat: a concurrent bead writes f2.txt"
-    git_q -C "$SEED" push origin HEAD:integration
-    local before tip
-    before=$(snapshot_beads_sans_proof)
-    tip=$(origin_tip)
-
-    run_batch land --head gcp-h1
-    assert_eq "land exits 3 when the re-rebase conflicts" 3 "$(last_rc)"
-    assert_eq "the last stdout line is the RESULT line" "merge-batch: RESULT 3 landed= left-open=" "$(last_line)"
-    assert_eq "origin/integration is unchanged" "$tip" "$(origin_tip)"
-    assert_only_proof_written "land status 3" "$before"
-    [ ! -d "$(git -C "$REFINERY" rev-parse --absolute-git-dir)/rebase-merge" ] ||
-        fail "a rebase was left in flight"
-    assert_no_temp "land status 3"
     end_case
 }
 
@@ -1362,12 +1303,10 @@ case_stack_degrade
 case_invariants
 case_extraction
 case_land_green
-case_land_target_moved_once
-case_land_retries_exhausted
+case_land_target_moved_drains_for_reentry
+case_land_push_race_drains_for_reentry
 case_land_refused
 case_land_left_open_recovery
-case_land_dropped_commit
-case_land_rerebase_conflict
 case_land_noop
 case_land_cleanup_blocked
 case_land_guards

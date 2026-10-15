@@ -64,9 +64,8 @@
 #       merge-state gate closes it as already merged), and in mr when
 #       --force-with-lease failed (temp is dropped; the next patrol's rebase step
 #       re-runs its ancestry decision on the moved branch).
-#    3  the re-rebase onto the moved target conflicted
 #    5  the ff-merge was a no-op; nothing landed
-#    6  retries exhausted; the target moved under every attempt
+#    6  lost the race: the target moved after the tests ran; nothing landed, temp dropped; the next patrol rebuilds and re-tests it
 #    7  the remote refused the push while the target stood still; the line
 #       `merge-ff-push: REFUSED target=<T> sha=<S>` names the target and the
 #       tip it stood at, and lane-wedge.sh mark reads it to park the lane
@@ -215,9 +214,8 @@ result_summary() {
     0) echo "work bead closed" ;;
     1) echo "usage or config error; nothing touched" ;;
     2) echo "hard stop; do not mutate bead state" ;;
-    3) echo "re-rebase onto the moved target conflicted" ;;
     5) echo "ff-merge was a no-op; nothing landed" ;;
-    6) echo "retries exhausted; the target moved under every attempt" ;;
+    6) echo "lost the race; the target moved after the tests ran; nothing landed" ;;
     7) echo "push refused while the target stood still" ;;
     8) echo "false completion halted; mayor and witness nudged" ;;
     9) echo "invalid existing_pr blocked; mayor mailed" ;;
@@ -497,13 +495,14 @@ lookup_pr_info() {
 # Land `temp` on $TARGET and prove it landed. Reads BRANCH, TARGET; sets
 # TEMP_SHA, MERGED_SHA, MERGED_SHORT on success.
 #
+# ONE attempt: a lost race is a step re-entry, never an in-place re-rebase (gcp-xs3eq; upstream #374).
 # Exit status:
 #   0 = landed and verified (MERGED_SHA is $TEMP_SHA, reachable on the target)
 #   2 = hard stop; do not mutate bead state
-#   3 = the re-rebase onto the new tip conflicted
 #   5 = no-op: origin/$TARGET already contains temp; nothing to land here
-#   6 = retries exhausted while losing the race (measured: the target moved
-#       under every attempt)
+#   6 = lost the race: the target moved after the tests ran; nothing landed.
+#       temp is dropped and the next patrol's rebase step rebuilds it, so
+#       run-tests runs again before any push
 #   7 = the remote REFUSED the push while $TARGET stood still — a push-gate
 #       veto, a receive hook, or permissions. Not a race; retrying cannot help.
 #       Prints `merge-ff-push: REFUSED target=$TARGET sha=$BEFORE_SHA` just
@@ -519,11 +518,13 @@ merge_ff_push_cleanup_wt() {
   mfp_parent=""
 }
 
+merge_ff_push_lost_race() {
+  echo "merge-ff-push: LOST RACE: origin/$TARGET moved after the tests ran; nothing landed. STOP. Do not mutate bead state. temp is not re-rebased in place: the lane drops it, the next patrol's rebase step rebuilds it from origin/$BRANCH, and run-tests runs again before any push."
+}
+
 merge_ff_push() {
   mfp_wt=""
   mfp_parent=""
-  mfp_max=3
-  mfp_attempt=0
   # Wait budget for the merge push, and for nothing else in this patrol. The
   # rig's pre-push gate (scripts/gate-slot-run) reads PUSH_GATE_MAX_WAIT_SECONDS
   # and defaults it to 0 — a NON-BLOCKING slot acquire that vetoes the push
@@ -536,142 +537,116 @@ merge_ff_push() {
   # what to look at, not the refusal status below.
   mfp_push_wait="${REFINERY_PUSH_GATE_MAX_WAIT_SECONDS:-3000}"
 
-  while [ "$mfp_attempt" -lt "$mfp_max" ]; do
-    mfp_attempt=$((mfp_attempt + 1))
+  if ! git fetch origin "+refs/heads/${TARGET}:refs/remotes/origin/${TARGET}"; then
+    echo "merge-ff-push: fetch of $TARGET failed; cannot establish the pre-merge tip."
+    return 2
+  fi
+  # BEFORE_SHA is resolved once and then used as the worktree base, so the
+  # advance check below compares against the commit the merge was really
+  # performed on rather than re-reading a ref that may have moved since.
+  if ! BEFORE_SHA=$(git rev-parse "origin/$TARGET"); then
+    echo "merge-ff-push: could not resolve origin/$TARGET."
+    return 2
+  fi
+  if ! TEMP_SHA=$(git rev-parse temp); then
+    echo "merge-ff-push: could not resolve the rebased temp branch."
+    return 2
+  fi
 
-    if ! git fetch origin "+refs/heads/${TARGET}:refs/remotes/origin/${TARGET}"; then
-      echo "merge-ff-push: fetch of $TARGET failed on attempt $mfp_attempt; cannot establish the pre-merge tip."
-      return 2
-    fi
-    # BEFORE_SHA is resolved once and then used as the worktree base, so the
-    # advance check below compares against the commit the merge was really
-    # performed on rather than re-reading a ref that may have moved since.
-    if ! BEFORE_SHA=$(git rev-parse "origin/$TARGET"); then
-      echo "merge-ff-push: could not resolve origin/$TARGET."
-      return 2
-    fi
-    if ! TEMP_SHA=$(git rev-parse temp); then
-      echo "merge-ff-push: could not resolve the rebased temp branch."
-      return 2
-    fi
-
-    if ! mfp_parent=$(mktemp -d "${TMPDIR:-/tmp}/gascity-refinery-merge.XXXXXX"); then
-      echo "merge-ff-push: could not create a scratch directory for the merge worktree."
-      return 2
-    fi
-    mfp_wt="$mfp_parent/target"
-    if ! git worktree add --detach "$mfp_wt" "$BEFORE_SHA" >/dev/null 2>&1; then
-      echo "merge-ff-push: could not create the merge worktree at $BEFORE_SHA."
-      merge_ff_push_cleanup_wt
-      return 2
-    fi
-
-    # Explicit status check. Do NOT reintroduce a `set -e` dependency here:
-    # this is the branch that reported a false merge when set -e did not
-    # propagate through the execution harness.
-    git -C "$mfp_wt" merge --ff-only "$TEMP_SHA"
-    mfp_merge_status=$?
-    if [ "$mfp_merge_status" -ne 0 ]; then
-      merge_ff_push_cleanup_wt
-      echo "merge-ff-push: ff-merge of $TEMP_SHA onto $BEFORE_SHA failed (status $mfp_merge_status) — origin/$TARGET moved under this patrol."
-      if [ "$mfp_attempt" -ge "$mfp_max" ]; then
-        break
-      fi
-      if ! git checkout temp >/dev/null 2>&1; then
-        echo "merge-ff-push: could not check out temp to re-rebase it."
-        return 2
-      fi
-      if ! git rebase "$BEFORE_SHA"; then
-        git rebase --abort >/dev/null 2>&1 || true
-        echo "merge-ff-push: re-rebase of temp onto $BEFORE_SHA conflicted; aborted. Nothing landed. STOP: the lane drops temp on its way out, so the next patrol rebuilds it from origin/$BRANCH in the rebase step and runs the tests again; if the conflict stands, the rebase step's conflict path rejects the branch back to the pool."
-        return 3
-      fi
-      echo "merge-ff-push: re-rebased temp onto $BEFORE_SHA; retrying (attempt $mfp_attempt of $mfp_max used)."
-      continue
-    fi
-
-    MERGED_SHA=$(git -C "$mfp_wt" rev-parse HEAD)
-    MERGED_SHORT=$(git -C "$mfp_wt" rev-parse --short HEAD)
-
-    # An "Already up to date" ff-merge leaves HEAD at the target tip. Reporting
-    # that as merged is precisely the target-tip-for-branch-tip mislabel; the
-    # already-merged gate resolves this case from origin/$BRANCH instead.
-    if [ "$MERGED_SHA" = "$BEFORE_SHA" ]; then
-      merge_ff_push_cleanup_wt
-      echo "merge-ff-push: ff-merge was a no-op — origin/$TARGET ($BEFORE_SHA) already contains temp. Nothing to land; not recording a merge."
-      return 5
-    fi
-    # ff-only either fast-forwards HEAD to TEMP_SHA or leaves it alone, so this
-    # cannot fire. Asserted anyway: it is the invariant that keeps merged_sha
-    # the commit that carried the bead.
-    if [ "$MERGED_SHA" != "$TEMP_SHA" ]; then
-      merge_ff_push_cleanup_wt
-      echo "merge-ff-push: ff-merge left HEAD at $MERGED_SHA, not the branch tip $TEMP_SHA. Refusing to record a merge."
-      return 2
-    fi
-
-    PUSH_GATE_MAX_WAIT_SECONDS="$mfp_push_wait" git -C "$mfp_wt" push origin "HEAD:$TARGET"
-    mfp_push_status=$?
+  if ! mfp_parent=$(mktemp -d "${TMPDIR:-/tmp}/gascity-refinery-merge.XXXXXX"); then
+    echo "merge-ff-push: could not create a scratch directory for the merge worktree."
+    return 2
+  fi
+  mfp_wt="$mfp_parent/target"
+  if ! git worktree add --detach "$mfp_wt" "$BEFORE_SHA" >/dev/null 2>&1; then
+    echo "merge-ff-push: could not create the merge worktree at $BEFORE_SHA."
     merge_ff_push_cleanup_wt
-    if [ "$mfp_push_status" -ne 0 ]; then
-      # MEASURE the cause; do not assert it. A rejection is either "the target
-      # advanced under us" — retryable, re-rebase and go again — or "the remote
-      # refused this push" (gate veto, receive hook, permissions), which no
-      # number of retries can fix and which every retry pays for in gate load:
-      # each attempt relaunches the pre-push hook and queues for another slot.
-      # The verification below already draws exactly this comparison against the
-      # freshly fetched tip; the rejection path never learned it, so every veto
-      # was reported as movement and then retried three times (gcp-ileo).
-      if ! git fetch origin "+refs/heads/${TARGET}:refs/remotes/origin/${TARGET}"; then
-        echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status) and the follow-up fetch failed, so the cause cannot be measured. STOP. Do not mutate bead state."
-        return 2
-      fi
-      if ! mfp_reject_sha=$(git rev-parse "origin/$TARGET"); then
-        echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status) and origin/$TARGET could not be resolved, so the cause cannot be measured. STOP. Do not mutate bead state."
-        return 2
-      fi
-      if [ "$mfp_reject_sha" = "$BEFORE_SHA" ]; then
-        echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status) and origin/$TARGET is STILL $BEFORE_SHA — the target did not move, so the remote refused this push (push-gate veto, receive hook, or permissions). This is not a race; retrying re-runs the pre-push gate and cannot succeed. STOP. Do not mutate bead state."
-        echo "merge-ff-push: REFUSED target=$TARGET sha=$BEFORE_SHA"
-        return 7
-      fi
-      echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status); origin/$TARGET moved $BEFORE_SHA -> $mfp_reject_sha, so the target really did advance between the fetch and the push."
-      if [ "$mfp_attempt" -ge "$mfp_max" ]; then
-        break
-      fi
-      continue
-    fi
+    return 2
+  fi
 
-    # Re-fetch and verify against the FRESH tip. The pre-push snapshot proves
-    # nothing: a no-op push also exits 0.
+  # Explicit status check. Do NOT reintroduce a `set -e` dependency here:
+  # this is the branch that reported a false merge when set -e did not
+  # propagate through the execution harness.
+  git -C "$mfp_wt" merge --ff-only "$TEMP_SHA"
+  mfp_merge_status=$?
+  if [ "$mfp_merge_status" -ne 0 ]; then
+    merge_ff_push_cleanup_wt
+    echo "merge-ff-push: ff-merge of $TEMP_SHA onto $BEFORE_SHA failed (status $mfp_merge_status) — origin/$TARGET moved under this patrol."
+    merge_ff_push_lost_race
+    return 6
+  fi
+
+  MERGED_SHA=$(git -C "$mfp_wt" rev-parse HEAD)
+  MERGED_SHORT=$(git -C "$mfp_wt" rev-parse --short HEAD)
+
+  # An "Already up to date" ff-merge leaves HEAD at the target tip. Reporting
+  # that as merged is precisely the target-tip-for-branch-tip mislabel; the
+  # already-merged gate resolves this case from origin/$BRANCH instead.
+  if [ "$MERGED_SHA" = "$BEFORE_SHA" ]; then
+    merge_ff_push_cleanup_wt
+    echo "merge-ff-push: ff-merge was a no-op — origin/$TARGET ($BEFORE_SHA) already contains temp. Nothing to land; not recording a merge."
+    return 5
+  fi
+  # ff-only either fast-forwards HEAD to TEMP_SHA or leaves it alone, so this
+  # cannot fire. Asserted anyway: it is the invariant that keeps merged_sha
+  # the commit that carried the bead.
+  if [ "$MERGED_SHA" != "$TEMP_SHA" ]; then
+    merge_ff_push_cleanup_wt
+    echo "merge-ff-push: ff-merge left HEAD at $MERGED_SHA, not the branch tip $TEMP_SHA. Refusing to record a merge."
+    return 2
+  fi
+
+  PUSH_GATE_MAX_WAIT_SECONDS="$mfp_push_wait" git -C "$mfp_wt" push origin "HEAD:$TARGET"
+  mfp_push_status=$?
+  merge_ff_push_cleanup_wt
+  if [ "$mfp_push_status" -ne 0 ]; then
+    # MEASURE the cause; do not assert it. A rejection is either "the target
+    # advanced under us" — a lost race, a step re-entry (6) — or "the remote
+    # refused this push" (gate veto, receive hook, permissions), which no retry
+    # can fix and which every retry pays for in gate load: each attempt
+    # relaunches the pre-push hook and queues for another slot. The comparison
+    # below draws exactly that line against the freshly fetched tip: a moved
+    # target is a lost race (6), a target that stood still is a veto (7)
+    # (gcp-ileo).
     if ! git fetch origin "+refs/heads/${TARGET}:refs/remotes/origin/${TARGET}"; then
-      echo "merge-ff-push: post-push fetch of $TARGET failed; the merge cannot be verified. STOP. Do not mutate bead state."
+      echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status) and the follow-up fetch failed, so the cause cannot be measured. STOP. Do not mutate bead state."
       return 2
     fi
-    if ! AFTER_SHA=$(git rev-parse "origin/$TARGET"); then
-      echo "merge-ff-push: could not resolve origin/$TARGET after the push; the merge cannot be verified."
+    if ! mfp_reject_sha=$(git rev-parse "origin/$TARGET"); then
+      echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status) and origin/$TARGET could not be resolved, so the cause cannot be measured. STOP. Do not mutate bead state."
       return 2
     fi
-    if [ "$AFTER_SHA" = "$BEFORE_SHA" ]; then
-      echo "merge-ff-push: origin/$TARGET did not advance — still $BEFORE_SHA after a push that exited 0. STOP. Do not mutate bead state."
-      return 2
+    if [ "$mfp_reject_sha" = "$BEFORE_SHA" ]; then
+      echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status) and origin/$TARGET is STILL $BEFORE_SHA — the target did not move, so the remote refused this push (push-gate veto, receive hook, or permissions). This is not a race; retrying re-runs the pre-push gate and cannot succeed. STOP. Do not mutate bead state."
+      echo "merge-ff-push: REFUSED target=$TARGET sha=$BEFORE_SHA"
+      return 7
     fi
-    if ! git merge-base --is-ancestor "$TEMP_SHA" "$AFTER_SHA"; then
-      echo "merge-ff-push: origin/$TARGET advanced to $AFTER_SHA but $TEMP_SHA is not reachable from it — the target moved for some other reason. STOP. Do not mutate bead state."
-      return 2
-    fi
+    echo "merge-ff-push: push to $TARGET was rejected (status $mfp_push_status); origin/$TARGET moved $BEFORE_SHA -> $mfp_reject_sha, so the target really did advance between the fetch and the push."
+    merge_ff_push_lost_race
+    return 6
+  fi
 
-    echo "merge-ff-push: landed $BRANCH on $TARGET at $MERGED_SHA (target advanced $BEFORE_SHA -> $AFTER_SHA)."
-    return 0
-  done
+  # Re-fetch and verify against the FRESH tip. The pre-push snapshot proves
+  # nothing: a no-op push also exits 0.
+  if ! git fetch origin "+refs/heads/${TARGET}:refs/remotes/origin/${TARGET}"; then
+    echo "merge-ff-push: post-push fetch of $TARGET failed; the merge cannot be verified. STOP. Do not mutate bead state."
+    return 2
+  fi
+  if ! AFTER_SHA=$(git rev-parse "origin/$TARGET"); then
+    echo "merge-ff-push: could not resolve origin/$TARGET after the push; the merge cannot be verified."
+    return 2
+  fi
+  if [ "$AFTER_SHA" = "$BEFORE_SHA" ]; then
+    echo "merge-ff-push: origin/$TARGET did not advance — still $BEFORE_SHA after a push that exited 0. STOP. Do not mutate bead state."
+    return 2
+  fi
+  if ! git merge-base --is-ancestor "$TEMP_SHA" "$AFTER_SHA"; then
+    echo "merge-ff-push: origin/$TARGET advanced to $AFTER_SHA but $TEMP_SHA is not reachable from it — the target moved for some other reason. STOP. Do not mutate bead state."
+    return 2
+  fi
 
-  # Only reachable after an attempt MEASURED the target moving — either the
-  # ff-merge failed because origin/$TARGET had advanced, or the push was
-  # rejected and the re-read tip differed from the one merged onto. A veto
-  # against a stationary target returns 7 above and never reaches here, so this
-  # message no longer steers the reader toward retrying harder (gcp-ileo).
-  echo "merge-ff-push: could not land $BRANCH on $TARGET in $mfp_max attempts; the target moved under every attempt. STOP. Do not mutate bead state."
-  return 6
+  echo "merge-ff-push: landed $BRANCH on $TARGET at $MERGED_SHA (target advanced $BEFORE_SHA -> $AFTER_SHA)."
+  return 0
 }
 # --- lanes ------------------------------------------------------------------
 #

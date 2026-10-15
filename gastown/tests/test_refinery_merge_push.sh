@@ -24,9 +24,16 @@
 # The second known bad record (winnow-rp57: merged_sha named a different bead's
 # commit while its own work landed elsewhere) shares one shape with the first —
 # bookkeeping recording a target TIP rather than the commit that carried the
-# bead. test_lost_race_rerebases_and_lands_this_branch pins the other half:
-# after a lost race the reported sha must be this branch's tip, never the
-# racing commit that moved the target.
+# bead. test_lost_race_stops_for_a_rebase_reentry pins the other half: after a
+# lost race nothing is reported as merged at all, so the racing commit that moved
+# the target can never be mistaken for this branch's tip.
+#
+# A lost race is a step re-entry, never an in-place re-rebase (gcp-xs3eq; upstream
+# #374): the lane stops with status 6 and leaves the target alone, and the next
+# patrol rebuilds temp and runs the tests again before any push. An in-place
+# re-rebase landed a tree run-tests never saw, which
+# test_lost_race_leaves_a_merge_topology_temp_unflattened pins for a temp that
+# carries a merge.
 #
 # A later defect (gcp-ileo, twin gascity-mfac) sat in the same block's rejection
 # path: it ATTRIBUTED every push rejection to target movement without re-reading
@@ -34,10 +41,11 @@
 # three times, each retry relaunching the pre-push hook and re-queueing for a
 # test-mac slot it could never win. The cause must be measured, not asserted, so
 # the two rejection shapes are separated here — test_vetoed_push_stops_without_retrying
-# (target stationary: one attempt, distinct status) and
-# test_rejected_push_with_a_moving_target_still_retries (target really moving:
-# keep retrying) — and test_push_carries_an_explicit_gate_wait_budget pins the
-# budget that keeps the refinery queueing for a slot rather than refused one.
+# (target stationary: one attempt, status 7) and
+# test_rejected_push_with_a_moving_target_stops_for_a_rebase_reentry (target
+# really moving: one attempt, status 6, a step re-entry) — and
+# test_push_carries_an_explicit_gate_wait_budget pins the budget that keeps the
+# refinery queueing for a slot rather than refused one.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -151,60 +159,57 @@ test_clean_ff_lands_and_reports_the_branch_tip() {
     rm -rf "$tmp"
 }
 
-test_lost_race_rerebases_and_lands_this_branch() {
+test_lost_race_stops_for_a_rebase_reentry() {
     # The reported case: origin/dev moved between the rebase and the merge, so
-    # the ff-merge fails. The lane must re-rebase and land, and the sha it
-    # reports must be THIS branch's commit — not the racing commit that moved
-    # the target, which is the mislabel winnow-rp57 recorded.
-    local tmp got racing after merged
+    # the ff-merge fails. A lost race is a step re-entry, never an in-place
+    # re-rebase: the lane lands nothing, leaves temp as the tests saw it, and
+    # stops with 6 so the next patrol rebuilds temp and runs the tests again.
+    local tmp got racing temp_before
     tmp=$(mktemp -d)
     make_rig "$tmp"
+    temp_before=$(git -C "$WORK" rev-parse temp)
     racing=$(race_the_target "$tmp")
 
-    got=$(run_merge 2>/dev/null)
-    after=$(origin_tip)
-    merged=$(merged_of "$got")
+    got=$(run_merge 2>"$tmp/merge.err")
 
-    [ "$(status_of "$got")" = "0" ] ||
-        fail "lost race returned $(status_of "$got"), want 0 (re-rebase and retry, never fall through)"
-    [ "$merged" != "$racing" ] ||
-        fail "lost race reported the racing commit $racing as merged_sha — a target tip, not this bead's commit"
-    [ "$merged" = "$(temp_of "$got")" ] ||
-        fail "lost race reported merged_sha $merged, want the post-rebase branch tip $(temp_of "$got")"
-    [ "$after" = "$merged" ] ||
-        fail "lost race left origin/dev at $after, want the merged sha $merged"
-    git --git-dir="$ORIGIN" merge-base --is-ancestor "$racing" "$after" ||
-        fail "lost race clobbered the racing commit $racing instead of rebasing onto it"
+    [ "$(status_of "$got")" = "6" ] ||
+        fail "lost race returned $(status_of "$got"), want 6 (a lost race is a step re-entry, never an in-place re-rebase)"
+    [ "$(origin_tip)" = "$racing" ] ||
+        fail "lost race left origin/dev at $(origin_tip), want the racing commit $racing untouched"
+    [ "$(git -C "$WORK" rev-parse temp)" = "$temp_before" ] ||
+        fail "lost race moved temp from $temp_before to $(git -C "$WORK" rev-parse temp) — temp must stay the tree the tests ran on"
+    grep -qF 'merge-ff-push: LOST RACE: origin/dev moved after the tests ran; nothing landed.' "$tmp/merge.err" ||
+        fail "lost race did not report itself: $(tr '\n' ' ' <"$tmp/merge.err")"
     rm -rf "$tmp"
 }
 
-test_failed_ff_with_conflicting_rebase_pushes_nothing() {
-    # The winnow-ksyp shape with no mechanical way out: the ff-merge fails and
-    # the re-rebase conflicts. The old lane reported merged here. Nothing may be
-    # pushed and the status must be non-zero.
-    local tmp got before after
+test_lost_race_leaves_a_merge_topology_temp_unflattened() {
+    # The demo (ana/rc/demo-retry-flatten.sh) shape: a temp that carries a merge,
+    # which the skip-rebase arm leaves as it is. The old in-place re-rebase
+    # flattened it and landed a tree run-tests never saw. Now the lost race must
+    # leave the merge exactly as built.
+    local tmp got racing temp_before
     tmp=$(mktemp -d)
     make_rig "$tmp"
-    # The racer touches the same file the branch does, so the re-rebase cannot
-    # apply mechanically.
-    echo conflicting >"$WORK/feature.txt"
-    git_q -C "$WORK" add feature.txt
-    git_q -C "$WORK" commit --amend -m "feat: the work this bead carried"
-    local racer="$tmp/racer"
-    git_q clone "$ORIGIN" "$racer"
-    echo "other side" >"$racer/feature.txt"
-    git_q -C "$racer" add feature.txt
-    git_q -C "$racer" commit -m "feat: someone else touched the same file"
-    git_q -C "$racer" push origin dev
-    before=$(origin_tip)
+    git_q -C "$WORK" checkout -b side dev
+    echo side >"$WORK/side.txt"
+    git_q -C "$WORK" add side.txt
+    git_q -C "$WORK" commit -m "feat: the side line"
+    git_q -C "$WORK" checkout temp
+    git_q -C "$WORK" merge --no-ff side -m "merge: join the side line"
+    [ "$(git -C "$WORK" rev-list --merges --count dev..temp)" = "1" ] ||
+        fail "harness bug: temp should carry exactly one merge over dev"
+    temp_before=$(git -C "$WORK" rev-parse temp)
+    racing=$(race_the_target "$tmp")
 
     got=$(run_merge 2>/dev/null)
-    after=$(origin_tip)
 
-    [ "$(status_of "$got")" = "3" ] ||
-        fail "conflicting re-rebase returned $(status_of "$got"), want 3"
-    [ "$after" = "$before" ] ||
-        fail "conflicting re-rebase moved origin/dev from $before to $after — nothing may be pushed"
+    [ "$(status_of "$got")" = "6" ] ||
+        fail "lost race on a merge-topology temp returned $(status_of "$got"), want 6"
+    [ "$(origin_tip)" = "$racing" ] ||
+        fail "lost race on a merge-topology temp left origin/dev at $(origin_tip), want the racing commit $racing"
+    [ "$(git -C "$WORK" rev-parse temp)" = "$temp_before" ] ||
+        fail "lost race on a merge-topology temp rewrote temp from $temp_before to $(git -C "$WORK" rev-parse temp)"
     rm -rf "$tmp"
 }
 
@@ -316,14 +321,16 @@ HOOK
     rm -rf "$tmp"
 }
 
-test_rejected_push_with_a_moving_target_still_retries() {
+test_rejected_push_with_a_moving_target_stops_for_a_rebase_reentry() {
     # The other half of the same measurement: the push is rejected AND the
-    # target really does advance each time. That is the racing-pusher case the
-    # retry bound exists for, so the lane must keep retrying and must exhaust
-    # into status 6 — which now means what it says.
-    local tmp got attempts n
+    # target really does advance. That is a lost race, so the lane makes ONE
+    # attempt and stops with 6 (a step re-entry); the next patrol rebuilds temp
+    # and re-runs the tests. Re-rebasing in place and pushing again would land a
+    # tree run-tests never saw.
+    local tmp got attempts n temp_before
     tmp=$(mktemp -d)
     make_rig "$tmp"
+    temp_before=$(git -C "$WORK" rev-parse temp)
     # Build the racing chain BEFORE the hook is armed, so pushing it does not
     # trip the hook. Every commit is a fast-forward of dev, so each update-ref
     # below is the advance a real racing pusher would produce.
@@ -341,7 +348,7 @@ test_rejected_push_with_a_moving_target_still_retries() {
     git_q -C "$racer" push origin HEAD:refs/heads/racing
 
     # Reject the incoming push, but move dev on the way out: the rejection now
-    # has a measurable cause, and re-rebasing is the way through it. A receive
+    # has a measurable cause, and the lost race is the way through it. A receive
     # hook runs inside git's object quarantine, which forbids ref updates, so
     # the racing advance has to step outside it.
     cat >"$ORIGIN/hooks/pre-receive" <<HOOK
@@ -363,13 +370,13 @@ HOOK
     attempts=$(wc -l <"$tmp/push-attempts" | tr -d ' ')
 
     [ "$(status_of "$got")" = "6" ] ||
-        fail "a rejected push against a target that kept moving returned $(status_of "$got"), want 6 (retries exhausted)"
-    [ "$attempts" -gt 1 ] ||
-        fail "a measurably racing target was pushed $attempts time(s), want more than 1 — the retry bound exists for this case"
-    # The hook advances dev to chain entry n on push n, so the tip pins how many
-    # advances the lane actually saw — not just that something moved.
-    [ "$(origin_tip)" = "$(sed -n "${attempts}p" "$tmp/chain")" ] ||
-        fail "harness bug: after $attempts rejected push(es) dev should sit at racing commit #$attempts, found $(origin_tip)"
+        fail "a rejected push against a target that moved returned $(status_of "$got"), want 6 (lost race)"
+    [ "$attempts" = "1" ] ||
+        fail "a rejected push against a moving target was pushed $attempts time(s), want 1 — a lost race is a step re-entry, not a retry"
+    [ "$(origin_tip)" = "$(sed -n 1p "$tmp/chain")" ] ||
+        fail "harness bug: after one rejected push dev should sit at racing commit #1, found $(origin_tip)"
+    [ "$(git -C "$WORK" rev-parse temp)" = "$temp_before" ] ||
+        fail "a lost race moved temp from $temp_before to $(git -C "$WORK" rev-parse temp)"
     rm -rf "$tmp"
 }
 
@@ -635,28 +642,7 @@ test_script_status_2_after_a_landing_it_could_not_record_drops_temp() {
     rm -rf "$tmp"
 }
 
-test_script_status_3_conflicting_rerebase_drops_temp() {
-    # test_failed_ff_with_conflicting_rebase_pushes_nothing's rig.
-    local tmp racer
-    tmp=$(mktemp -d)
-    make_rig "$tmp"
-    echo conflicting >"$WORK/feature.txt"
-    git_q -C "$WORK" add feature.txt
-    git_q -C "$WORK" commit --amend -m "feat: the work this bead carried"
-    racer="$tmp/racer"
-    git_q clone "$ORIGIN" "$racer"
-    echo "other side" >"$racer/feature.txt"
-    git_q -C "$racer" add feature.txt
-    git_q -C "$racer" commit -m "feat: someone else touched the same file"
-    git_q -C "$racer" push origin dev
-    finish_script_rig "$tmp"
-    expect_stop_drops_temp "$tmp" "a re-rebase that conflicted" 3 "$(run_script "$tmp")"
-    [ ! -d "$WORK/.git/rebase-merge" ] && [ ! -d "$WORK/.git/rebase-apply" ] ||
-        fail "a re-rebase was left in flight"
-    rm -rf "$tmp"
-}
-
-test_script_status_6_retries_exhausted_drops_temp() {
+test_script_status_6_lost_race_drops_temp() {
     local tmp racer n
     tmp=$(mktemp -d)
     script_rig "$tmp"
@@ -684,7 +670,11 @@ echo "push refused by the test (race \$n)" >&2
 exit 1
 HOOK
     chmod +x "$ORIGIN/hooks/pre-receive"
-    expect_stop_drops_temp "$tmp" "a target that moved under every attempt" 6 "$(run_script "$tmp")"
+    expect_stop_drops_temp "$tmp" "a lost race" 6 "$(run_script "$tmp")"
+    [ "$(wc -l <"$tmp/push-attempts" | tr -d ' ')" = "1" ] ||
+        fail "a lost race pushed $(wc -l <"$tmp/push-attempts" | tr -d ' ') times, want 1"
+    grep -q '^merge-push: RESULT 6 gcp-mp: lost the race' "$tmp/script.out" ||
+        fail "a lost race did not print the status 6 RESULT line: $(tail -n 1 "$tmp/script.out")"
     rm -rf "$tmp"
 }
 
@@ -745,21 +735,20 @@ export BLOCK
 
 test_block_does_not_rely_on_set_e
 test_clean_ff_lands_and_reports_the_branch_tip
-test_lost_race_rerebases_and_lands_this_branch
-test_failed_ff_with_conflicting_rebase_pushes_nothing
+test_lost_race_stops_for_a_rebase_reentry
+test_lost_race_leaves_a_merge_topology_temp_unflattened
 test_push_that_does_not_advance_the_target_is_refused
 test_target_advanced_by_someone_else_is_refused
 test_noop_ff_does_not_report_a_merge
 test_vetoed_push_stops_without_retrying
-test_rejected_push_with_a_moving_target_still_retries
+test_rejected_push_with_a_moving_target_stops_for_a_rebase_reentry
 test_push_carries_an_explicit_gate_wait_budget
 test_cleanup_removes_emptied_parent
 test_cleanup_leaks_parent_loudly_when_worktree_remove_fails
 test_script_landing_drops_temp
 test_script_status_2_after_a_push_that_did_not_advance_drops_temp
 test_script_status_2_after_a_landing_it_could_not_record_drops_temp
-test_script_status_3_conflicting_rerebase_drops_temp
-test_script_status_6_retries_exhausted_drops_temp
+test_script_status_6_lost_race_drops_temp
 test_script_status_7_refused_push_drops_temp
 test_script_status_8_false_completion_drops_temp
 test_script_status_1_usage_error_touches_nothing

@@ -63,24 +63,23 @@
 #
 # land    Land the stacked batch with ONE fast-forward push and close each member
 #         against ITS OWN landed commit. It reads the manifest stack wrote and
-#         runs merge-push.sh's merge_ff_push on `temp`, so the retry loop and the
-#         statuses are the lane's: 0 landed, 2 hard stop, 3 the re-rebase
-#         conflicted, 5 no-op, 6 retries exhausted, 7 the remote refused. Any of
-#         2/3/5/6/7 from the push writes nothing but the artifact proof below and
-#         leaves the manifest where it is.
+#         runs merge-push.sh's merge_ff_push on `temp`, so the statuses are the
+#         lane's: 0 landed, 2 hard stop, 5 no-op, 6 lost the race (nothing
+#         written; the next patrol re-selects, re-stacks and re-tests), 7 the
+#         remote refused. Any of 2/5/6/7 from the push writes nothing but the
+#         artifact proof below and leaves the manifest where it is.
 #         Before the push, every member gets the task-artifact proof the patrol's
 #         rebase step records for the head (upstream #245): artifact_source_sha
 #         and artifact_cleanup_state=pending (mb_capture_artifact_proof). A member
 #         whose proof cannot be recorded stops land with 2 before anything lands.
 #         After a landing, member i's commit is found in the LANDED stack, not in
-#         the manifest, because a retry re-rebases temp and so rewrites every
-#         sha: with L the landed tip and offset_i the commit count of the members
-#         behind member i, member i's tip is L~offset_i, and it is trusted only
-#         when its patch-id equals the one stack recorded. A member that fails
-#         that check, or whose bead write or close fails, is LEFT OPEN with its
-#         branch kept, never given the batch tip or another member's commit, and
-#         never rolled back: the merge-state gate closes it as already merged on
-#         a later patrol. No member's source branch is ever deleted: it is the
+#         the manifest: with L the landed tip and offset_i the commit count of
+#         the members behind member i, member i's tip is L~offset_i, and it is
+#         trusted only when its patch-id equals the one stack recorded. A member
+#         that fails that check, or whose bead write or close fails, is LEFT
+#         OPEN with its branch kept, never given the batch tip or another
+#         member's commit, and never rolled back: the merge-state gate closes it
+#         as already merged on a later patrol. No member's source branch is ever deleted: it is the
 #         task artifact's recovery copy. After each member's close, its
 #         task-artifact cleanup runs; one that does not converge is handled as
 #         merge-push.sh's direct_cleanup handles it: the member stays closed, its
