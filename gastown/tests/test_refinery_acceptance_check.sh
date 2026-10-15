@@ -43,13 +43,13 @@
 # of 47 where the criteria say 0, a keep-passing file named but unchanged), with
 # invented paths and wording.
 #
-# The suite fails unless all 22 cases ran.
+# The suite fails unless all 23 cases ran.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 PACK_DIR="$ROOT/gastown"
 SCRIPT="${SCRIPT:-$PACK_DIR/assets/scripts/refinery/acceptance-check.sh}"
-EXPECTED_CASES=22
+EXPECTED_CASES=23
 
 AGENT=testrig/gastown.refinery
 TARGET_NAME=integration
@@ -1191,6 +1191,44 @@ case_record_reject_route_failure() {
     end_case
 }
 
+# The pool a rejected bead goes back to is the one gc sling routed it to (its
+# gc.execution_routed_to), else the rig's polecat pool (gcp-j1ao).
+case_record_reject_routes_to_the_slung_pool() {
+    new_case record-reject-routes-to-the-slung-pool
+    record_rig
+
+    # A bead slung to a pool that is not the rig's polecat pool goes back to it.
+    set_meta gcp-r1 gc.execution_routed_to testrig/specialists.view
+    printf '%s\n' 'AC2 MISSING — c | absent' >"$T/stdin"
+    run_ac record --work gcp-r1 --verdict MISS --tip "$X" --mode reject
+    assert_eq "slung pool: exit status" 0 "$RC"
+    assert_eq "slung pool: gc.routed_to" testrig/specialists.view "$(bead_meta gcp-r1 gc.routed_to)"
+    assert_eq "slung pool: the pool-return update" \
+        "gc bd update gcp-r1 --status=open --assignee= --unset-metadata handoff_stage --set-metadata rejection_reason=acceptance: AC2 - see note --set-metadata gc.routed_to=testrig/specialists.view" \
+        "$(write_calls | tail -n 1)"
+
+    # An empty stamp is no stamp: the rig's polecat pool.
+    reset_record
+    set_meta gcp-r1 gc.execution_routed_to ""
+    printf '%s\n' 'AC2 MISSING — c | absent' >"$T/stdin"
+    run_ac record --work gcp-r1 --verdict MISS --tip "$X" --mode reject
+    assert_eq "empty stamp: exit status" 0 "$RC"
+    assert_eq "empty stamp: gc.routed_to" testrig/gastown.polecat "$(bead_meta gcp-r1 gc.routed_to)"
+
+    # A bead the route read cannot open still goes back, to the rig's polecat
+    # pool, and the read says so on stderr.
+    reset_record
+    set_meta gcp-r1 gc.execution_routed_to testrig/specialists.view
+    FAIL_SHOW=gcp-r1
+    printf '%s\n' 'AC2 MISSING — c | absent' >"$T/stdin"
+    run_ac record --work gcp-r1 --verdict MISS --tip "$X" --mode reject
+    assert_eq "unreadable: exit status" 0 "$RC"
+    assert_eq "unreadable: gc.routed_to" testrig/gastown.polecat "$(bead_meta gcp-r1 gc.routed_to)"
+    grep -qF -- 'WARN cannot read gcp-r1 for gc.execution_routed_to; routing the rejection to testrig/gastown.polecat' "$T/err" ||
+        fail "unreadable: stderr lacks the WARN naming the default pool: $(cat "$T/err")"
+    end_case
+}
+
 # --- cases: the script's text -----------------------------------------------
 
 # text_invariants_ok <file> — the file contains none of the forbidden fragments.
@@ -1245,6 +1283,7 @@ case_record_write_failure
 case_record_reject_miss
 case_record_no_route
 case_record_reject_route_failure
+case_record_reject_routes_to_the_slung_pool
 case_text_invariants
 
 if [ "$PASS_CASES" -ne "$EXPECTED_CASES" ]; then

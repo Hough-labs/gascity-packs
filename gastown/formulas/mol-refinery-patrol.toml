@@ -1055,14 +1055,21 @@ errors, so what reaches a failed rebase is a genuine content conflict with
 ```bash
 gc workflow delete-source $WORK --apply && gc workflow reopen-source $WORK
 ```
-3. Put the work bead back in the pool with rejection metadata:
+3. Put the work bead back in the pool with rejection metadata. Run the fence in ONE Bash call, never inside `bash -c`:
 ```bash
+# --- rebase-reject-update:begin ---
+# Back to the pool gc sling routed this bead to (gc.execution_routed_to), else
+# the rig's default polecat pool (gcp-j1ao). merge-push.sh's
+# resolve_reject_route applies the same rule for acceptance-check.sh.
+REJECT_ROUTE=$(gc bd show "$WORK" --json 2>/dev/null | jq -r '(.[0].metadata."gc.execution_routed_to" // "") | tostring' 2>/dev/null)
+[ -n "$REJECT_ROUTE" ] || REJECT_ROUTE="${GC_RIG:+$GC_RIG/}{{binding_prefix}}polecat"
 gc bd update $WORK \
   --status=open \
   --assignee="" \
   --unset-metadata handoff_stage \
   --set-metadata rejection_reason="Conflicts with $TARGET at $(git rev-parse origin/$TARGET)" \
-  --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{binding_prefix}}polecat"
+  --set-metadata gc.routed_to="$REJECT_ROUTE"
+# --- rebase-reject-update:end ---
 ```
 Clearing `handoff_stage` is required, not cosmetic: rejection invalidates the
 polecat's "submit completed" marker, and leaving it set would let the witness's
@@ -1338,14 +1345,21 @@ fi
      ```bash
      gc workflow delete-source $WORK --apply && gc workflow reopen-source $WORK
      ```
-   - Put the work bead back in the pool with rejection metadata:
+   - Put the work bead back in the pool with rejection metadata. Run the fence in ONE Bash call, never inside `bash -c`:
      ```bash
+     # --- failure-reject-update:begin ---
+     # Back to the pool gc sling routed this bead to (gc.execution_routed_to), else
+     # the rig's default polecat pool (gcp-j1ao). merge-push.sh's
+     # resolve_reject_route applies the same rule for acceptance-check.sh.
+     REJECT_ROUTE=$(gc bd show "$WORK" --json 2>/dev/null | jq -r '(.[0].metadata."gc.execution_routed_to" // "") | tostring' 2>/dev/null)
+     [ -n "$REJECT_ROUTE" ] || REJECT_ROUTE="${GC_RIG:+$GC_RIG/}{{binding_prefix}}polecat"
      gc bd update $WORK \
        --status=open \
        --assignee="" \
        --unset-metadata handoff_stage \
        --set-metadata rejection_reason="<failure summary>" \
-       --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{binding_prefix}}polecat"
+       --set-metadata gc.routed_to="$REJECT_ROUTE"
+     # --- failure-reject-update:end ---
      ```
      `handoff_stage` must be cleared here too: rejection invalidates the
      polecat's completed submit, and a stale marker would point the witness's

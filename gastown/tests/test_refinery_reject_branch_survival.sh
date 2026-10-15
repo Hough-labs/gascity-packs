@@ -34,6 +34,8 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 REFINERY_FORMULA="$ROOT/gastown/formulas/mol-refinery-patrol.toml"
 POLECAT_FORMULA="$ROOT/gastown/formulas/mol-polecat-work.toml"
 MERGE_PUSH="$ROOT/gastown/assets/scripts/refinery/merge-push.sh"
+ACCEPTANCE_CHECK="$ROOT/gastown/assets/scripts/refinery/acceptance-check.sh"
+REFINERY_PROMPT="$ROOT/gastown/agents/refinery/prompt.template.md"
 
 FAILURES=0
 
@@ -309,9 +311,114 @@ PY
     [ $? -eq 0 ] || FAILURES=$((FAILURES + 1))
 }
 
+# ---------------------------------------------------------------------------
+# 4. The route a rejection gives the bead (gcp-j1ao). A rejected bead goes back
+#    to the pool gc sling routed it to (metadata gc.execution_routed_to), else
+#    to the rig's default polecat pool. Both rejection blocks in the formula are
+#    EXECUTED here against a stub gc that serves one canned bead and journals
+#    the update; the scripts and the prompt copy are pinned by text, because the
+#    formula blocks cannot source the resolver and every copy must keep the one
+#    rule.
+# ---------------------------------------------------------------------------
+
+# A `gc` for the reject-update blocks: it journals every call, serves the canned
+# bead JSON in $GC_STUB_SHOW for the bead read (or fails it when
+# GC_STUB_SHOW_FAIL=1), and accepts anything else.
+make_route_gc_stub() {
+    local dir="$1"
+    mkdir -p "$dir"
+    cat > "$dir/gc" <<'STUB'
+#!/usr/bin/env bash
+printf 'gc %s\n' "$*" >> "${GC_STUB_LOG:?GC_STUB_LOG unset}"
+case "$1:$2" in
+    bd:show)
+        if [ "${GC_STUB_SHOW_FAIL:-}" = 1 ]; then
+            exit 1
+        fi
+        cat "${GC_STUB_SHOW:?GC_STUB_SHOW unset}"
+        ;;
+esac
+exit 0
+STUB
+    chmod +x "$dir/gc"
+}
+
+# run_reject_update <block> <bead JSON | FAIL> — run one extracted reject-update
+# block in a refinery clone, as the rig winnow, and echo the gc.routed_to its
+# update set. FAIL makes the bead read fail. Echoes nothing when the block never
+# reached its update.
+run_reject_update() {
+    local block="$1" show="$2" root script log
+    root=$(mktemp -d "$WORKDIR/route.XXXXXX")
+    build_fixture "$root" "polecat/gcp-fixture" >/dev/null 2>&1
+    script="$root/reject-update.sh"
+    extract_block "$REFINERY_FORMULA" "$block" "$script" || {
+        echo "could not extract $block from mol-refinery-patrol" >&2
+        return
+    }
+    make_route_gc_stub "$root/bin"
+    log="$root/gc-calls.log"
+    : > "$log"
+    printf '%s\n' "$show" > "$root/show.json"
+    (cd "$root/refinery" && \
+        PATH="$root/bin:$PATH" GC_STUB_LOG="$log" GC_STUB_SHOW="$root/show.json" \
+        GC_STUB_SHOW_FAIL=$([ "$show" = FAIL ] && echo 1 || echo 0) \
+        GC_RIG=winnow WORK=gcp-fixture TARGET=integration \
+        bash "$script") >/dev/null 2>&1
+    sed -n 's/^gc bd update gcp-fixture .* --set-metadata gc\.routed_to=\(.*\)$/\1/p' "$log"
+}
+
+test_rejection_routes_to_the_slung_pool() {
+    local block got
+    for block in rebase-reject-update failure-reject-update; do
+        got=$(run_reject_update "$block" '[{"id":"gcp-fixture","metadata":{"gc.execution_routed_to":"winnow/specialists.view"}}]')
+        [ "$got" = winnow/specialists.view ] || fail "$block: gc.routed_to is '$got', want 'winnow/specialists.view'"
+    done
+}
+
+test_rejection_without_a_slung_pool_routes_to_the_default() {
+    local block show got
+    for block in rebase-reject-update failure-reject-update; do
+        for show in '[{"id":"gcp-fixture","metadata":{}}]' '[{"id":"gcp-fixture","metadata":{"gc.execution_routed_to":""}}]'; do
+            got=$(run_reject_update "$block" "$show")
+            [ "$got" = winnow/polecat ] || fail "$block: gc.routed_to is '$got' for $show, want 'winnow/polecat'"
+        done
+    done
+}
+
+test_rejection_of_an_unreadable_bead_routes_to_the_default() {
+    local block got
+    for block in rebase-reject-update failure-reject-update; do
+        got=$(run_reject_update "$block" FAIL)
+        [ "$got" = winnow/polecat ] || fail "$block: gc.routed_to is '$got' for an unreadable bead, want 'winnow/polecat'"
+    done
+}
+
+# One rule, at every site that reads the stamp, and no copy of the old
+# hard-coded route left behind.
+test_reject_route_is_one_rule_at_every_site() {
+    local rule='(.[0].metadata."gc.execution_routed_to" // "") | tostring' got
+    got=$(grep -cF -- "$rule" "$REFINERY_FORMULA")
+    [ "$got" = 2 ] || fail "the formula carries the rule $got time(s), want 2 (one per reject block)"
+    got=$(grep -cF -- "$rule" "$MERGE_PUSH")
+    [ "$got" = 1 ] || fail "merge-push.sh carries the rule $got time(s), want 1 (resolve_reject_route)"
+    got=$(grep -cF -- "$rule" "$REFINERY_PROMPT")
+    [ "$got" = 1 ] || fail "the refinery prompt carries the rule $got time(s), want 1 (its copy of the update)"
+    got=$(grep -cF -- 'gc.routed_to="${GC_RIG:+$GC_RIG/}{{binding_prefix}}polecat"' "$REFINERY_FORMULA")
+    [ "$got" = 0 ] || fail "the formula still sets gc.routed_to to the default pool $got time(s), want 0"
+    got=$(grep -cF -- 'gc.routed_to=${CFG_RIG:+$CFG_RIG/}${CFG_BINDING_PREFIX}polecat' "$ACCEPTANCE_CHECK")
+    [ "$got" = 0 ] || fail "acceptance-check.sh still sets gc.routed_to to the default pool $got time(s), want 0"
+    got=$(grep -cF -- 'resolve_reject_route "$1"' "$ACCEPTANCE_CHECK")
+    [ "$got" = 1 ] || fail "acceptance-check.sh calls resolve_reject_route $got time(s), want 1"
+}
+
 test_reject_then_resume_from_a_different_worktree
 test_resolution_still_halts_on_a_missing_branch
 test_branch_deletion_lives_only_on_the_merged_path
+test_rejection_routes_to_the_slung_pool
+test_rejection_without_a_slung_pool_routes_to_the_default
+test_rejection_of_an_unreadable_bead_routes_to_the_default
+test_reject_route_is_one_rule_at_every_site
 
 if [ "$FAILURES" -ne 0 ]; then
     echo "$FAILURES failure(s) in $(basename "${BASH_SOURCE[0]}")" >&2

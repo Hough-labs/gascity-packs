@@ -1,0 +1,389 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 15 Oct 2026 16:07:56 -0400
+Subject: [PATCH 181/181] fix(gastown): route a rejected bead back to the pool
+ that built it (gcp-j1ao)
+
+mol-refinery-patrol's reject paths (rebase-conflict reject and the handle-failures
+step) and acceptance-check.sh rec_return_to_pool all hardcoded gc.routed_to to the
+rig's default polecat pool. In a rig with more than one implementer pool, a rejected
+bead built by a non-default pool (winnow-jkhs1, built by specialists.view) was queued
+for a Go polecat that lacks that lane's skills and verification setup.
+
+A rejected bead now goes back to its gc.execution_routed_to, which gc sling stamps with
+the pool it routed the bead to, falling back to the rig's default polecat pool when the
+stamp is empty (MAYOR ruling 7, option A). One rule everywhere:
+(.[0].metadata."gc.execution_routed_to" // "") | tostring. merge-push.sh gains
+resolve_reject_route for the scripts; the formula's two reject-update fences and the
+verbatim refinery prompt copy read REJECT_ROUTE by the same rule. An unreadable bead
+takes the default with a WARN on stderr. Both prose lines now say the fence runs in ONE
+Bash call, because REJECT_ROUTE crosses statements and an empty one would orphan the
+bead silently.
+
+Applied verbatim from the verified artifact (carrier gcp-uc988, sha256 603cae39...).
+Tests: test_refinery_acceptance_check.sh gains
+case_record_reject_routes_to_the_slung_pool (22 -> 23 cases) and
+test_refinery_reject_branch_survival.sh gains four route tests. Beads slung before the
+stamp existed fall back to the default; no backfill.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ gastown/agents/refinery/prompt.template.md    |   6 +-
+ .../scripts/refinery/acceptance-check.sh      |  16 +--
+ gastown/assets/scripts/refinery/merge-push.sh |  15 +++
+ gastown/formulas/mol-refinery-patrol.toml     |  22 +++-
+ .../tests/test_refinery_acceptance_check.sh   |  43 ++++++-
+ .../test_refinery_reject_branch_survival.sh   | 107 ++++++++++++++++++
+ 6 files changed, 195 insertions(+), 14 deletions(-)
+
+diff --git a/gastown/agents/refinery/prompt.template.md b/gastown/agents/refinery/prompt.template.md
+index e4bf4fcf..def0dd94 100644
+--- a/gastown/agents/refinery/prompt.template.md
++++ b/gastown/agents/refinery/prompt.template.md
+@@ -293,14 +293,18 @@ original lives in `mol-refinery-patrol` steps `rebase` and `handle-failures`,
+ which are authoritative if these ever disagree:
+ 
+ ```bash
++REJECT_ROUTE=$(gc bd show "$WORK" --json 2>/dev/null | jq -r '(.[0].metadata."gc.execution_routed_to" // "") | tostring' 2>/dev/null)
++[ -n "$REJECT_ROUTE" ] || REJECT_ROUTE="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat"
+ gc bd update $WORK \
+   --status=open \
+   --assignee="" \
+   --unset-metadata handoff_stage \
+   --set-metadata rejection_reason="<why>" \
+-  --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat"
++  --set-metadata gc.routed_to="$REJECT_ROUTE"
+ ```
+ 
++`REJECT_ROUTE` is the pool `gc sling` routed the bead to (`gc.execution_routed_to`), else the rig's default polecat pool.
++
+ The full step also runs `gc workflow delete-source $WORK --apply && gc workflow
+ reopen-source $WORK` before this update, and cleans up the `temp` branch after.
+ That is why you run the step rather than this fragment.
+diff --git a/gastown/assets/scripts/refinery/acceptance-check.sh b/gastown/assets/scripts/refinery/acceptance-check.sh
+index e37d6fa0..177499db 100755
+--- a/gastown/assets/scripts/refinery/acceptance-check.sh
++++ b/gastown/assets/scripts/refinery/acceptance-check.sh
+@@ -81,7 +81,8 @@
+ #           7. one `gc bd update`: status open, no assignee, metadata
+ #              rejection_reason ("acceptance: <ids> - see note", <ids> being the AC
+ #              ids marked MISSING or SUBSTITUTED, or "acceptance: see note" with
+-#              none) and gc.routed_to (the rig's polecat pool)
++#              none) and gc.routed_to (the pool gc sling routed the bead to, else
++#              the rig's polecat pool: resolve_reject_route)
+ #         Nothing else routes: DECLARED, CONFORMS and SKIP write what they write in
+ #         warn mode, plus acceptance_check_mode=reject, and make no workflow call and
+ #         no status or assignee write. record never closes a bead and never touches a
+@@ -591,15 +592,16 @@ rec_run() {
+ # rec_return_to_pool <id> <items> — a reject-mode MISS goes back to the polecat
+ # pool the way the patrol's rebase step sends back a conflict: the workflow is
+ # cleaned up and the source reopened, then the bead is put back with its reason and
+-# its routing. Each write runs only after the one before it succeeded. CFG_RIG and
+-# CFG_BINDING_PREFIX are resolve_config's twins of the rebase step's
+-# ${GC_RIG:+$GC_RIG/}<binding prefix>polecat. handoff_stage is cleared as on every
+-# rejection (upstream #322): the polecat's completed submit no longer stands, and a
+-# stale marker would let the witness's Step 3a hand this tip straight back here.
++# its routing. Each write runs only after the one before it succeeded. The route is
++# merge-push.sh's resolve_reject_route, read before the workflow calls.
++# handoff_stage is cleared as on every rejection (upstream #322): the polecat's
++# completed submit no longer stands, and a stale marker would let the witness's
++# Step 3a hand this tip straight back here.
+ # Returns 1 when a write failed.
+ rec_return_to_pool() {
+   rp_ids=$(ac_nudge_ids MISS "$2")
+   rp_reason="acceptance: ${rp_ids:+$rp_ids - }see note"
++  rp_route=$(resolve_reject_route "$1" "${CFG_RIG:+$CFG_RIG/}${CFG_BINDING_PREFIX}polecat")
+   if ! gc workflow delete-source "$1" --apply >/dev/null; then
+     ac_warn "gc workflow delete-source for $1 failed; the bead stays with the refinery"
+     return 1
+@@ -610,7 +612,7 @@ rec_return_to_pool() {
+   fi
+   if ! gc bd update "$1" --status=open --assignee= --unset-metadata handoff_stage \
+     --set-metadata "rejection_reason=$rp_reason" \
+-    --set-metadata "gc.routed_to=${CFG_RIG:+$CFG_RIG/}${CFG_BINDING_PREFIX}polecat" >/dev/null; then
++    --set-metadata "gc.routed_to=$rp_route" >/dev/null; then
+     ac_warn "the pool return of $1 failed; the bead stays with the refinery"
+     return 1
+   fi
+diff --git a/gastown/assets/scripts/refinery/merge-push.sh b/gastown/assets/scripts/refinery/merge-push.sh
+index 975967a6..08acc493 100755
+--- a/gastown/assets/scripts/refinery/merge-push.sh
++++ b/gastown/assets/scripts/refinery/merge-push.sh
+@@ -1092,6 +1092,21 @@ resolve_merge_strategy() {
+   printf '%s\n' "$rms_strategy"
+ }
+ 
++# resolve_reject_route <bead-id> <default-pool> — the pool a rejected bead goes
++# back to (gcp-j1ao): its gc.execution_routed_to, which gc sling stamps with the
++# pool it routed the bead to, else <default-pool>. An unreadable bead gets the
++# default and a WARN on stderr. Always returns 0. mol-refinery-patrol's reject
++# blocks carry the same rule inline; the reject suite pins every copy.
++resolve_reject_route() {
++  rrr_route=""
++  if rrr_json=$(gc bd show "$1" --json 2>/dev/null); then
++    rrr_route=$(printf '%s' "$rrr_json" | jq -r '(.[0].metadata."gc.execution_routed_to" // "") | tostring' 2>/dev/null)
++  else
++    echo "WARN cannot read $1 for gc.execution_routed_to; routing the rejection to $2" >&2
++  fi
++  printf '%s\n' "${rrr_route:-$2}"
++}
++
+ main() {
+ resolve_config "$@" || return 1
+ WORK="$CFG_WORK"
+diff --git a/gastown/formulas/mol-refinery-patrol.toml b/gastown/formulas/mol-refinery-patrol.toml
+index f1032cb5..9e976cc8 100644
+--- a/gastown/formulas/mol-refinery-patrol.toml
++++ b/gastown/formulas/mol-refinery-patrol.toml
+@@ -1055,14 +1055,21 @@ errors, so what reaches a failed rebase is a genuine content conflict with
+ ```bash
+ gc workflow delete-source $WORK --apply && gc workflow reopen-source $WORK
+ ```
+-3. Put the work bead back in the pool with rejection metadata:
++3. Put the work bead back in the pool with rejection metadata. Run the fence in ONE Bash call, never inside `bash -c`:
+ ```bash
++# --- rebase-reject-update:begin ---
++# Back to the pool gc sling routed this bead to (gc.execution_routed_to), else
++# the rig's default polecat pool (gcp-j1ao). merge-push.sh's
++# resolve_reject_route applies the same rule for acceptance-check.sh.
++REJECT_ROUTE=$(gc bd show "$WORK" --json 2>/dev/null | jq -r '(.[0].metadata."gc.execution_routed_to" // "") | tostring' 2>/dev/null)
++[ -n "$REJECT_ROUTE" ] || REJECT_ROUTE="${GC_RIG:+$GC_RIG/}{{binding_prefix}}polecat"
+ gc bd update $WORK \
+   --status=open \
+   --assignee="" \
+   --unset-metadata handoff_stage \
+   --set-metadata rejection_reason="Conflicts with $TARGET at $(git rev-parse origin/$TARGET)" \
+-  --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{binding_prefix}}polecat"
++  --set-metadata gc.routed_to="$REJECT_ROUTE"
++# --- rebase-reject-update:end ---
+ ```
+ Clearing `handoff_stage` is required, not cosmetic: rejection invalidates the
+ polecat's "submit completed" marker, and leaving it set would let the witness's
+@@ -1338,14 +1345,21 @@ fi
+      ```bash
+      gc workflow delete-source $WORK --apply && gc workflow reopen-source $WORK
+      ```
+-   - Put the work bead back in the pool with rejection metadata:
++   - Put the work bead back in the pool with rejection metadata. Run the fence in ONE Bash call, never inside `bash -c`:
+      ```bash
++     # --- failure-reject-update:begin ---
++     # Back to the pool gc sling routed this bead to (gc.execution_routed_to), else
++     # the rig's default polecat pool (gcp-j1ao). merge-push.sh's
++     # resolve_reject_route applies the same rule for acceptance-check.sh.
++     REJECT_ROUTE=$(gc bd show "$WORK" --json 2>/dev/null | jq -r '(.[0].metadata."gc.execution_routed_to" // "") | tostring' 2>/dev/null)
++     [ -n "$REJECT_ROUTE" ] || REJECT_ROUTE="${GC_RIG:+$GC_RIG/}{{binding_prefix}}polecat"
+      gc bd update $WORK \
+        --status=open \
+        --assignee="" \
+        --unset-metadata handoff_stage \
+        --set-metadata rejection_reason="<failure summary>" \
+-       --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{binding_prefix}}polecat"
++       --set-metadata gc.routed_to="$REJECT_ROUTE"
++     # --- failure-reject-update:end ---
+      ```
+      `handoff_stage` must be cleared here too: rejection invalidates the
+      polecat's completed submit, and a stale marker would point the witness's
+diff --git a/gastown/tests/test_refinery_acceptance_check.sh b/gastown/tests/test_refinery_acceptance_check.sh
+index ca2c3340..d66b286e 100755
+--- a/gastown/tests/test_refinery_acceptance_check.sh
++++ b/gastown/tests/test_refinery_acceptance_check.sh
+@@ -43,13 +43,13 @@
+ # of 47 where the criteria say 0, a keep-passing file named but unchanged), with
+ # invented paths and wording.
+ #
+-# The suite fails unless all 22 cases ran.
++# The suite fails unless all 23 cases ran.
+ set -uo pipefail
+ 
+ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+ PACK_DIR="$ROOT/gastown"
+ SCRIPT="${SCRIPT:-$PACK_DIR/assets/scripts/refinery/acceptance-check.sh}"
+-EXPECTED_CASES=22
++EXPECTED_CASES=23
+ 
+ AGENT=testrig/gastown.refinery
+ TARGET_NAME=integration
+@@ -1191,6 +1191,44 @@ case_record_reject_route_failure() {
+     end_case
+ }
+ 
++# The pool a rejected bead goes back to is the one gc sling routed it to (its
++# gc.execution_routed_to), else the rig's polecat pool (gcp-j1ao).
++case_record_reject_routes_to_the_slung_pool() {
++    new_case record-reject-routes-to-the-slung-pool
++    record_rig
++
++    # A bead slung to a pool that is not the rig's polecat pool goes back to it.
++    set_meta gcp-r1 gc.execution_routed_to testrig/specialists.view
++    printf '%s\n' 'AC2 MISSING — c | absent' >"$T/stdin"
++    run_ac record --work gcp-r1 --verdict MISS --tip "$X" --mode reject
++    assert_eq "slung pool: exit status" 0 "$RC"
++    assert_eq "slung pool: gc.routed_to" testrig/specialists.view "$(bead_meta gcp-r1 gc.routed_to)"
++    assert_eq "slung pool: the pool-return update" \
++        "gc bd update gcp-r1 --status=open --assignee= --unset-metadata handoff_stage --set-metadata rejection_reason=acceptance: AC2 - see note --set-metadata gc.routed_to=testrig/specialists.view" \
++        "$(write_calls | tail -n 1)"
++
++    # An empty stamp is no stamp: the rig's polecat pool.
++    reset_record
++    set_meta gcp-r1 gc.execution_routed_to ""
++    printf '%s\n' 'AC2 MISSING — c | absent' >"$T/stdin"
++    run_ac record --work gcp-r1 --verdict MISS --tip "$X" --mode reject
++    assert_eq "empty stamp: exit status" 0 "$RC"
++    assert_eq "empty stamp: gc.routed_to" testrig/gastown.polecat "$(bead_meta gcp-r1 gc.routed_to)"
++
++    # A bead the route read cannot open still goes back, to the rig's polecat
++    # pool, and the read says so on stderr.
++    reset_record
++    set_meta gcp-r1 gc.execution_routed_to testrig/specialists.view
++    FAIL_SHOW=gcp-r1
++    printf '%s\n' 'AC2 MISSING — c | absent' >"$T/stdin"
++    run_ac record --work gcp-r1 --verdict MISS --tip "$X" --mode reject
++    assert_eq "unreadable: exit status" 0 "$RC"
++    assert_eq "unreadable: gc.routed_to" testrig/gastown.polecat "$(bead_meta gcp-r1 gc.routed_to)"
++    grep -qF -- 'WARN cannot read gcp-r1 for gc.execution_routed_to; routing the rejection to testrig/gastown.polecat' "$T/err" ||
++        fail "unreadable: stderr lacks the WARN naming the default pool: $(cat "$T/err")"
++    end_case
++}
++
+ # --- cases: the script's text -----------------------------------------------
+ 
+ # text_invariants_ok <file> — the file contains none of the forbidden fragments.
+@@ -1245,6 +1283,7 @@ case_record_write_failure
+ case_record_reject_miss
+ case_record_no_route
+ case_record_reject_route_failure
++case_record_reject_routes_to_the_slung_pool
+ case_text_invariants
+ 
+ if [ "$PASS_CASES" -ne "$EXPECTED_CASES" ]; then
+diff --git a/gastown/tests/test_refinery_reject_branch_survival.sh b/gastown/tests/test_refinery_reject_branch_survival.sh
+index 3c147afd..f3fdd3c9 100755
+--- a/gastown/tests/test_refinery_reject_branch_survival.sh
++++ b/gastown/tests/test_refinery_reject_branch_survival.sh
+@@ -34,6 +34,8 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+ REFINERY_FORMULA="$ROOT/gastown/formulas/mol-refinery-patrol.toml"
+ POLECAT_FORMULA="$ROOT/gastown/formulas/mol-polecat-work.toml"
+ MERGE_PUSH="$ROOT/gastown/assets/scripts/refinery/merge-push.sh"
++ACCEPTANCE_CHECK="$ROOT/gastown/assets/scripts/refinery/acceptance-check.sh"
++REFINERY_PROMPT="$ROOT/gastown/agents/refinery/prompt.template.md"
+ 
+ FAILURES=0
+ 
+@@ -309,9 +311,114 @@ PY
+     [ $? -eq 0 ] || FAILURES=$((FAILURES + 1))
+ }
+ 
++# ---------------------------------------------------------------------------
++# 4. The route a rejection gives the bead (gcp-j1ao). A rejected bead goes back
++#    to the pool gc sling routed it to (metadata gc.execution_routed_to), else
++#    to the rig's default polecat pool. Both rejection blocks in the formula are
++#    EXECUTED here against a stub gc that serves one canned bead and journals
++#    the update; the scripts and the prompt copy are pinned by text, because the
++#    formula blocks cannot source the resolver and every copy must keep the one
++#    rule.
++# ---------------------------------------------------------------------------
++
++# A `gc` for the reject-update blocks: it journals every call, serves the canned
++# bead JSON in $GC_STUB_SHOW for the bead read (or fails it when
++# GC_STUB_SHOW_FAIL=1), and accepts anything else.
++make_route_gc_stub() {
++    local dir="$1"
++    mkdir -p "$dir"
++    cat > "$dir/gc" <<'STUB'
++#!/usr/bin/env bash
++printf 'gc %s\n' "$*" >> "${GC_STUB_LOG:?GC_STUB_LOG unset}"
++case "$1:$2" in
++    bd:show)
++        if [ "${GC_STUB_SHOW_FAIL:-}" = 1 ]; then
++            exit 1
++        fi
++        cat "${GC_STUB_SHOW:?GC_STUB_SHOW unset}"
++        ;;
++esac
++exit 0
++STUB
++    chmod +x "$dir/gc"
++}
++
++# run_reject_update <block> <bead JSON | FAIL> — run one extracted reject-update
++# block in a refinery clone, as the rig winnow, and echo the gc.routed_to its
++# update set. FAIL makes the bead read fail. Echoes nothing when the block never
++# reached its update.
++run_reject_update() {
++    local block="$1" show="$2" root script log
++    root=$(mktemp -d "$WORKDIR/route.XXXXXX")
++    build_fixture "$root" "polecat/gcp-fixture" >/dev/null 2>&1
++    script="$root/reject-update.sh"
++    extract_block "$REFINERY_FORMULA" "$block" "$script" || {
++        echo "could not extract $block from mol-refinery-patrol" >&2
++        return
++    }
++    make_route_gc_stub "$root/bin"
++    log="$root/gc-calls.log"
++    : > "$log"
++    printf '%s\n' "$show" > "$root/show.json"
++    (cd "$root/refinery" && \
++        PATH="$root/bin:$PATH" GC_STUB_LOG="$log" GC_STUB_SHOW="$root/show.json" \
++        GC_STUB_SHOW_FAIL=$([ "$show" = FAIL ] && echo 1 || echo 0) \
++        GC_RIG=winnow WORK=gcp-fixture TARGET=integration \
++        bash "$script") >/dev/null 2>&1
++    sed -n 's/^gc bd update gcp-fixture .* --set-metadata gc\.routed_to=\(.*\)$/\1/p' "$log"
++}
++
++test_rejection_routes_to_the_slung_pool() {
++    local block got
++    for block in rebase-reject-update failure-reject-update; do
++        got=$(run_reject_update "$block" '[{"id":"gcp-fixture","metadata":{"gc.execution_routed_to":"winnow/specialists.view"}}]')
++        [ "$got" = winnow/specialists.view ] || fail "$block: gc.routed_to is '$got', want 'winnow/specialists.view'"
++    done
++}
++
++test_rejection_without_a_slung_pool_routes_to_the_default() {
++    local block show got
++    for block in rebase-reject-update failure-reject-update; do
++        for show in '[{"id":"gcp-fixture","metadata":{}}]' '[{"id":"gcp-fixture","metadata":{"gc.execution_routed_to":""}}]'; do
++            got=$(run_reject_update "$block" "$show")
++            [ "$got" = winnow/polecat ] || fail "$block: gc.routed_to is '$got' for $show, want 'winnow/polecat'"
++        done
++    done
++}
++
++test_rejection_of_an_unreadable_bead_routes_to_the_default() {
++    local block got
++    for block in rebase-reject-update failure-reject-update; do
++        got=$(run_reject_update "$block" FAIL)
++        [ "$got" = winnow/polecat ] || fail "$block: gc.routed_to is '$got' for an unreadable bead, want 'winnow/polecat'"
++    done
++}
++
++# One rule, at every site that reads the stamp, and no copy of the old
++# hard-coded route left behind.
++test_reject_route_is_one_rule_at_every_site() {
++    local rule='(.[0].metadata."gc.execution_routed_to" // "") | tostring' got
++    got=$(grep -cF -- "$rule" "$REFINERY_FORMULA")
++    [ "$got" = 2 ] || fail "the formula carries the rule $got time(s), want 2 (one per reject block)"
++    got=$(grep -cF -- "$rule" "$MERGE_PUSH")
++    [ "$got" = 1 ] || fail "merge-push.sh carries the rule $got time(s), want 1 (resolve_reject_route)"
++    got=$(grep -cF -- "$rule" "$REFINERY_PROMPT")
++    [ "$got" = 1 ] || fail "the refinery prompt carries the rule $got time(s), want 1 (its copy of the update)"
++    got=$(grep -cF -- 'gc.routed_to="${GC_RIG:+$GC_RIG/}{{binding_prefix}}polecat"' "$REFINERY_FORMULA")
++    [ "$got" = 0 ] || fail "the formula still sets gc.routed_to to the default pool $got time(s), want 0"
++    got=$(grep -cF -- 'gc.routed_to=${CFG_RIG:+$CFG_RIG/}${CFG_BINDING_PREFIX}polecat' "$ACCEPTANCE_CHECK")
++    [ "$got" = 0 ] || fail "acceptance-check.sh still sets gc.routed_to to the default pool $got time(s), want 0"
++    got=$(grep -cF -- 'resolve_reject_route "$1"' "$ACCEPTANCE_CHECK")
++    [ "$got" = 1 ] || fail "acceptance-check.sh calls resolve_reject_route $got time(s), want 1"
++}
++
+ test_reject_then_resume_from_a_different_worktree
+ test_resolution_still_halts_on_a_missing_branch
+ test_branch_deletion_lives_only_on_the_merged_path
++test_rejection_routes_to_the_slung_pool
++test_rejection_without_a_slung_pool_routes_to_the_default
++test_rejection_of_an_unreadable_bead_routes_to_the_default
++test_reject_route_is_one_rule_at_every_site
+ 
+ if [ "$FAILURES" -ne 0 ]; then
+     echo "$FAILURES failure(s) in $(basename "${BASH_SOURCE[0]}")" >&2
+-- 
+2.54.0 (Apple Git-157)
+

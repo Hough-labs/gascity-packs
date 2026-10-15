@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 15 Oct 2026 15:04:53 -0400
-Subject: [PATCH 179/180] test(gastown): cover merge-batch stack-time artifact
+Subject: [PATCH 179/181] test(gastown): cover merge-batch stack-time artifact
  cleanup non-convergence WARN (gcp-8qkdy)
 
 merge-batch.sh runs task-artifact-cleanup on a member that stack time finds

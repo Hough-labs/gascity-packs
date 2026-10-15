@@ -81,7 +81,8 @@
 #           7. one `gc bd update`: status open, no assignee, metadata
 #              rejection_reason ("acceptance: <ids> - see note", <ids> being the AC
 #              ids marked MISSING or SUBSTITUTED, or "acceptance: see note" with
-#              none) and gc.routed_to (the rig's polecat pool)
+#              none) and gc.routed_to (the pool gc sling routed the bead to, else
+#              the rig's polecat pool: resolve_reject_route)
 #         Nothing else routes: DECLARED, CONFORMS and SKIP write what they write in
 #         warn mode, plus acceptance_check_mode=reject, and make no workflow call and
 #         no status or assignee write. record never closes a bead and never touches a
@@ -591,15 +592,16 @@ rec_run() {
 # rec_return_to_pool <id> <items> — a reject-mode MISS goes back to the polecat
 # pool the way the patrol's rebase step sends back a conflict: the workflow is
 # cleaned up and the source reopened, then the bead is put back with its reason and
-# its routing. Each write runs only after the one before it succeeded. CFG_RIG and
-# CFG_BINDING_PREFIX are resolve_config's twins of the rebase step's
-# ${GC_RIG:+$GC_RIG/}<binding prefix>polecat. handoff_stage is cleared as on every
-# rejection (upstream #322): the polecat's completed submit no longer stands, and a
-# stale marker would let the witness's Step 3a hand this tip straight back here.
+# its routing. Each write runs only after the one before it succeeded. The route is
+# merge-push.sh's resolve_reject_route, read before the workflow calls.
+# handoff_stage is cleared as on every rejection (upstream #322): the polecat's
+# completed submit no longer stands, and a stale marker would let the witness's
+# Step 3a hand this tip straight back here.
 # Returns 1 when a write failed.
 rec_return_to_pool() {
   rp_ids=$(ac_nudge_ids MISS "$2")
   rp_reason="acceptance: ${rp_ids:+$rp_ids - }see note"
+  rp_route=$(resolve_reject_route "$1" "${CFG_RIG:+$CFG_RIG/}${CFG_BINDING_PREFIX}polecat")
   if ! gc workflow delete-source "$1" --apply >/dev/null; then
     ac_warn "gc workflow delete-source for $1 failed; the bead stays with the refinery"
     return 1
@@ -610,7 +612,7 @@ rec_return_to_pool() {
   fi
   if ! gc bd update "$1" --status=open --assignee= --unset-metadata handoff_stage \
     --set-metadata "rejection_reason=$rp_reason" \
-    --set-metadata "gc.routed_to=${CFG_RIG:+$CFG_RIG/}${CFG_BINDING_PREFIX}polecat" >/dev/null; then
+    --set-metadata "gc.routed_to=$rp_route" >/dev/null; then
     ac_warn "the pool return of $1 failed; the bead stays with the refinery"
     return 1
   fi

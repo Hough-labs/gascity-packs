@@ -293,13 +293,17 @@ original lives in `mol-refinery-patrol` steps `rebase` and `handle-failures`,
 which are authoritative if these ever disagree:
 
 ```bash
+REJECT_ROUTE=$(gc bd show "$WORK" --json 2>/dev/null | jq -r '(.[0].metadata."gc.execution_routed_to" // "") | tostring' 2>/dev/null)
+[ -n "$REJECT_ROUTE" ] || REJECT_ROUTE="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat"
 gc bd update $WORK \
   --status=open \
   --assignee="" \
   --unset-metadata handoff_stage \
   --set-metadata rejection_reason="<why>" \
-  --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat"
+  --set-metadata gc.routed_to="$REJECT_ROUTE"
 ```
+
+`REJECT_ROUTE` is the pool `gc sling` routed the bead to (`gc.execution_routed_to`), else the rig's default polecat pool.
 
 The full step also runs `gc workflow delete-source $WORK --apply && gc workflow
 reopen-source $WORK` before this update, and cleans up the `temp` branch after.

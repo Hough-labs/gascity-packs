@@ -1092,6 +1092,21 @@ resolve_merge_strategy() {
   printf '%s\n' "$rms_strategy"
 }
 
+# resolve_reject_route <bead-id> <default-pool> — the pool a rejected bead goes
+# back to (gcp-j1ao): its gc.execution_routed_to, which gc sling stamps with the
+# pool it routed the bead to, else <default-pool>. An unreadable bead gets the
+# default and a WARN on stderr. Always returns 0. mol-refinery-patrol's reject
+# blocks carry the same rule inline; the reject suite pins every copy.
+resolve_reject_route() {
+  rrr_route=""
+  if rrr_json=$(gc bd show "$1" --json 2>/dev/null); then
+    rrr_route=$(printf '%s' "$rrr_json" | jq -r '(.[0].metadata."gc.execution_routed_to" // "") | tostring' 2>/dev/null)
+  else
+    echo "WARN cannot read $1 for gc.execution_routed_to; routing the rejection to $2" >&2
+  fi
+  printf '%s\n' "${rrr_route:-$2}"
+}
+
 main() {
 resolve_config "$@" || return 1
 WORK="$CFG_WORK"

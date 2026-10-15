@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 15 Oct 2026 04:31:32 -0400
-Subject: [PATCH 168/180] fix(gastown): a lost fast-forward race re-enters the
+Subject: [PATCH 168/181] fix(gastown): a lost fast-forward race re-enters the
  rebase step instead of re-rebasing in place (gcp-xs3eq)
 
 merge_ff_push retried a lost race in place: on a failed ff-merge, or a push

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 15 Oct 2026 10:03:02 -0400
-Subject: [PATCH 174/180] fix(gastown): a declining polecat writes nothing on
+Subject: [PATCH 174/181] fix(gastown): a declining polecat writes nothing on
  any bead (gcp-ajv1y)
 
 A polecat that declined a duplicate pour (CLAIM_DECLINED_LIVE_OWNER) wrote a
