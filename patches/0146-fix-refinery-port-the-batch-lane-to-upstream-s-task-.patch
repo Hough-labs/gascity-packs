@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sat, 10 Oct 2026 16:54:45 -0400
-Subject: [PATCH 146/178] fix(refinery): port the batch lane to upstream's
+Subject: [PATCH 146/179] fix(refinery): port the batch lane to upstream's
  task-artifact lifecycle (gcp-fooz4)
 
 f709abe5 (#245) made every verified close keep the source branch ("MUST NOT

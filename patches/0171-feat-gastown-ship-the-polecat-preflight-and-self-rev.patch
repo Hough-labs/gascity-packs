@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 15 Oct 2026 07:53:37 -0400
-Subject: [PATCH 171/178] feat(gastown): ship the polecat preflight and
+Subject: [PATCH 171/179] feat(gastown): ship the polecat preflight and
  self-review gates as one pack executable (gcp-v9mvh)
 
 The preflight-tests section-1 fence (136 lines) and the self-review

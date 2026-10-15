@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 15 Oct 2026 13:27:40 -0400
-Subject: [PATCH 177/178] feat(gastown): ship the polecat workspace-setup
+Subject: [PATCH 177/179] feat(gastown): ship the polecat workspace-setup
  fences as a pack executable (gcp-xeael)
 
 workspace-setup was about 270 lines of shell the model retypes every time it sets up a bead, and it is the second most common polecat restart point. The base-resolve, key-load/roots, artifact-worktree validator, worktree create/adopt and new-branch fences now live in gastown/assets/scripts/polecat-workspace.sh, and the step carries three 8-line stubs that locate the script and source it.

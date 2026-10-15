@@ -36,7 +36,7 @@
 # in. SCRIPT may point at another copy of merge-batch.sh; it finds merge-push.sh
 # beside itself, so stage a copy as a pack tree.
 #
-# The suite fails unless all 20 cases ran.
+# The suite fails unless all 21 cases ran.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -44,7 +44,7 @@ PACK_DIR="$ROOT/gastown"
 SCRIPT="${SCRIPT:-$PACK_DIR/assets/scripts/refinery/merge-batch.sh}"
 PUSH_SCRIPT="$(dirname "$SCRIPT")/merge-push.sh"
 CLEANUP_SCRIPT="$ROOT/gastown/assets/scripts/task-artifact-cleanup.sh"
-EXPECTED_CASES=20
+EXPECTED_CASES=21
 
 AGENT=testrig/gastown.refinery
 TARGET_NAME=integration
@@ -696,6 +696,48 @@ case_stack_already_landed() {
     end_case
 }
 
+# The closed member's task-artifact cleanup that does not converge is a WARN at
+# stack time, not a stop: the member stays closed, its durable cleanup state
+# stays for find-work's sweep to retry, and stacking continues past it. The
+# land-time analogue is case_land_cleanup_blocked.
+case_stack_already_landed_cleanup_blocked() {
+    new_case stack-already-landed-cleanup-blocked
+    init_rig
+    add_branch gcp-l1 f1.txt "member one"
+    add_branch gcp-l2 f2.txt "member two"
+    add_branch gcp-l3 f3.txt "member three"
+    move_target elsewhere.txt
+    land_by_patch_id gcp-l2
+    finish_rig gcp-l1
+    write_bead gcp-l1 1 2026-10-02T01:00:00Z
+    write_bead gcp-l2 1 2026-10-02T02:00:00Z rejection_reason="an earlier attempt was rejected"
+    write_bead gcp-l3 1 2026-10-02T03:00:00Z
+    # write_bead makes the task worktree, so it exists to be dirtied here. A
+    # dirty task worktree is one cleanup will not remove.
+    echo scratch >"$(artifact_of gcp-l2)/scratch.txt"
+    local before_l1 before_l3
+    before_l1=$(bead_sum gcp-l1)
+    before_l3=$(bead_sum gcp-l3)
+
+    run_batch stack --head gcp-l1 --members gcp-l1,gcp-l2,gcp-l3
+    assert_eq "stack exits 0 though a member's cleanup did not converge" 0 "$(last_rc)"
+    grep -qF "merge-batch: WARN task artifact cleanup for gcp-l2 did not converge" "$T/err" ||
+        fail "stack did not WARN that gcp-l2's cleanup did not converge"
+    grep -qx "gc gastown task-artifact-cleanup gcp-l2" "$T/gc.log" || fail "no task-artifact cleanup ran for gcp-l2"
+    assert_eq "the member is still closed" closed "$(bead_field gcp-l2 status)"
+    assert_eq "its merge_result is already_merged" already_merged "$(bead_meta gcp-l2 merge_result)"
+    assert_eq "gcp-l2's artifact_cleanup_state" blocked "$(bead_meta gcp-l2 artifact_cleanup_state)"
+    [ -d "$(artifact_of gcp-l2)" ] || fail "gcp-l2's dirty task worktree was removed"
+    [ -n "$(branch_on_origin gcp-l2)" ] || fail "origin/polecat/gcp-l2 was deleted"
+    assert_eq "the manifest skips the member that already landed" \
+        "gcp-l1 gcp-l3" "$(mf '[.members[].id] | join(" ")')"
+    git -C "$REFINERY" cat-file -e "temp:f3.txt" 2>/dev/null || fail "stacking did not continue past the member whose cleanup is blocked"
+    assert_eq "the head's bead is untouched" "$before_l1" "$(bead_sum gcp-l1)"
+    assert_eq "the stacked member's bead is untouched" "$before_l3" "$(bead_sum gcp-l3)"
+    assert_tidy
+    end_case
+}
+
 # A head whose rebase collapsed has no commit of its own. Batched, land would map
 # it to another member's commit and close it merged on that sha (M1), so stack
 # leaves a batch of 1 and the single-bead lane's merge-state gate decides it.
@@ -1298,6 +1340,7 @@ case_select_truncation
 case_stack_clean
 case_stack_conflict
 case_stack_already_landed
+case_stack_already_landed_cleanup_blocked
 case_stack_collapsed_head
 case_stack_degrade
 case_invariants
