@@ -1497,6 +1497,45 @@ def test_validate_gastown_orchestration_contract_rejects_missing_refinery_false_
         gascity_pack_inference_gate.validate_gastown_orchestration_contract(pack)
 
 
+def test_validate_gastown_orchestration_contract_rejects_missing_workspace_worktree_add(tmp_path) -> None:
+    # The worktree creation moved out of the formula into polecat-workspace.sh
+    # (gcp-xeael). A formula-side `git worktree add` pin would be satisfied by
+    # self-review's detached worktree, so the contract that holds it reads the script.
+    pack = write_gastown_contract_pack(
+        tmp_path,
+        script_edit=lambda path, text: (
+            text.replace("--detach", "") if path.endswith("polecat-workspace.sh") else text
+        ),
+    )
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="polecat-workspace.sh"):
+        gascity_pack_inference_gate.validate_gastown_orchestration_contract(pack)
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        '. "$WS" base-resolve "${WORK_BEAD_ID:-}"',
+        '. "$WS" worktree "${WORK_BEAD_ID:-}" "${BASE_REF:-}"',
+        '. "$WS" new-branch "${WORK_BEAD_ID:-}" "${BASE_REF:-}"',
+    ],
+)
+def test_validate_gastown_orchestration_contract_rejects_a_polecat_step_that_stops_calling_the_workspace_script(
+    tmp_path, call
+) -> None:
+    # The step keeps only the calls; a step that stops running one is a polecat
+    # that never resolves its base, never gets a worktree, or never gets a branch.
+    pack = write_gastown_contract_pack(
+        tmp_path,
+        formula_edit=lambda name, text: (
+            text.replace(call, "true", 1) if name == "mol-polecat-work" else text
+        ),
+    )
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="mol-polecat-work"):
+        gascity_pack_inference_gate.validate_gastown_orchestration_contract(pack)
+
+
 def test_validate_gastown_orchestration_contract_rejects_a_pack_without_the_merge_push_script(tmp_path) -> None:
     pack = write_gastown_contract_pack(tmp_path)
     (pack / "assets" / "scripts" / "refinery" / "merge-push.sh").unlink()
@@ -1515,18 +1554,25 @@ def gastown_formulas_copy(tmp_path: Path) -> Path:
 
 
 def mutated_gastown_source(tmp_path: Path, old: str, new: str) -> Path:
-    """Copy the real gastown formulas into tmp_path with one mol-polecat-work edit."""
+    """Copy the real gastown formulas and the workspace script into tmp_path with one edit.
+
+    The edit lands in mol-polecat-work, or, when the anchor is not there, in
+    polecat-workspace.sh: the base-resolution block lives in the script now
+    (gcp-xeael), and the lint reads both.
+    """
     pack_source = tmp_path / "gastown"
-    shutil.copytree(
-        gascity_pack_inference_gate.PACK_SPECS["gastown"].source / "formulas",
-        pack_source / "formulas",
-    )
-    formula = pack_source / "formulas" / "mol-polecat-work.toml"
-    original = formula.read_text(encoding="utf-8")
-    mutated = original.replace(old, new, 1)
-    assert mutated != original, f"mutation anchor not present in the formula: {old!r}"
-    formula.write_text(mutated, encoding="utf-8")
-    return pack_source
+    source = gascity_pack_inference_gate.PACK_SPECS["gastown"].source
+    shutil.copytree(source / "formulas", pack_source / "formulas")
+    script_rel = gascity_pack_inference_gate.POLECAT_WORKSPACE_SCRIPT
+    (pack_source / script_rel).parent.mkdir(parents=True)
+    shutil.copy(source / script_rel, pack_source / script_rel)
+    for target in (pack_source / "formulas" / "mol-polecat-work.toml", pack_source / script_rel):
+        original = target.read_text(encoding="utf-8")
+        mutated = original.replace(old, new, 1)
+        if mutated != original:
+            target.write_text(mutated, encoding="utf-8")
+            return pack_source
+    raise AssertionError(f"mutation anchor not present in the formula or the workspace script: {old!r}")
 
 
 def test_validate_polecat_branch_content_gate_accepts_current_pack() -> None:
@@ -1720,7 +1766,7 @@ def test_polecat_base_ref_contract_allows_shell_comment_mentions_of_the_bare_ref
     pack_source = mutated_gastown_source(
         tmp_path,
         'BASE_REF="$BASE_REMOTE"    # preferred: freshly fetched, no local drift',
-        'BASE_REF="$BASE_REMOTE"    # preferred over origin/{{base_branch}}, freshly fetched',
+        'BASE_REF="$BASE_REMOTE"    # preferred over origin/${WS_BASE_BRANCH}, freshly fetched',
     )
 
     gascity_pack_inference_gate.validate_polecat_base_ref_contract(pack_source)
@@ -1760,8 +1806,8 @@ def test_polecat_base_ref_contract_rejects_a_neutralised_stop_arm(tmp_path) -> N
 def test_polecat_base_ref_contract_rejects_a_missing_stop_arm(tmp_path) -> None:
     pack_source = mutated_gastown_source(
         tmp_path,
-        'else\n    echo "STOP: base branch {{base_branch}} exists neither on origin nor locally."',
-        'elif true; then\n    echo "STOP: base branch {{base_branch}} exists neither on origin nor locally."',
+        'else\n    echo "STOP: base branch ${WS_BASE_BRANCH} exists neither on origin nor locally."',
+        'elif true; then\n    echo "STOP: base branch ${WS_BASE_BRANCH} exists neither on origin nor locally."',
     )
 
     with pytest.raises(gascity_pack_inference_gate.GateError, match="no else arm"):
@@ -1787,18 +1833,13 @@ def test_polecat_base_ref_contract_reports_only_the_anchor_when_the_block_moves(
     # "assigns no BASE_REF" and "has no else arm" -- both false, and both send a
     # maintainer after an intact block instead of the moved anchor. The exact
     # count is the assertion: it is what fails if the short-circuit is dropped.
-    formula = (
-        gascity_pack_inference_gate.PACK_SPECS["gastown"].source
-        / "formulas"
-        / f"{gascity_pack_inference_gate.POLECAT_WORK_FORMULA}.toml"
-    )
-    text = formula.read_text(encoding="utf-8")
+    text = gascity_pack_inference_gate.polecat_base_ref_text(gascity_pack_inference_gate.PACK_SPECS["gastown"].source)
     moved = text.replace(
         'if git show-ref --verify --quiet "$BASE_REMOTE"; then',
         'if git show-ref --verify --quiet "$BASE_REMOTE" ; then',
         1,
     )
-    assert moved != text, "mutation anchor not present in the formula"
+    assert moved != text, "mutation anchor not present in the formula or the workspace script"
 
     problems = gascity_pack_inference_gate.polecat_base_ref_problems(moved)
 
@@ -1822,8 +1863,8 @@ def test_polecat_base_ref_contract_rejects_a_dropped_carrier_stamp(tmp_path) -> 
 def test_polecat_base_ref_contract_fails_closed_on_an_unbalanced_fence(tmp_path) -> None:
     pack_source = mutated_gastown_source(
         tmp_path,
-        'BASE_REMOTE="refs/remotes/origin/{{base_branch}}"',
-        '```\nBASE_REMOTE="refs/remotes/origin/{{base_branch}}"',
+        'BASE_REMOTE="refs/remotes/origin/${WS_BASE_BRANCH}"',
+        '```\nBASE_REMOTE="refs/remotes/origin/${WS_BASE_BRANCH}"',
     )
 
     with pytest.raises(gascity_pack_inference_gate.GateError, match="unterminated"):
@@ -2021,6 +2062,14 @@ def test_gastown_build_workflow_contract_covers_orchestration_roles() -> None:
         "mol-idea-to-plan",
     }
     assert "gc session wake \"$REFINERY_TARGET\"" in contracts["mol-polecat-work"]
+    # The worktree, branch and base resolution are the workspace script's
+    # (gcp-xeael): the step keeps the calls, the script's contract holds the rest.
+    for fragment in ("polecat-workspace.sh", '. "$WS" base-resolve', '. "$WS" worktree', '. "$WS" new-branch'):
+        assert any(fragment in item for item in contracts["mol-polecat-work"])
+    workspace_contracts = gascity_pack_inference_gate.GASTOWN_SCRIPT_CONTRACTS["assets/scripts/polecat-workspace.sh"]
+    assert 'git -C "$RIG_ROOT" worktree add "$WORKTREE_PATH" --detach "$BASE_REF"' in workspace_contracts
+    assert 'git checkout -b "$BRANCH" "$BASE_REF"' in workspace_contracts
+    assert not {"git worktree add", '--set-metadata branch="$BRANCH"'} & set(contracts["mol-polecat-work"])
     # The push gate and the handoff are the script's (gcp-nc8wg): the step keeps
     # the calls, and the script's own contract holds what moved with them.
     for fragment in ("polecat-submit.sh", 'bash "$PS" push-gate', 'bash "$PS" reassign'):

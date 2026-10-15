@@ -51,6 +51,8 @@ CHECKED_STEPS = {
 # these wait on the v2 early-abort idiom (scope + on_fail=abort_scope). Tracked
 # in gascity; see the ga-uppw56 follow-ups. Remove an entry when it is fixed.
 DEFERRED_STEPS = {
+    # Its three stubs' workspace-script-not-found STOP (gcp-xeael) is the same
+    # mid-workflow early exit as the fences' own halts: STOP, drain-ack, exit 1.
     ("gastown/formulas/mol-polecat-work.toml", "workspace-setup"),
     # The gates-script-not-found STOP, the same mid-workflow early exit as self-review's.
     ("gastown/formulas/mol-polecat-work.toml", "preflight-tests"),

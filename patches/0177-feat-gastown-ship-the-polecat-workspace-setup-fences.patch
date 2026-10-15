@@ -1,0 +1,1925 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 15 Oct 2026 13:27:40 -0400
+Subject: [PATCH 177/177] feat(gastown): ship the polecat workspace-setup
+ fences as a pack executable (gcp-xeael)
+
+workspace-setup was about 270 lines of shell the model retypes every time it sets up a bead, and it is the second most common polecat restart point. The base-resolve, key-load/roots, artifact-worktree validator, worktree create/adopt and new-branch fences now live in gastown/assets/scripts/polecat-workspace.sh, and the step carries three 8-line stubs that locate the script and source it.
+
+The script is SOURCED, not executed, so the cd into the task worktree, BASE_REF, WORKTREE and the validator functions land in the caller's shell exactly as the inline fences did. Run directly it prints WORKSPACE_USAGE and exits 2. Every formula substitution became an explicit positional argument, so the script holds no template text. Behaviour is identical: a throwaway identity harness diffed old and new over 91 paths under bash 5.3 and 3.2 with no differences (harness not committed).
+
+Tests that extracted or pinned the moved text are re-pointed to the script (test_polecat_artifact_dir.sh, test_polecat_base_resolution.sh, the inference gate and its test), plus a new foreign-repo canonical-path case and test_polecat_workspace.sh for the behavioural cases. Applied verbatim from the seat-verified artifact in gcp-2qq67 (sha256 9390e833).
+
+Validation: see the acceptance evidence recorded on gcp-xeael.
+---
+ gastown/assets/scripts/polecat-workspace.sh   | 383 +++++++++++++++
+ gastown/assets/scripts/worktree-setup.sh      |   3 +-
+ gastown/formulas/mol-polecat-work.toml        | 343 ++-----------
+ gastown/tests/test_polecat_artifact_dir.sh    | 120 +++--
+ gastown/tests/test_polecat_base_resolution.sh |  59 +--
+ gastown/tests/test_polecat_workspace.sh       | 459 ++++++++++++++++++
+ scripts/gascity_pack_inference_gate.py        |  84 +++-
+ tests/test_gascity_pack_inference_gate.py     |  95 +++-
+ tests/test_v2_drain_ack_closes_own_step.py    |   2 +
+ 9 files changed, 1146 insertions(+), 402 deletions(-)
+ create mode 100755 gastown/assets/scripts/polecat-workspace.sh
+ create mode 100755 gastown/tests/test_polecat_workspace.sh
+
+diff --git a/gastown/assets/scripts/polecat-workspace.sh b/gastown/assets/scripts/polecat-workspace.sh
+new file mode 100755
+index 00000000..784d807c
+--- /dev/null
++++ b/gastown/assets/scripts/polecat-workspace.sh
+@@ -0,0 +1,383 @@
++#!/usr/bin/env bash
++# polecat-workspace.sh — the deterministic shell of mol-polecat-work's
++# workspace-setup step, run as one script so the polecat makes a short call and
++# does not retype it (gcp-xeael).
++#
++# SOURCE IT, do not execute it:
++#
++#   . polecat-workspace.sh base-resolve <work-bead-id> <base-branch> <binding-prefix>
++#   . polecat-workspace.sh worktree     <work-bead-id> <base-ref>
++#   . polecat-workspace.sh new-branch   <work-bead-id> <base-ref> <base-branch>
++#
++# The fences it replaces ran in the polecat's own shell and left three things
++# there that later fences read: the working directory (worktree ends with a cd
++# into the task worktree), BASE_REF (base-resolve sets it; the rejection-rebase
++# fence and new-branch read it), and the shell variables each body assigns. A
++# child process cannot hand any of that back, so this file is sourced and every
++# line below runs in the caller's shell exactly as the inline fence did: an
++# `exit 1` ends the caller's call, as it always did. Executed instead of
++# sourced, it stops with WORKSPACE_USAGE before it touches anything.
++#
++#   base-resolve  workspace-setup section 1: resolve what the base branch means in
++#                 this clone (remote first, then local, else STOP), set BASE_REF
++#                 and record it as metadata.base_ref.
++#   worktree      section 2: load the task keys and roots, validate, then reuse,
++#                 adopt or create the per-bead artifact worktree, record
++#                 metadata.artifact_dir and cd into it.
++#   new-branch    section 3 "If no branch": record polecat/<work-bead-id> on a
++#                 clean detached checkout, or stop. The resume-an-existing-branch
++#                 and rejection-rebase fences stay in the step: the model acts on
++#                 them.
++#
++# Inputs are the positional arguments above. The formula step passes the shell's
++# own WORK_BEAD_ID (set by section 1) and BASE_REF (set by base-resolve), and
++# fills <base-branch> and <binding-prefix> from the rig. An EMPTY <work-bead-id>
++# or <base-ref> leaves the caller's variable exactly as it was, so a call made
++# without them meets the guards the fences always had: worktree rejects an
++# unsafe id and checks BASE_REF where it first needs it, new-branch checks it on
++# entry.
++# Env also read: GC_CITY_PATH GC_RIG GC_RIG_ROOT (worktree), GC_RIG (base-resolve).
++#
++# Variables left in the caller's shell are the ones the fences always left: the
++# mode's own assignments plus WORK_BEAD_ID and BASE_REF. The WS_* parameters are
++# removed again before the file returns, and the file returns the status of the
++# mode's last command, as the fence did. (On an `exit` path the shell is gone, so
++# nothing is left to see.)
++
++if ! (return 0 2>/dev/null); then
++    echo "WORKSPACE_USAGE polecat-workspace.sh is sourced, not executed: . polecat-workspace.sh base-resolve|worktree|new-branch ..."
++    exit 2
++fi
++WS_MODE="${1:-}"
++case "$WS_MODE:$#" in
++    base-resolve:4 | worktree:3 | new-branch:4) ;;
++    *)
++        echo "WORKSPACE_USAGE . polecat-workspace.sh base-resolve <work-bead-id> <base-branch> <binding-prefix> | worktree <work-bead-id> <base-ref> | new-branch <work-bead-id> <base-ref> <base-branch>"
++        exit 2
++        ;;
++esac
++# An empty argument leaves the caller's variable exactly as it was (unset stays
++# unset), so a call made without the id or the ref behaves as the fence did.
++[ -z "$2" ] || WORK_BEAD_ID="$2"
++case "$WS_MODE" in
++    base-resolve) WS_BASE_BRANCH="$3"; WS_BINDING_PREFIX="$4" ;;
++    worktree) [ -z "$3" ] || BASE_REF="$3" ;;
++    new-branch) [ -z "$3" ] || BASE_REF="$3"; WS_BASE_BRANCH="$4" ;;
++esac
++case "$WS_MODE" in
++base-resolve)
++# --- base-resolve:begin ---
++# GUARD_BEGIN base-resolve
++BASE_REMOTE="refs/remotes/origin/${WS_BASE_BRANCH}"
++BASE_LOCAL="refs/heads/${WS_BASE_BRANCH}"
++WITNESS_TARGET="${GC_RIG:+$GC_RIG/}${WS_BINDING_PREFIX}witness"
++if git show-ref --verify --quiet "$BASE_REMOTE"; then
++    if git show-ref --verify --quiet "$BASE_LOCAL" && ! git merge-base --is-ancestor "$BASE_LOCAL" "$BASE_REMOTE"; then
++        LOCAL_ONLY=$(git rev-list --count "$BASE_LOCAL" --not --remotes) || LOCAL_ONLY=err
++        if [ "$LOCAL_ONLY" != "0" ]; then
++            echo "STOP: local ${WS_BASE_BRANCH} has local-only commits that are not on origin or any other remote branch."
++            echo "Reconcile or push ${WS_BASE_BRANCH} first; do not branch from a stale base."
++            gc bd update "$WORK_BEAD_ID" --set-metadata halt_reason=base_branch_diverged
++            gc mail send "$WITNESS_TARGET" -s "polecat halted: base_branch_diverged ($WORK_BEAD_ID)" -m "Local ${WS_BASE_BRANCH} has local-only commits (count: $LOCAL_ONLY) that are not an ancestor of the copy on origin and are on no remote branch; $WORK_BEAD_ID cannot pick a fork point. Reconcile the branch."
++            gc runtime drain-ack
++            exit 1
++        fi
++        echo "note: local ${WS_BASE_BRANCH} is stale (0 commits off-remote); branching from origin"
++    fi
++    BASE_REF="$BASE_REMOTE"    # preferred: freshly fetched, no local drift
++elif git show-ref --verify --quiet "$BASE_LOCAL"; then
++    BASE_REF="$BASE_LOCAL"     # local-only base (unpushed integration branch)
++    echo "note: base branch ${WS_BASE_BRANCH} is local-only — it does not exist on origin"
++else
++    echo "STOP: base branch ${WS_BASE_BRANCH} exists neither on origin nor locally."
++    echo "Fix the rig/bead base configuration; do not substitute a different base."
++    gc bd update "$WORK_BEAD_ID" --set-metadata halt_reason=base_branch_missing
++    gc mail send "$WITNESS_TARGET" -s "polecat halted: base_branch_missing ($WORK_BEAD_ID)" -m "Base branch ${WS_BASE_BRANCH} exists neither on origin nor locally in this clone. $WORK_BEAD_ID cannot start until the rig/bead base configuration is fixed."
++    gc runtime drain-ack
++    exit 1
++fi
++gc bd update "$WORK_BEAD_ID" --set-metadata base_ref="$BASE_REF"
++# GUARD_END base-resolve
++# --- base-resolve:end ---
++;;
++worktree)
++# --- worktree:begin ---
++BEAD_JSON=$(gc bd show "$WORK_BEAD_ID" --json) || {
++  echo "Could not read work bead metadata for $WORK_BEAD_ID." >&2
++  gc runtime drain-ack
++  exit 1
++}
++BEAD_META=$(printf '%s' "$BEAD_JSON" | jq -ce '
++  if type == "array" and length == 1 and (.[0] | type) == "object" and
++     ((.[0].metadata // {}) | type) == "object"
++  then .[0].metadata // {}
++  else error("expected exactly one work bead object")
++  end
++') || {
++  echo "Invalid work bead response for $WORK_BEAD_ID; refusing to create or adopt an artifact." >&2
++  gc runtime drain-ack
++  exit 1
++}
++ARTIFACT_DIR=$(printf '%s' "$BEAD_META" | jq -r '.artifact_dir // empty')
++LEGACY_WORK_DIR=$(printf '%s' "$BEAD_META" | jq -r '.work_dir // empty')
++if [ -z "${GC_CITY_PATH:-}" ] || [ -z "${GC_RIG:-}" ] ||
++   [ -z "${GC_RIG_ROOT:-}" ]; then
++  echo "GC_CITY_PATH, GC_RIG, and GC_RIG_ROOT are required for task worktrees." >&2
++  gc runtime drain-ack
++  exit 1
++fi
++case "$WORK_BEAD_ID" in
++  ""|"."|".."|*[!A-Za-z0-9._-]*)
++    echo "Unsafe work bead id for artifact path: $WORK_BEAD_ID" >&2
++    gc runtime drain-ack
++    exit 1
++    ;;
++esac
++case "$GC_RIG" in
++  ""|"."|".."|*[!A-Za-z0-9._-]*)
++    echo "Unsafe rig name for artifact path: $GC_RIG" >&2
++    gc runtime drain-ack
++    exit 1
++    ;;
++esac
++CITY_ROOT=$(CDPATH= cd -- "$GC_CITY_PATH" 2>/dev/null && pwd -P) || {
++  echo "City root is missing: $GC_CITY_PATH" >&2
++  gc runtime drain-ack
++  exit 1
++}
++RIG_ROOT=$(CDPATH= cd -- "$GC_RIG_ROOT" 2>/dev/null && pwd -P) || {
++  echo "Rig root is missing: $GC_RIG_ROOT" >&2
++  gc runtime drain-ack
++  exit 1
++}
++
++# BEGIN ARTIFACT_WORKTREE_VALIDATOR
++artifact_git_common_dir() {
++  local repo_dir=$1 common_dir
++  common_dir=$(git -C "$repo_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) ||
++    return 1
++  (CDPATH= cd -- "$common_dir" 2>/dev/null && pwd -P)
++}
++
++validate_artifact_worktree() {
++  local candidate=$1 city_root=$2 rig_name=$3 rig_root=$4 bead_id=$5
++  local policy=${6:-existing}
++  local candidate_real candidate_top candidate_common rig_common
++  local rig_namespace rig_namespace_real canonical_path
++  local worktrees_parent provider_home provider_root provider_name
++
++  [ -n "$candidate" ] && [ -d "$candidate" ] || return 1
++  candidate_real=$(CDPATH= cd -- "$candidate" 2>/dev/null && pwd -P) || return 1
++
++  # Only the exact bead-scoped .../worktrees/<bead-id> shape is reusable.
++  [ "$(basename -- "$candidate_real")" = "$bead_id" ] || return 1
++  [ "$(basename -- "$(dirname -- "$candidate_real")")" = "worktrees" ] || return 1
++
++  # Same-repository is not an ownership boundary: multiple cities and rigs can
++  # share one Git common dir. Require this city's exact canonical path or the
++  # one historical provider-nested layout that Gastown actually created.
++  rig_namespace="$city_root/.gc/worktrees/$rig_name"
++  rig_namespace_real=$(CDPATH= cd -- "$rig_namespace" 2>/dev/null && pwd -P) ||
++    return 1
++  [ "$rig_namespace_real" = "$rig_namespace" ] || return 1
++  canonical_path="$rig_namespace_real/artifacts/worktrees/$bead_id"
++  if [ "$candidate_real" = "$canonical_path" ]; then
++    [ "$policy" != legacy-only ] || return 1
++  else
++    [ "$policy" != canonical-only ] || return 1
++    worktrees_parent=$(dirname -- "$candidate_real")
++    provider_home=$(dirname -- "$worktrees_parent")
++    provider_root=$(dirname -- "$provider_home")
++    provider_name=$(basename -- "$provider_home")
++    [ "$provider_root" = "$rig_namespace_real/polecats" ] || return 1
++    case "$provider_name" in
++      ""|"."|".."|*[!A-Za-z0-9._-]*) return 1 ;;
++    esac
++  fi
++
++  # Reject a plain subdirectory of a worktree and worktrees from another repo.
++  candidate_top=$(git -C "$candidate_real" rev-parse --show-toplevel 2>/dev/null) ||
++    return 1
++  candidate_top=$(CDPATH= cd -- "$candidate_top" 2>/dev/null && pwd -P) || return 1
++  [ "$candidate_top" = "$candidate_real" ] || return 1
++  candidate_common=$(artifact_git_common_dir "$candidate_real") || return 1
++  rig_common=$(artifact_git_common_dir "$rig_root") || return 1
++  [ "$candidate_common" = "$rig_common" ] || return 1
++
++  printf '%s\n' "$candidate_real"
++}
++# END ARTIFACT_WORKTREE_VALIDATOR
++
++WORKTREE=
++if [ -n "$ARTIFACT_DIR" ]; then
++  if WORKTREE=$(validate_artifact_worktree \
++      "$ARTIFACT_DIR" "$CITY_ROOT" "$GC_RIG" "$RIG_ROOT" \
++      "$WORK_BEAD_ID" existing); then
++    echo "Reusing artifact_dir=$WORKTREE"
++  else
++    echo "Canonical artifact_dir is missing or unsafe: $ARTIFACT_DIR" >&2
++    echo "STOP. Preserve it for manual recovery; only an absent canonical key may fall back or create." >&2
++    gc runtime drain-ack
++    exit 1
++  fi
++elif [ -n "$LEGACY_WORK_DIR" ]; then
++  if WORKTREE=$(validate_artifact_worktree \
++      "$LEGACY_WORK_DIR" "$CITY_ROOT" "$GC_RIG" "$RIG_ROOT" \
++      "$WORK_BEAD_ID" legacy-only); then
++    echo "Adopting validated in-place legacy work_dir=$WORKTREE as artifact_dir."
++    echo "It remains provider-nested until terminal cleanup; new artifacts are always canonical."
++  else
++    echo "Ignoring unsafe legacy work_dir=$LEGACY_WORK_DIR; creating a new per-bead worktree." >&2
++  fi
++fi
++
++if [ -z "$WORKTREE" ]; then
++  ARTIFACT_HOME="$CITY_ROOT/.gc/worktrees/$GC_RIG/artifacts"
++  if [ -L "$ARTIFACT_HOME" ] ||
++     { [ -e "$ARTIFACT_HOME" ] && [ ! -d "$ARTIFACT_HOME" ]; }; then
++    echo "Task artifact root is redirected or is not a directory: $ARTIFACT_HOME" >&2
++    gc runtime drain-ack
++    exit 1
++  fi
++  mkdir -p -- "$ARTIFACT_HOME"
++  ARTIFACT_HOME_REAL=$(CDPATH= cd -- "$ARTIFACT_HOME" 2>/dev/null && pwd -P) || {
++    echo "Cannot resolve task artifact root." >&2
++    gc runtime drain-ack
++    exit 1
++  }
++  if [ "$ARTIFACT_HOME_REAL" != "$ARTIFACT_HOME" ]; then
++    echo "Task artifact root is redirected outside the city/rig namespace." >&2
++    gc runtime drain-ack
++    exit 1
++  fi
++  WORKTREE_PARENT="$ARTIFACT_HOME/worktrees"
++  if [ -L "$WORKTREE_PARENT" ] ||
++     { [ -e "$WORKTREE_PARENT" ] && [ ! -d "$WORKTREE_PARENT" ]; }; then
++    echo "Task worktree parent is redirected or is not a directory: $WORKTREE_PARENT" >&2
++    gc runtime drain-ack
++    exit 1
++  fi
++  mkdir -p -- "$WORKTREE_PARENT"
++  WORKTREE_PARENT=$(CDPATH= cd -- "$WORKTREE_PARENT" 2>/dev/null && pwd -P) || {
++    echo "Cannot resolve task worktree parent under the city artifact root." >&2
++    gc runtime drain-ack
++    exit 1
++  }
++  if [ "$WORKTREE_PARENT" != "$ARTIFACT_HOME/worktrees" ]; then
++    echo "Task worktree parent is redirected outside the city artifact root." >&2
++    gc runtime drain-ack
++    exit 1
++  fi
++  WORKTREE_PATH="$WORKTREE_PARENT/$WORK_BEAD_ID"
++
++  if [ -e "$WORKTREE_PATH" ]; then
++    # Recover the narrow crash window after git worktree add but before the
++    # metadata write. Never reuse an unrelated directory at this path.
++    if WORKTREE=$(validate_artifact_worktree \
++        "$WORKTREE_PATH" "$CITY_ROOT" "$GC_RIG" "$RIG_ROOT" \
++        "$WORK_BEAD_ID" canonical-only); then
++      echo "Recovering existing validated per-bead worktree=$WORKTREE"
++    else
++      echo "Canonical artifact path already exists but is not this bead's validated worktree: $WORKTREE_PATH" >&2
++      echo "STOP. Preserve and resolve the collision manually; do not create an alternate artifact." >&2
++      gc runtime drain-ack
++      exit 1
++    fi
++  fi
++
++  if [ -z "$WORKTREE" ]; then
++    git -C "$RIG_ROOT" worktree prune
++    : "${BASE_REF:?base ref not resolved — run step 1 first}"
++    git -C "$RIG_ROOT" worktree add "$WORKTREE_PATH" --detach "$BASE_REF"
++    WORKTREE=$(validate_artifact_worktree \
++      "$WORKTREE_PATH" "$CITY_ROOT" "$GC_RIG" "$RIG_ROOT" \
++      "$WORK_BEAD_ID" canonical-only) || {
++        echo "New task worktree failed validation: $WORKTREE_PATH" >&2
++        gc runtime drain-ack
++        exit 1
++      }
++  fi
++fi
++
++# Record the canonical key immediately, then retire any legacy task key.
++gc bd update "$WORK_BEAD_ID" \
++  --set-metadata artifact_dir="$WORKTREE" \
++  --unset-metadata work_dir || {
++    echo "Could not record artifact_dir; refusing to enter an untracked task worktree." >&2
++    gc runtime drain-ack
++    exit 1
++  }
++cd -- "$WORKTREE" || {
++  echo "Validated task worktree disappeared: $WORKTREE" >&2
++  gc runtime drain-ack
++  exit 1
++}
++# --- worktree:end ---
++;;
++new-branch)
++# --- new-branch:begin ---
++: "${BASE_REF:?base ref not resolved — run step 1 first}"
++EXPECTED_BRANCH="polecat/$WORK_BEAD_ID"
++CURRENT_BRANCH=$(git branch --show-current)
++if [ "$CURRENT_BRANCH" = "$EXPECTED_BRANCH" ]; then
++  BRANCH="$EXPECTED_BRANCH"
++  FORK_SHA=$(git merge-base "$BRANCH" "$BASE_REF") || {
++    echo "Cannot derive fork point for recovered branch $BRANCH." >&2
++    gc runtime drain-ack
++    exit 1
++  }
++  gc bd update "$WORK_BEAD_ID" \
++    --set-metadata branch="$BRANCH" \
++    --set-metadata fork_sha="$FORK_SHA" || {
++      echo "Could not record recovered branch metadata." >&2
++      gc runtime drain-ack
++      exit 1
++    }
++elif [ -n "$CURRENT_BRANCH" ] ||
++     [ -n "$(git status --porcelain)" ] ||
++     git show-ref --verify --quiet "refs/heads/$EXPECTED_BRANCH" ||
++     git show-ref --verify --quiet "refs/remotes/origin/$EXPECTED_BRANCH" ||
++     ! git merge-base --is-ancestor HEAD "$BASE_REF"; then
++  echo "artifact_dir contains branch/work not recorded in metadata.branch." >&2
++  echo "STOP. Recover and record it manually; do not reset or delete refs." >&2
++  gc runtime drain-ack
++  exit 1
++else
++  # A clean detached checkout at or behind the base has no unique work.
++  if [ "$BASE_REF" = "refs/heads/${WS_BASE_BRANCH}" ]; then
++    :  # local-only base: nothing on origin to refresh
++  elif ! git fetch origin ${WS_BASE_BRANCH} >/dev/null 2>&1; then
++    # Step 1 already resolved this base on origin, so a failure here is
++    # either transient or the base disappearing mid-run. Ask origin rather
++    # than silently branching from a stale remote-tracking ref.
++    if git ls-remote --exit-code --heads origin "refs/heads/${WS_BASE_BRANCH}" >/dev/null 2>&1; then
++      echo "warning: could not refresh ${WS_BASE_BRANCH}; using the ref fetched in step 1"
++    else
++      echo "STOP: ${WS_BASE_BRANCH} no longer resolves on origin (deleted, renamed, or unreachable)." >&2
++      echo "Re-run workspace-setup to re-resolve the base; do not branch from a stale ref." >&2
++      gc runtime drain-ack
++      exit 1
++    fi
++  fi
++  BRANCH="$EXPECTED_BRANCH"
++  git checkout -b "$BRANCH" "$BASE_REF" || {
++    echo "Could not create $BRANCH from $BASE_REF." >&2
++    gc runtime drain-ack
++    exit 1
++  }
++  gc bd update "$WORK_BEAD_ID" \
++    --set-metadata branch="$BRANCH" \
++    --set-metadata fork_sha="$(git rev-parse "$BASE_REF")" || {
++      echo "Could not record new branch metadata." >&2
++      gc runtime drain-ack
++      exit 1
++    }
++fi
++# --- new-branch:end ---
++;;
++esac
++# Return the mode's own status with no WS_ variable left behind. `return` takes
++# its status from WS_RC, so the eval expands it before it unsets it.
++WS_RC=$?
++unset WS_MODE WS_BASE_BRANCH WS_BINDING_PREFIX
++eval "unset WS_RC; return $WS_RC"
+diff --git a/gastown/assets/scripts/worktree-setup.sh b/gastown/assets/scripts/worktree-setup.sh
+index c47b2dfc..fe19c2fe 100755
+--- a/gastown/assets/scripts/worktree-setup.sh
++++ b/gastown/assets/scripts/worktree-setup.sh
+@@ -197,7 +197,8 @@ report_branch_disagreement() {
+     fi
+ }
+ 
+-# Remote, then local, else stop: the rule of mol-polecat-work.toml workspace-setup (GUARD base-resolve).
++# Remote, then local, else stop: the rule of mol-polecat-work.toml workspace-setup, which runs it as
++# assets/scripts/polecat-workspace.sh's base-resolve mode (GUARD base-resolve).
+ # Sets DEFAULT_REF to the fully-qualified ref for the rig's default_branch. Both
+ # arms name refs/remotes/ and refs/heads/ outright, because git resolves a
+ # same-named tag ahead of a bare branch name.
+diff --git a/gastown/formulas/mol-polecat-work.toml b/gastown/formulas/mol-polecat-work.toml
+index 5bca5e3b..2014746e 100644
+--- a/gastown/formulas/mol-polecat-work.toml
++++ b/gastown/formulas/mol-polecat-work.toml
+@@ -124,38 +124,21 @@ This order — remote, then local, else stop — is the same contract
+ base selection of its own; keep the two halves in step, or they will
+ disagree about what "the base" means.
+ 
++Run the block below as ONE Bash call, exactly as written. It runs the pack's
++workspace script (`assets/scripts/polecat-workspace.sh base-resolve`) in YOUR
++shell: the script is sourced, not executed, so `$BASE_REF` is set for the
++blocks below exactly as the inline block set it. Do not retype the script or
++read it first.
++
+ ```bash
+-# GUARD_BEGIN base-resolve
+-BASE_REMOTE="refs/remotes/origin/{{base_branch}}"
+-BASE_LOCAL="refs/heads/{{base_branch}}"
+-WITNESS_TARGET="${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness"
+-if git show-ref --verify --quiet "$BASE_REMOTE"; then
+-    if git show-ref --verify --quiet "$BASE_LOCAL" && ! git merge-base --is-ancestor "$BASE_LOCAL" "$BASE_REMOTE"; then
+-        LOCAL_ONLY=$(git rev-list --count "$BASE_LOCAL" --not --remotes) || LOCAL_ONLY=err
+-        if [ "$LOCAL_ONLY" != "0" ]; then
+-            echo "STOP: local {{base_branch}} has local-only commits that are not on origin or any other remote branch."
+-            echo "Reconcile or push {{base_branch}} first; do not branch from a stale base."
+-            gc bd update "$WORK_BEAD_ID" --set-metadata halt_reason=base_branch_diverged
+-            gc mail send "$WITNESS_TARGET" -s "polecat halted: base_branch_diverged ($WORK_BEAD_ID)" -m "Local {{base_branch}} has local-only commits (count: $LOCAL_ONLY) that are not an ancestor of the copy on origin and are on no remote branch; $WORK_BEAD_ID cannot pick a fork point. Reconcile the branch."
+-            gc runtime drain-ack
+-            exit 1
+-        fi
+-        echo "note: local {{base_branch}} is stale (0 commits off-remote); branching from origin"
+-    fi
+-    BASE_REF="$BASE_REMOTE"    # preferred: freshly fetched, no local drift
+-elif git show-ref --verify --quiet "$BASE_LOCAL"; then
+-    BASE_REF="$BASE_LOCAL"     # local-only base (unpushed integration branch)
+-    echo "note: base branch {{base_branch}} is local-only — it does not exist on origin"
+-else
+-    echo "STOP: base branch {{base_branch}} exists neither on origin nor locally."
+-    echo "Fix the rig/bead base configuration; do not substitute a different base."
+-    gc bd update "$WORK_BEAD_ID" --set-metadata halt_reason=base_branch_missing
+-    gc mail send "$WITNESS_TARGET" -s "polecat halted: base_branch_missing ($WORK_BEAD_ID)" -m "Base branch {{base_branch}} exists neither on origin nor locally in this clone. $WORK_BEAD_ID cannot start until the rig/bead base configuration is fixed."
++WS_SRC=$(gc formula list --json 2>/dev/null | jq -r '.formulas[]? | select(.name == "mol-polecat-work") | .source // empty' | head -1)
++WS="${WS_SRC:+$(dirname "$(dirname "$WS_SRC")")/assets/scripts/polecat-workspace.sh}"
++if [ -z "$WS" ] || [ ! -f "$WS" ]; then
++    echo "STOP: workspace script not found (resolved '${WS:-}'); the pack is broken. Do not set up the workspace by hand."
+     gc runtime drain-ack
+     exit 1
+ fi
+-gc bd update "$WORK_BEAD_ID" --set-metadata base_ref="$BASE_REF"
+-# GUARD_END base-resolve
++. "$WS" base-resolve "${WORK_BEAD_ID:-}" '{{base_branch}}' '{{binding_prefix}}'
+ ```
+ 
+ The STOP arms stamp `halt_reason` and mail the witness on the way out —
+@@ -179,230 +162,35 @@ Adoption migrates the metadata key in place; it does not claim that a legacy
+ provider-nested directory has physically moved. Never `cd` to either task
+ metadata path before it passes the city, rig, layout, bead, and Git checks.
+ 
+-Load both task keys and resolve the city-managed artifact root before changing
+-directories. New task worktrees are siblings of prunable polecat homes, never
+-children of them:
+-```bash
+-BEAD_JSON=$(gc bd show "$WORK_BEAD_ID" --json) || {
+-  echo "Could not read work bead metadata for $WORK_BEAD_ID." >&2
+-  gc runtime drain-ack
+-  exit 1
+-}
+-BEAD_META=$(printf '%s' "$BEAD_JSON" | jq -ce '
+-  if type == "array" and length == 1 and (.[0] | type) == "object" and
+-     ((.[0].metadata // {}) | type) == "object"
+-  then .[0].metadata // {}
+-  else error("expected exactly one work bead object")
+-  end
+-') || {
+-  echo "Invalid work bead response for $WORK_BEAD_ID; refusing to create or adopt an artifact." >&2
+-  gc runtime drain-ack
+-  exit 1
+-}
+-ARTIFACT_DIR=$(printf '%s' "$BEAD_META" | jq -r '.artifact_dir // empty')
+-LEGACY_WORK_DIR=$(printf '%s' "$BEAD_META" | jq -r '.work_dir // empty')
+-if [ -z "${GC_CITY_PATH:-}" ] || [ -z "${GC_RIG:-}" ] ||
+-   [ -z "${GC_RIG_ROOT:-}" ]; then
+-  echo "GC_CITY_PATH, GC_RIG, and GC_RIG_ROOT are required for task worktrees." >&2
+-  gc runtime drain-ack
+-  exit 1
+-fi
+-case "$WORK_BEAD_ID" in
+-  ""|"."|".."|*[!A-Za-z0-9._-]*)
+-    echo "Unsafe work bead id for artifact path: $WORK_BEAD_ID" >&2
+-    gc runtime drain-ack
+-    exit 1
+-    ;;
+-esac
+-case "$GC_RIG" in
+-  ""|"."|".."|*[!A-Za-z0-9._-]*)
+-    echo "Unsafe rig name for artifact path: $GC_RIG" >&2
+-    gc runtime drain-ack
+-    exit 1
+-    ;;
+-esac
+-CITY_ROOT=$(CDPATH= cd -- "$GC_CITY_PATH" 2>/dev/null && pwd -P) || {
+-  echo "City root is missing: $GC_CITY_PATH" >&2
+-  gc runtime drain-ack
+-  exit 1
+-}
+-RIG_ROOT=$(CDPATH= cd -- "$GC_RIG_ROOT" 2>/dev/null && pwd -P) || {
+-  echo "Rig root is missing: $GC_RIG_ROOT" >&2
+-  gc runtime drain-ack
+-  exit 1
+-}
+-```
+-
+-Use this validator for canonical paths, legacy adoption, and any newly-created
+-path:
+-```bash
+-# BEGIN ARTIFACT_WORKTREE_VALIDATOR
+-artifact_git_common_dir() {
+-  local repo_dir=$1 common_dir
+-  common_dir=$(git -C "$repo_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) ||
+-    return 1
+-  (CDPATH= cd -- "$common_dir" 2>/dev/null && pwd -P)
+-}
+-
+-validate_artifact_worktree() {
+-  local candidate=$1 city_root=$2 rig_name=$3 rig_root=$4 bead_id=$5
+-  local policy=${6:-existing}
+-  local candidate_real candidate_top candidate_common rig_common
+-  local rig_namespace rig_namespace_real canonical_path
+-  local worktrees_parent provider_home provider_root provider_name
+-
+-  [ -n "$candidate" ] && [ -d "$candidate" ] || return 1
+-  candidate_real=$(CDPATH= cd -- "$candidate" 2>/dev/null && pwd -P) || return 1
+-
+-  # Only the exact bead-scoped .../worktrees/<bead-id> shape is reusable.
+-  [ "$(basename -- "$candidate_real")" = "$bead_id" ] || return 1
+-  [ "$(basename -- "$(dirname -- "$candidate_real")")" = "worktrees" ] || return 1
+-
+-  # Same-repository is not an ownership boundary: multiple cities and rigs can
+-  # share one Git common dir. Require this city's exact canonical path or the
+-  # one historical provider-nested layout that Gastown actually created.
+-  rig_namespace="$city_root/.gc/worktrees/$rig_name"
+-  rig_namespace_real=$(CDPATH= cd -- "$rig_namespace" 2>/dev/null && pwd -P) ||
+-    return 1
+-  [ "$rig_namespace_real" = "$rig_namespace" ] || return 1
+-  canonical_path="$rig_namespace_real/artifacts/worktrees/$bead_id"
+-  if [ "$candidate_real" = "$canonical_path" ]; then
+-    [ "$policy" != legacy-only ] || return 1
+-  else
+-    [ "$policy" != canonical-only ] || return 1
+-    worktrees_parent=$(dirname -- "$candidate_real")
+-    provider_home=$(dirname -- "$worktrees_parent")
+-    provider_root=$(dirname -- "$provider_home")
+-    provider_name=$(basename -- "$provider_home")
+-    [ "$provider_root" = "$rig_namespace_real/polecats" ] || return 1
+-    case "$provider_name" in
+-      ""|"."|".."|*[!A-Za-z0-9._-]*) return 1 ;;
+-    esac
+-  fi
+-
+-  # Reject a plain subdirectory of a worktree and worktrees from another repo.
+-  candidate_top=$(git -C "$candidate_real" rev-parse --show-toplevel 2>/dev/null) ||
+-    return 1
+-  candidate_top=$(CDPATH= cd -- "$candidate_top" 2>/dev/null && pwd -P) || return 1
+-  [ "$candidate_top" = "$candidate_real" ] || return 1
+-  candidate_common=$(artifact_git_common_dir "$candidate_real") || return 1
+-  rig_common=$(artifact_git_common_dir "$rig_root") || return 1
+-  [ "$candidate_common" = "$rig_common" ] || return 1
+-
+-  printf '%s\n' "$candidate_real"
+-}
+-# END ARTIFACT_WORKTREE_VALIDATOR
+-```
++Run the block below as ONE Bash call, exactly as written. It runs the pack's
++workspace script (`assets/scripts/polecat-workspace.sh worktree`) in YOUR shell.
++The script is sourced, not executed, because it ends with a `cd` into the task
++worktree and that `cd` has to stay with you. In order, it:
++
++1. loads both task keys and resolves the city-managed artifact root before
++   changing directories. New task worktrees are siblings of prunable polecat
++   homes, never children of them;
++2. defines the validator that canonical paths, legacy adoption, and any
++   newly-created path must all pass;
++3. applies the rule below, then records the canonical key immediately and
++   retires any legacy task key.
+ 
+ Canonical metadata wins. If it is absent, a valid legacy path can be adopted
+ in place. A stale, missing, provider-root, wrong-city, wrong-rig, wrong-bead,
+ or foreign-repo legacy path is ignored and a new canonical artifact worktree
+-is created:
+-```bash
+-WORKTREE=
+-if [ -n "$ARTIFACT_DIR" ]; then
+-  if WORKTREE=$(validate_artifact_worktree \
+-      "$ARTIFACT_DIR" "$CITY_ROOT" "$GC_RIG" "$RIG_ROOT" \
+-      "$WORK_BEAD_ID" existing); then
+-    echo "Reusing artifact_dir=$WORKTREE"
+-  else
+-    echo "Canonical artifact_dir is missing or unsafe: $ARTIFACT_DIR" >&2
+-    echo "STOP. Preserve it for manual recovery; only an absent canonical key may fall back or create." >&2
+-    gc runtime drain-ack
+-    exit 1
+-  fi
+-elif [ -n "$LEGACY_WORK_DIR" ]; then
+-  if WORKTREE=$(validate_artifact_worktree \
+-      "$LEGACY_WORK_DIR" "$CITY_ROOT" "$GC_RIG" "$RIG_ROOT" \
+-      "$WORK_BEAD_ID" legacy-only); then
+-    echo "Adopting validated in-place legacy work_dir=$WORKTREE as artifact_dir."
+-    echo "It remains provider-nested until terminal cleanup; new artifacts are always canonical."
+-  else
+-    echo "Ignoring unsafe legacy work_dir=$LEGACY_WORK_DIR; creating a new per-bead worktree." >&2
+-  fi
+-fi
++is created.
+ 
+-if [ -z "$WORKTREE" ]; then
+-  ARTIFACT_HOME="$CITY_ROOT/.gc/worktrees/$GC_RIG/artifacts"
+-  if [ -L "$ARTIFACT_HOME" ] ||
+-     { [ -e "$ARTIFACT_HOME" ] && [ ! -d "$ARTIFACT_HOME" ]; }; then
+-    echo "Task artifact root is redirected or is not a directory: $ARTIFACT_HOME" >&2
+-    gc runtime drain-ack
+-    exit 1
+-  fi
+-  mkdir -p -- "$ARTIFACT_HOME"
+-  ARTIFACT_HOME_REAL=$(CDPATH= cd -- "$ARTIFACT_HOME" 2>/dev/null && pwd -P) || {
+-    echo "Cannot resolve task artifact root." >&2
+-    gc runtime drain-ack
+-    exit 1
+-  }
+-  if [ "$ARTIFACT_HOME_REAL" != "$ARTIFACT_HOME" ]; then
+-    echo "Task artifact root is redirected outside the city/rig namespace." >&2
+-    gc runtime drain-ack
+-    exit 1
+-  fi
+-  WORKTREE_PARENT="$ARTIFACT_HOME/worktrees"
+-  if [ -L "$WORKTREE_PARENT" ] ||
+-     { [ -e "$WORKTREE_PARENT" ] && [ ! -d "$WORKTREE_PARENT" ]; }; then
+-    echo "Task worktree parent is redirected or is not a directory: $WORKTREE_PARENT" >&2
+-    gc runtime drain-ack
+-    exit 1
+-  fi
+-  mkdir -p -- "$WORKTREE_PARENT"
+-  WORKTREE_PARENT=$(CDPATH= cd -- "$WORKTREE_PARENT" 2>/dev/null && pwd -P) || {
+-    echo "Cannot resolve task worktree parent under the city artifact root." >&2
+-    gc runtime drain-ack
+-    exit 1
+-  }
+-  if [ "$WORKTREE_PARENT" != "$ARTIFACT_HOME/worktrees" ]; then
+-    echo "Task worktree parent is redirected outside the city artifact root." >&2
+-    gc runtime drain-ack
+-    exit 1
+-  fi
+-  WORKTREE_PATH="$WORKTREE_PARENT/$WORK_BEAD_ID"
+-
+-  if [ -e "$WORKTREE_PATH" ]; then
+-    # Recover the narrow crash window after git worktree add but before the
+-    # metadata write. Never reuse an unrelated directory at this path.
+-    if WORKTREE=$(validate_artifact_worktree \
+-        "$WORKTREE_PATH" "$CITY_ROOT" "$GC_RIG" "$RIG_ROOT" \
+-        "$WORK_BEAD_ID" canonical-only); then
+-      echo "Recovering existing validated per-bead worktree=$WORKTREE"
+-    else
+-      echo "Canonical artifact path already exists but is not this bead's validated worktree: $WORKTREE_PATH" >&2
+-      echo "STOP. Preserve and resolve the collision manually; do not create an alternate artifact." >&2
+-      gc runtime drain-ack
+-      exit 1
+-    fi
+-  fi
++Do not retype the script or read it first.
+ 
+-  if [ -z "$WORKTREE" ]; then
+-    git -C "$RIG_ROOT" worktree prune
+-    : "${BASE_REF:?base ref not resolved — run step 1 first}"
+-    git -C "$RIG_ROOT" worktree add "$WORKTREE_PATH" --detach "$BASE_REF"
+-    WORKTREE=$(validate_artifact_worktree \
+-      "$WORKTREE_PATH" "$CITY_ROOT" "$GC_RIG" "$RIG_ROOT" \
+-      "$WORK_BEAD_ID" canonical-only) || {
+-        echo "New task worktree failed validation: $WORKTREE_PATH" >&2
+-        gc runtime drain-ack
+-        exit 1
+-      }
+-  fi
+-fi
+-
+-# Record the canonical key immediately, then retire any legacy task key.
+-gc bd update "$WORK_BEAD_ID" \
+-  --set-metadata artifact_dir="$WORKTREE" \
+-  --unset-metadata work_dir || {
+-    echo "Could not record artifact_dir; refusing to enter an untracked task worktree." >&2
++```bash
++WS_SRC=$(gc formula list --json 2>/dev/null | jq -r '.formulas[]? | select(.name == "mol-polecat-work") | .source // empty' | head -1)
++WS="${WS_SRC:+$(dirname "$(dirname "$WS_SRC")")/assets/scripts/polecat-workspace.sh}"
++if [ -z "$WS" ] || [ ! -f "$WS" ]; then
++    echo "STOP: workspace script not found (resolved '${WS:-}'); the pack is broken. Do not set up the workspace by hand."
+     gc runtime drain-ack
+     exit 1
+-  }
+-cd -- "$WORKTREE" || {
+-  echo "Validated task worktree disappeared: $WORKTREE" >&2
+-  gc runtime drain-ack
+-  exit 1
+-}
++fi
++. "$WS" worktree "${WORK_BEAD_ID:-}" "${BASE_REF:-}"
+ ```
+ 
+ Worktrees are scoped to the work bead (not the agent name) so that:
+@@ -468,65 +256,22 @@ Every other non-pristine state fails closed; never delete or reset a ref to
+ repair empty metadata. New branches always start from the resolved
+ `$BASE_REF`, never from whatever branch happens to be checked out. When the
+ base exists on origin, `$BASE_REF` is its freshly-fetched remote-tracking ref;
+-when the base is local-only, the local branch IS the tip:
++when the base is local-only, the local branch IS the tip.
++
++Run the block below as ONE Bash call, exactly as written. It runs the pack's
++workspace script (`assets/scripts/polecat-workspace.sh new-branch`) in YOUR shell:
++the script is sourced, not executed, and does what the paragraph above says.
++Do not retype the script or read it first.
++
+ ```bash
+-: "${BASE_REF:?base ref not resolved — run step 1 first}"
+-EXPECTED_BRANCH="polecat/$WORK_BEAD_ID"
+-CURRENT_BRANCH=$(git branch --show-current)
+-if [ "$CURRENT_BRANCH" = "$EXPECTED_BRANCH" ]; then
+-  BRANCH="$EXPECTED_BRANCH"
+-  FORK_SHA=$(git merge-base "$BRANCH" "$BASE_REF") || {
+-    echo "Cannot derive fork point for recovered branch $BRANCH." >&2
+-    gc runtime drain-ack
+-    exit 1
+-  }
+-  gc bd update "$WORK_BEAD_ID" \
+-    --set-metadata branch="$BRANCH" \
+-    --set-metadata fork_sha="$FORK_SHA" || {
+-      echo "Could not record recovered branch metadata." >&2
+-      gc runtime drain-ack
+-      exit 1
+-    }
+-elif [ -n "$CURRENT_BRANCH" ] ||
+-     [ -n "$(git status --porcelain)" ] ||
+-     git show-ref --verify --quiet "refs/heads/$EXPECTED_BRANCH" ||
+-     git show-ref --verify --quiet "refs/remotes/origin/$EXPECTED_BRANCH" ||
+-     ! git merge-base --is-ancestor HEAD "$BASE_REF"; then
+-  echo "artifact_dir contains branch/work not recorded in metadata.branch." >&2
+-  echo "STOP. Recover and record it manually; do not reset or delete refs." >&2
+-  gc runtime drain-ack
+-  exit 1
+-else
+-  # A clean detached checkout at or behind the base has no unique work.
+-  if [ "$BASE_REF" = "refs/heads/{{base_branch}}" ]; then
+-    :  # local-only base: nothing on origin to refresh
+-  elif ! git fetch origin {{base_branch}} >/dev/null 2>&1; then
+-    # Step 1 already resolved this base on origin, so a failure here is
+-    # either transient or the base disappearing mid-run. Ask origin rather
+-    # than silently branching from a stale remote-tracking ref.
+-    if git ls-remote --exit-code --heads origin "refs/heads/{{base_branch}}" >/dev/null 2>&1; then
+-      echo "warning: could not refresh {{base_branch}}; using the ref fetched in step 1"
+-    else
+-      echo "STOP: {{base_branch}} no longer resolves on origin (deleted, renamed, or unreachable)." >&2
+-      echo "Re-run workspace-setup to re-resolve the base; do not branch from a stale ref." >&2
+-      gc runtime drain-ack
+-      exit 1
+-    fi
+-  fi
+-  BRANCH="$EXPECTED_BRANCH"
+-  git checkout -b "$BRANCH" "$BASE_REF" || {
+-    echo "Could not create $BRANCH from $BASE_REF." >&2
++WS_SRC=$(gc formula list --json 2>/dev/null | jq -r '.formulas[]? | select(.name == "mol-polecat-work") | .source // empty' | head -1)
++WS="${WS_SRC:+$(dirname "$(dirname "$WS_SRC")")/assets/scripts/polecat-workspace.sh}"
++if [ -z "$WS" ] || [ ! -f "$WS" ]; then
++    echo "STOP: workspace script not found (resolved '${WS:-}'); the pack is broken. Do not set up the workspace by hand."
+     gc runtime drain-ack
+     exit 1
+-  }
+-  gc bd update "$WORK_BEAD_ID" \
+-    --set-metadata branch="$BRANCH" \
+-    --set-metadata fork_sha="$(git rev-parse "$BASE_REF")" || {
+-      echo "Could not record new branch metadata." >&2
+-      gc runtime drain-ack
+-      exit 1
+-    }
+ fi
++. "$WS" new-branch "${WORK_BEAD_ID:-}" "${BASE_REF:-}" '{{base_branch}}'
+ ```
+ 
+ Existing expected refs with missing metadata are left untouched for manual
+diff --git a/gastown/tests/test_polecat_artifact_dir.sh b/gastown/tests/test_polecat_artifact_dir.sh
+index f8ebc1bc..a709e91c 100755
+--- a/gastown/tests/test_polecat_artifact_dir.sh
++++ b/gastown/tests/test_polecat_artifact_dir.sh
+@@ -4,6 +4,9 @@ set -euo pipefail
+ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+ GASTOWN="$ROOT/gastown"
+ POLECAT_FORMULA="$GASTOWN/formulas/mol-polecat-work.toml"
++# workspace-setup's base resolution, validator and worktree creation run as this
++# script (gcp-xeael); the formula step carries only the calls.
++WORKSPACE_SCRIPT="$GASTOWN/assets/scripts/polecat-workspace.sh"
+ WITNESS_FORMULA="$GASTOWN/formulas/mol-witness-patrol.toml"
+ SHUTDOWN_FORMULA="$GASTOWN/formulas/mol-shutdown-dance.toml"
+ REFINERY_FORMULA="$GASTOWN/formulas/mol-refinery-patrol.toml"
+@@ -32,20 +35,16 @@ WORKSPACE_TEST_ACTOR=ac-test-polecat
+ 
+ extract_validator() {
+     local output=$1
+-    python3 - "$POLECAT_FORMULA" "$output" <<'PY'
++    python3 - "$WORKSPACE_SCRIPT" "$output" <<'PY'
+ import pathlib
+ import sys
+-import tomllib
+ 
+-formula_path = pathlib.Path(sys.argv[1])
++script_path = pathlib.Path(sys.argv[1])
+ output_path = pathlib.Path(sys.argv[2])
+-with formula_path.open("rb") as handle:
+-    formula = tomllib.load(handle)
+-workspace = next(step for step in formula["steps"] if step["id"] == "workspace-setup")
+-description = workspace["description"]
+-begin = description.index("# BEGIN ARTIFACT_WORKTREE_VALIDATOR")
+-end = description.index("# END ARTIFACT_WORKTREE_VALIDATOR", begin)
+-block = description[begin:end].splitlines()[1:]
++text = script_path.read_text(encoding="utf-8")
++begin = text.index("# BEGIN ARTIFACT_WORKTREE_VALIDATOR")
++end = text.index("# END ARTIFACT_WORKTREE_VALIDATOR", begin)
++block = text[begin:end].splitlines()[1:]
+ output_path.write_text("\n".join(block) + "\n", encoding="utf-8")
+ PY
+ }
+@@ -93,32 +92,58 @@ output_path.write_text(script + "\n", encoding="utf-8")
+ PY
+ }
+ 
++# extract_workspace_creation writes the shell the polecat runs for sections 1 and
++# 2 of workspace-setup, in ONE shell as the formula intends: the section-1 fence
++# that derives the work bead, the base-resolve call, and the worktree call. The
++# two calls are the formula's own stub lines, rendered the way gc renders them;
++# only the stub's script locator (`gc formula list --json`, tested in
++# test_polecat_workspace.sh) is swapped for the script's path, and the swap
++# refuses a stub whose locator has changed shape.
+ extract_workspace_creation() {
+     local output=$1
+-    python3 - "$POLECAT_FORMULA" "$output" <<'PY'
++    python3 - "$POLECAT_FORMULA" "$output" "$WORKSPACE_SCRIPT" <<'PY'
+ import pathlib
+ import re
++import shlex
+ import sys
+ import tomllib
+ 
+ formula_path = pathlib.Path(sys.argv[1])
+ output_path = pathlib.Path(sys.argv[2])
++script = sys.argv[3]
+ with formula_path.open("rb") as handle:
+     formula = tomllib.load(handle)
+ workspace = next(step for step in formula["steps"] if step["id"] == "workspace-setup")
+ blocks = re.findall(r"```bash\n(.*?)```", workspace["description"], re.DOTALL)
+-# Everything up to and including the block that adds the worktree. Counting
+-# blocks goes stale each time the step gains or loses one.
+-creation = next((i for i, block in enumerate(blocks) if "worktree add" in block), None)
+-if creation is None:
+-    raise SystemExit(f"workspace-setup has no worktree-creation block among {len(blocks)} bash blocks")
+-script = "\n".join(blocks[: creation + 1])
+-script = script.replace("{{convoy_id}}", "convoy-test")
+-script = script.replace("{{base_branch}}", "main")
+-script = script.replace("{{binding_prefix}}", "gastown.")
+-if "{{" in script:
++
++
++def only(marker):
++    hits = [block for block in blocks if marker in block]
++    if len(hits) != 1:
++        raise SystemExit(f"workspace-setup: want exactly one bash block with {marker!r}, found {len(hits)}")
++    return hits[0]
++
++
++def call_line(block):
++    lines = block.rstrip("\n").split("\n")
++    if not (lines[0].startswith("WS_SRC=$(gc formula list --json") and lines[1].startswith('WS="${WS_SRC:+')):
++        raise SystemExit("workspace-setup stub no longer locates the script the way this test replaces")
++    return lines[-1]
++
++
++parts = [
++    only("git fetch --prune origin"),
++    "WS=" + shlex.quote(script),
++    call_line(only('. "$WS" base-resolve')),
++    call_line(only('. "$WS" worktree')),
++]
++text = "\n".join(parts) + "\n"
++text = text.replace("{{convoy_id}}", "convoy-test")
++text = text.replace("{{base_branch}}", "main")
++text = text.replace("{{binding_prefix}}", "gastown.")
++if "{{" in text:
+     raise SystemExit("workspace creation extraction retained an unresolved template")
+-output_path.write_text(script, encoding="utf-8")
++output_path.write_text(text, encoding="utf-8")
+ PY
+ }
+ 
+@@ -520,7 +545,7 @@ test_shutdown_probe_scopes_rig_and_fails_closed() {
+ 
+ test_validator_rejects_provider_and_unrelated_paths() {
+     local tmp validator rig city_a city_b provider bead valid got plain
+-    local alias_root foreign foreign_wt cross_city other_rig wrong_namespace
++    local alias_root foreign foreign_wt foreign_canonical cross_city other_rig wrong_namespace
+     tmp=$(physical_mktemp_dir)
+     trap 'rm -rf "$tmp"' RETURN
+     validator="$tmp/validator.sh"
+@@ -578,6 +603,17 @@ test_validator_rejects_provider_and_unrelated_paths() {
+         fail "same-shaped worktree from a foreign repository was accepted"
+     fi
+ 
++    # The path checks are not an ownership boundary: a worktree of ANOTHER
++    # repository at this city's exact canonical path passes all of them, and is
++    # rejected only because its git common dir is not the rig's.
++    foreign_canonical="$city_a/.gc/worktrees/demo/artifacts/worktrees/ac-foreign"
++    mkdir -p "$(dirname "$foreign_canonical")"
++    git -C "$foreign" worktree add -qb foreign-canonical "$foreign_canonical" HEAD
++    if validate_artifact_worktree \
++        "$foreign_canonical" "$city_a" demo "$rig" ac-foreign existing >/dev/null; then
++        fail "canonical-path worktree from a foreign repository was accepted"
++    fi
++
+     cross_city="$city_b/.gc/worktrees/demo/artifacts/worktrees/$bead"
+     mkdir -p "$(dirname "$cross_city")"
+     git -C "$rig" worktree add -qb cross-city "$cross_city" HEAD
+@@ -1532,7 +1568,8 @@ test_metadata_migration_and_consumers_are_canonical_first() {
+         "$GASTOWN/agents/polecat/prompt.template.md" \
+         "$GASTOWN/agents/witness/prompt.template.md" \
+         "$GASTOWN/assets/scripts/refinery/merge-push.sh" \
+-        "$ARTIFACT_CLEANUP" <<'PY'
++        "$ARTIFACT_CLEANUP" \
++        "$WORKSPACE_SCRIPT" <<'PY'
+ import pathlib
+ import sys
+ import tomllib
+@@ -1546,6 +1583,7 @@ import tomllib
+     witness_prompt_path,
+     merge_push_path,
+     cleanup_script_path,
++    workspace_script_path,
+ ) = (
+     pathlib.Path(arg) for arg in sys.argv[1:]
+ )
+@@ -1554,6 +1592,18 @@ with polecat_path.open("rb") as handle:
+     polecat = tomllib.load(handle)
+ workspace = next(step["description"] for step in polecat["steps"] if step["id"] == "workspace-setup")
+ submit = next(step["description"] for step in polecat["steps"] if step["id"] == "submit-and-exit")
++# The workspace shell is the script's (gcp-xeael); the step keeps the three calls.
++# Contract fragments are read from the script, and the prohibitions apply to the
++# script AND the step text, so neither can bring a forbidden pattern back.
++workspace_script = workspace_script_path.read_text(encoding="utf-8")
++workspace_code = workspace + "\n" + workspace_script
++for call in (
++    '. "$WS" base-resolve ',
++    '. "$WS" worktree ',
++    '. "$WS" new-branch ',
++):
++    if workspace.count(call) != 1:
++        raise SystemExit(f"workspace-setup must call the workspace script exactly once with: {call}")
+ 
+ required_workspace = (
+     'BEAD_JSON=$(gc bd show "$WORK_BEAD_ID" --json) ||',
+@@ -1575,33 +1625,33 @@ required_workspace = (
+     "do not create an alternate artifact",
+ )
+ for fragment in required_workspace:
+-    if fragment not in workspace:
++    if fragment not in workspace_script:
+         raise SystemExit(f"workspace contract missing: {fragment}")
+-if workspace.index(".artifact_dir // empty") > workspace.index(".work_dir // empty"):
++if workspace_script.index(".artifact_dir // empty") > workspace_script.index(".work_dir // empty"):
+     raise SystemExit("legacy task work_dir is read before canonical artifact_dir")
+-if workspace.index("validate_artifact_worktree") > workspace.index('cd -- "$WORKTREE"'):
++if workspace_script.index("validate_artifact_worktree") > workspace_script.index('cd -- "$WORKTREE"'):
+     raise SystemExit("workspace enters the task path before defining/using its validator")
+-if "--set-metadata work_dir=" in workspace:
++if "--set-metadata work_dir=" in workspace_code:
+     raise SystemExit("workspace still writes deprecated task work_dir")
+ for forbidden in (
+     'WORKTREE_PATH=$(pwd)/worktrees/',
+     'WORKTREE_PATH="$PWD/worktrees/',
+     'WORKTREE_PATH="${PWD}/worktrees/',
+ ):
+-    if forbidden in workspace:
++    if forbidden in workspace_code:
+         raise SystemExit(f"workspace still creates provider-nested task artifacts: {forbidden}")
+-if "GC_WORK_DIR" in workspace:
++if "GC_WORK_DIR" in workspace_code:
+     raise SystemExit("workspace relies on convergence-only GC_WORK_DIR")
+-if ".artifact-worktree-" in workspace or "WORKTREE_GENERATION" in workspace:
++if ".artifact-worktree-" in workspace_code or "WORKTREE_GENERATION" in workspace_code:
+     raise SystemExit("workspace can create a non-canonical random artifact generation")
+-if 'git branch -D "$EXPECTED_BRANCH"' in workspace or 'git branch -D "$BRANCH"' in workspace:
++if 'git branch -D "$EXPECTED_BRANCH"' in workspace_code or 'git branch -D "$BRANCH"' in workspace_code:
+     raise SystemExit("empty-branch recovery can delete an unrecorded work branch")
+ if "--unset-metadata artifact_source_sha" not in submit:
+     raise SystemExit("polecat submission does not retire stale refinery artifact proof")
+ if "--unset-metadata artifact_cleanup_state" not in submit:
+     raise SystemExit("polecat submission does not retire stale cleanup state")
+-canonical_guard = workspace.index("Canonical artifact_dir is missing or unsafe")
+-legacy_fallback = workspace.index('elif [ -n "$LEGACY_WORK_DIR" ]')
++canonical_guard = workspace_script.index("Canonical artifact_dir is missing or unsafe")
++legacy_fallback = workspace_script.index('elif [ -n "$LEGACY_WORK_DIR" ]')
+ if canonical_guard > legacy_fallback:
+     raise SystemExit("invalid canonical artifact_dir can fall through to legacy/new creation")
+ 
+@@ -1740,7 +1790,7 @@ for fragment in (
+         raise SystemExit(f"polecat prompt lacks fail-closed workspace guidance: {fragment}")
+ if "<home>/worktrees/vg-1jp" in polecat_prompt:
+     raise SystemExit("polecat prompt still advertises the legacy provider-nested path")
+-if "new nested worktree is created" in workspace:
++if "new nested worktree is created" in workspace_code:
+     raise SystemExit("workspace recipe still describes canonical artifacts as nested worktrees")
+ if "`metadata.artifact_dir`" not in witness_prompt:
+     raise SystemExit("witness prompt does not document canonical artifact_dir")
+diff --git a/gastown/tests/test_polecat_base_resolution.sh b/gastown/tests/test_polecat_base_resolution.sh
+index 5d01e506..10ed4842 100755
+--- a/gastown/tests/test_polecat_base_resolution.sh
++++ b/gastown/tests/test_polecat_base_resolution.sh
+@@ -10,11 +10,13 @@
+ # base that has advanced only locally". Every future restack would strand the
+ # pool the same way.
+ #
+-# These tests extract the base-resolution block out of mol-polecat-work verbatim
+-# (between the GUARD_BEGIN/GUARD_END base-resolve markers) and run it against a
+-# scratch bare origin plus clone per case, with a stubbed `gc` that logs its
+-# argv. Only case A changes with the fix; B, C and E pin the STOP that must
+-# survive, D the in-sync path.
++# The base-resolution block now lives in gastown/assets/scripts/polecat-workspace.sh
++# (its `base-resolve` mode, between the GUARD_BEGIN/GUARD_END base-resolve
++# markers; gcp-xeael). These tests run that mode the way the formula step does:
++# SOURCED into the polecat's shell, because BASE_REF has to land in the caller's
++# shell for the blocks after it. Each case runs against a scratch bare origin
++# plus clone, with a stubbed `gc` that logs its argv. Only case A changes with
++# the fix; B, C and E pin the STOP that must survive, D the in-sync path.
+ #
+ #   A stale             local tip is not an ancestor of origin but is on a remote
+ #                       branch (archived)      -> proceed from origin
+@@ -23,13 +25,13 @@
+ #   D in_sync           local == origin        -> proceed
+ #   E revlist_error     the commit count itself fails -> STOP (fail closed)
+ #
+-# FORMULA overrides the formula under test, for a red-check against an older one.
++# WORKSPACE_SCRIPT overrides the script under test, for a red-check against an older one.
+ # Assertions grep for literal shell snippets, so single-quoted `$VAR` is the point.
+ # shellcheck disable=SC2016
+ set -euo pipefail
+ 
+ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+-FORMULA="${FORMULA:-$ROOT/gastown/formulas/mol-polecat-work.toml}"
++SCRIPT="${WORKSPACE_SCRIPT:-$ROOT/gastown/assets/scripts/polecat-workspace.sh}"
+ REAL_GIT=$(command -v git)
+ 
+ # A host global git config (tag signing, hooks path, templates) must not reach
+@@ -44,23 +46,21 @@ fail() {
+     exit 1
+ }
+ 
+-# extract_block pulls the base resolution verbatim out of the formula, so the
+-# code under test is the code that ships. A drifted or deleted block fails here
+-# rather than passing against a stale copy. The formula's template variables are
+-# rendered the way the pack renders them.
+-extract_block() {
+-    local out="$1"
+-    [[ "$(grep -c '^# GUARD_BEGIN base-resolve$' "$FORMULA")" == 1 ]] ||
+-        fail "expected exactly one '# GUARD_BEGIN base-resolve' in $FORMULA"
+-    [[ "$(grep -c '^# GUARD_END base-resolve$' "$FORMULA")" == 1 ]] ||
+-        fail "expected exactly one '# GUARD_END base-resolve' in $FORMULA"
+-    awk '/^# GUARD_BEGIN base-resolve$/{f=1} /^# GUARD_END base-resolve$/{f=0} f' "$FORMULA" |
+-        sed -e 's/{{base_branch}}/integration/g' -e 's/{{binding_prefix}}/gastown./g' >"$out"
+-    [[ -s "$out" ]] || fail "could not extract the base-resolve block from $FORMULA"
+-    grep -F 'halt_reason=base_branch_diverged' "$out" >/dev/null ||
+-        fail "extracted block does not contain the diverged STOP"
+-    ! grep -F '{{' "$out" >/dev/null || fail "extracted block has an unrendered template variable"
+-    bash -n "$out" || fail "extracted block is not valid shell"
++# check_script confirms the script under test still carries exactly one
++# base-resolution block, with the STOP that must survive, and no unrendered
++# template variable: the formula step renders its {{...}} into the call's
++# arguments, so the script must hold none. A drifted or deleted block fails here
++# rather than passing against a stale copy.
++check_script() {
++    [[ "$(grep -c '^# GUARD_BEGIN base-resolve$' "$SCRIPT")" == 1 ]] ||
++        fail "expected exactly one '# GUARD_BEGIN base-resolve' in $SCRIPT"
++    [[ "$(grep -c '^# GUARD_END base-resolve$' "$SCRIPT")" == 1 ]] ||
++        fail "expected exactly one '# GUARD_END base-resolve' in $SCRIPT"
++    awk '/^# GUARD_BEGIN base-resolve$/{f=1} /^# GUARD_END base-resolve$/{f=0} f' "$SCRIPT" |
++        grep -F 'halt_reason=base_branch_diverged' >/dev/null ||
++        fail "the base-resolve block does not contain the diverged STOP"
++    ! grep -F '{{' "$SCRIPT" >/dev/null || fail "$SCRIPT has an unrendered template variable"
++    bash -n "$SCRIPT" || fail "$SCRIPT is not valid shell"
+ }
+ 
+ # write_gc_stub records every call; the block only writes, never reads.
+@@ -104,7 +104,7 @@ new_case() {
+     dir=$(mktemp -d)
+     mkdir -p "$dir/bin"
+     write_gc_stub "$dir/bin"
+-    extract_block "$dir/block.sh"
++    check_script
+     : >"$dir/calls.log"
+ 
+     "$REAL_GIT" init -q --bare -b integration "$dir/origin.git"
+@@ -132,16 +132,17 @@ restack() {
+     "$REAL_GIT" -C "$dir/clone" fetch -q --prune origin
+ }
+ 
+-# run_block executes the block with the inputs workspace-setup binds beforehand,
+-# then echoes BASE_REF. A STOP exits before that line, so its absence is the
+-# assertion that the polecat never reached the work. Sets RC and OUT.
++# run_block sources the script's base-resolve mode with the inputs the formula
++# step binds (the work bead from section 1, the rendered base branch and binding
++# prefix), then echoes BASE_REF. A STOP exits before that line, so its absence
++# is the assertion that the polecat never reached the work. Sets RC and OUT.
+ run_block() {
+     local dir="$1" path_prefix="${2-$1/bin}"
+     cat >"$dir/harness.sh" <<HARNESS
+ WORK_BEAD_ID="gcp-test1"
+ GC_RIG="gascity-packs"
++. "$SCRIPT" base-resolve "\$WORK_BEAD_ID" integration gastown.
+ HARNESS
+-    cat "$dir/block.sh" >>"$dir/harness.sh"
+     echo 'echo "BASE_REF=$BASE_REF"' >>"$dir/harness.sh"
+ 
+     set +e
+diff --git a/gastown/tests/test_polecat_workspace.sh b/gastown/tests/test_polecat_workspace.sh
+new file mode 100755
+index 00000000..7735ebc2
+--- /dev/null
++++ b/gastown/tests/test_polecat_workspace.sh
+@@ -0,0 +1,459 @@
++#!/usr/bin/env bash
++# Tests for gastown/assets/scripts/polecat-workspace.sh, the one script behind
++# the base resolution, the worktree setup and the branch record of
++# mol-polecat-work's workspace-setup step (gcp-xeael).
++#
++# Those fences were about 270 lines of shell that every polecat retyped. They now
++# ship as one script with a `base-resolve`, a `worktree` and a `new-branch` mode,
++# and the step carries a short stub for each that locates the script, passes it
++# the formula's values as arguments, and SOURCES it. Sourced, not executed: the
++# fences ran in the polecat's own shell and left its working directory (a cd into
++# the task worktree), BASE_REF and their other variables there for the blocks
++# after them, and a child process could hand none of that back.
++#
++# These tests run the real script and the real stubs, decoded from the formula.
++# Their identity with the old fences was proven by a throwaway harness, which is
++# not committed; test_polecat_artifact_dir.sh and test_polecat_base_resolution.sh
++# run the worktree and base-resolve bodies against real git.
++#
++# What is pinned here is what those do not reach: the interface (it must be
++# sourced, usage, arity), what the call leaves in the caller's shell, the
++# arguments reaching the writes, and the stubs' unresolved-script stop.
++#
++# No test depends on wall-clock time or on a network: every external command is
++# a stub (or a scratch repo), and stdin is /dev/null.
++# shellcheck disable=SC2016  # the assertions grep literal $VAR text
++set -euo pipefail
++
++ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
++WORKSPACE="$ROOT/gastown/assets/scripts/polecat-workspace.sh"
++FORMULA="$ROOT/gastown/formulas/mol-polecat-work.toml"
++USAGE_PREFIX='WORKSPACE_USAGE'
++
++if ! command -v jq >/dev/null 2>&1; then
++    echo "  skip  jq not available (the stubs' locator needs it)"
++    exit 0
++fi
++
++# mktemp -d is /var/folders/... on macOS, where /var is a symlink to /private/var,
++# and the validator's rig-namespace guard rejects any path that differs from its
++# physical form. The worktree test needs a physical root.
++TMPROOT=$(cd "$(mktemp -d)" && pwd -P)
++trap 'rm -rf "$TMPROOT"' EXIT
++
++# fail names the test that called it, so a red run says which case broke.
++fail() {
++    local fn name=""
++    for fn in "${FUNCNAME[@]}"; do
++        case "$fn" in test_*) name=$fn; break ;; esac
++    done
++    echo "FAIL${name:+ $name}: $*" >&2
++    exit 1
++}
++
++# new_case <name> — a fresh sandbox $CASE with a stub `gc` and `git` in
++# $CASE/bin that journal every call to $CASE/calls.log. `gc formula list --json`
++# prints $FORMULAS. The git stub answers the ref probes from env:
++#   REMOTE_REF=0 / LOCAL_REF=0   the base is missing on origin / locally
++#   EXPECTED_REF=1               polecat/<bead> already exists (default: it does not)
++#   ANCESTOR_RC, REVLIST_OUT     the stale-base ancestry check and its count
++#   GIT_BRANCH, GIT_STATUS       what `git branch --show-current` / `status --porcelain` print
++#   FETCH_RC, CHECKOUT_RC        the exit codes of `git fetch origin` / `git checkout -b`
++new_case() {
++    CASE="$TMPROOT/$1"
++    mkdir -p "$CASE/bin" "$CASE/cwd"
++    : >"$CASE/calls.log"
++    cat >"$CASE/bin/gc" <<'SH'
++#!/usr/bin/env bash
++printf 'gc %s\n' "$*" >>"$CASE/calls.log"
++case "${1:-}:${2:-}" in
++    formula:list) printf '%s\n' "$FORMULAS" ;;
++    bd:update)
++        if [ -n "${REFUSE_UPDATE:-}" ]; then echo "gc: update refused" >&2; exit 1; fi ;;
++esac
++exit 0
++SH
++    cat >"$CASE/bin/git" <<'SH'
++#!/usr/bin/env bash
++printf 'git %s\n' "$*" >>"$CASE/calls.log"
++case "${1:-} ${2:-}" in
++    "show-ref --verify")
++        case "$4" in
++            refs/heads/polecat/* | refs/remotes/origin/polecat/*) [ "${EXPECTED_REF:-0}" = 1 ] || exit 1 ;;
++            refs/remotes/*) [ "${REMOTE_REF:-1}" = 1 ] || exit 1 ;;
++            refs/heads/*) [ "${LOCAL_REF:-1}" = 1 ] || exit 1 ;;
++        esac ;;
++    "merge-base --is-ancestor") exit "${ANCESTOR_RC:-0}" ;;
++    "rev-list --count") echo "${REVLIST_OUT:-0}" ;;
++    "branch --show-current") echo "${GIT_BRANCH-}" ;;
++    "status --porcelain") printf '%s' "${GIT_STATUS-}" ;;
++    "fetch origin") exit "${FETCH_RC:-0}" ;;
++    "checkout -b") exit "${CHECKOUT_RC:-0}" ;;
++    "ls-remote --exit-code") exit "${LSREMOTE_RC:-0}" ;;
++    "rev-parse "*) echo deadbeef ;;
++    "merge-base "*) echo deadbeef ;;
++esac
++exit 0
++SH
++    chmod +x "$CASE/bin/gc" "$CASE/bin/git"
++    FORMULAS='{"formulas":[]}'
++}
++
++# run_sourced <script-args...> -- <env...> -- <after-commands> — sources the
++# script into a fresh bash the way a stub does, with only the given env (plus the
++# stub plumbing), then runs <after-commands> in that same shell. Sets RC and
++# leaves stdout and stderr in $CASE/out and $CASE/err.
++run_sourced() {
++    local -a args=() env=()
++    while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do args+=("$1"); shift; done
++    [ "$#" -gt 0 ] && shift
++    while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do env+=("$1"); shift; done
++    [ "$#" -gt 0 ] && shift
++    local after="${1:-:}"
++    RC=0
++    (
++        cd "$CASE/cwd" &&
++            env -i PATH="$CASE/bin:$PATH" HOME="$CASE" GIT_CONFIG_GLOBAL=/dev/null \
++                CASE="$CASE" FORMULAS="$FORMULAS" ${env[@]+"${env[@]}"} \
++                "${BASH_UNDER_TEST:-bash}" -c '. "$@"; '"$after" _ "$WORKSPACE" ${args[@]+"${args[@]}"} </dev/null
++    ) >"$CASE/out" 2>"$CASE/err" || RC=$?
++}
++
++calls() { cat "$CASE/calls.log"; }
++
++# called <fixed-string> — fails unless some call in the log contains it.
++called() {
++    grep -qF -- "$1" "$CASE/calls.log" || fail "want a call containing '$1', calls: $(calls)"
++}
++never_called() {
++    ! grep -qF -- "$1" "$CASE/calls.log" || fail "want no call containing '$1', calls: $(calls)"
++}
++
++test_script_holds_no_formula_placeholder() {
++    [ "$(grep -c '{{' "$WORKSPACE")" = 0 ] || fail "$WORKSPACE must hold no {{...}}: gc renders the step text, not the script"
++    bash -n "$WORKSPACE" || fail "the script is not valid bash"
++    if [ -x /bin/bash ]; then
++        /bin/bash -n "$WORKSPACE" || fail "the script is not valid for the system bash"
++    fi
++}
++
++# The shell the script replaced must not also stay in the step: two copies drift.
++test_step_text_carries_no_second_copy() {
++    python3 -I - "$FORMULA" <<'PY' || fail "the step still carries shell the script now runs"
++import sys
++import tomllib
++
++doc = tomllib.load(open(sys.argv[1], "rb"))
++text = next(s["description"] for s in doc["steps"] if s["id"] == "workspace-setup")
++problems = [m for m in (
++    "validate_artifact_worktree", "ARTIFACT_WORKTREE_VALIDATOR", "BEAD_JSON=", "LEGACY_WORK_DIR",
++    "GUARD_BEGIN base-resolve", "BASE_REMOTE=", "WITNESS_TARGET=", 'git -C "$RIG_ROOT" worktree',
++    'EXPECTED_BRANCH=', 'git checkout -b "$BRANCH"', "FORK_SHA=", "ARTIFACT_HOME=",
++) if m in text]
++if problems:
++    sys.exit(f"still in the step text: {problems}")
++for mode in ("base-resolve", "worktree", "new-branch"):
++    if text.count(f'. "$WS" {mode} ') != 1:
++        sys.exit(f"want exactly one sourced call of the {mode} mode")
++if text.count("polecat-workspace.sh}") != 3:
++    sys.exit("want exactly three stubs that locate polecat-workspace.sh")
++PY
++}
++
++# The script changes its caller's shell, so run as a child it would lose the cd
++# and every variable: stop before touching anything rather than run half-useful.
++test_executing_instead_of_sourcing_stops() {
++    local label
++    new_case executed
++    for label in base-resolve worktree new-branch; do
++        RC=0
++        (cd "$CASE/cwd" && env -i PATH="$CASE/bin:$PATH" HOME="$CASE" CASE="$CASE" FORMULAS="$FORMULAS" \
++            bash "$WORKSPACE" "$label" w-1 main gastown. </dev/null) >"$CASE/out" 2>"$CASE/err" || RC=$?
++        [ "$RC" -eq 2 ] || fail "$label: executed, want exit 2, got $RC"
++        grep -q "^$USAGE_PREFIX .*sourced, not executed" "$CASE/out" ||
++            fail "$label: want the sourced-not-executed line, got: $(cat "$CASE/out")"
++        [ ! -s "$CASE/calls.log" ] || fail "$label: an executed call must run nothing, calls: $(calls)"
++    done
++}
++
++test_usage_rejects_unknown_mode_and_wrong_arity() {
++    local label
++    new_case usage
++    for label in none bogus base-resolve-3 base-resolve-5 worktree-2 worktree-4 new-branch-3 new-branch-5; do
++        : >"$CASE/calls.log"
++        case "$label" in
++            none) run_sourced -- ;;
++            bogus) run_sourced bogus w-1 refs/remotes/origin/main -- ;;
++            base-resolve-3) run_sourced base-resolve w-1 main -- ;;
++            base-resolve-5) run_sourced base-resolve w-1 main gastown. extra -- ;;
++            worktree-2) run_sourced worktree w-1 -- ;;
++            worktree-4) run_sourced worktree w-1 refs/remotes/origin/main extra -- ;;
++            new-branch-3) run_sourced new-branch w-1 refs/remotes/origin/main -- ;;
++            new-branch-5) run_sourced new-branch w-1 refs/remotes/origin/main main extra -- ;;
++        esac
++        [ "$RC" -eq 2 ] || fail "$label: want exit 2, got $RC"
++        grep -q "^$USAGE_PREFIX . polecat-workspace.sh base-resolve " "$CASE/out" ||
++            fail "$label: want the usage line, got: $(cat "$CASE/out")"
++        [ ! -s "$CASE/calls.log" ] || fail "$label: a usage error must run nothing, calls: $(calls)"
++    done
++}
++
++# base-resolve leaves BASE_REF in the caller's shell (the rejection-rebase fence
++# and new-branch read it there), returns the status of its last command like the
++# fence did, and leaves none of its own parameters behind.
++test_base_resolve_sets_base_ref_in_the_callers_shell() {
++    new_case base-ref
++    run_sourced base-resolve w-1 main gastown. -- GC_RIG=testrig -- 'echo "BASE_REF=$BASE_REF"; echo "WORK_BEAD_ID=$WORK_BEAD_ID"; compgen -v | grep "^WS_" || echo no-ws-vars'
++    [ "$RC" -eq 0 ] || fail "want exit 0, got $RC: $(cat "$CASE/err")"
++    grep -qx 'BASE_REF=refs/remotes/origin/main' "$CASE/out" || fail "want BASE_REF in the caller's shell, got: $(cat "$CASE/out")"
++    grep -qx 'WORK_BEAD_ID=w-1' "$CASE/out" || fail "want WORK_BEAD_ID kept, got: $(cat "$CASE/out")"
++    grep -qx 'no-ws-vars' "$CASE/out" || fail "the call left WS_ parameters in the shell: $(cat "$CASE/out")"
++    called 'gc bd update w-1 --set-metadata base_ref=refs/remotes/origin/main'
++    never_called 'drain-ack'
++
++    # The status of the last command comes back, and the shell carries on: a
++    # refused base_ref write is not a STOP (self-review reads it back and stops).
++    new_case base-ref-refused
++    run_sourced base-resolve w-1 main gastown. -- GC_RIG=testrig REFUSE_UPDATE=1 -- 'echo "after rc=$?"; echo "BASE_REF=$BASE_REF"'
++    grep -q 'update refused' "$CASE/err" || fail "want the refusal on stderr, got: $(cat "$CASE/err")"
++    grep -q 'BASE_REF=refs/remotes/origin/main' "$CASE/out" || fail "the shell must carry on with BASE_REF set, got: $(cat "$CASE/out")"
++    grep -qx 'after rc=1' "$CASE/out" || fail "want the failed write's status (1) to come back, got: $(cat "$CASE/out")"
++}
++
++# {{base_branch}}, {{binding_prefix}}, the work bead and GC_RIG reach the STOP's
++# writes through the arguments, and nothing else stands in.
++test_base_resolve_arguments_reach_the_stop() {
++    new_case base-stop
++    run_sourced base-resolve w-9 release/2.x gastown. -- GC_RIG=testrig REMOTE_REF=0 LOCAL_REF=0
++    [ "$RC" -eq 1 ] || fail "a missing base must exit 1, got $RC"
++    grep -qx 'STOP: base branch release/2.x exists neither on origin nor locally.' "$CASE/out" ||
++        fail "want the STOP line naming release/2.x, got: $(cat "$CASE/out")"
++    called 'git show-ref --verify --quiet refs/remotes/origin/release/2.x'
++    called 'git show-ref --verify --quiet refs/heads/release/2.x'
++    called 'gc bd update w-9 --set-metadata halt_reason=base_branch_missing'
++    called 'gc mail send testrig/gastown.witness -s polecat halted: base_branch_missing (w-9)'
++    called 'gc runtime drain-ack'
++
++    new_case base-stop-no-rig
++    run_sourced base-resolve w-9 main gastown. -- REMOTE_REF=0 LOCAL_REF=0
++    called 'gc mail send gastown.witness -s polecat halted: base_branch_missing (w-9)'
++
++    new_case base-stop-unbound
++    run_sourced base-resolve w-9 main '' -- GC_RIG=testrig REMOTE_REF=0 LOCAL_REF=0
++    called 'gc mail send testrig/witness -s polecat halted: base_branch_missing (w-9)'
++}
++
++# new-branch reads BASE_REF from its argument and the base branch from its own:
++# a local-only base is not fetched, a remote one is, by the name it is given.
++test_new_branch_arguments_reach_the_branch_and_its_record() {
++    new_case branch-remote
++    run_sourced new-branch w-1 refs/remotes/origin/release/2.x release/2.x -- GC_RIG=testrig
++    [ "$RC" -eq 0 ] || fail "want exit 0, got $RC: $(cat "$CASE/err")"
++    called 'git fetch origin release/2.x'
++    called 'git checkout -b polecat/w-1 refs/remotes/origin/release/2.x'
++    called 'gc bd update w-1 --set-metadata branch=polecat/w-1 --set-metadata fork_sha=deadbeef'
++    never_called 'drain-ack'
++
++    new_case branch-local-only
++    run_sourced new-branch w-1 refs/heads/release/2.x release/2.x -- GC_RIG=testrig
++    [ "$RC" -eq 0 ] || fail "want exit 0, got $RC: $(cat "$CASE/err")"
++    never_called 'git fetch origin'
++    called 'git checkout -b polecat/w-1 refs/heads/release/2.x'
++
++    new_case branch-fetch-lost
++    run_sourced new-branch w-1 refs/remotes/origin/release/2.x release/2.x -- GC_RIG=testrig FETCH_RC=1 LSREMOTE_RC=1
++    [ "$RC" -eq 1 ] || fail "a base that no longer resolves must exit 1, got $RC"
++    grep -q '^STOP: release/2.x no longer resolves on origin' "$CASE/err" ||
++        fail "want the STOP line naming release/2.x on stderr, got: $(cat "$CASE/err")"
++    called 'git ls-remote --exit-code --heads origin refs/heads/release/2.x'
++    never_called 'git checkout -b'
++    called 'gc runtime drain-ack'
++}
++
++# An empty ref or id is passed through, not invented: new-branch keeps the guard
++# it always had on entry, and nothing runs.
++test_new_branch_with_an_empty_ref_aborts_on_its_own_guard() {
++    new_case branch-no-ref
++    run_sourced new-branch w-1 '' main -- GC_RIG=testrig
++    [ "$RC" -ne 0 ] || fail "want a non-zero exit with no base ref, got 0"
++    grep -q 'base ref not resolved' "$CASE/err" || fail "want the base-ref guard's message, got: $(cat "$CASE/err")"
++    [ ! -s "$CASE/calls.log" ] || fail "an empty base ref must run nothing, calls: $(calls)"
++}
++
++# The cd is the point of sourcing: after the worktree call the caller is IN the
++# task worktree, with the validator defined and nothing of the script's own left.
++# Real git, because the validator rejects anything that is not a real worktree of
++# the rig's repository.
++test_worktree_moves_the_callers_shell_into_the_task_worktree() {
++    local rig city provider canonical out
++    new_case worktree
++    rig="$CASE/rig"
++    city="$CASE/city"
++    provider="$city/.gc/worktrees/demo/polecats/gastown.nux"
++    canonical="$city/.gc/worktrees/demo/artifacts/worktrees/w-1"
++    git init -q "$rig"
++    git -C "$rig" config user.email t@example.invalid
++    git -C "$rig" config user.name t
++    git -C "$rig" config commit.gpgsign false
++    printf 'x\n' >"$rig/x"
++    git -C "$rig" add x
++    git -C "$rig" commit -qm x
++    git -C "$rig" branch -M main
++    git init -q --bare "$CASE/origin.git"
++    git -C "$rig" remote add origin "$CASE/origin.git"
++    git -C "$rig" push -q origin main
++    git -C "$rig" fetch -q origin
++    mkdir -p "$(dirname "$provider")"
++    git -C "$rig" worktree add -q -b provider-home "$provider" main
++    # The sandbox stubs would shadow the real git; these tests need the real one.
++    rm -f "$CASE/bin/git"
++    # The work bead has no metadata yet: the stub gc answers its show call with an empty object.
++    cat >"$CASE/bin/gc" <<'SH'
++#!/usr/bin/env bash
++printf 'gc %s\n' "$*" >>"$CASE/calls.log"
++case "${1:-}:${2:-}" in
++    bd:show) printf '[{"id":"w-1","metadata":{}}]\n' ;;
++esac
++exit 0
++SH
++    cd "$CASE/cwd"
++    for BASH_UNDER_TEST in bash /bin/bash; do
++        [ -x "$(command -v "$BASH_UNDER_TEST")" ] || continue
++        rm -rf "$canonical"
++        git -C "$rig" worktree prune
++        : >"$CASE/calls.log"
++        # The cwd the polecat starts in is its provider home.
++        RC=0
++        (
++            cd "$provider" &&
++                env -i PATH="$CASE/bin:$PATH" HOME="$CASE" GIT_CONFIG_GLOBAL=/dev/null CASE="$CASE" \
++                    GC_CITY_PATH="$city" GC_RIG=demo GC_RIG_ROOT="$rig" \
++                    "$BASH_UNDER_TEST" -c '. "$1" worktree w-1 refs/remotes/origin/main
++                        echo "PWD=$(pwd -P)"; echo "WORKTREE=$WORKTREE"
++                        declare -F validate_artifact_worktree >/dev/null && echo validator-defined
++                        compgen -v | grep "^WS_" || echo no-ws-vars' _ "$WORKSPACE" </dev/null
++        ) >"$CASE/out" 2>"$CASE/err" || RC=$?
++        out=$(cat "$CASE/out")
++        [ "$RC" -eq 0 ] || fail "$BASH_UNDER_TEST: want exit 0, got $RC: $(cat "$CASE/err")"
++        [[ "$out" == *"PWD=$canonical"* ]] || fail "$BASH_UNDER_TEST: the caller was not left in $canonical: $out"
++        [[ "$out" == *"WORKTREE=$canonical"* ]] || fail "$BASH_UNDER_TEST: WORKTREE not set in the caller's shell: $out"
++        [[ "$out" == *validator-defined* ]] || fail "$BASH_UNDER_TEST: the validator is not defined in the caller's shell: $out"
++        [[ "$out" == *no-ws-vars* ]] || fail "$BASH_UNDER_TEST: the call left WS_ parameters behind: $out"
++        called "gc bd update w-1 --set-metadata artifact_dir=$canonical --unset-metadata work_dir"
++        never_called 'drain-ack'
++    done
++    unset BASH_UNDER_TEST
++}
++
++# render_stub <call-fragment> <outfile> [base_branch] — the bash fence of the step
++# that holds that call, with every {{var}} replaced the way gc renders the step. A
++# {{var}} left over is a hard error.
++render_stub() {
++    python3 -I - "$FORMULA" "$1" "$2" "${3:-main}" <<'PY'
++import re
++import sys
++import tomllib
++
++formula, call, out, base = sys.argv[1:5]
++values = {"base_branch": base, "binding_prefix": "gastown.", "convoy_id": "gcp-convoy"}
++doc = tomllib.load(open(formula, "rb"))
++text = next(s["description"] for s in doc["steps"] if s["id"] == "workspace-setup")
++stubs = [f for f in re.findall(r"```bash\n(.*?)\n```", text, re.S) if call in f]
++if len(stubs) != 1:
++    sys.exit(f"want exactly one fence calling {call!r}, found {len(stubs)}")
++rendered = re.sub(r"\{\{(\w+)\}\}", lambda m: values.get(m.group(1), m.group(0)), stubs[0])
++left = sorted(set(re.findall(r"\{\{\w+\}\}", rendered)))
++if left:
++    sys.exit(f"unrendered placeholders in the stub: {left}")
++open(out, "w").write(rendered + "\n")
++PY
++}
++
++# run_stub <stubfile> <env...> — runs a rendered stub from $CASE/cwd in one bash,
++# then echoes what it left in the shell. The stub is sourced-script glue, so it
++# runs as a script file whose last line sources the pack's script.
++run_stub() {
++    local stub="$1"
++    shift
++    RC=0
++    (
++        cd "$CASE/cwd" &&
++            env -i PATH="$CASE/bin:$PATH" HOME="$CASE" GIT_CONFIG_GLOBAL=/dev/null \
++                CASE="$CASE" FORMULAS="$FORMULAS" GC_RIG=testrig "$@" \
++                bash "$stub" </dev/null
++    ) >"$CASE/out" 2>"$CASE/err" || RC=$?
++}
++
++# workspace-setup is a DEFERRED step in tests/test_v2_drain_ack_closes_own_step.py:
++# a mid-workflow early exit, where closing the step alone does not stop its
++# dependents. Its stubs therefore stop and ack the drain the way preflight-tests's
++# does, with no step close and no write to any bead.
++test_stubs_stop_when_the_script_is_unresolved() {
++    local call mode
++    for call in '. "$WS" base-resolve ' '. "$WS" worktree ' '. "$WS" new-branch '; do
++        mode=$(printf '%s' "$call" | awk '{print $3}')
++        new_case "stub-missing-$mode"
++        render_stub "$call" "$CASE/stub.sh" || fail "$mode: could not render the stub"
++        # `gc formula list --json` finds no formula, so the script cannot be located.
++        run_stub "$CASE/stub.sh" WORK_BEAD_ID=w-1 BASE_REF=refs/remotes/origin/main
++        [ "$RC" -eq 1 ] || fail "$mode: want exit 1, got $RC: $(cat "$CASE/err")"
++        grep -q '^STOP: workspace script not found' "$CASE/out" ||
++            fail "$mode: want a line starting 'STOP: workspace script not found', got: $(cat "$CASE/out")"
++        called 'gc runtime drain-ack'
++        [ "$(grep -c 'drain-ack' "$CASE/calls.log")" = 1 ] || fail "$mode: want exactly one drain-ack: $(calls)"
++        # The STOP ends the call: a stub that fell through would source an empty
++        # path and say so on stderr.
++        [ ! -s "$CASE/err" ] || fail "$mode: the STOP must end the call, stderr shows it went on: $(cat "$CASE/err")"
++        never_called 'gc bd'
++        never_called 'git '
++        never_called 'gc mail'
++    done
++}
++
++# The stubs pass the shell's own WORK_BEAD_ID and BASE_REF and the formula's base
++# branch and binding prefix, in the order the script takes them.
++test_stubs_run_the_script_the_formula_resolves() {
++    new_case stub-base-resolve
++    FORMULAS='{"formulas":[{"name":"mol-polecat-work","source":"'"$FORMULA"'"}]}'
++    render_stub '. "$WS" base-resolve ' "$CASE/base.sh" release/2.x || fail "could not render the base-resolve stub"
++    run_stub "$CASE/base.sh" WORK_BEAD_ID=w-3
++    [ "$RC" -eq 0 ] || fail "base-resolve stub: want exit 0, got $RC: $(cat "$CASE/out") $(cat "$CASE/err")"
++    called 'git show-ref --verify --quiet refs/remotes/origin/release/2.x'
++    called 'gc bd update w-3 --set-metadata base_ref=refs/remotes/origin/release/2.x'
++
++    new_case stub-base-resolve-stop
++    FORMULAS='{"formulas":[{"name":"mol-polecat-work","source":"'"$FORMULA"'"}]}'
++    render_stub '. "$WS" base-resolve ' "$CASE/base.sh" release/2.x || fail "could not render the base-resolve stub"
++    run_stub "$CASE/base.sh" WORK_BEAD_ID=w-3 REMOTE_REF=0 LOCAL_REF=0
++    [ "$RC" -eq 1 ] || fail "base-resolve stub on a missing base: want exit 1, got $RC"
++    called 'gc mail send testrig/gastown.witness -s polecat halted: base_branch_missing (w-3)'
++
++    new_case stub-new-branch
++    FORMULAS='{"formulas":[{"name":"mol-polecat-work","source":"'"$FORMULA"'"}]}'
++    render_stub '. "$WS" new-branch ' "$CASE/branch.sh" release/2.x || fail "could not render the new-branch stub"
++    run_stub "$CASE/branch.sh" WORK_BEAD_ID=w-3 BASE_REF=refs/remotes/origin/release/2.x
++    [ "$RC" -eq 0 ] || fail "new-branch stub: want exit 0, got $RC: $(cat "$CASE/out") $(cat "$CASE/err")"
++    called 'git fetch origin release/2.x'
++    called 'git checkout -b polecat/w-3 refs/remotes/origin/release/2.x'
++
++    new_case stub-new-branch-unset-ref
++    FORMULAS='{"formulas":[{"name":"mol-polecat-work","source":"'"$FORMULA"'"}]}'
++    render_stub '. "$WS" new-branch ' "$CASE/branch.sh" || fail "could not render the new-branch stub"
++    run_stub "$CASE/branch.sh" WORK_BEAD_ID=w-3
++    [ "$RC" -ne 0 ] || fail "new-branch stub with no BASE_REF in the shell: want a non-zero exit, got 0"
++    grep -q 'base ref not resolved' "$CASE/err" || fail "want the base-ref guard's message, got: $(cat "$CASE/err")"
++    never_called 'git checkout -b'
++}
++
++test_script_holds_no_formula_placeholder
++test_step_text_carries_no_second_copy
++test_executing_instead_of_sourcing_stops
++test_usage_rejects_unknown_mode_and_wrong_arity
++test_base_resolve_sets_base_ref_in_the_callers_shell
++test_base_resolve_arguments_reach_the_stop
++test_new_branch_arguments_reach_the_branch_and_its_record
++test_new_branch_with_an_empty_ref_aborts_on_its_own_guard
++test_worktree_moves_the_callers_shell_into_the_task_worktree
++test_stubs_stop_when_the_script_is_unresolved
++test_stubs_run_the_script_the_formula_resolves
++echo "polecat workspace tests passed"
+diff --git a/scripts/gascity_pack_inference_gate.py b/scripts/gascity_pack_inference_gate.py
+index 71e28fa4..8eab256a 100644
+--- a/scripts/gascity_pack_inference_gate.py
++++ b/scripts/gascity_pack_inference_gate.py
+@@ -82,8 +82,10 @@ GASTOWN_FORMULA_CONTRACTS = {
+     ),
+     "mol-polecat-work": (
+         'extends = ["mol-polecat-base"]',
+-        "git worktree add",
+-        "--set-metadata branch=\"$BRANCH\"",
++        # The worktree creation and the branch record (`git worktree add`,
++        # --set-metadata branch="$BRANCH") are polecat-workspace.sh's
++        # (gcp-xeael): GASTOWN_SCRIPT_CONTRACTS holds those fragments. The step
++        # keeps only the three calls, pinned in GASTOWN_BUILD_WORKFLOW_CONTRACTS.
+         "{{test_command}}",
+         "REFINERY_TARGET=\"${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery\"",
+         # The handoff write itself (--assignee="$REFINERY_TARGET") is
+@@ -106,7 +108,15 @@ GASTOWN_FORMULA_CONTRACTS = {
+ }
+ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
+     "mol-polecat-work": (
++        # The step's own copy of the branch convention is submit-and-exit's
++        # branch-shape gate; workspace-setup's is polecat-workspace.sh's
++        # (GASTOWN_SCRIPT_CONTRACTS). The calls are pinned here: a step that stops
++        # calling the script is a polecat that never gets a worktree or a branch.
+         "EXPECTED_BRANCH=\"polecat/$WORK_BEAD_ID\"",
++        "polecat-workspace.sh",
++        '. "$WS" base-resolve "${WORK_BEAD_ID:-}"',
++        '. "$WS" worktree "${WORK_BEAD_ID:-}" "${BASE_REF:-}"',
++        '. "$WS" new-branch "${WORK_BEAD_ID:-}" "${BASE_REF:-}"',
+         "{{typecheck_command}}",
+         "{{lint_command}}",
+         "{{build_command}}",
+@@ -324,13 +334,22 @@ POLECAT_BRANCH_CONTENT_GATE_HALT_PATH = (
+ # a structural lint over the formula's executable shell instead.
+ POLECAT_WORK_FORMULA = "mol-polecat-work"
+ POLECAT_SHELL_FENCE_INFO = frozenset({"bash", "sh", "shell"})
+-# Matches a bare `origin/{{base_branch}}` git ref, but not the fully-qualified
+-# `refs/remotes/origin/{{base_branch}}` the resolution block is required to use.
+-POLECAT_BARE_ORIGIN_BASE_REF = re.compile(r"(?<!refs/remotes/)\borigin/\{\{base_branch\}\}")
++# The base-resolution block is the `base-resolve` mode of polecat-workspace.sh
++# (gcp-xeael): the formula step passes {{base_branch}} to it as an argument, and
++# the script holds it as ${WS_BASE_BRANCH}. The lint reads the formula's shell and
++# the script's together, so a bare ref in either, and a block in the script, are
++# judged by one set of rules.
++POLECAT_WORKSPACE_SCRIPT = "assets/scripts/polecat-workspace.sh"
++# Matches a bare `origin/{{base_branch}}` git ref (or its script spelling,
++# `origin/${WS_BASE_BRANCH}`), but not the fully-qualified
++# `refs/remotes/origin/...` the resolution block is required to use.
++POLECAT_BARE_ORIGIN_BASE_REF = re.compile(
++    r"(?<!refs/remotes/)\borigin/(?:\{\{base_branch\}\}|\$\{?WS_BASE_BRANCH\}?)"
++)
+ POLECAT_BASE_REF_ANCHOR = 'if git show-ref --verify --quiet "$BASE_REMOTE"; then'
+ POLECAT_BASE_REF_REQUIRED_FRAGMENTS = (
+-    'BASE_REMOTE="refs/remotes/origin/{{base_branch}}"',
+-    'BASE_LOCAL="refs/heads/{{base_branch}}"',
++    'BASE_REMOTE="refs/remotes/origin/${WS_BASE_BRANCH}"',
++    'BASE_LOCAL="refs/heads/${WS_BASE_BRANCH}"',
+     'gc bd update "$WORK_BEAD_ID" --set-metadata base_ref="$BASE_REF"',
+     "metadata.base_ref",
+ )
+@@ -339,7 +358,7 @@ POLECAT_BASE_REF_REQUIRED_FRAGMENTS = (
+ POLECAT_BASE_REF_ALLOWED_ASSIGNMENTS = frozenset(
+     {'BASE_REF="$BASE_REMOTE"', 'BASE_REF="$BASE_LOCAL"'}
+ )
+-POLECAT_BASE_REF_STOP_MESSAGE = "STOP: base branch {{base_branch}} exists neither on origin nor locally."
++POLECAT_BASE_REF_STOP_MESSAGE = "STOP: base branch ${WS_BASE_BRANCH} exists neither on origin nor locally."
+ # Pack-relative script files whose text carries contract fragments, validated
+ # alongside the formulas. The refinery's merge lane moved out of
+ # mol-refinery-patrol's merge-push step into merge-push.sh (gcp-l8td.6), and
+@@ -408,6 +427,19 @@ GASTOWN_SCRIPT_CONTRACTS = {
+         "git push origin HEAD",
+         '--status=open --assignee="$REFINERY_TARGET"',
+     ),
++    # The polecat's worktree and branch setup (gcp-xeael). Each fragment is the
++    # line that makes one guarantee real: the per-bead worktree is added from the
++    # resolved base, the canonical key is recorded before the cd into it, the branch
++    # is the per-bead convention cut from the resolved base, and its record carries
++    # the fork point the refinery reads.
++    "assets/scripts/polecat-workspace.sh": (
++        'git -C "$RIG_ROOT" worktree add "$WORKTREE_PATH" --detach "$BASE_REF"',
++        "--set-metadata artifact_dir=\"$WORKTREE\"",
++        'EXPECTED_BRANCH="polecat/$WORK_BEAD_ID"',
++        'git checkout -b "$BRANCH" "$BASE_REF"',
++        "--set-metadata branch=\"$BRANCH\"",
++        "--set-metadata fork_sha=",
++    ),
+ }
+ METHODOLOGY_FLOW_CONTRACTS = {
+     "superpowers": {
+@@ -3422,18 +3454,40 @@ def polecat_base_ref_problems(text: str) -> list[str]:
+     return problems
+ 
+ 
+-def validate_polecat_base_ref_contract(pack_source: Path) -> None:
+-    """Pin mol-polecat-work's base-ref resolution against reintroduced origin refs.
++def polecat_base_ref_text(pack_source: Path) -> str:
++    """The formula's text plus the workspace script as one more fenced shell block.
+ 
+-    Complements the literal-fragment contract above: this reads the formula's
+-    executable shell structurally, so a hard-coded ref added to a later step,
+-    a substituted base, or a neutralised STOP arm fails the gate even while
+-    every pinned fragment is still present.
++    The resolution block moved out of the formula into polecat-workspace.sh's
++    `base-resolve` mode (gcp-xeael), so the structural lint has to read both: the
++    formula still holds the later steps whose bare refs it forbids, and the
++    script holds the block it anchors on. The script is appended as a bash fence
++    so `formula_shell_lines` judges it exactly as it judges the formula's own
++    shell; a ``` inside the script would unbalance that fence and fail closed.
+     """
+     path = pack_source / "formulas" / f"{POLECAT_WORK_FORMULA}.toml"
+     if not path.is_file():
+         raise GateError(f"{POLECAT_WORK_FORMULA}: missing formula file {path}")
+-    problems = polecat_base_ref_problems(path.read_text(encoding="utf-8", errors="replace"))
++    script = pack_source / POLECAT_WORKSPACE_SCRIPT
++    if not script.is_file():
++        raise GateError(f"{POLECAT_WORK_FORMULA}: missing workspace script {script}")
++    return (
++        path.read_text(encoding="utf-8", errors="replace")
++        + "\n```bash\n"
++        + script.read_text(encoding="utf-8", errors="replace")
++        + "\n```\n"
++    )
++
++
++def validate_polecat_base_ref_contract(pack_source: Path) -> None:
++    """Pin mol-polecat-work's base-ref resolution against reintroduced origin refs.
++
++    Complements the literal-fragment contract above: this reads the formula's
++    executable shell and the workspace script's (where the resolution block
++    lives) structurally, so a hard-coded ref added to a later step, a
++    substituted base, or a neutralised STOP arm fails the gate even while every
++    pinned fragment is still present.
++    """
++    problems = polecat_base_ref_problems(polecat_base_ref_text(pack_source))
+     if problems:
+         raise GateError(
+             f"{POLECAT_WORK_FORMULA} base-ref resolution contract drifted:\n"
+diff --git a/tests/test_gascity_pack_inference_gate.py b/tests/test_gascity_pack_inference_gate.py
+index 0cac8053..10301430 100644
+--- a/tests/test_gascity_pack_inference_gate.py
++++ b/tests/test_gascity_pack_inference_gate.py
+@@ -1497,6 +1497,45 @@ def test_validate_gastown_orchestration_contract_rejects_missing_refinery_false_
+         gascity_pack_inference_gate.validate_gastown_orchestration_contract(pack)
+ 
+ 
++def test_validate_gastown_orchestration_contract_rejects_missing_workspace_worktree_add(tmp_path) -> None:
++    # The worktree creation moved out of the formula into polecat-workspace.sh
++    # (gcp-xeael). A formula-side `git worktree add` pin would be satisfied by
++    # self-review's detached worktree, so the contract that holds it reads the script.
++    pack = write_gastown_contract_pack(
++        tmp_path,
++        script_edit=lambda path, text: (
++            text.replace("--detach", "") if path.endswith("polecat-workspace.sh") else text
++        ),
++    )
++
++    with pytest.raises(gascity_pack_inference_gate.GateError, match="polecat-workspace.sh"):
++        gascity_pack_inference_gate.validate_gastown_orchestration_contract(pack)
++
++
++@pytest.mark.parametrize(
++    "call",
++    [
++        '. "$WS" base-resolve "${WORK_BEAD_ID:-}"',
++        '. "$WS" worktree "${WORK_BEAD_ID:-}" "${BASE_REF:-}"',
++        '. "$WS" new-branch "${WORK_BEAD_ID:-}" "${BASE_REF:-}"',
++    ],
++)
++def test_validate_gastown_orchestration_contract_rejects_a_polecat_step_that_stops_calling_the_workspace_script(
++    tmp_path, call
++) -> None:
++    # The step keeps only the calls; a step that stops running one is a polecat
++    # that never resolves its base, never gets a worktree, or never gets a branch.
++    pack = write_gastown_contract_pack(
++        tmp_path,
++        formula_edit=lambda name, text: (
++            text.replace(call, "true", 1) if name == "mol-polecat-work" else text
++        ),
++    )
++
++    with pytest.raises(gascity_pack_inference_gate.GateError, match="mol-polecat-work"):
++        gascity_pack_inference_gate.validate_gastown_orchestration_contract(pack)
++
++
+ def test_validate_gastown_orchestration_contract_rejects_a_pack_without_the_merge_push_script(tmp_path) -> None:
+     pack = write_gastown_contract_pack(tmp_path)
+     (pack / "assets" / "scripts" / "refinery" / "merge-push.sh").unlink()
+@@ -1515,18 +1554,25 @@ def gastown_formulas_copy(tmp_path: Path) -> Path:
+ 
+ 
+ def mutated_gastown_source(tmp_path: Path, old: str, new: str) -> Path:
+-    """Copy the real gastown formulas into tmp_path with one mol-polecat-work edit."""
++    """Copy the real gastown formulas and the workspace script into tmp_path with one edit.
++
++    The edit lands in mol-polecat-work, or, when the anchor is not there, in
++    polecat-workspace.sh: the base-resolution block lives in the script now
++    (gcp-xeael), and the lint reads both.
++    """
+     pack_source = tmp_path / "gastown"
+-    shutil.copytree(
+-        gascity_pack_inference_gate.PACK_SPECS["gastown"].source / "formulas",
+-        pack_source / "formulas",
+-    )
+-    formula = pack_source / "formulas" / "mol-polecat-work.toml"
+-    original = formula.read_text(encoding="utf-8")
+-    mutated = original.replace(old, new, 1)
+-    assert mutated != original, f"mutation anchor not present in the formula: {old!r}"
+-    formula.write_text(mutated, encoding="utf-8")
+-    return pack_source
++    source = gascity_pack_inference_gate.PACK_SPECS["gastown"].source
++    shutil.copytree(source / "formulas", pack_source / "formulas")
++    script_rel = gascity_pack_inference_gate.POLECAT_WORKSPACE_SCRIPT
++    (pack_source / script_rel).parent.mkdir(parents=True)
++    shutil.copy(source / script_rel, pack_source / script_rel)
++    for target in (pack_source / "formulas" / "mol-polecat-work.toml", pack_source / script_rel):
++        original = target.read_text(encoding="utf-8")
++        mutated = original.replace(old, new, 1)
++        if mutated != original:
++            target.write_text(mutated, encoding="utf-8")
++            return pack_source
++    raise AssertionError(f"mutation anchor not present in the formula or the workspace script: {old!r}")
+ 
+ 
+ def test_validate_polecat_branch_content_gate_accepts_current_pack() -> None:
+@@ -1720,7 +1766,7 @@ def test_polecat_base_ref_contract_allows_shell_comment_mentions_of_the_bare_ref
+     pack_source = mutated_gastown_source(
+         tmp_path,
+         'BASE_REF="$BASE_REMOTE"    # preferred: freshly fetched, no local drift',
+-        'BASE_REF="$BASE_REMOTE"    # preferred over origin/{{base_branch}}, freshly fetched',
++        'BASE_REF="$BASE_REMOTE"    # preferred over origin/${WS_BASE_BRANCH}, freshly fetched',
+     )
+ 
+     gascity_pack_inference_gate.validate_polecat_base_ref_contract(pack_source)
+@@ -1760,8 +1806,8 @@ def test_polecat_base_ref_contract_rejects_a_neutralised_stop_arm(tmp_path) -> N
+ def test_polecat_base_ref_contract_rejects_a_missing_stop_arm(tmp_path) -> None:
+     pack_source = mutated_gastown_source(
+         tmp_path,
+-        'else\n    echo "STOP: base branch {{base_branch}} exists neither on origin nor locally."',
+-        'elif true; then\n    echo "STOP: base branch {{base_branch}} exists neither on origin nor locally."',
++        'else\n    echo "STOP: base branch ${WS_BASE_BRANCH} exists neither on origin nor locally."',
++        'elif true; then\n    echo "STOP: base branch ${WS_BASE_BRANCH} exists neither on origin nor locally."',
+     )
+ 
+     with pytest.raises(gascity_pack_inference_gate.GateError, match="no else arm"):
+@@ -1787,18 +1833,13 @@ def test_polecat_base_ref_contract_reports_only_the_anchor_when_the_block_moves(
+     # "assigns no BASE_REF" and "has no else arm" -- both false, and both send a
+     # maintainer after an intact block instead of the moved anchor. The exact
+     # count is the assertion: it is what fails if the short-circuit is dropped.
+-    formula = (
+-        gascity_pack_inference_gate.PACK_SPECS["gastown"].source
+-        / "formulas"
+-        / f"{gascity_pack_inference_gate.POLECAT_WORK_FORMULA}.toml"
+-    )
+-    text = formula.read_text(encoding="utf-8")
++    text = gascity_pack_inference_gate.polecat_base_ref_text(gascity_pack_inference_gate.PACK_SPECS["gastown"].source)
+     moved = text.replace(
+         'if git show-ref --verify --quiet "$BASE_REMOTE"; then',
+         'if git show-ref --verify --quiet "$BASE_REMOTE" ; then',
+         1,
+     )
+-    assert moved != text, "mutation anchor not present in the formula"
++    assert moved != text, "mutation anchor not present in the formula or the workspace script"
+ 
+     problems = gascity_pack_inference_gate.polecat_base_ref_problems(moved)
+ 
+@@ -1822,8 +1863,8 @@ def test_polecat_base_ref_contract_rejects_a_dropped_carrier_stamp(tmp_path) ->
+ def test_polecat_base_ref_contract_fails_closed_on_an_unbalanced_fence(tmp_path) -> None:
+     pack_source = mutated_gastown_source(
+         tmp_path,
+-        'BASE_REMOTE="refs/remotes/origin/{{base_branch}}"',
+-        '```\nBASE_REMOTE="refs/remotes/origin/{{base_branch}}"',
++        'BASE_REMOTE="refs/remotes/origin/${WS_BASE_BRANCH}"',
++        '```\nBASE_REMOTE="refs/remotes/origin/${WS_BASE_BRANCH}"',
+     )
+ 
+     with pytest.raises(gascity_pack_inference_gate.GateError, match="unterminated"):
+@@ -2021,6 +2062,14 @@ def test_gastown_build_workflow_contract_covers_orchestration_roles() -> None:
+         "mol-idea-to-plan",
+     }
+     assert "gc session wake \"$REFINERY_TARGET\"" in contracts["mol-polecat-work"]
++    # The worktree, branch and base resolution are the workspace script's
++    # (gcp-xeael): the step keeps the calls, the script's contract holds the rest.
++    for fragment in ("polecat-workspace.sh", '. "$WS" base-resolve', '. "$WS" worktree', '. "$WS" new-branch'):
++        assert any(fragment in item for item in contracts["mol-polecat-work"])
++    workspace_contracts = gascity_pack_inference_gate.GASTOWN_SCRIPT_CONTRACTS["assets/scripts/polecat-workspace.sh"]
++    assert 'git -C "$RIG_ROOT" worktree add "$WORKTREE_PATH" --detach "$BASE_REF"' in workspace_contracts
++    assert 'git checkout -b "$BRANCH" "$BASE_REF"' in workspace_contracts
++    assert not {"git worktree add", '--set-metadata branch="$BRANCH"'} & set(contracts["mol-polecat-work"])
+     # The push gate and the handoff are the script's (gcp-nc8wg): the step keeps
+     # the calls, and the script's own contract holds what moved with them.
+     for fragment in ("polecat-submit.sh", 'bash "$PS" push-gate', 'bash "$PS" reassign'):
+diff --git a/tests/test_v2_drain_ack_closes_own_step.py b/tests/test_v2_drain_ack_closes_own_step.py
+index 4a5ab2e2..82ce6c36 100644
+--- a/tests/test_v2_drain_ack_closes_own_step.py
++++ b/tests/test_v2_drain_ack_closes_own_step.py
+@@ -51,6 +51,8 @@ CHECKED_STEPS = {
+ # these wait on the v2 early-abort idiom (scope + on_fail=abort_scope). Tracked
+ # in gascity; see the ga-uppw56 follow-ups. Remove an entry when it is fixed.
+ DEFERRED_STEPS = {
++    # Its three stubs' workspace-script-not-found STOP (gcp-xeael) is the same
++    # mid-workflow early exit as the fences' own halts: STOP, drain-ack, exit 1.
+     ("gastown/formulas/mol-polecat-work.toml", "workspace-setup"),
+     # The gates-script-not-found STOP, the same mid-workflow early exit as self-review's.
+     ("gastown/formulas/mol-polecat-work.toml", "preflight-tests"),
+-- 
+2.54.0 (Apple Git-157)
+

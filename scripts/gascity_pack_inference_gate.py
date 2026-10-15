@@ -82,8 +82,10 @@ GASTOWN_FORMULA_CONTRACTS = {
     ),
     "mol-polecat-work": (
         'extends = ["mol-polecat-base"]',
-        "git worktree add",
-        "--set-metadata branch=\"$BRANCH\"",
+        # The worktree creation and the branch record (`git worktree add`,
+        # --set-metadata branch="$BRANCH") are polecat-workspace.sh's
+        # (gcp-xeael): GASTOWN_SCRIPT_CONTRACTS holds those fragments. The step
+        # keeps only the three calls, pinned in GASTOWN_BUILD_WORKFLOW_CONTRACTS.
         "{{test_command}}",
         "REFINERY_TARGET=\"${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery\"",
         # The handoff write itself (--assignee="$REFINERY_TARGET") is
@@ -106,7 +108,15 @@ GASTOWN_FORMULA_CONTRACTS = {
 }
 GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
     "mol-polecat-work": (
+        # The step's own copy of the branch convention is submit-and-exit's
+        # branch-shape gate; workspace-setup's is polecat-workspace.sh's
+        # (GASTOWN_SCRIPT_CONTRACTS). The calls are pinned here: a step that stops
+        # calling the script is a polecat that never gets a worktree or a branch.
         "EXPECTED_BRANCH=\"polecat/$WORK_BEAD_ID\"",
+        "polecat-workspace.sh",
+        '. "$WS" base-resolve "${WORK_BEAD_ID:-}"',
+        '. "$WS" worktree "${WORK_BEAD_ID:-}" "${BASE_REF:-}"',
+        '. "$WS" new-branch "${WORK_BEAD_ID:-}" "${BASE_REF:-}"',
         "{{typecheck_command}}",
         "{{lint_command}}",
         "{{build_command}}",
@@ -324,13 +334,22 @@ POLECAT_BRANCH_CONTENT_GATE_HALT_PATH = (
 # a structural lint over the formula's executable shell instead.
 POLECAT_WORK_FORMULA = "mol-polecat-work"
 POLECAT_SHELL_FENCE_INFO = frozenset({"bash", "sh", "shell"})
-# Matches a bare `origin/{{base_branch}}` git ref, but not the fully-qualified
-# `refs/remotes/origin/{{base_branch}}` the resolution block is required to use.
-POLECAT_BARE_ORIGIN_BASE_REF = re.compile(r"(?<!refs/remotes/)\borigin/\{\{base_branch\}\}")
+# The base-resolution block is the `base-resolve` mode of polecat-workspace.sh
+# (gcp-xeael): the formula step passes {{base_branch}} to it as an argument, and
+# the script holds it as ${WS_BASE_BRANCH}. The lint reads the formula's shell and
+# the script's together, so a bare ref in either, and a block in the script, are
+# judged by one set of rules.
+POLECAT_WORKSPACE_SCRIPT = "assets/scripts/polecat-workspace.sh"
+# Matches a bare `origin/{{base_branch}}` git ref (or its script spelling,
+# `origin/${WS_BASE_BRANCH}`), but not the fully-qualified
+# `refs/remotes/origin/...` the resolution block is required to use.
+POLECAT_BARE_ORIGIN_BASE_REF = re.compile(
+    r"(?<!refs/remotes/)\borigin/(?:\{\{base_branch\}\}|\$\{?WS_BASE_BRANCH\}?)"
+)
 POLECAT_BASE_REF_ANCHOR = 'if git show-ref --verify --quiet "$BASE_REMOTE"; then'
 POLECAT_BASE_REF_REQUIRED_FRAGMENTS = (
-    'BASE_REMOTE="refs/remotes/origin/{{base_branch}}"',
-    'BASE_LOCAL="refs/heads/{{base_branch}}"',
+    'BASE_REMOTE="refs/remotes/origin/${WS_BASE_BRANCH}"',
+    'BASE_LOCAL="refs/heads/${WS_BASE_BRANCH}"',
     'gc bd update "$WORK_BEAD_ID" --set-metadata base_ref="$BASE_REF"',
     "metadata.base_ref",
 )
@@ -339,7 +358,7 @@ POLECAT_BASE_REF_REQUIRED_FRAGMENTS = (
 POLECAT_BASE_REF_ALLOWED_ASSIGNMENTS = frozenset(
     {'BASE_REF="$BASE_REMOTE"', 'BASE_REF="$BASE_LOCAL"'}
 )
-POLECAT_BASE_REF_STOP_MESSAGE = "STOP: base branch {{base_branch}} exists neither on origin nor locally."
+POLECAT_BASE_REF_STOP_MESSAGE = "STOP: base branch ${WS_BASE_BRANCH} exists neither on origin nor locally."
 # Pack-relative script files whose text carries contract fragments, validated
 # alongside the formulas. The refinery's merge lane moved out of
 # mol-refinery-patrol's merge-push step into merge-push.sh (gcp-l8td.6), and
@@ -407,6 +426,19 @@ GASTOWN_SCRIPT_CONTRACTS = {
     "assets/scripts/polecat-submit.sh": (
         "git push origin HEAD",
         '--status=open --assignee="$REFINERY_TARGET"',
+    ),
+    # The polecat's worktree and branch setup (gcp-xeael). Each fragment is the
+    # line that makes one guarantee real: the per-bead worktree is added from the
+    # resolved base, the canonical key is recorded before the cd into it, the branch
+    # is the per-bead convention cut from the resolved base, and its record carries
+    # the fork point the refinery reads.
+    "assets/scripts/polecat-workspace.sh": (
+        'git -C "$RIG_ROOT" worktree add "$WORKTREE_PATH" --detach "$BASE_REF"',
+        "--set-metadata artifact_dir=\"$WORKTREE\"",
+        'EXPECTED_BRANCH="polecat/$WORK_BEAD_ID"',
+        'git checkout -b "$BRANCH" "$BASE_REF"',
+        "--set-metadata branch=\"$BRANCH\"",
+        "--set-metadata fork_sha=",
     ),
 }
 METHODOLOGY_FLOW_CONTRACTS = {
@@ -3422,18 +3454,40 @@ def polecat_base_ref_problems(text: str) -> list[str]:
     return problems
 
 
-def validate_polecat_base_ref_contract(pack_source: Path) -> None:
-    """Pin mol-polecat-work's base-ref resolution against reintroduced origin refs.
+def polecat_base_ref_text(pack_source: Path) -> str:
+    """The formula's text plus the workspace script as one more fenced shell block.
 
-    Complements the literal-fragment contract above: this reads the formula's
-    executable shell structurally, so a hard-coded ref added to a later step,
-    a substituted base, or a neutralised STOP arm fails the gate even while
-    every pinned fragment is still present.
+    The resolution block moved out of the formula into polecat-workspace.sh's
+    `base-resolve` mode (gcp-xeael), so the structural lint has to read both: the
+    formula still holds the later steps whose bare refs it forbids, and the
+    script holds the block it anchors on. The script is appended as a bash fence
+    so `formula_shell_lines` judges it exactly as it judges the formula's own
+    shell; a ``` inside the script would unbalance that fence and fail closed.
     """
     path = pack_source / "formulas" / f"{POLECAT_WORK_FORMULA}.toml"
     if not path.is_file():
         raise GateError(f"{POLECAT_WORK_FORMULA}: missing formula file {path}")
-    problems = polecat_base_ref_problems(path.read_text(encoding="utf-8", errors="replace"))
+    script = pack_source / POLECAT_WORKSPACE_SCRIPT
+    if not script.is_file():
+        raise GateError(f"{POLECAT_WORK_FORMULA}: missing workspace script {script}")
+    return (
+        path.read_text(encoding="utf-8", errors="replace")
+        + "\n```bash\n"
+        + script.read_text(encoding="utf-8", errors="replace")
+        + "\n```\n"
+    )
+
+
+def validate_polecat_base_ref_contract(pack_source: Path) -> None:
+    """Pin mol-polecat-work's base-ref resolution against reintroduced origin refs.
+
+    Complements the literal-fragment contract above: this reads the formula's
+    executable shell and the workspace script's (where the resolution block
+    lives) structurally, so a hard-coded ref added to a later step, a
+    substituted base, or a neutralised STOP arm fails the gate even while every
+    pinned fragment is still present.
+    """
+    problems = polecat_base_ref_problems(polecat_base_ref_text(pack_source))
     if problems:
         raise GateError(
             f"{POLECAT_WORK_FORMULA} base-ref resolution contract drifted:\n"

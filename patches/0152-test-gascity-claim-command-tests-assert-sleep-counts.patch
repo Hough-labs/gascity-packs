@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Tue, 13 Oct 2026 17:17:11 -0400
-Subject: [PATCH 152/176] test(gascity): claim-command tests assert sleep
+Subject: [PATCH 152/177] test(gascity): claim-command tests assert sleep
  counts, not a 2s wall clock (gcp-tzai, gcp-dy0qj)
 
 Two claim-command tests ran gascity/commands/claim/run.sh under

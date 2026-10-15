@@ -10,11 +10,13 @@
 # base that has advanced only locally". Every future restack would strand the
 # pool the same way.
 #
-# These tests extract the base-resolution block out of mol-polecat-work verbatim
-# (between the GUARD_BEGIN/GUARD_END base-resolve markers) and run it against a
-# scratch bare origin plus clone per case, with a stubbed `gc` that logs its
-# argv. Only case A changes with the fix; B, C and E pin the STOP that must
-# survive, D the in-sync path.
+# The base-resolution block now lives in gastown/assets/scripts/polecat-workspace.sh
+# (its `base-resolve` mode, between the GUARD_BEGIN/GUARD_END base-resolve
+# markers; gcp-xeael). These tests run that mode the way the formula step does:
+# SOURCED into the polecat's shell, because BASE_REF has to land in the caller's
+# shell for the blocks after it. Each case runs against a scratch bare origin
+# plus clone, with a stubbed `gc` that logs its argv. Only case A changes with
+# the fix; B, C and E pin the STOP that must survive, D the in-sync path.
 #
 #   A stale             local tip is not an ancestor of origin but is on a remote
 #                       branch (archived)      -> proceed from origin
@@ -23,13 +25,13 @@
 #   D in_sync           local == origin        -> proceed
 #   E revlist_error     the commit count itself fails -> STOP (fail closed)
 #
-# FORMULA overrides the formula under test, for a red-check against an older one.
+# WORKSPACE_SCRIPT overrides the script under test, for a red-check against an older one.
 # Assertions grep for literal shell snippets, so single-quoted `$VAR` is the point.
 # shellcheck disable=SC2016
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-FORMULA="${FORMULA:-$ROOT/gastown/formulas/mol-polecat-work.toml}"
+SCRIPT="${WORKSPACE_SCRIPT:-$ROOT/gastown/assets/scripts/polecat-workspace.sh}"
 REAL_GIT=$(command -v git)
 
 # A host global git config (tag signing, hooks path, templates) must not reach
@@ -44,23 +46,21 @@ fail() {
     exit 1
 }
 
-# extract_block pulls the base resolution verbatim out of the formula, so the
-# code under test is the code that ships. A drifted or deleted block fails here
-# rather than passing against a stale copy. The formula's template variables are
-# rendered the way the pack renders them.
-extract_block() {
-    local out="$1"
-    [[ "$(grep -c '^# GUARD_BEGIN base-resolve$' "$FORMULA")" == 1 ]] ||
-        fail "expected exactly one '# GUARD_BEGIN base-resolve' in $FORMULA"
-    [[ "$(grep -c '^# GUARD_END base-resolve$' "$FORMULA")" == 1 ]] ||
-        fail "expected exactly one '# GUARD_END base-resolve' in $FORMULA"
-    awk '/^# GUARD_BEGIN base-resolve$/{f=1} /^# GUARD_END base-resolve$/{f=0} f' "$FORMULA" |
-        sed -e 's/{{base_branch}}/integration/g' -e 's/{{binding_prefix}}/gastown./g' >"$out"
-    [[ -s "$out" ]] || fail "could not extract the base-resolve block from $FORMULA"
-    grep -F 'halt_reason=base_branch_diverged' "$out" >/dev/null ||
-        fail "extracted block does not contain the diverged STOP"
-    ! grep -F '{{' "$out" >/dev/null || fail "extracted block has an unrendered template variable"
-    bash -n "$out" || fail "extracted block is not valid shell"
+# check_script confirms the script under test still carries exactly one
+# base-resolution block, with the STOP that must survive, and no unrendered
+# template variable: the formula step renders its {{...}} into the call's
+# arguments, so the script must hold none. A drifted or deleted block fails here
+# rather than passing against a stale copy.
+check_script() {
+    [[ "$(grep -c '^# GUARD_BEGIN base-resolve$' "$SCRIPT")" == 1 ]] ||
+        fail "expected exactly one '# GUARD_BEGIN base-resolve' in $SCRIPT"
+    [[ "$(grep -c '^# GUARD_END base-resolve$' "$SCRIPT")" == 1 ]] ||
+        fail "expected exactly one '# GUARD_END base-resolve' in $SCRIPT"
+    awk '/^# GUARD_BEGIN base-resolve$/{f=1} /^# GUARD_END base-resolve$/{f=0} f' "$SCRIPT" |
+        grep -F 'halt_reason=base_branch_diverged' >/dev/null ||
+        fail "the base-resolve block does not contain the diverged STOP"
+    ! grep -F '{{' "$SCRIPT" >/dev/null || fail "$SCRIPT has an unrendered template variable"
+    bash -n "$SCRIPT" || fail "$SCRIPT is not valid shell"
 }
 
 # write_gc_stub records every call; the block only writes, never reads.
@@ -104,7 +104,7 @@ new_case() {
     dir=$(mktemp -d)
     mkdir -p "$dir/bin"
     write_gc_stub "$dir/bin"
-    extract_block "$dir/block.sh"
+    check_script
     : >"$dir/calls.log"
 
     "$REAL_GIT" init -q --bare -b integration "$dir/origin.git"
@@ -132,16 +132,17 @@ restack() {
     "$REAL_GIT" -C "$dir/clone" fetch -q --prune origin
 }
 
-# run_block executes the block with the inputs workspace-setup binds beforehand,
-# then echoes BASE_REF. A STOP exits before that line, so its absence is the
-# assertion that the polecat never reached the work. Sets RC and OUT.
+# run_block sources the script's base-resolve mode with the inputs the formula
+# step binds (the work bead from section 1, the rendered base branch and binding
+# prefix), then echoes BASE_REF. A STOP exits before that line, so its absence
+# is the assertion that the polecat never reached the work. Sets RC and OUT.
 run_block() {
     local dir="$1" path_prefix="${2-$1/bin}"
     cat >"$dir/harness.sh" <<HARNESS
 WORK_BEAD_ID="gcp-test1"
 GC_RIG="gascity-packs"
+. "$SCRIPT" base-resolve "\$WORK_BEAD_ID" integration gastown.
 HARNESS
-    cat "$dir/block.sh" >>"$dir/harness.sh"
     echo 'echo "BASE_REF=$BASE_REF"' >>"$dir/harness.sh"
 
     set +e

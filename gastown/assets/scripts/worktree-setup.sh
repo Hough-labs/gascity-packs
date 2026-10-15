@@ -197,7 +197,8 @@ report_branch_disagreement() {
     fi
 }
 
-# Remote, then local, else stop: the rule of mol-polecat-work.toml workspace-setup (GUARD base-resolve).
+# Remote, then local, else stop: the rule of mol-polecat-work.toml workspace-setup, which runs it as
+# assets/scripts/polecat-workspace.sh's base-resolve mode (GUARD base-resolve).
 # Sets DEFAULT_REF to the fully-qualified ref for the rig's default_branch. Both
 # arms name refs/remotes/ and refs/heads/ outright, because git resolves a
 # same-named tag ahead of a bare branch name.

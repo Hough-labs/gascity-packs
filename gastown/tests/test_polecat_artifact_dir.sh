@@ -4,6 +4,9 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 GASTOWN="$ROOT/gastown"
 POLECAT_FORMULA="$GASTOWN/formulas/mol-polecat-work.toml"
+# workspace-setup's base resolution, validator and worktree creation run as this
+# script (gcp-xeael); the formula step carries only the calls.
+WORKSPACE_SCRIPT="$GASTOWN/assets/scripts/polecat-workspace.sh"
 WITNESS_FORMULA="$GASTOWN/formulas/mol-witness-patrol.toml"
 SHUTDOWN_FORMULA="$GASTOWN/formulas/mol-shutdown-dance.toml"
 REFINERY_FORMULA="$GASTOWN/formulas/mol-refinery-patrol.toml"
@@ -32,20 +35,16 @@ WORKSPACE_TEST_ACTOR=ac-test-polecat
 
 extract_validator() {
     local output=$1
-    python3 - "$POLECAT_FORMULA" "$output" <<'PY'
+    python3 - "$WORKSPACE_SCRIPT" "$output" <<'PY'
 import pathlib
 import sys
-import tomllib
 
-formula_path = pathlib.Path(sys.argv[1])
+script_path = pathlib.Path(sys.argv[1])
 output_path = pathlib.Path(sys.argv[2])
-with formula_path.open("rb") as handle:
-    formula = tomllib.load(handle)
-workspace = next(step for step in formula["steps"] if step["id"] == "workspace-setup")
-description = workspace["description"]
-begin = description.index("# BEGIN ARTIFACT_WORKTREE_VALIDATOR")
-end = description.index("# END ARTIFACT_WORKTREE_VALIDATOR", begin)
-block = description[begin:end].splitlines()[1:]
+text = script_path.read_text(encoding="utf-8")
+begin = text.index("# BEGIN ARTIFACT_WORKTREE_VALIDATOR")
+end = text.index("# END ARTIFACT_WORKTREE_VALIDATOR", begin)
+block = text[begin:end].splitlines()[1:]
 output_path.write_text("\n".join(block) + "\n", encoding="utf-8")
 PY
 }
@@ -93,32 +92,58 @@ output_path.write_text(script + "\n", encoding="utf-8")
 PY
 }
 
+# extract_workspace_creation writes the shell the polecat runs for sections 1 and
+# 2 of workspace-setup, in ONE shell as the formula intends: the section-1 fence
+# that derives the work bead, the base-resolve call, and the worktree call. The
+# two calls are the formula's own stub lines, rendered the way gc renders them;
+# only the stub's script locator (`gc formula list --json`, tested in
+# test_polecat_workspace.sh) is swapped for the script's path, and the swap
+# refuses a stub whose locator has changed shape.
 extract_workspace_creation() {
     local output=$1
-    python3 - "$POLECAT_FORMULA" "$output" <<'PY'
+    python3 - "$POLECAT_FORMULA" "$output" "$WORKSPACE_SCRIPT" <<'PY'
 import pathlib
 import re
+import shlex
 import sys
 import tomllib
 
 formula_path = pathlib.Path(sys.argv[1])
 output_path = pathlib.Path(sys.argv[2])
+script = sys.argv[3]
 with formula_path.open("rb") as handle:
     formula = tomllib.load(handle)
 workspace = next(step for step in formula["steps"] if step["id"] == "workspace-setup")
 blocks = re.findall(r"```bash\n(.*?)```", workspace["description"], re.DOTALL)
-# Everything up to and including the block that adds the worktree. Counting
-# blocks goes stale each time the step gains or loses one.
-creation = next((i for i, block in enumerate(blocks) if "worktree add" in block), None)
-if creation is None:
-    raise SystemExit(f"workspace-setup has no worktree-creation block among {len(blocks)} bash blocks")
-script = "\n".join(blocks[: creation + 1])
-script = script.replace("{{convoy_id}}", "convoy-test")
-script = script.replace("{{base_branch}}", "main")
-script = script.replace("{{binding_prefix}}", "gastown.")
-if "{{" in script:
+
+
+def only(marker):
+    hits = [block for block in blocks if marker in block]
+    if len(hits) != 1:
+        raise SystemExit(f"workspace-setup: want exactly one bash block with {marker!r}, found {len(hits)}")
+    return hits[0]
+
+
+def call_line(block):
+    lines = block.rstrip("\n").split("\n")
+    if not (lines[0].startswith("WS_SRC=$(gc formula list --json") and lines[1].startswith('WS="${WS_SRC:+')):
+        raise SystemExit("workspace-setup stub no longer locates the script the way this test replaces")
+    return lines[-1]
+
+
+parts = [
+    only("git fetch --prune origin"),
+    "WS=" + shlex.quote(script),
+    call_line(only('. "$WS" base-resolve')),
+    call_line(only('. "$WS" worktree')),
+]
+text = "\n".join(parts) + "\n"
+text = text.replace("{{convoy_id}}", "convoy-test")
+text = text.replace("{{base_branch}}", "main")
+text = text.replace("{{binding_prefix}}", "gastown.")
+if "{{" in text:
     raise SystemExit("workspace creation extraction retained an unresolved template")
-output_path.write_text(script, encoding="utf-8")
+output_path.write_text(text, encoding="utf-8")
 PY
 }
 
@@ -520,7 +545,7 @@ test_shutdown_probe_scopes_rig_and_fails_closed() {
 
 test_validator_rejects_provider_and_unrelated_paths() {
     local tmp validator rig city_a city_b provider bead valid got plain
-    local alias_root foreign foreign_wt cross_city other_rig wrong_namespace
+    local alias_root foreign foreign_wt foreign_canonical cross_city other_rig wrong_namespace
     tmp=$(physical_mktemp_dir)
     trap 'rm -rf "$tmp"' RETURN
     validator="$tmp/validator.sh"
@@ -576,6 +601,17 @@ test_validator_rejects_provider_and_unrelated_paths() {
     if validate_artifact_worktree \
         "$foreign_wt" "$city_a" demo "$rig" "$bead" existing >/dev/null; then
         fail "same-shaped worktree from a foreign repository was accepted"
+    fi
+
+    # The path checks are not an ownership boundary: a worktree of ANOTHER
+    # repository at this city's exact canonical path passes all of them, and is
+    # rejected only because its git common dir is not the rig's.
+    foreign_canonical="$city_a/.gc/worktrees/demo/artifacts/worktrees/ac-foreign"
+    mkdir -p "$(dirname "$foreign_canonical")"
+    git -C "$foreign" worktree add -qb foreign-canonical "$foreign_canonical" HEAD
+    if validate_artifact_worktree \
+        "$foreign_canonical" "$city_a" demo "$rig" ac-foreign existing >/dev/null; then
+        fail "canonical-path worktree from a foreign repository was accepted"
     fi
 
     cross_city="$city_b/.gc/worktrees/demo/artifacts/worktrees/$bead"
@@ -1532,7 +1568,8 @@ test_metadata_migration_and_consumers_are_canonical_first() {
         "$GASTOWN/agents/polecat/prompt.template.md" \
         "$GASTOWN/agents/witness/prompt.template.md" \
         "$GASTOWN/assets/scripts/refinery/merge-push.sh" \
-        "$ARTIFACT_CLEANUP" <<'PY'
+        "$ARTIFACT_CLEANUP" \
+        "$WORKSPACE_SCRIPT" <<'PY'
 import pathlib
 import sys
 import tomllib
@@ -1546,6 +1583,7 @@ import tomllib
     witness_prompt_path,
     merge_push_path,
     cleanup_script_path,
+    workspace_script_path,
 ) = (
     pathlib.Path(arg) for arg in sys.argv[1:]
 )
@@ -1554,6 +1592,18 @@ with polecat_path.open("rb") as handle:
     polecat = tomllib.load(handle)
 workspace = next(step["description"] for step in polecat["steps"] if step["id"] == "workspace-setup")
 submit = next(step["description"] for step in polecat["steps"] if step["id"] == "submit-and-exit")
+# The workspace shell is the script's (gcp-xeael); the step keeps the three calls.
+# Contract fragments are read from the script, and the prohibitions apply to the
+# script AND the step text, so neither can bring a forbidden pattern back.
+workspace_script = workspace_script_path.read_text(encoding="utf-8")
+workspace_code = workspace + "\n" + workspace_script
+for call in (
+    '. "$WS" base-resolve ',
+    '. "$WS" worktree ',
+    '. "$WS" new-branch ',
+):
+    if workspace.count(call) != 1:
+        raise SystemExit(f"workspace-setup must call the workspace script exactly once with: {call}")
 
 required_workspace = (
     'BEAD_JSON=$(gc bd show "$WORK_BEAD_ID" --json) ||',
@@ -1575,33 +1625,33 @@ required_workspace = (
     "do not create an alternate artifact",
 )
 for fragment in required_workspace:
-    if fragment not in workspace:
+    if fragment not in workspace_script:
         raise SystemExit(f"workspace contract missing: {fragment}")
-if workspace.index(".artifact_dir // empty") > workspace.index(".work_dir // empty"):
+if workspace_script.index(".artifact_dir // empty") > workspace_script.index(".work_dir // empty"):
     raise SystemExit("legacy task work_dir is read before canonical artifact_dir")
-if workspace.index("validate_artifact_worktree") > workspace.index('cd -- "$WORKTREE"'):
+if workspace_script.index("validate_artifact_worktree") > workspace_script.index('cd -- "$WORKTREE"'):
     raise SystemExit("workspace enters the task path before defining/using its validator")
-if "--set-metadata work_dir=" in workspace:
+if "--set-metadata work_dir=" in workspace_code:
     raise SystemExit("workspace still writes deprecated task work_dir")
 for forbidden in (
     'WORKTREE_PATH=$(pwd)/worktrees/',
     'WORKTREE_PATH="$PWD/worktrees/',
     'WORKTREE_PATH="${PWD}/worktrees/',
 ):
-    if forbidden in workspace:
+    if forbidden in workspace_code:
         raise SystemExit(f"workspace still creates provider-nested task artifacts: {forbidden}")
-if "GC_WORK_DIR" in workspace:
+if "GC_WORK_DIR" in workspace_code:
     raise SystemExit("workspace relies on convergence-only GC_WORK_DIR")
-if ".artifact-worktree-" in workspace or "WORKTREE_GENERATION" in workspace:
+if ".artifact-worktree-" in workspace_code or "WORKTREE_GENERATION" in workspace_code:
     raise SystemExit("workspace can create a non-canonical random artifact generation")
-if 'git branch -D "$EXPECTED_BRANCH"' in workspace or 'git branch -D "$BRANCH"' in workspace:
+if 'git branch -D "$EXPECTED_BRANCH"' in workspace_code or 'git branch -D "$BRANCH"' in workspace_code:
     raise SystemExit("empty-branch recovery can delete an unrecorded work branch")
 if "--unset-metadata artifact_source_sha" not in submit:
     raise SystemExit("polecat submission does not retire stale refinery artifact proof")
 if "--unset-metadata artifact_cleanup_state" not in submit:
     raise SystemExit("polecat submission does not retire stale cleanup state")
-canonical_guard = workspace.index("Canonical artifact_dir is missing or unsafe")
-legacy_fallback = workspace.index('elif [ -n "$LEGACY_WORK_DIR" ]')
+canonical_guard = workspace_script.index("Canonical artifact_dir is missing or unsafe")
+legacy_fallback = workspace_script.index('elif [ -n "$LEGACY_WORK_DIR" ]')
 if canonical_guard > legacy_fallback:
     raise SystemExit("invalid canonical artifact_dir can fall through to legacy/new creation")
 
@@ -1740,7 +1790,7 @@ for fragment in (
         raise SystemExit(f"polecat prompt lacks fail-closed workspace guidance: {fragment}")
 if "<home>/worktrees/vg-1jp" in polecat_prompt:
     raise SystemExit("polecat prompt still advertises the legacy provider-nested path")
-if "new nested worktree is created" in workspace:
+if "new nested worktree is created" in workspace_code:
     raise SystemExit("workspace recipe still describes canonical artifacts as nested worktrees")
 if "`metadata.artifact_dir`" not in witness_prompt:
     raise SystemExit("witness prompt does not document canonical artifact_dir")
