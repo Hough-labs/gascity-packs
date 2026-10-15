@@ -321,13 +321,13 @@ test_claim_verify_separates_read_failure_from_unassigned() {
     # "read failed" were therefore the same observation, and a readable
     # unassigned bead took the CLAIM_RELEASED path instead of CLAIM_REJECTED.
     # Key read-success on the bead echoing its own id, never on the assignee.
-    local prompt="$GASTOWN/agents/polecat/prompt.template.md"
+    local claim="$GASTOWN/assets/scripts/polecat-claim.sh"
 
-    grep -F 'SHOW_ID="$(printf '"'"'%s'"'"' "$SHOW_JSON" | jq -r '"'"'.[0].id // empty'"'"' 2>/dev/null)"' "$prompt" >/dev/null ||
+    grep -F 'SHOW_ID="$(printf '"'"'%s'"'"' "$SHOW_JSON" | jq -r '"'"'.[0].id // empty'"'"' 2>/dev/null)"' "$claim" >/dev/null ||
         fail "claim-verify must read the bead id to prove the show succeeded"
-    grep -F 'if [ "$SHOW_CODE" -eq 0 ] && [ -n "$SHOW_ID" ] && [ -n "$STATUS" ]; then' "$prompt" >/dev/null ||
+    grep -F 'if [ "$SHOW_CODE" -eq 0 ] && [ -n "$SHOW_ID" ] && [ -n "$STATUS" ]; then' "$claim" >/dev/null ||
         fail "claim-verify read-success test must not depend on a non-empty assignee"
-    ! grep -F '[ -n "$STATUS" ] && [ -n "$ASSIGNEE" ]' "$prompt" >/dev/null ||
+    ! grep -F '[ -n "$STATUS" ] && [ -n "$ASSIGNEE" ]' "$claim" >/dev/null ||
         fail "claim-verify regressed to conflating an unassigned bead with a failed read"
 }
 
@@ -342,27 +342,59 @@ test_claim_refuses_a_pour_onto_a_live_owner() {
     # this pins the guard into the startup contract so it cannot be quietly
     # dropped from the claim block.
     local prompt="$GASTOWN/agents/polecat/prompt.template.md"
+    local claim="$GASTOWN/assets/scripts/polecat-claim.sh"
 
-    grep -F '# GUARD_BEGIN live-owner' "$prompt" >/dev/null ||
+    grep -F '# GUARD_BEGIN live-owner' "$claim" >/dev/null ||
         fail "polecat claim block lost the live-owner guard"
-    grep -F '# GUARD_END live-owner' "$prompt" >/dev/null ||
+    grep -F '# GUARD_END live-owner' "$claim" >/dev/null ||
         fail "live-owner guard is missing its extraction sentinel"
-    grep -F 'CLAIM_DECLINED_LIVE_OWNER' "$prompt" >/dev/null ||
+    grep -F 'CLAIM_DECLINED_LIVE_OWNER' "$claim" >/dev/null ||
         fail "live-owner guard must announce its refusal with a distinct token"
-    grep -F 'gc session list --json' "$prompt" >/dev/null ||
+    grep -F 'gc session list --json' "$claim" >/dev/null ||
         fail "live-owner guard must probe session liveness, not assume it"
 
     # The guard runs BEFORE the step re-point and the polecat_session stamp:
     # both mutate bead state, and a declining polecat must touch nothing. The
     # stamp is the write on the claimed bead.
     local guard_line stamp_line
-    guard_line=$(grep -n '# GUARD_END live-owner' "$prompt" | head -1 | cut -d: -f1)
-    stamp_line=$(grep -n '"\$WORK_ID" --set-metadata polecat_session="\$EXPECTED_ASSIGNEE"' "$prompt" | head -1 | cut -d: -f1)
+    guard_line=$(grep -n '# GUARD_END live-owner' "$claim" | head -1 | cut -d: -f1)
+    stamp_line=$(grep -n '"\$WORK_ID" --set-metadata polecat_session="\$EXPECTED_ASSIGNEE"' "$claim" | head -1 | cut -d: -f1)
     [[ -n "$guard_line" && -n "$stamp_line" && "$guard_line" -lt "$stamp_line" ]] ||
         fail "live-owner guard must run before the claim block stamps polecat_session"
 
     grep -F '`CLAIM_DECLINED_LIVE_OWNER`, it has already drain-acked' "$prompt" >/dev/null ||
         fail "the prose listing drain-acked claim outcomes must name CLAIM_DECLINED_LIVE_OWNER"
+}
+
+test_polecat_claim_ships_as_a_script_not_a_heredoc() {
+    # gcp-zzb0: the claim was a 267-line heredoc the model retyped as one Bash
+    # call at the start of every session. It ships as a script the prompt calls,
+    # so the model types five lines and the claim is testable. Behavioural
+    # coverage lives in test_polecat_claim.sh; this pins the seam between the
+    # prompt and the script.
+    local prompt="$GASTOWN/agents/polecat/prompt.template.md"
+    local claim="$GASTOWN/assets/scripts/polecat-claim.sh"
+
+    [[ -x "$claim" ]] || fail "polecat-claim.sh must be executable"
+    [[ "$(head -1 "$claim")" == '#!/usr/bin/env bash' ]] ||
+        fail "polecat-claim.sh must start with a bash shebang"
+    bash -n "$claim" || fail "polecat-claim.sh is not valid shell"
+
+    # The prompt calls the script with the binding prefix and no longer carries it.
+    [[ "$(grep -cF 'CLAIM_SH="{{ .ConfigDir }}/assets/scripts/polecat-claim.sh"' "$prompt")" == 1 ]] ||
+        fail "the prompt must locate the claim script through {{ .ConfigDir }}"
+    [[ "$(grep -cF 'bash "$CLAIM_SH" "{{ .BindingPrefix }}"' "$prompt")" == 1 ]] ||
+        fail "the prompt must run the claim script with the binding prefix"
+    ! grep -E 'GC_CLAIM|GUARD_BEGIN live-owner|GUARD_END live-owner' "$prompt" >/dev/null ||
+        fail "the prompt inlines the claim again"
+
+    # The script takes the prefix as its one argument; nothing in it is a template value.
+    grep -F 'CLAIM_REJECTED polecat-claim.sh takes exactly one argument' "$claim" >/dev/null ||
+        fail "polecat-claim.sh must reject a call without exactly one argument"
+    ! grep -v '^ *#' "$claim" | grep -F '{{' >/dev/null ||
+        fail "polecat-claim.sh carries a template value; it is not rendered"
+    [[ "$(grep -cF '${BINDING_PREFIX}' "$claim")" == 3 ]] ||
+        fail "polecat-claim.sh must use the binding prefix for the restamp, the worker check and the witness nudge"
 }
 
 test_review_leg_contract_forbids_synthetic_mutation() {
@@ -1162,9 +1194,10 @@ test_work_bead_is_never_claimed() {
     # the work bead back, which is what forced STEP_REPOINTED, the
     # `gc.step_ref` close fallback and the `--if-assignee` takeover. All of that
     # stays gone.
-    local formula prompt fragment
+    local formula prompt claim fragment
     formula="$GASTOWN/formulas/mol-polecat-work.toml"
     prompt="$GASTOWN/agents/polecat/prompt.template.md"
+    claim="$GASTOWN/assets/scripts/polecat-claim.sh"
     fragment="$GASTOWN/template-fragments/approval-fallacy.template.md"
 
     parse_toml "$formula"
@@ -1197,11 +1230,11 @@ PY
     # compare-and-set takeover, and the close fallback that tolerated a hook
     # that named the work bead.
     local file
-    for file in "$prompt" "$formula"; do
+    for file in "$prompt" "$claim" "$formula"; do
         ! grep -F 'STEP_REPOINTED' "$file" >/dev/null ||
             fail "$(basename "$file") re-points a work-bead hook result onto a step; the work bead is never claimed, so the hook never returns it"
     done
-    ! grep -F -- '--if-assignee' "$prompt" "$formula" >/dev/null ||
+    ! grep -F -- '--if-assignee' "$prompt" "$claim" "$formula" >/dev/null ||
         fail "an --if-assignee takeover is back; there is no claim on the work bead to take over"
     ! grep -F 'tier 2' "$formula" >/dev/null ||
         fail "submit-and-exit regained its gc.step_ref close fallback"
@@ -1275,6 +1308,7 @@ test_composition_is_documented
 test_polecat_startup_uses_standard_hook_claim
 test_claim_verify_separates_read_failure_from_unassigned
 test_claim_refuses_a_pour_onto_a_live_owner
+test_polecat_claim_ships_as_a_script_not_a_heredoc
 test_review_leg_contract_forbids_synthetic_mutation
 test_prime_prompts_are_city_generic_and_compact
 test_witness_wisp_queries_pin_include_infra

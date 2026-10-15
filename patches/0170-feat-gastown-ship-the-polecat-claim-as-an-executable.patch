@@ -1,0 +1,1784 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 15 Oct 2026 06:23:03 -0400
+Subject: [PATCH 170/170] feat(gastown): ship the polecat claim as an
+ executable the prompt calls (gcp-zzb0)
+
+Every polecat session opened by retyping a 267-line GC_CLAIM heredoc as one
+Bash call: about 4.5k output tokens and 20-60s of wall time per session, and
+a copy of race-critical logic that only ever ran inside a model's transcription
+of it. The claim now lives in gastown/assets/scripts/polecat-claim.sh and the
+prompt carries a five-line call to it.
+
+The script takes the binding prefix as its one required argument and carries
+the heredoc body byte for byte, with the four {{ .BindingPrefix }} values
+becoming ${BINDING_PREFIX}. The prompt finds the script through
+{{ .ConfigDir }} (gascity #5315, in v1.5.0). On an older gc that renders empty,
+the -f test fails and the block prints CLAIM_REJECTED and drains, so it fails
+closed rather than claiming wrongly.
+
+Every reader of the heredoc moves in the same commit: the live-owner guard and
+resume re-verify tests extract the guard from the script (resume-reverify stays
+on the prompt), the pack-asset pins read the script, and the bare-bd lint row
+follows the re-pointed fixture. test_polecat_claim.sh runs the real script
+against a stubbed gc and sleep, one test per claim path (27) plus the
+missing-argument rejection, asserting stdout and the exact call log.
+
+Validation: the identity harness shows 27 same / 0 differ against the merge
+base for prefix "gastown." and for "". Two can-fail mutations (worker-check
+pattern, hook-retry sleep) turn test_case_livepole and test_case_hookfail red.
+Behaviour is identical on purpose; the two comment/code mismatches found on
+the way are gcp-4b7ji.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ gastown/agents/polecat/prompt.template.md     | 274 +-----
+ gastown/assets/scripts/polecat-claim.sh       | 298 +++++++
+ gastown/tests/test_gastown_pack_assets.sh     |  60 +-
+ gastown/tests/test_polecat_claim.sh           | 844 ++++++++++++++++++
+ .../tests/test_polecat_live_owner_guard.sh    |  23 +-
+ gastown/tests/test_polecat_resume_reverify.sh |  31 +-
+ tests/test_no_bare_bd_commands.py             |   2 +-
+ 7 files changed, 1225 insertions(+), 307 deletions(-)
+ create mode 100755 gastown/assets/scripts/polecat-claim.sh
+ create mode 100755 gastown/tests/test_polecat_claim.sh
+
+diff --git a/gastown/agents/polecat/prompt.template.md b/gastown/agents/polecat/prompt.template.md
+index 8812c0b5..da3cb823 100644
+--- a/gastown/agents/polecat/prompt.template.md
++++ b/gastown/agents/polecat/prompt.template.md
+@@ -187,277 +187,17 @@ polecat race-claims the same bead. Polecat-vs-polecat races are the #1 source of
+ churn — close the window.
+ 
+ ```bash
+-bash <<'GC_CLAIM'
+-set +e
+-EXPECTED_ASSIGNEE="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
+-if [ -z "$EXPECTED_ASSIGNEE" ]; then
+-  echo "CLAIM_REJECTED no session identity in env; cannot verify ownership"
+-  gc runtime drain-ack
+-  exit 0
+-fi
+-
+-# Claim with retry. A hook-call failure (non-zero exit, malformed JSON) is a
+-# transient CLI/daemon fault — NOT "no work" — so retry it before giving up.
+-# Only action==drain, or a clean empty result, is genuine NO_ROUTED_WORK.
+-WORK_ID=""
+-CLAIM_TRY=0
+-while [ "$CLAIM_TRY" -lt 3 ]; do
+-  CLAIM_TRY=$((CLAIM_TRY + 1))
+-  CLAIM_ERR="$(mktemp)"
+-  CLAIM_JSON="$(gc hook --claim --json 2>"$CLAIM_ERR")"
+-  CLAIM_CODE=$?
+-  CLAIM_ERR_TEXT="$(sed -n '1p' "$CLAIM_ERR")"
+-  rm -f "$CLAIM_ERR"
+-  ACTION="$(printf '%s' "$CLAIM_JSON" | jq -r '.action // empty' 2>/dev/null)"
+-  WORK_ID="$(printf '%s' "$CLAIM_JSON" | jq -r '.bead_id // empty' 2>/dev/null)"
+-  # `claimed` means this bead was open and UNASSIGNED and we took it out of the
+-  # pool. `existing_assignment` / `ready_assignment` mean it already carried our
+-  # identity. The live-owner guard below only has to run in the first case.
+-  CLAIM_REASON="$(printf '%s' "$CLAIM_JSON" | jq -r '.reason // empty' 2>/dev/null)"
+-  if [ "$ACTION" = "drain" ]; then
+-    echo "NO_ROUTED_WORK"
+-    gc runtime drain-ack
+-    exit 0
+-  fi
+-  if [ "$CLAIM_CODE" -eq 0 ] && [ -n "$WORK_ID" ]; then
+-    break
+-  fi
+-  if [ "$CLAIM_CODE" -eq 0 ] && [ -z "$ACTION" ] && [ -z "$WORK_ID" ]; then
+-    echo "NO_ROUTED_WORK"
+-    gc runtime drain-ack
+-    exit 0
+-  fi
+-  echo "CLAIM_RETRY hook call failed (code=$CLAIM_CODE): ${CLAIM_ERR_TEXT:-malformed claim result}"
+-  WORK_ID=""
+-  sleep 2
+-done
+-if [ -z "$WORK_ID" ]; then
+-  echo "CLAIM_REJECTED gc hook --claim returned no workable bead after retries"
+-  gc runtime drain-ack
+-  exit 0
+-fi
+-
+-# Post-claim ownership verification. The bead MUST be yours and in_progress
+-# before you touch any code. A polecat NEVER works a bead it did not claim this
+-# session. Distinguish a READ FAILURE (gc bd show non-zero / empty JSON —
+-# transient) from a genuine MISMATCH (non-empty assignee that differs, or
+-# status not in_progress). Retry the read before deciding; only a genuine
+-# mismatch is CLAIM_REJECTED.
+-#
+-# The read-success test keys on the bead ECHOING ITS OWN ID, never on a
+-# non-empty assignee: `gc bd show` omits `assignee` entirely when it is null, so
+-# requiring it conflated "read fine, genuinely unassigned" with "read failed"
+-# and sent a perfectly readable unassigned bead down the CLAIM_RELEASED path
+-# instead of the CLAIM_REJECTED one it belongs in (winnow-2fj8u). An id plus a
+-# status is the envelope actually arriving; the assignee is then free to be
+-# empty and be judged on its merits below.
+-#
+-# Five tries with a rising backoff, not three at 1s: `gc` pays seconds of fixed
+-# startup before any subcommand reaches Dolt, and this box has been observed at
+-# load 44.91 while a polecat claimed. A budget that small turns ordinary
+-# contention into a spurious release.
+-STATUS=""
+-ASSIGNEE=""
+-SHOW_JSON=""
+-SHOW_ID=""
+-SHOW_OK=0
+-SHOW_TRY=0
+-while [ "$SHOW_TRY" -lt 5 ]; do
+-  SHOW_TRY=$((SHOW_TRY + 1))
+-  SHOW_JSON="$(gc bd show "$WORK_ID" --json 2>/dev/null)"
+-  SHOW_CODE=$?
+-  SHOW_ID="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].id // empty' 2>/dev/null)"
+-  STATUS="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].status // empty' 2>/dev/null)"
+-  ASSIGNEE="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].assignee // empty' 2>/dev/null)"
+-  if [ "$SHOW_CODE" -eq 0 ] && [ -n "$SHOW_ID" ] && [ -n "$STATUS" ]; then
+-    SHOW_OK=1
+-    break
+-  fi
+-  sleep "$SHOW_TRY"
+-done
+-if [ "$SHOW_OK" -ne 1 ]; then
+-  # Never leave a claimed bead stranded in_progress on an unreadable state:
+-  # release it so it re-enters the pool instead of being lost. Restate the
+-  # routing on the way out — an open, unassigned bead with no gc.routed_to is
+-  # not pooled, it is orphaned: nothing spawns for it and it looks healthy.
+-  # The claim falls through to assigned work too, so this can be a bead that
+-  # never carried pool routing; routing it here is strictly better than
+-  # dropping it.
+-  echo "CLAIM_RELEASED $WORK_ID unreadable after retries; returning it to the pool"
+-  gc bd update "$WORK_ID" --status=open --assignee="" \
+-    --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat"
+-  gc runtime drain-ack
+-  exit 0
+-fi
+-if [ "$ASSIGNEE" != "$EXPECTED_ASSIGNEE" ] || [ "$STATUS" != "in_progress" ]; then
+-  echo "CLAIM_REJECTED $WORK_ID assignee=$ASSIGNEE status=$STATUS (expected $EXPECTED_ASSIGNEE / in_progress)"
++CLAIM_SH="{{ .ConfigDir }}/assets/scripts/polecat-claim.sh"
++if [ -f "$CLAIM_SH" ]; then
++  bash "$CLAIM_SH" "{{ .BindingPrefix }}"
++else
++  echo "CLAIM_REJECTED claim script not found at '$CLAIM_SH'"
+   gc runtime drain-ack
+-  exit 0
+-fi
+-
+-STEP_REF="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].metadata."gc.step_ref" // empty' 2>/dev/null)"
+-
+-# GUARD_BEGIN live-owner
+-# A clean claim is NOT proof the work is free. A formula STEP bead can be put
+-# back in the pool while the session working it is alive and mid-task: gc's
+-# ReleaseIfCurrent swaps status/assignee to open/'' in one Dolt transaction
+-# ("gc: release bead <id> if current") and writes NO bd event, so the release is
+-# invisible to every audit surface and the bead simply reappears as ordinary
+-# unclaimed pool work. Observed on winnow-iaroy, released twice — 20:11:56Z and
+-# 20:33:37Z on 2026-09-07 — while gastown__polecat-gc-8a4d held it and was
+-# state=active, mid-sweep on a multi-minute evaluation. The pool then poured
+-# gastown__polecat-gc-psfm onto it. Nothing in the machinery refused; the
+-# duplicate declined by judgement, and had it not, it would have stomped a live
+-# worktree. This block is that judgement made mechanical (gcp-mjjg).
+-#
+-# What makes the check possible is that the release only touches the step's
+-# status and assignee (ReleaseIfCurrent). The step's own `polecat_session`
+-# survives it, and so does every sibling step's assignee, so the molecule keeps
+-# a durable record of its last holder. Ask that. The WORK bead is never read:
+-# the polecat does not claim it, and a crew seat's name on it is the slinger's,
+-# not a holder's (gcp-952j9).
+-#
+-# "Is the owner us?" is a test against the session's whole identity SET, not
+-# the one spelling EXPECTED_ASSIGNEE picks: the same session is its alias, its
+-# bead id and its runtime session name, and which one a claim was recorded
+-# under depends on the gc that wrote it. Upstream #360 (9f98ea4e) made this
+-# exact correction to the gascity pack's claim (claim_assignee_is_ours,
+-# gascity/commands/claim/run.sh); this is that function.
+-claim_assignee_is_ours() {
+-  for _own in "${BEADS_ACTOR:-}" "${GC_ALIAS:-}" "${GC_SESSION_ID:-}" "${GC_SESSION_NAME:-}" "${GC_AGENT:-}"; do
+-    if [ -n "$_own" ] && [ "$1" = "$_own" ]; then
+-      return 0
+-    fi
+-  done
+-  return 1
+-}
+-
+-# Only a `claimed` reason can be a duplicate pour. `existing_assignment` and
+-# `ready_assignment` mean the bead already carried this session's identity
+-# before the hook ran, and the release clears the assignee — so a released bead
+-# can never reach us by those tiers. Skipping them keeps three `gc` round-trips
+-# off the ordinary step-to-step path, where a molecule's own preassigned steps
+-# come back as `ready_assignment` every time. An unknown reason still checks.
+-if [ -n "$STEP_REF" ] && { [ -z "$CLAIM_REASON" ] || [ "$CLAIM_REASON" = "claimed" ]; }; then
+-  # The molecule's last holder. Source 1 is the claimed step's own
+-  # `polecat_session`, which gc's release and our hook claim both leave alone.
+-  # Source 2 is required because mid-run steps are claimed with a bare
+-  # `gc hook --claim` and carry no `polecat_session`: the most recently updated
+-  # sibling step that still names an assignee stands in for it.
+-  GUARD_ROOT="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].metadata."gc.root_bead_id" // empty' 2>/dev/null)"
+-  GUARD_OWNER="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].metadata.polecat_session // empty' 2>/dev/null)"
+-  if [ -z "$GUARD_OWNER" ] && [ -n "$GUARD_ROOT" ]; then
+-    GUARD_OWNER="$(gc bd list --metadata-field "gc.root_bead_id=$GUARD_ROOT" --all --limit=0 --json 2>/dev/null |
+-      jq -r --arg me "$WORK_ID" '[.[] | select(.id != $me and (.assignee // "") != "")]
+-        | sort_by(.updated_at // "") | last | .assignee // empty' 2>/dev/null)"
+-  fi
+-  if [ -z "$GUARD_OWNER" ]; then
+-    # An unresolvable or unowned molecule is not evidence of a duplicate pour.
+-    # Proceed exactly as this block did before the guard existed.
+-    echo "WARN live-owner guard could not resolve an owner for this molecule; proceeding unguarded"
+-  elif [ "$GUARD_OWNER" != "$EXPECTED_ASSIGNEE" ]; then
+-    if claim_assignee_is_ours "$GUARD_OWNER"; then
+-      # Another spelling of THIS session: gc 1.4.3 claimed under the runtime
+-      # session_name, a gc 1.5.0 namepool polecat acts under its alias. Its
+-      # live row is us, so probing liveness would decline our own molecule.
+-      echo "WARN molecule $GUARD_ROOT was last held by $GUARD_OWNER, another identity of this session ($EXPECTED_ASSIGNEE); it is ours."
+-    else
+-      # Someone else's name is on the molecule. Only a LIVE someone blocks: a
+-      # restarted session usually claims under a new identity, so a DEAD prior
+-      # holder is the ordinary resume case and must not stall
+-      # the engine.
+-      # `gc session list` omits closed sessions by default, so a hit there is
+-      # the liveness answer. asleep and draining count as alive — both still own
+-      # their work and get woken back onto it.
+-      GUARD_ALIVE=""
+-      GUARD_OWNER_SN=""
+-      GUARD_OWNER_TPL=""
+-      GUARD_LIST_OK=0
+-      GUARD_TRY=0
+-      while [ "$GUARD_TRY" -lt 3 ]; do
+-        GUARD_TRY=$((GUARD_TRY + 1))
+-        GUARD_LIST="$(gc session list --json 2>/dev/null)"
+-        if printf '%s' "$GUARD_LIST" | jq -e 'has("sessions")' >/dev/null 2>&1; then
+-          GUARD_LIST_OK=1
+-          GUARD_ROW="$(printf '%s' "$GUARD_LIST" | jq -c --arg o "$GUARD_OWNER" \
+-            '[.sessions[] | select(.closed != true)
+-              | select(.session_name == $o or .id == $o or .name == $o or .alias == $o)]
+-             | .[0] // empty' 2>/dev/null)"
+-          GUARD_ALIVE="$(printf '%s' "$GUARD_ROW" | jq -r '.id // empty' 2>/dev/null)"
+-          GUARD_OWNER_SN="$(printf '%s' "$GUARD_ROW" | jq -r '.session_name // empty' 2>/dev/null)"
+-          GUARD_OWNER_TPL="$(printf '%s' "$GUARD_ROW" | jq -r '.template // empty' 2>/dev/null)"
+-          break
+-        fi
+-        sleep "$GUARD_TRY"
+-      done
+-      # Only a live WORKER blocks. A crew, specialist or mayor seat is always
+-      # live and never runs polecat steps: when one is the molecule's last holder
+-      # it is the slinger, and declining would hand the step to a seat that will
+-      # not run it and strand the molecule (gcp-qjkp). A worker is a live row
+-      # whose template is EXACTLY the polecat or the refinery. A row with no
+-      # template cannot be classified, so it is treated like a worker: that is
+-      # the fail-closed behaviour from before the template check existed.
+-      GUARD_DECLINE=0
+-      if [ "$GUARD_LIST_OK" -ne 1 ]; then
+-        GUARD_DECLINE=1
+-      elif [ -n "$GUARD_ALIVE" ]; then
+-        case "$GUARD_OWNER_TPL" in
+-          ""|"${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat"|"${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}refinery")
+-            GUARD_DECLINE=1 ;;
+-        esac
+-      fi
+-      if [ "$GUARD_DECLINE" -eq 1 ]; then
+-        # A live worker, or liveness unreadable. Unreadable is NOT evidence the owner is
+-        # gone, and the two mistakes are not symmetric: declining costs one pool
+-        # slot and the bead stays claimable, proceeding stomps a live worktree
+-        # and corrupts whatever the owner is mid-write on. Fail closed.
+-        echo "CLAIM_DECLINED_LIVE_OWNER $WORK_ID"
+-        echo "  molecule $GUARD_ROOT was last held by $GUARD_OWNER, and this session is $EXPECTED_ASSIGNEE."
+-        if [ "$GUARD_LIST_OK" -ne 1 ]; then
+-          echo "  session liveness was UNREADABLE after retries — declining rather than assuming the owner is gone."
+-        else
+-          echo "  that owner is live (session $GUARD_ALIVE). This is a duplicate pour onto an in-flight molecule."
+-        fi
+-        echo "  Restoring the step to its owner and draining. No code, branch, or worktree touched."
+-        # The hook stamped OUR gc.session_id/gc.session_name onto the step
+-        # during the claim. Put the owner's back. Both come from the live row:
+-        # GUARD_OWNER is an assignee, which under gc 1.5.0 is an alias or a
+-        # session bead id, not the runtime session name or id gc reads from
+-        # these keys. When either value cannot be read, clear the key rather
+-        # than leave ours standing — a wrong binding is worse than an absent
+-        # one, and the owner's next write restores it.
+-        gc bd update "$WORK_ID" --assignee="$GUARD_OWNER" \
+-          --set-metadata gc.session_name="$GUARD_OWNER_SN" \
+-          --set-metadata polecat_session="$GUARD_OWNER" \
+-          --set-metadata gc.session_id="$GUARD_ALIVE" \
+-          || echo "WARN could not restore $WORK_ID to $GUARD_OWNER — the step is left claimed by a session that will not run it; escalate to the witness"
+-        gc session nudge "${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}witness" \
+-          "DUPLICATE_POUR declined: step $WORK_ID poured onto $EXPECTED_ASSIGNEE while molecule $GUARD_ROOT was last held by $GUARD_OWNER. Step restored to its owner." \
+-          >/dev/null 2>&1 || true
+-        gc runtime drain-ack
+-        exit 0
+-      fi
+-      if [ -n "$GUARD_ALIVE" ]; then
+-        echo "WARN molecule $GUARD_ROOT was last held by $GUARD_OWNER, a live $GUARD_OWNER_TPL session: that is the slinger, not a worker; proceeding."
+-      else
+-        echo "WARN molecule $GUARD_ROOT was last held by $GUARD_OWNER, but no live session holds that identity — treating this as a resume and proceeding."
+-      fi
+-    fi
+-  fi
+ fi
+-# GUARD_END live-owner
+-
+-# Ownership confirmed.
+-# Stamp a stable session identity so the churn-watcher and the live-owner guard
+-# can key on metadata.polecat_session.
+-gc bd update "$WORK_ID" --set-metadata polecat_session="$EXPECTED_ASSIGNEE" \
+-  || echo "WARN metadata stamp failed for $WORK_ID; churn-watcher/resume lose session keying (proceeding — the claim is valid)"
+-
+-printf 'CLAIMED_BEAD_ID=%s\n' "$WORK_ID"
+-printf '%s' "$SHOW_JSON" | jq '.[0].metadata'
+-GC_CLAIM
+ ```
+ 
++The claim lives in this pack's assets/scripts/polecat-claim.sh; run it, do not retype or read it first.
++
+ If the block prints `NO_ROUTED_WORK`, `CLAIM_REJECTED`, `CLAIM_RELEASED`, or
+ `CLAIM_DECLINED_LIVE_OWNER`, it has already drain-acked — stop and exit.
+ Only after it prints `CLAIMED_BEAD_ID` do you read the recipe with `gc bd formula show mol-polecat-work --rig "$GC_RIG"` and run
+diff --git a/gastown/assets/scripts/polecat-claim.sh b/gastown/assets/scripts/polecat-claim.sh
+new file mode 100755
+index 00000000..106866fd
+--- /dev/null
++++ b/gastown/assets/scripts/polecat-claim.sh
+@@ -0,0 +1,298 @@
++#!/usr/bin/env bash
++# polecat-claim.sh — the polecat's first action: claim the hooked work bead.
++#
++# Usage:  bash polecat-claim.sh <binding-prefix>
++#
++# <binding-prefix> is the pack's binding prefix with its trailing dot
++# ("gastown."), or "" for an unbound pack. It is required even when empty: a
++# missing one would restamp gc.routed_to and nudge the witness under the wrong
++# name, and would misread a live polecat owner as a slinger.
++#
++# Env read: BEADS_ACTOR GC_SESSION_NAME GC_SESSION_ID GC_AGENT GC_ALIAS GC_RIG
++#
++# Outcome contract: it always exits 0 and prints exactly one of
++#   NO_ROUTED_WORK              nothing to claim; drain-acked
++#   CLAIM_REJECTED ...          no identity, no workable bead, or not ours; drain-acked
++#   CLAIM_RELEASED <id> ...     bead unreadable; returned to the pool, drain-acked
++#   CLAIM_DECLINED_LIVE_OWNER   duplicate pour onto a live owner; step restored, drain-acked
++#   CLAIMED_BEAD_ID=<id>        followed by the bead's metadata JSON
++#
++# Everything between the claim:begin and claim:end markers is the claim that
++# used to be typed into the polecat prompt as a heredoc; tests extract the
++# guard from here, so keep its sentinels in place.
++if [ "$#" -ne 1 ]; then
++  echo "CLAIM_REJECTED polecat-claim.sh takes exactly one argument, the binding prefix (got $#)"
++  gc runtime drain-ack
++  exit 0
++fi
++BINDING_PREFIX="$1"
++
++# --- claim:begin ---
++set +e
++EXPECTED_ASSIGNEE="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
++if [ -z "$EXPECTED_ASSIGNEE" ]; then
++  echo "CLAIM_REJECTED no session identity in env; cannot verify ownership"
++  gc runtime drain-ack
++  exit 0
++fi
++
++# Claim with retry. A hook-call failure (non-zero exit, malformed JSON) is a
++# transient CLI/daemon fault — NOT "no work" — so retry it before giving up.
++# Only action==drain, or a clean empty result, is genuine NO_ROUTED_WORK.
++WORK_ID=""
++CLAIM_TRY=0
++while [ "$CLAIM_TRY" -lt 3 ]; do
++  CLAIM_TRY=$((CLAIM_TRY + 1))
++  CLAIM_ERR="$(mktemp)"
++  CLAIM_JSON="$(gc hook --claim --json 2>"$CLAIM_ERR")"
++  CLAIM_CODE=$?
++  CLAIM_ERR_TEXT="$(sed -n '1p' "$CLAIM_ERR")"
++  rm -f "$CLAIM_ERR"
++  ACTION="$(printf '%s' "$CLAIM_JSON" | jq -r '.action // empty' 2>/dev/null)"
++  WORK_ID="$(printf '%s' "$CLAIM_JSON" | jq -r '.bead_id // empty' 2>/dev/null)"
++  # `claimed` means this bead was open and UNASSIGNED and we took it out of the
++  # pool. `existing_assignment` / `ready_assignment` mean it already carried our
++  # identity. The live-owner guard below only has to run in the first case.
++  CLAIM_REASON="$(printf '%s' "$CLAIM_JSON" | jq -r '.reason // empty' 2>/dev/null)"
++  if [ "$ACTION" = "drain" ]; then
++    echo "NO_ROUTED_WORK"
++    gc runtime drain-ack
++    exit 0
++  fi
++  if [ "$CLAIM_CODE" -eq 0 ] && [ -n "$WORK_ID" ]; then
++    break
++  fi
++  if [ "$CLAIM_CODE" -eq 0 ] && [ -z "$ACTION" ] && [ -z "$WORK_ID" ]; then
++    echo "NO_ROUTED_WORK"
++    gc runtime drain-ack
++    exit 0
++  fi
++  echo "CLAIM_RETRY hook call failed (code=$CLAIM_CODE): ${CLAIM_ERR_TEXT:-malformed claim result}"
++  WORK_ID=""
++  sleep 2
++done
++if [ -z "$WORK_ID" ]; then
++  echo "CLAIM_REJECTED gc hook --claim returned no workable bead after retries"
++  gc runtime drain-ack
++  exit 0
++fi
++
++# Post-claim ownership verification. The bead MUST be yours and in_progress
++# before you touch any code. A polecat NEVER works a bead it did not claim this
++# session. Distinguish a READ FAILURE (gc bd show non-zero / empty JSON —
++# transient) from a genuine MISMATCH (non-empty assignee that differs, or
++# status not in_progress). Retry the read before deciding; only a genuine
++# mismatch is CLAIM_REJECTED.
++#
++# The read-success test keys on the bead ECHOING ITS OWN ID, never on a
++# non-empty assignee: `gc bd show` omits `assignee` entirely when it is null, so
++# requiring it conflated "read fine, genuinely unassigned" with "read failed"
++# and sent a perfectly readable unassigned bead down the CLAIM_RELEASED path
++# instead of the CLAIM_REJECTED one it belongs in (winnow-2fj8u). An id plus a
++# status is the envelope actually arriving; the assignee is then free to be
++# empty and be judged on its merits below.
++#
++# Five tries with a rising backoff, not three at 1s: `gc` pays seconds of fixed
++# startup before any subcommand reaches Dolt, and this box has been observed at
++# load 44.91 while a polecat claimed. A budget that small turns ordinary
++# contention into a spurious release.
++STATUS=""
++ASSIGNEE=""
++SHOW_JSON=""
++SHOW_ID=""
++SHOW_OK=0
++SHOW_TRY=0
++while [ "$SHOW_TRY" -lt 5 ]; do
++  SHOW_TRY=$((SHOW_TRY + 1))
++  SHOW_JSON="$(gc bd show "$WORK_ID" --json 2>/dev/null)"
++  SHOW_CODE=$?
++  SHOW_ID="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].id // empty' 2>/dev/null)"
++  STATUS="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].status // empty' 2>/dev/null)"
++  ASSIGNEE="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].assignee // empty' 2>/dev/null)"
++  if [ "$SHOW_CODE" -eq 0 ] && [ -n "$SHOW_ID" ] && [ -n "$STATUS" ]; then
++    SHOW_OK=1
++    break
++  fi
++  sleep "$SHOW_TRY"
++done
++if [ "$SHOW_OK" -ne 1 ]; then
++  # Never leave a claimed bead stranded in_progress on an unreadable state:
++  # release it so it re-enters the pool instead of being lost. Restate the
++  # routing on the way out — an open, unassigned bead with no gc.routed_to is
++  # not pooled, it is orphaned: nothing spawns for it and it looks healthy.
++  # The claim falls through to assigned work too, so this can be a bead that
++  # never carried pool routing; routing it here is strictly better than
++  # dropping it.
++  echo "CLAIM_RELEASED $WORK_ID unreadable after retries; returning it to the pool"
++  gc bd update "$WORK_ID" --status=open --assignee="" \
++    --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}${BINDING_PREFIX}polecat"
++  gc runtime drain-ack
++  exit 0
++fi
++if [ "$ASSIGNEE" != "$EXPECTED_ASSIGNEE" ] || [ "$STATUS" != "in_progress" ]; then
++  echo "CLAIM_REJECTED $WORK_ID assignee=$ASSIGNEE status=$STATUS (expected $EXPECTED_ASSIGNEE / in_progress)"
++  gc runtime drain-ack
++  exit 0
++fi
++
++STEP_REF="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].metadata."gc.step_ref" // empty' 2>/dev/null)"
++
++# GUARD_BEGIN live-owner
++# A clean claim is NOT proof the work is free. A formula STEP bead can be put
++# back in the pool while the session working it is alive and mid-task: gc's
++# ReleaseIfCurrent swaps status/assignee to open/'' in one Dolt transaction
++# ("gc: release bead <id> if current") and writes NO bd event, so the release is
++# invisible to every audit surface and the bead simply reappears as ordinary
++# unclaimed pool work. Observed on winnow-iaroy, released twice — 20:11:56Z and
++# 20:33:37Z on 2026-09-07 — while gastown__polecat-gc-8a4d held it and was
++# state=active, mid-sweep on a multi-minute evaluation. The pool then poured
++# gastown__polecat-gc-psfm onto it. Nothing in the machinery refused; the
++# duplicate declined by judgement, and had it not, it would have stomped a live
++# worktree. This block is that judgement made mechanical (gcp-mjjg).
++#
++# What makes the check possible is that the release only touches the step's
++# status and assignee (ReleaseIfCurrent). The step's own `polecat_session`
++# survives it, and so does every sibling step's assignee, so the molecule keeps
++# a durable record of its last holder. Ask that. The WORK bead is never read:
++# the polecat does not claim it, and a crew seat's name on it is the slinger's,
++# not a holder's (gcp-952j9).
++#
++# "Is the owner us?" is a test against the session's whole identity SET, not
++# the one spelling EXPECTED_ASSIGNEE picks: the same session is its alias, its
++# bead id and its runtime session name, and which one a claim was recorded
++# under depends on the gc that wrote it. Upstream #360 (9f98ea4e) made this
++# exact correction to the gascity pack's claim (claim_assignee_is_ours,
++# gascity/commands/claim/run.sh); this is that function.
++claim_assignee_is_ours() {
++  for _own in "${BEADS_ACTOR:-}" "${GC_ALIAS:-}" "${GC_SESSION_ID:-}" "${GC_SESSION_NAME:-}" "${GC_AGENT:-}"; do
++    if [ -n "$_own" ] && [ "$1" = "$_own" ]; then
++      return 0
++    fi
++  done
++  return 1
++}
++
++# Only a `claimed` reason can be a duplicate pour. `existing_assignment` and
++# `ready_assignment` mean the bead already carried this session's identity
++# before the hook ran, and the release clears the assignee — so a released bead
++# can never reach us by those tiers. Skipping them keeps three `gc` round-trips
++# off the ordinary step-to-step path, where a molecule's own preassigned steps
++# come back as `ready_assignment` every time. An unknown reason still checks.
++if [ -n "$STEP_REF" ] && { [ -z "$CLAIM_REASON" ] || [ "$CLAIM_REASON" = "claimed" ]; }; then
++  # The molecule's last holder. Source 1 is the claimed step's own
++  # `polecat_session`, which gc's release and our hook claim both leave alone.
++  # Source 2 is required because mid-run steps are claimed with a bare
++  # `gc hook --claim` and carry no `polecat_session`: the most recently updated
++  # sibling step that still names an assignee stands in for it.
++  GUARD_ROOT="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].metadata."gc.root_bead_id" // empty' 2>/dev/null)"
++  GUARD_OWNER="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].metadata.polecat_session // empty' 2>/dev/null)"
++  if [ -z "$GUARD_OWNER" ] && [ -n "$GUARD_ROOT" ]; then
++    GUARD_OWNER="$(gc bd list --metadata-field "gc.root_bead_id=$GUARD_ROOT" --all --limit=0 --json 2>/dev/null |
++      jq -r --arg me "$WORK_ID" '[.[] | select(.id != $me and (.assignee // "") != "")]
++        | sort_by(.updated_at // "") | last | .assignee // empty' 2>/dev/null)"
++  fi
++  if [ -z "$GUARD_OWNER" ]; then
++    # An unresolvable or unowned molecule is not evidence of a duplicate pour.
++    # Proceed exactly as this block did before the guard existed.
++    echo "WARN live-owner guard could not resolve an owner for this molecule; proceeding unguarded"
++  elif [ "$GUARD_OWNER" != "$EXPECTED_ASSIGNEE" ]; then
++    if claim_assignee_is_ours "$GUARD_OWNER"; then
++      # Another spelling of THIS session: gc 1.4.3 claimed under the runtime
++      # session_name, a gc 1.5.0 namepool polecat acts under its alias. Its
++      # live row is us, so probing liveness would decline our own molecule.
++      echo "WARN molecule $GUARD_ROOT was last held by $GUARD_OWNER, another identity of this session ($EXPECTED_ASSIGNEE); it is ours."
++    else
++      # Someone else's name is on the molecule. Only a LIVE someone blocks: a
++      # restarted session usually claims under a new identity, so a DEAD prior
++      # holder is the ordinary resume case and must not stall
++      # the engine.
++      # `gc session list` omits closed sessions by default, so a hit there is
++      # the liveness answer. asleep and draining count as alive — both still own
++      # their work and get woken back onto it.
++      GUARD_ALIVE=""
++      GUARD_OWNER_SN=""
++      GUARD_OWNER_TPL=""
++      GUARD_LIST_OK=0
++      GUARD_TRY=0
++      while [ "$GUARD_TRY" -lt 3 ]; do
++        GUARD_TRY=$((GUARD_TRY + 1))
++        GUARD_LIST="$(gc session list --json 2>/dev/null)"
++        if printf '%s' "$GUARD_LIST" | jq -e 'has("sessions")' >/dev/null 2>&1; then
++          GUARD_LIST_OK=1
++          GUARD_ROW="$(printf '%s' "$GUARD_LIST" | jq -c --arg o "$GUARD_OWNER" \
++            '[.sessions[] | select(.closed != true)
++              | select(.session_name == $o or .id == $o or .name == $o or .alias == $o)]
++             | .[0] // empty' 2>/dev/null)"
++          GUARD_ALIVE="$(printf '%s' "$GUARD_ROW" | jq -r '.id // empty' 2>/dev/null)"
++          GUARD_OWNER_SN="$(printf '%s' "$GUARD_ROW" | jq -r '.session_name // empty' 2>/dev/null)"
++          GUARD_OWNER_TPL="$(printf '%s' "$GUARD_ROW" | jq -r '.template // empty' 2>/dev/null)"
++          break
++        fi
++        sleep "$GUARD_TRY"
++      done
++      # Only a live WORKER blocks. A crew, specialist or mayor seat is always
++      # live and never runs polecat steps: when one is the molecule's last holder
++      # it is the slinger, and declining would hand the step to a seat that will
++      # not run it and strand the molecule (gcp-qjkp). A worker is a live row
++      # whose template is EXACTLY the polecat or the refinery. A row with no
++      # template cannot be classified, so it is treated like a worker: that is
++      # the fail-closed behaviour from before the template check existed.
++      GUARD_DECLINE=0
++      if [ "$GUARD_LIST_OK" -ne 1 ]; then
++        GUARD_DECLINE=1
++      elif [ -n "$GUARD_ALIVE" ]; then
++        case "$GUARD_OWNER_TPL" in
++          ""|"${GC_RIG:+$GC_RIG/}${BINDING_PREFIX}polecat"|"${GC_RIG:+$GC_RIG/}${BINDING_PREFIX}refinery")
++            GUARD_DECLINE=1 ;;
++        esac
++      fi
++      if [ "$GUARD_DECLINE" -eq 1 ]; then
++        # A live worker, or liveness unreadable. Unreadable is NOT evidence the owner is
++        # gone, and the two mistakes are not symmetric: declining costs one pool
++        # slot and the bead stays claimable, proceeding stomps a live worktree
++        # and corrupts whatever the owner is mid-write on. Fail closed.
++        echo "CLAIM_DECLINED_LIVE_OWNER $WORK_ID"
++        echo "  molecule $GUARD_ROOT was last held by $GUARD_OWNER, and this session is $EXPECTED_ASSIGNEE."
++        if [ "$GUARD_LIST_OK" -ne 1 ]; then
++          echo "  session liveness was UNREADABLE after retries — declining rather than assuming the owner is gone."
++        else
++          echo "  that owner is live (session $GUARD_ALIVE). This is a duplicate pour onto an in-flight molecule."
++        fi
++        echo "  Restoring the step to its owner and draining. No code, branch, or worktree touched."
++        # The hook stamped OUR gc.session_id/gc.session_name onto the step
++        # during the claim. Put the owner's back. Both come from the live row:
++        # GUARD_OWNER is an assignee, which under gc 1.5.0 is an alias or a
++        # session bead id, not the runtime session name or id gc reads from
++        # these keys. When either value cannot be read, clear the key rather
++        # than leave ours standing — a wrong binding is worse than an absent
++        # one, and the owner's next write restores it.
++        gc bd update "$WORK_ID" --assignee="$GUARD_OWNER" \
++          --set-metadata gc.session_name="$GUARD_OWNER_SN" \
++          --set-metadata polecat_session="$GUARD_OWNER" \
++          --set-metadata gc.session_id="$GUARD_ALIVE" \
++          || echo "WARN could not restore $WORK_ID to $GUARD_OWNER — the step is left claimed by a session that will not run it; escalate to the witness"
++        gc session nudge "${GC_RIG:+$GC_RIG/}${BINDING_PREFIX}witness" \
++          "DUPLICATE_POUR declined: step $WORK_ID poured onto $EXPECTED_ASSIGNEE while molecule $GUARD_ROOT was last held by $GUARD_OWNER. Step restored to its owner." \
++          >/dev/null 2>&1 || true
++        gc runtime drain-ack
++        exit 0
++      fi
++      if [ -n "$GUARD_ALIVE" ]; then
++        echo "WARN molecule $GUARD_ROOT was last held by $GUARD_OWNER, a live $GUARD_OWNER_TPL session: that is the slinger, not a worker; proceeding."
++      else
++        echo "WARN molecule $GUARD_ROOT was last held by $GUARD_OWNER, but no live session holds that identity — treating this as a resume and proceeding."
++      fi
++    fi
++  fi
++fi
++# GUARD_END live-owner
++
++# Ownership confirmed.
++# Stamp a stable session identity so the churn-watcher and the live-owner guard
++# can key on metadata.polecat_session.
++gc bd update "$WORK_ID" --set-metadata polecat_session="$EXPECTED_ASSIGNEE" \
++  || echo "WARN metadata stamp failed for $WORK_ID; churn-watcher/resume lose session keying (proceeding — the claim is valid)"
++
++printf 'CLAIMED_BEAD_ID=%s\n' "$WORK_ID"
++printf '%s' "$SHOW_JSON" | jq '.[0].metadata'
++# --- claim:end ---
+diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
+index e36946cb..b82f5f41 100755
+--- a/gastown/tests/test_gastown_pack_assets.sh
++++ b/gastown/tests/test_gastown_pack_assets.sh
+@@ -321,13 +321,13 @@ test_claim_verify_separates_read_failure_from_unassigned() {
+     # "read failed" were therefore the same observation, and a readable
+     # unassigned bead took the CLAIM_RELEASED path instead of CLAIM_REJECTED.
+     # Key read-success on the bead echoing its own id, never on the assignee.
+-    local prompt="$GASTOWN/agents/polecat/prompt.template.md"
++    local claim="$GASTOWN/assets/scripts/polecat-claim.sh"
+ 
+-    grep -F 'SHOW_ID="$(printf '"'"'%s'"'"' "$SHOW_JSON" | jq -r '"'"'.[0].id // empty'"'"' 2>/dev/null)"' "$prompt" >/dev/null ||
++    grep -F 'SHOW_ID="$(printf '"'"'%s'"'"' "$SHOW_JSON" | jq -r '"'"'.[0].id // empty'"'"' 2>/dev/null)"' "$claim" >/dev/null ||
+         fail "claim-verify must read the bead id to prove the show succeeded"
+-    grep -F 'if [ "$SHOW_CODE" -eq 0 ] && [ -n "$SHOW_ID" ] && [ -n "$STATUS" ]; then' "$prompt" >/dev/null ||
++    grep -F 'if [ "$SHOW_CODE" -eq 0 ] && [ -n "$SHOW_ID" ] && [ -n "$STATUS" ]; then' "$claim" >/dev/null ||
+         fail "claim-verify read-success test must not depend on a non-empty assignee"
+-    ! grep -F '[ -n "$STATUS" ] && [ -n "$ASSIGNEE" ]' "$prompt" >/dev/null ||
++    ! grep -F '[ -n "$STATUS" ] && [ -n "$ASSIGNEE" ]' "$claim" >/dev/null ||
+         fail "claim-verify regressed to conflating an unassigned bead with a failed read"
+ }
+ 
+@@ -342,22 +342,23 @@ test_claim_refuses_a_pour_onto_a_live_owner() {
+     # this pins the guard into the startup contract so it cannot be quietly
+     # dropped from the claim block.
+     local prompt="$GASTOWN/agents/polecat/prompt.template.md"
++    local claim="$GASTOWN/assets/scripts/polecat-claim.sh"
+ 
+-    grep -F '# GUARD_BEGIN live-owner' "$prompt" >/dev/null ||
++    grep -F '# GUARD_BEGIN live-owner' "$claim" >/dev/null ||
+         fail "polecat claim block lost the live-owner guard"
+-    grep -F '# GUARD_END live-owner' "$prompt" >/dev/null ||
++    grep -F '# GUARD_END live-owner' "$claim" >/dev/null ||
+         fail "live-owner guard is missing its extraction sentinel"
+-    grep -F 'CLAIM_DECLINED_LIVE_OWNER' "$prompt" >/dev/null ||
++    grep -F 'CLAIM_DECLINED_LIVE_OWNER' "$claim" >/dev/null ||
+         fail "live-owner guard must announce its refusal with a distinct token"
+-    grep -F 'gc session list --json' "$prompt" >/dev/null ||
++    grep -F 'gc session list --json' "$claim" >/dev/null ||
+         fail "live-owner guard must probe session liveness, not assume it"
+ 
+     # The guard runs BEFORE the step re-point and the polecat_session stamp:
+     # both mutate bead state, and a declining polecat must touch nothing. The
+     # stamp is the write on the claimed bead.
+     local guard_line stamp_line
+-    guard_line=$(grep -n '# GUARD_END live-owner' "$prompt" | head -1 | cut -d: -f1)
+-    stamp_line=$(grep -n '"\$WORK_ID" --set-metadata polecat_session="\$EXPECTED_ASSIGNEE"' "$prompt" | head -1 | cut -d: -f1)
++    guard_line=$(grep -n '# GUARD_END live-owner' "$claim" | head -1 | cut -d: -f1)
++    stamp_line=$(grep -n '"\$WORK_ID" --set-metadata polecat_session="\$EXPECTED_ASSIGNEE"' "$claim" | head -1 | cut -d: -f1)
+     [[ -n "$guard_line" && -n "$stamp_line" && "$guard_line" -lt "$stamp_line" ]] ||
+         fail "live-owner guard must run before the claim block stamps polecat_session"
+ 
+@@ -365,6 +366,37 @@ test_claim_refuses_a_pour_onto_a_live_owner() {
+         fail "the prose listing drain-acked claim outcomes must name CLAIM_DECLINED_LIVE_OWNER"
+ }
+ 
++test_polecat_claim_ships_as_a_script_not_a_heredoc() {
++    # gcp-zzb0: the claim was a 267-line heredoc the model retyped as one Bash
++    # call at the start of every session. It ships as a script the prompt calls,
++    # so the model types five lines and the claim is testable. Behavioural
++    # coverage lives in test_polecat_claim.sh; this pins the seam between the
++    # prompt and the script.
++    local prompt="$GASTOWN/agents/polecat/prompt.template.md"
++    local claim="$GASTOWN/assets/scripts/polecat-claim.sh"
++
++    [[ -x "$claim" ]] || fail "polecat-claim.sh must be executable"
++    [[ "$(head -1 "$claim")" == '#!/usr/bin/env bash' ]] ||
++        fail "polecat-claim.sh must start with a bash shebang"
++    bash -n "$claim" || fail "polecat-claim.sh is not valid shell"
++
++    # The prompt calls the script with the binding prefix and no longer carries it.
++    [[ "$(grep -cF 'CLAIM_SH="{{ .ConfigDir }}/assets/scripts/polecat-claim.sh"' "$prompt")" == 1 ]] ||
++        fail "the prompt must locate the claim script through {{ .ConfigDir }}"
++    [[ "$(grep -cF 'bash "$CLAIM_SH" "{{ .BindingPrefix }}"' "$prompt")" == 1 ]] ||
++        fail "the prompt must run the claim script with the binding prefix"
++    ! grep -E 'GC_CLAIM|GUARD_BEGIN live-owner|GUARD_END live-owner' "$prompt" >/dev/null ||
++        fail "the prompt inlines the claim again"
++
++    # The script takes the prefix as its one argument; nothing in it is a template value.
++    grep -F 'CLAIM_REJECTED polecat-claim.sh takes exactly one argument' "$claim" >/dev/null ||
++        fail "polecat-claim.sh must reject a call without exactly one argument"
++    ! grep -v '^ *#' "$claim" | grep -F '{{' >/dev/null ||
++        fail "polecat-claim.sh carries a template value; it is not rendered"
++    [[ "$(grep -cF '${BINDING_PREFIX}' "$claim")" == 3 ]] ||
++        fail "polecat-claim.sh must use the binding prefix for the restamp, the worker check and the witness nudge"
++}
++
+ test_review_leg_contract_forbids_synthetic_mutation() {
+     local formula prompt
+     formula="$GASTOWN/formulas/mol-review-leg.toml"
+@@ -1162,9 +1194,10 @@ test_work_bead_is_never_claimed() {
+     # the work bead back, which is what forced STEP_REPOINTED, the
+     # `gc.step_ref` close fallback and the `--if-assignee` takeover. All of that
+     # stays gone.
+-    local formula prompt fragment
++    local formula prompt claim fragment
+     formula="$GASTOWN/formulas/mol-polecat-work.toml"
+     prompt="$GASTOWN/agents/polecat/prompt.template.md"
++    claim="$GASTOWN/assets/scripts/polecat-claim.sh"
+     fragment="$GASTOWN/template-fragments/approval-fallacy.template.md"
+ 
+     parse_toml "$formula"
+@@ -1197,11 +1230,11 @@ PY
+     # compare-and-set takeover, and the close fallback that tolerated a hook
+     # that named the work bead.
+     local file
+-    for file in "$prompt" "$formula"; do
++    for file in "$prompt" "$claim" "$formula"; do
+         ! grep -F 'STEP_REPOINTED' "$file" >/dev/null ||
+             fail "$(basename "$file") re-points a work-bead hook result onto a step; the work bead is never claimed, so the hook never returns it"
+     done
+-    ! grep -F -- '--if-assignee' "$prompt" "$formula" >/dev/null ||
++    ! grep -F -- '--if-assignee' "$prompt" "$claim" "$formula" >/dev/null ||
+         fail "an --if-assignee takeover is back; there is no claim on the work bead to take over"
+     ! grep -F 'tier 2' "$formula" >/dev/null ||
+         fail "submit-and-exit regained its gc.step_ref close fallback"
+@@ -1275,6 +1308,7 @@ test_composition_is_documented
+ test_polecat_startup_uses_standard_hook_claim
+ test_claim_verify_separates_read_failure_from_unassigned
+ test_claim_refuses_a_pour_onto_a_live_owner
++test_polecat_claim_ships_as_a_script_not_a_heredoc
+ test_review_leg_contract_forbids_synthetic_mutation
+ test_prime_prompts_are_city_generic_and_compact
+ test_witness_wisp_queries_pin_include_infra
+diff --git a/gastown/tests/test_polecat_claim.sh b/gastown/tests/test_polecat_claim.sh
+new file mode 100755
+index 00000000..5fed8671
+--- /dev/null
++++ b/gastown/tests/test_polecat_claim.sh
+@@ -0,0 +1,844 @@
++#!/usr/bin/env bash
++# Tests for gastown/assets/scripts/polecat-claim.sh, the polecat's first action.
++#
++# The claim used to be a heredoc in the polecat prompt that every session
++# retyped (gcp-zzb0). It now ships as a script, and these tests run the real
++# script against a stubbed `gc` and a stubbed `sleep`. Each test_case_<name>
++# builds one claim setup and asserts the outcome token, the whole of stdout and
++# the exact `gc`/`sleep` call log, so a changed retry count, backoff, restamp
++# target or nudge target fails here. The setups mirror the identity harness the
++# script was proven against when the heredoc moved: the script and the old
++# heredoc produced the same stdout, exit code and call log for each of them.
++#
++# No test depends on wall-clock time: `sleep` is a stub that logs its argument
++# and returns at once, and stdin is /dev/null.
++set -euo pipefail
++
++ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
++CLAIM_SH="$ROOT/gastown/assets/scripts/polecat-claim.sh"
++
++TMPROOT=$(mktemp -d)
++trap 'rm -rf "$TMPROOT"' EXIT
++
++# fail names the test that called it, so a red run says which case broke.
++fail() {
++    local fn name=""
++    for fn in "${FUNCNAME[@]}"; do
++        case "$fn" in test_*) name=$fn; break ;; esac
++    done
++    echo "FAIL${name:+ $name}: $*" >&2
++    exit 1
++}
++
++ME=gastown__polecat-gc-psfm
++SHOW_OK='[{"id":"w-1","status":"in_progress","assignee":"'$ME'","metadata":{"gc.step_ref":"mol-polecat-work.implement","gc.root_bead_id":"w-root"}}]'
++SESS='{"sessions":[{"id":"gc-8a4d","name":"winnow/gastown.furiosa","session_name":"gastown__polecat-gc-8a4d","alias":"winnow/gastown.furiosa","template":"winnow/gastown.polecat","closed":false},{"id":"gc-ref1","session_name":"winnow--gastown__refinery","alias":"winnow/gastown.refinery","name":"winnow/gastown.refinery","template":"winnow/gastown.refinery","closed":false},{"id":"gc-crw1","session_name":"winnow--specialists__thomas","alias":"winnow/specialists.thomas","name":"winnow/specialists.thomas","template":"winnow/specialists.spec","closed":false},{"id":"gc-nt","session_name":"nt-sess","alias":"winnow/x.nt","name":"winnow/x.nt","closed":false},{"id":"gc-dead","session_name":"dead-sess","alias":"winnow/gastown.dead","name":"winnow/gastown.dead","template":"winnow/gastown.polecat","closed":true}]}'
++
++# write_stubs answers only the reads and writes the claim makes and journals
++# every call to $FX/calls.log, so a test can assert on what the claim did, not
++# just on what it printed. Each read serves $FX/<name>, or $FX/<name>.<N> for the
++# Nth call, with $FX/<name>[.<N>].code as the exit status. gc bd update serves
++# only an exit status, from $FX/update.<N>.code.
++write_stubs() {
++    local bin="$1"
++    mkdir -p "$bin"
++    cat >"$bin/gc" <<'SH'
++#!/usr/bin/env bash
++printf 'gc %s\n' "$*" >>"$FX/calls.log"
++next() { # <name>: serve name.N for the Nth call, falling back to name
++    local n c
++    n=$(($(cat "$FX/$1.n" 2>/dev/null || echo 0) + 1))
++    echo "$n" >"$FX/$1.n"
++    if [ -e "$FX/$1.$n" ]; then cat "$FX/$1.$n"; else cat "$FX/$1" 2>/dev/null; fi
++    c="$FX/$1.$n.code"
++    [ -e "$c" ] || c="$FX/$1.code"
++    return "$(cat "$c" 2>/dev/null || echo 0)"
++}
++case "$1:$2" in
++    hook:--claim) next hook; exit $? ;;
++    bd:show) next show; exit $? ;;
++    bd:list) next list; exit $? ;;
++    session:list) next sessions; exit $? ;;
++    bd:update)
++        n=$(($(cat "$FX/update.n" 2>/dev/null || echo 0) + 1))
++        echo "$n" >"$FX/update.n"
++        c="$FX/update.$n.code"
++        exit "$(cat "$c" 2>/dev/null || echo 0)"
++        ;;
++    *) exit 0 ;;
++esac
++SH
++    cat >"$bin/sleep" <<'SH'
++#!/usr/bin/env bash
++printf 'sleep %s\n' "$*" >>"$FX/calls.log"
++SH
++    chmod +x "$bin/gc" "$bin/sleep"
++}
++
++new_case() {
++    local dir
++    dir=$(mktemp -d "$TMPROOT/case.XXXXXX")
++    write_stubs "$dir/bin"
++    : >"$dir/calls.log"
++    printf '%s' "$dir"
++}
++
++# run_claim <dir> [args...] runs the script as the polecat does, under a clean
++# identity (GC_RIG=winnow, BEADS_ACTOR=$ME) that a case may override through
++# $dir/env. With no args it passes the binding prefix "gastown.". It must exit 0.
++run_claim() {
++    local dir="$1" rc=0
++    shift
++    [ "$#" -gt 0 ] || set -- "gastown."
++    (
++        export FX="$dir" PATH="$dir/bin:$PATH"
++        unset BEADS_ACTOR GC_ALIAS GC_SESSION_ID GC_SESSION_NAME GC_AGENT GC_RIG
++        export GC_RIG=winnow BEADS_ACTOR=$ME
++        # shellcheck disable=SC1091
++        [ -f "$dir/env" ] && . "$dir/env"
++        bash "$CLAIM_SH" "$@" </dev/null >"$dir/out" 2>"$dir/err"
++    ) || rc=$?
++    [ "$rc" -eq 0 ] || fail "the claim exited $rc, but it always exits 0: $(cat "$dir/out" "$dir/err")"
++}
++
++assert_stdout() {
++    local dir="$1"
++    cat >"$dir/want.out"
++    diff -u "$dir/want.out" "$dir/out" || fail "stdout differs from the heredoc's (diff above)"
++}
++
++assert_calls() {
++    local dir="$1"
++    cat >"$dir/want.calls"
++    diff -u "$dir/want.calls" "$dir/calls.log" || fail "the gc/sleep call log differs from the heredoc's (diff above)"
++}
++
++# ok_hook <dir> [reason] has gc hook --claim hand back w-1.
++ok_hook() {
++    printf '{"action":"claimed","bead_id":"w-1","reason":"%s"}' "${2-claimed}" >"$1/hook"
++}
++
++# sib <assignee> prints the molecule's step list: an older sibling held by
++# <assignee> and the claimed step itself, with a LATER stamp.
++sib() {
++    printf '[{"id":"w-sib","assignee":"%s","updated_at":"2026-09-07T20:30:00Z"},{"id":"w-1","assignee":"%s","updated_at":"2026-09-07T20:40:00Z"}]' "$1" "$ME"
++}
++
++setup_noid() { echo 'unset BEADS_ACTOR' >"$1/env"; }
++setup_drain() { echo '{"action":"drain"}' >"$1/hook"; }
++setup_empty() { echo '{}' >"$1/hook"; }
++setup_garbage() { echo 'not json' >"$1/hook"; }
++setup_hookfail() {
++    : >"$1/hook"
++    echo 1 >"$1/hook.code"
++}
++setup_hookflaky() {
++    : >"$1/hook.1"
++    echo 1 >"$1/hook.1.code"
++    ok_hook "$1"
++    echo "$SHOW_OK" >"$1/show"
++    echo '{"sessions":[]}' >"$1/sessions"
++    sib "$ME" >"$1/list"
++}
++setup_unread() {
++    ok_hook "$1"
++    echo '[]' >"$1/show"
++}
++setup_showflaky() {
++    ok_hook "$1"
++    echo '[]' >"$1/show.1"
++    echo "$SHOW_OK" >"$1/show"
++    sib "$ME" >"$1/list"
++}
++setup_mismatch() {
++    ok_hook "$1"
++    echo '[{"id":"w-1","status":"in_progress","assignee":"someone"}]' >"$1/show"
++}
++setup_unassigned() {
++    ok_hook "$1"
++    echo '[{"id":"w-1","status":"in_progress"}]' >"$1/show"
++}
++setup_notinprog() {
++    ok_hook "$1"
++    echo '[{"id":"w-1","status":"open","assignee":"'$ME'"}]' >"$1/show"
++}
++setup_nonstep() {
++    ok_hook "$1"
++    echo '[{"id":"w-1","status":"in_progress","assignee":"'$ME'","metadata":{"x":"y"}}]' >"$1/show"
++}
++setup_ready() {
++    ok_hook "$1" ready_assignment
++    echo "$SHOW_OK" >"$1/show"
++}
++setup_unknownrsn() {
++    ok_hook "$1" weird
++    echo "$SHOW_OK" >"$1/show"
++    sib gastown__polecat-gc-8a4d >"$1/list"
++    echo "$SESS" >"$1/sessions"
++}
++setup_noowner() {
++    ok_hook "$1"
++    echo "$SHOW_OK" >"$1/show"
++    echo '[]' >"$1/list"
++}
++setup_self() {
++    ok_hook "$1"
++    echo "$SHOW_OK" >"$1/show"
++    sib "$ME" >"$1/list"
++}
++setup_alias() {
++    ok_hook "$1"
++    echo "$SHOW_OK" >"$1/show"
++    sib winnow/gastown.nux >"$1/list"
++    echo 'export GC_ALIAS=winnow/gastown.nux' >"$1/env"
++}
++setup_livepole() {
++    ok_hook "$1"
++    echo "$SHOW_OK" >"$1/show"
++    sib winnow/gastown.furiosa >"$1/list"
++    echo "$SESS" >"$1/sessions"
++}
++setup_tagowner() {
++    ok_hook "$1"
++    echo '[{"id":"w-1","status":"in_progress","assignee":"'$ME'","metadata":{"gc.step_ref":"s","gc.root_bead_id":"w-root","polecat_session":"gastown__polecat-gc-8a4d"}}]' >"$1/show"
++    echo "$SESS" >"$1/sessions"
++}
++setup_liveref() {
++    ok_hook "$1"
++    echo "$SHOW_OK" >"$1/show"
++    sib winnow/gastown.refinery >"$1/list"
++    echo "$SESS" >"$1/sessions"
++}
++setup_livecrew() {
++    ok_hook "$1"
++    echo "$SHOW_OK" >"$1/show"
++    sib winnow/specialists.thomas >"$1/list"
++    echo "$SESS" >"$1/sessions"
++}
++setup_notpl() {
++    ok_hook "$1"
++    echo "$SHOW_OK" >"$1/show"
++    sib winnow/x.nt >"$1/list"
++    echo "$SESS" >"$1/sessions"
++}
++setup_dead() {
++    ok_hook "$1"
++    echo "$SHOW_OK" >"$1/show"
++    sib winnow/gastown.dead >"$1/list"
++    echo "$SESS" >"$1/sessions"
++}
++setup_sessunread() {
++    ok_hook "$1"
++    echo "$SHOW_OK" >"$1/show"
++    sib winnow/gastown.furiosa >"$1/list"
++    echo 'nope' >"$1/sessions"
++}
++setup_restorefail() {
++    setup_livepole "$1"
++    echo 1 >"$1/update.1.code"
++}
++setup_stampfail() {
++    setup_self "$1"
++    echo 1 >"$1/update.1.code"
++}
++setup_norig() {
++    setup_unread "$1"
++    echo 'export GC_RIG=' >"$1/env"
++}
++
++test_missing_prefix_argument_is_rejected() {
++    local dir
++    dir=$(new_case)
++    echo '{"action":"claimed","bead_id":"w-1"}' >"$dir/hook"
++    run_claim "$dir" "gastown." "extra"
++    assert_stdout "$dir" <<'EOF'
++CLAIM_REJECTED polecat-claim.sh takes exactly one argument, the binding prefix (got 2)
++EOF
++    assert_calls "$dir" <<'EOF'
++gc runtime drain-ack
++EOF
++    # No argument at all: the same rejection, and the claim never reaches gc.
++    dir=$(new_case)
++    echo '{"action":"claimed","bead_id":"w-1"}' >"$dir/hook"
++    (
++        export FX="$dir" PATH="$dir/bin:$PATH" BEADS_ACTOR=$ME GC_RIG=winnow
++        bash "$CLAIM_SH" </dev/null >"$dir/out" 2>"$dir/err"
++    ) || fail "the claim exited non-zero with no argument: $(cat "$dir/out" "$dir/err")"
++    assert_stdout "$dir" <<'EOF'
++CLAIM_REJECTED polecat-claim.sh takes exactly one argument, the binding prefix (got 0)
++EOF
++    assert_calls "$dir" <<'EOF'
++gc runtime drain-ack
++EOF
++}
++
++test_case_noid() {
++    local dir
++    dir=$(new_case)
++    setup_noid "$dir"
++    run_claim "$dir"
++    assert_stdout "$dir" <<'EOF'
++CLAIM_REJECTED no session identity in env; cannot verify ownership
++EOF
++    assert_calls "$dir" <<'EOF'
++gc runtime drain-ack
++EOF
++}
++
++test_case_drain() {
++    local dir
++    dir=$(new_case)
++    setup_drain "$dir"
++    run_claim "$dir"
++    assert_stdout "$dir" <<'EOF'
++NO_ROUTED_WORK
++EOF
++    assert_calls "$dir" <<'EOF'
++gc hook --claim --json
++gc runtime drain-ack
++EOF
++}
++
++test_case_empty() {
++    local dir
++    dir=$(new_case)
++    setup_empty "$dir"
++    run_claim "$dir"
++    assert_stdout "$dir" <<'EOF'
++NO_ROUTED_WORK
++EOF
++    assert_calls "$dir" <<'EOF'
++gc hook --claim --json
++gc runtime drain-ack
++EOF
++}
++
++test_case_garbage() {
++    local dir
++    dir=$(new_case)
++    setup_garbage "$dir"
++    run_claim "$dir"
++    assert_stdout "$dir" <<'EOF'
++NO_ROUTED_WORK
++EOF
++    assert_calls "$dir" <<'EOF'
++gc hook --claim --json
++gc runtime drain-ack
++EOF
++}
++
++test_case_hookfail() {
++    local dir
++    dir=$(new_case)
++    setup_hookfail "$dir"
++    run_claim "$dir"
++    assert_stdout "$dir" <<'EOF'
++CLAIM_RETRY hook call failed (code=1): malformed claim result
++CLAIM_RETRY hook call failed (code=1): malformed claim result
++CLAIM_RETRY hook call failed (code=1): malformed claim result
++CLAIM_REJECTED gc hook --claim returned no workable bead after retries
++EOF
++    assert_calls "$dir" <<'EOF'
++gc hook --claim --json
++sleep 2
++gc hook --claim --json
++sleep 2
++gc hook --claim --json
++sleep 2
++gc runtime drain-ack
++EOF
++}
++
++test_case_hookflaky() {
++    local dir
++    dir=$(new_case)
++    setup_hookflaky "$dir"
++    run_claim "$dir"
++    assert_stdout "$dir" <<'EOF'
++CLAIM_RETRY hook call failed (code=1): malformed claim result
++CLAIMED_BEAD_ID=w-1
++{
++  "gc.step_ref": "mol-polecat-work.implement",
++  "gc.root_bead_id": "w-root"
++}
++EOF
++    assert_calls "$dir" <<'EOF'
++gc hook --claim --json
++sleep 2
++gc hook --claim --json
++gc bd show w-1 --json
++gc bd list --metadata-field gc.root_bead_id=w-root --all --limit=0 --json
++gc bd update w-1 --set-metadata polecat_session=gastown__polecat-gc-psfm
++EOF
++}
++
++test_case_unread() {
++    local dir
++    dir=$(new_case)
++    setup_unread "$dir"
++    run_claim "$dir"
++    assert_stdout "$dir" <<'EOF'
++CLAIM_RELEASED w-1 unreadable after retries; returning it to the pool
++EOF
++    assert_calls "$dir" <<'EOF'
++gc hook --claim --json
++gc bd show w-1 --json
++sleep 1
++gc bd show w-1 --json
++sleep 2
++gc bd show w-1 --json
++sleep 3
++gc bd show w-1 --json
++sleep 4
++gc bd show w-1 --json
++sleep 5
++gc bd update w-1 --status=open --assignee= --set-metadata gc.routed_to=winnow/gastown.polecat
++gc runtime drain-ack
++EOF
++}
++
++test_case_showflaky() {
++    local dir
++    dir=$(new_case)
++    setup_showflaky "$dir"
++    run_claim "$dir"
++    assert_stdout "$dir" <<'EOF'
++CLAIMED_BEAD_ID=w-1
++{
++  "gc.step_ref": "mol-polecat-work.implement",
++  "gc.root_bead_id": "w-root"
++}
++EOF
++    assert_calls "$dir" <<'EOF'
++gc hook --claim --json
++gc bd show w-1 --json
++sleep 1
++gc bd show w-1 --json
++gc bd list --metadata-field gc.root_bead_id=w-root --all --limit=0 --json
++gc bd update w-1 --set-metadata polecat_session=gastown__polecat-gc-psfm
++EOF
++}
++
++test_case_mismatch() {
++    local dir
++    dir=$(new_case)
++    setup_mismatch "$dir"
++    run_claim "$dir"
++    assert_stdout "$dir" <<'EOF'
++CLAIM_REJECTED w-1 assignee=someone status=in_progress (expected gastown__polecat-gc-psfm / in_progress)
++EOF
++    assert_calls "$dir" <<'EOF'
++gc hook --claim --json
++gc bd show w-1 --json
++gc runtime drain-ack
++EOF
++}
++
++test_case_unassigned() {
++    local dir
++    dir=$(new_case)
++    setup_unassigned "$dir"
++    run_claim "$dir"
++    assert_stdout "$dir" <<'EOF'
++CLAIM_REJECTED w-1 assignee= status=in_progress (expected gastown__polecat-gc-psfm / in_progress)
++EOF
++    assert_calls "$dir" <<'EOF'
++gc hook --claim --json
++gc bd show w-1 --json
++gc runtime drain-ack
++EOF
++}
++
++test_case_notinprog() {
++    local dir
++    dir=$(new_case)
++    setup_notinprog "$dir"
++    run_claim "$dir"
++    assert_stdout "$dir" <<'EOF'
++CLAIM_REJECTED w-1 assignee=gastown__polecat-gc-psfm status=open (expected gastown__polecat-gc-psfm / in_progress)
++EOF
++    assert_calls "$dir" <<'EOF'
++gc hook --claim --json
++gc bd show w-1 --json
++gc runtime drain-ack
++EOF
++}
++
++test_case_nonstep() {
++    local dir
++    dir=$(new_case)
++    setup_nonstep "$dir"
++    run_claim "$dir"
++    assert_stdout "$dir" <<'EOF'
++CLAIMED_BEAD_ID=w-1
++{
++  "x": "y"
++}
++EOF
++    assert_calls "$dir" <<'EOF'
++gc hook --claim --json
++gc bd show w-1 --json
++gc bd update w-1 --set-metadata polecat_session=gastown__polecat-gc-psfm
++EOF
++}
++
++test_case_ready() {
++    local dir
++    dir=$(new_case)
++    setup_ready "$dir"
++    run_claim "$dir"
++    assert_stdout "$dir" <<'EOF'
++CLAIMED_BEAD_ID=w-1
++{
++  "gc.step_ref": "mol-polecat-work.implement",
++  "gc.root_bead_id": "w-root"
++}
++EOF
++    assert_calls "$dir" <<'EOF'
++gc hook --claim --json
++gc bd show w-1 --json
++gc bd update w-1 --set-metadata polecat_session=gastown__polecat-gc-psfm
++EOF
++}
++
++test_case_unknownrsn() {
++    local dir
++    dir=$(new_case)
++    # Documents CURRENT behaviour: a hook reason other than "claimed" skips the
++    # live-owner guard, so the bead is claimed without reading the molecule, even
++    # though the guard's own comment says an unknown reason still checks. The
++    # script keeps that as the heredoc had it; gcp-4b7ji tracks the mismatch.
++    setup_unknownrsn "$dir"
++    run_claim "$dir"
++    assert_stdout "$dir" <<'EOF'
++CLAIMED_BEAD_ID=w-1
++{
++  "gc.step_ref": "mol-polecat-work.implement",
++  "gc.root_bead_id": "w-root"
++}
++EOF
++    assert_calls "$dir" <<'EOF'
++gc hook --claim --json
++gc bd show w-1 --json
++gc bd update w-1 --set-metadata polecat_session=gastown__polecat-gc-psfm
++EOF
++}
++
++test_case_noowner() {
++    local dir
++    dir=$(new_case)
++    setup_noowner "$dir"
++    run_claim "$dir"
++    assert_stdout "$dir" <<'EOF'
++WARN live-owner guard could not resolve an owner for this molecule; proceeding unguarded
++CLAIMED_BEAD_ID=w-1
++{
++  "gc.step_ref": "mol-polecat-work.implement",
++  "gc.root_bead_id": "w-root"
++}
++EOF
++    assert_calls "$dir" <<'EOF'
++gc hook --claim --json
++gc bd show w-1 --json
++gc bd list --metadata-field gc.root_bead_id=w-root --all --limit=0 --json
++gc bd update w-1 --set-metadata polecat_session=gastown__polecat-gc-psfm
++EOF
++}
++
++test_case_self() {
++    local dir
++    dir=$(new_case)
++    setup_self "$dir"
++    run_claim "$dir"
++    assert_stdout "$dir" <<'EOF'
++CLAIMED_BEAD_ID=w-1
++{
++  "gc.step_ref": "mol-polecat-work.implement",
++  "gc.root_bead_id": "w-root"
++}
++EOF
++    assert_calls "$dir" <<'EOF'
++gc hook --claim --json
++gc bd show w-1 --json
++gc bd list --metadata-field gc.root_bead_id=w-root --all --limit=0 --json
++gc bd update w-1 --set-metadata polecat_session=gastown__polecat-gc-psfm
++EOF
++}
++
++test_case_alias() {
++    local dir
++    dir=$(new_case)
++    setup_alias "$dir"
++    run_claim "$dir"
++    assert_stdout "$dir" <<'EOF'
++WARN molecule w-root was last held by winnow/gastown.nux, another identity of this session (gastown__polecat-gc-psfm); it is ours.
++CLAIMED_BEAD_ID=w-1
++{
++  "gc.step_ref": "mol-polecat-work.implement",
++  "gc.root_bead_id": "w-root"
++}
++EOF
++    assert_calls "$dir" <<'EOF'
++gc hook --claim --json
++gc bd show w-1 --json
++gc bd list --metadata-field gc.root_bead_id=w-root --all --limit=0 --json
++gc bd update w-1 --set-metadata polecat_session=gastown__polecat-gc-psfm
++EOF
++}
++
++test_case_livepole() {
++    local dir
++    dir=$(new_case)
++    setup_livepole "$dir"
++    run_claim "$dir"
++    assert_stdout "$dir" <<'EOF'
++CLAIM_DECLINED_LIVE_OWNER w-1
++  molecule w-root was last held by winnow/gastown.furiosa, and this session is gastown__polecat-gc-psfm.
++  that owner is live (session gc-8a4d). This is a duplicate pour onto an in-flight molecule.
++  Restoring the step to its owner and draining. No code, branch, or worktree touched.
++EOF
++    assert_calls "$dir" <<'EOF'
++gc hook --claim --json
++gc bd show w-1 --json
++gc bd list --metadata-field gc.root_bead_id=w-root --all --limit=0 --json
++gc session list --json
++gc bd update w-1 --assignee=winnow/gastown.furiosa --set-metadata gc.session_name=gastown__polecat-gc-8a4d --set-metadata polecat_session=winnow/gastown.furiosa --set-metadata gc.session_id=gc-8a4d
++gc session nudge winnow/gastown.witness DUPLICATE_POUR declined: step w-1 poured onto gastown__polecat-gc-psfm while molecule w-root was last held by winnow/gastown.furiosa. Step restored to its owner.
++gc runtime drain-ack
++EOF
++}
++
++test_case_tagowner() {
++    local dir
++    dir=$(new_case)
++    setup_tagowner "$dir"
++    run_claim "$dir"
++    assert_stdout "$dir" <<'EOF'
++CLAIM_DECLINED_LIVE_OWNER w-1
++  molecule w-root was last held by gastown__polecat-gc-8a4d, and this session is gastown__polecat-gc-psfm.
++  that owner is live (session gc-8a4d). This is a duplicate pour onto an in-flight molecule.
++  Restoring the step to its owner and draining. No code, branch, or worktree touched.
++EOF
++    assert_calls "$dir" <<'EOF'
++gc hook --claim --json
++gc bd show w-1 --json
++gc session list --json
++gc bd update w-1 --assignee=gastown__polecat-gc-8a4d --set-metadata gc.session_name=gastown__polecat-gc-8a4d --set-metadata polecat_session=gastown__polecat-gc-8a4d --set-metadata gc.session_id=gc-8a4d
++gc session nudge winnow/gastown.witness DUPLICATE_POUR declined: step w-1 poured onto gastown__polecat-gc-psfm while molecule w-root was last held by gastown__polecat-gc-8a4d. Step restored to its owner.
++gc runtime drain-ack
++EOF
++}
++
++test_case_liveref() {
++    local dir
++    dir=$(new_case)
++    setup_liveref "$dir"
++    run_claim "$dir"
++    assert_stdout "$dir" <<'EOF'
++CLAIM_DECLINED_LIVE_OWNER w-1
++  molecule w-root was last held by winnow/gastown.refinery, and this session is gastown__polecat-gc-psfm.
++  that owner is live (session gc-ref1). This is a duplicate pour onto an in-flight molecule.
++  Restoring the step to its owner and draining. No code, branch, or worktree touched.
++EOF
++    assert_calls "$dir" <<'EOF'
++gc hook --claim --json
++gc bd show w-1 --json
++gc bd list --metadata-field gc.root_bead_id=w-root --all --limit=0 --json
++gc session list --json
++gc bd update w-1 --assignee=winnow/gastown.refinery --set-metadata gc.session_name=winnow--gastown__refinery --set-metadata polecat_session=winnow/gastown.refinery --set-metadata gc.session_id=gc-ref1
++gc session nudge winnow/gastown.witness DUPLICATE_POUR declined: step w-1 poured onto gastown__polecat-gc-psfm while molecule w-root was last held by winnow/gastown.refinery. Step restored to its owner.
++gc runtime drain-ack
++EOF
++}
++
++test_case_livecrew() {
++    local dir
++    dir=$(new_case)
++    setup_livecrew "$dir"
++    run_claim "$dir"
++    assert_stdout "$dir" <<'EOF'
++WARN molecule w-root was last held by winnow/specialists.thomas, a live winnow/specialists.spec session: that is the slinger, not a worker; proceeding.
++CLAIMED_BEAD_ID=w-1
++{
++  "gc.step_ref": "mol-polecat-work.implement",
++  "gc.root_bead_id": "w-root"
++}
++EOF
++    assert_calls "$dir" <<'EOF'
++gc hook --claim --json
++gc bd show w-1 --json
++gc bd list --metadata-field gc.root_bead_id=w-root --all --limit=0 --json
++gc session list --json
++gc bd update w-1 --set-metadata polecat_session=gastown__polecat-gc-psfm
++EOF
++}
++
++test_case_notpl() {
++    local dir
++    dir=$(new_case)
++    setup_notpl "$dir"
++    run_claim "$dir"
++    assert_stdout "$dir" <<'EOF'
++CLAIM_DECLINED_LIVE_OWNER w-1
++  molecule w-root was last held by winnow/x.nt, and this session is gastown__polecat-gc-psfm.
++  that owner is live (session gc-nt). This is a duplicate pour onto an in-flight molecule.
++  Restoring the step to its owner and draining. No code, branch, or worktree touched.
++EOF
++    assert_calls "$dir" <<'EOF'
++gc hook --claim --json
++gc bd show w-1 --json
++gc bd list --metadata-field gc.root_bead_id=w-root --all --limit=0 --json
++gc session list --json
++gc bd update w-1 --assignee=winnow/x.nt --set-metadata gc.session_name=nt-sess --set-metadata polecat_session=winnow/x.nt --set-metadata gc.session_id=gc-nt
++gc session nudge winnow/gastown.witness DUPLICATE_POUR declined: step w-1 poured onto gastown__polecat-gc-psfm while molecule w-root was last held by winnow/x.nt. Step restored to its owner.
++gc runtime drain-ack
++EOF
++}
++
++test_case_dead() {
++    local dir
++    dir=$(new_case)
++    setup_dead "$dir"
++    run_claim "$dir"
++    assert_stdout "$dir" <<'EOF'
++WARN molecule w-root was last held by winnow/gastown.dead, but no live session holds that identity — treating this as a resume and proceeding.
++CLAIMED_BEAD_ID=w-1
++{
++  "gc.step_ref": "mol-polecat-work.implement",
++  "gc.root_bead_id": "w-root"
++}
++EOF
++    assert_calls "$dir" <<'EOF'
++gc hook --claim --json
++gc bd show w-1 --json
++gc bd list --metadata-field gc.root_bead_id=w-root --all --limit=0 --json
++gc session list --json
++gc bd update w-1 --set-metadata polecat_session=gastown__polecat-gc-psfm
++EOF
++}
++
++test_case_sessunread() {
++    local dir
++    dir=$(new_case)
++    setup_sessunread "$dir"
++    run_claim "$dir"
++    assert_stdout "$dir" <<'EOF'
++CLAIM_DECLINED_LIVE_OWNER w-1
++  molecule w-root was last held by winnow/gastown.furiosa, and this session is gastown__polecat-gc-psfm.
++  session liveness was UNREADABLE after retries — declining rather than assuming the owner is gone.
++  Restoring the step to its owner and draining. No code, branch, or worktree touched.
++EOF
++    assert_calls "$dir" <<'EOF'
++gc hook --claim --json
++gc bd show w-1 --json
++gc bd list --metadata-field gc.root_bead_id=w-root --all --limit=0 --json
++gc session list --json
++sleep 1
++gc session list --json
++sleep 2
++gc session list --json
++sleep 3
++gc bd update w-1 --assignee=winnow/gastown.furiosa --set-metadata gc.session_name= --set-metadata polecat_session=winnow/gastown.furiosa --set-metadata gc.session_id=
++gc session nudge winnow/gastown.witness DUPLICATE_POUR declined: step w-1 poured onto gastown__polecat-gc-psfm while molecule w-root was last held by winnow/gastown.furiosa. Step restored to its owner.
++gc runtime drain-ack
++EOF
++}
++
++test_case_restorefail() {
++    local dir
++    dir=$(new_case)
++    setup_restorefail "$dir"
++    run_claim "$dir"
++    assert_stdout "$dir" <<'EOF'
++CLAIM_DECLINED_LIVE_OWNER w-1
++  molecule w-root was last held by winnow/gastown.furiosa, and this session is gastown__polecat-gc-psfm.
++  that owner is live (session gc-8a4d). This is a duplicate pour onto an in-flight molecule.
++  Restoring the step to its owner and draining. No code, branch, or worktree touched.
++WARN could not restore w-1 to winnow/gastown.furiosa — the step is left claimed by a session that will not run it; escalate to the witness
++EOF
++    assert_calls "$dir" <<'EOF'
++gc hook --claim --json
++gc bd show w-1 --json
++gc bd list --metadata-field gc.root_bead_id=w-root --all --limit=0 --json
++gc session list --json
++gc bd update w-1 --assignee=winnow/gastown.furiosa --set-metadata gc.session_name=gastown__polecat-gc-8a4d --set-metadata polecat_session=winnow/gastown.furiosa --set-metadata gc.session_id=gc-8a4d
++gc session nudge winnow/gastown.witness DUPLICATE_POUR declined: step w-1 poured onto gastown__polecat-gc-psfm while molecule w-root was last held by winnow/gastown.furiosa. Step restored to its owner.
++gc runtime drain-ack
++EOF
++}
++
++test_case_stampfail() {
++    local dir
++    dir=$(new_case)
++    setup_stampfail "$dir"
++    run_claim "$dir"
++    assert_stdout "$dir" <<'EOF'
++WARN metadata stamp failed for w-1; churn-watcher/resume lose session keying (proceeding — the claim is valid)
++CLAIMED_BEAD_ID=w-1
++{
++  "gc.step_ref": "mol-polecat-work.implement",
++  "gc.root_bead_id": "w-root"
++}
++EOF
++    assert_calls "$dir" <<'EOF'
++gc hook --claim --json
++gc bd show w-1 --json
++gc bd list --metadata-field gc.root_bead_id=w-root --all --limit=0 --json
++gc bd update w-1 --set-metadata polecat_session=gastown__polecat-gc-psfm
++EOF
++}
++
++test_case_norig() {
++    local dir
++    dir=$(new_case)
++    setup_norig "$dir"
++    run_claim "$dir"
++    assert_stdout "$dir" <<'EOF'
++CLAIM_RELEASED w-1 unreadable after retries; returning it to the pool
++EOF
++    assert_calls "$dir" <<'EOF'
++gc hook --claim --json
++gc bd show w-1 --json
++sleep 1
++gc bd show w-1 --json
++sleep 2
++gc bd show w-1 --json
++sleep 3
++gc bd show w-1 --json
++sleep 4
++gc bd show w-1 --json
++sleep 5
++gc bd update w-1 --status=open --assignee= --set-metadata gc.routed_to=gastown.polecat
++gc runtime drain-ack
++EOF
++}
++
++test_missing_prefix_argument_is_rejected
++test_case_noid
++test_case_drain
++test_case_empty
++test_case_garbage
++test_case_hookfail
++test_case_hookflaky
++test_case_unread
++test_case_showflaky
++test_case_mismatch
++test_case_unassigned
++test_case_notinprog
++test_case_nonstep
++test_case_ready
++test_case_unknownrsn
++test_case_noowner
++test_case_self
++test_case_alias
++test_case_livepole
++test_case_tagowner
++test_case_liveref
++test_case_livecrew
++test_case_notpl
++test_case_dead
++test_case_sessunread
++test_case_restorefail
++test_case_stampfail
++test_case_norig
++echo "polecat claim tests passed"
+diff --git a/gastown/tests/test_polecat_live_owner_guard.sh b/gastown/tests/test_polecat_live_owner_guard.sh
+index b7e184b4..f8d01759 100755
+--- a/gastown/tests/test_polecat_live_owner_guard.sh
++++ b/gastown/tests/test_polecat_live_owner_guard.sh
+@@ -9,7 +9,7 @@
+ # claimed it cleanly at 20:37:51Z. Nothing in the machinery refused — the
+ # duplicate backed off because it happened to notice.
+ #
+-# These tests run the live-owner guard out of the polecat prompt's claim block
++# These tests run the live-owner guard out of the polecat claim script
+ # against a stubbed `gc` and assert that the refusal is now mechanical: a live
+ # owner is declined and the step restored, a dead owner is not (that is the
+ # ordinary post-restart resume, and stalling it would stall the engine).
+@@ -21,20 +21,20 @@
+ set -euo pipefail
+ 
+ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+-PROMPT="$ROOT/gastown/agents/polecat/prompt.template.md"
++CLAIM_SH="$ROOT/gastown/assets/scripts/polecat-claim.sh"
+ 
+ fail() {
+     echo "FAIL: $*" >&2
+     exit 1
+ }
+ 
+-# extract_guard pulls the guard verbatim out of the prompt template, so the code
++# extract_guard pulls the guard verbatim out of the claim script, so the code
+ # under test is the code that ships. A drifted or deleted guard fails here
+ # rather than passing against a stale copy.
+ extract_guard() {
+     local out="$1"
+-    awk '/^# GUARD_BEGIN live-owner$/{f=1} /^# GUARD_END live-owner$/{f=0} f' "$PROMPT" >"$out"
+-    [[ -s "$out" ]] || fail "could not extract the live-owner guard from $PROMPT"
++    awk '/^# GUARD_BEGIN live-owner$/{f=1} /^# GUARD_END live-owner$/{f=0} f' "$CLAIM_SH" >"$out"
++    [[ -s "$out" ]] || fail "could not extract the live-owner guard from $CLAIM_SH"
+     grep -F 'CLAIM_DECLINED_LIVE_OWNER' "$out" >/dev/null ||
+         fail "extracted guard does not contain the decline path"
+     bash -n "$out" || fail "extracted guard is not valid shell"
+@@ -113,6 +113,7 @@ STEP_REF="$step_ref"
+ CLAIM_REASON="$claim_reason"
+ SHOW_JSON='[{"id":"winnow-iaroy","status":"in_progress","assignee":"$me","metadata":{${root_meta}${tag_meta}"gc.step_ref":"$step_ref"}}]'
+ GC_RIG="winnow"
++BINDING_PREFIX="gastown."
+ HARNESS
+     cat "$dir/guard.sh" >>"$dir/guard-harness.sh"
+     echo 'echo GUARD_PROCEEDED' >>"$dir/guard-harness.sh"
+@@ -137,10 +138,10 @@ new_case() {
+ live_sessions() {
+     cat >"$1/sessions.json" <<'JSON'
+ {"sessions":[
+-  {"id":"gc-8a4d","name":"winnow/gastown.furiosa","session_name":"gastown__polecat-gc-8a4d","alias":"winnow/gastown.furiosa","template":"winnow/{{ .BindingPrefix }}polecat","state":"active","closed":false},
+-  {"id":"gc-psfm","name":"winnow/gastown.nux","session_name":"gastown__polecat-gc-psfm","alias":"winnow/gastown.nux","template":"winnow/{{ .BindingPrefix }}polecat","state":"active","closed":false},
++  {"id":"gc-8a4d","name":"winnow/gastown.furiosa","session_name":"gastown__polecat-gc-8a4d","alias":"winnow/gastown.furiosa","template":"winnow/gastown.polecat","state":"active","closed":false},
++  {"id":"gc-psfm","name":"winnow/gastown.nux","session_name":"gastown__polecat-gc-psfm","alias":"winnow/gastown.nux","template":"winnow/gastown.polecat","state":"active","closed":false},
+   {"id":"gc-crw1","name":"winnow/specialists.thomas","session_name":"winnow--specialists__thomas","alias":"winnow/specialists.thomas","template":"winnow/specialists.spec","state":"active","closed":false},
+-  {"id":"gc-ref1","name":"winnow/{{ .BindingPrefix }}refinery","session_name":"winnow--gastown__refinery","alias":"winnow/{{ .BindingPrefix }}refinery","template":"winnow/{{ .BindingPrefix }}refinery","state":"active","closed":false}
++  {"id":"gc-ref1","name":"winnow/gastown.refinery","session_name":"winnow--gastown__refinery","alias":"winnow/gastown.refinery","template":"winnow/gastown.refinery","state":"active","closed":false}
+ ]}
+ JSON
+ }
+@@ -169,7 +170,7 @@ test_live_owner_is_declined_and_the_step_restored() {
+         fail "declining polecat did not restore the owner's session binding"
+     grep -F 'runtime drain-ack' "$dir/calls.log" >/dev/null ||
+         fail "declining polecat did not drain"
+-    grep -F 'session nudge winnow/{{ .BindingPrefix }}witness' "$dir/calls.log" >/dev/null ||
++    grep -F 'session nudge winnow/gastown.witness' "$dir/calls.log" >/dev/null ||
+         fail "declining polecat did not report the duplicate pour to the witness"
+ }
+ 
+@@ -452,13 +453,13 @@ test_live_refinery_owner_is_still_declined() {
+     dir=$(new_case)
+     live_sessions "$dir"
+ 
+-    out=$(run_guard "$dir" "winnow/{{ .BindingPrefix }}refinery" "winnow/gastown.nux")
++    out=$(run_guard "$dir" "winnow/gastown.refinery" "winnow/gastown.nux")
+ 
+     grep -F 'CLAIM_DECLINED_LIVE_OWNER winnow-iaroy' <<<"$out" >/dev/null ||
+         fail "a live refinery owner was not declined: $out"
+     ! grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null ||
+         fail "guard declined but still fell through to the work"
+-    grep -F 'bd update winnow-iaroy --assignee=winnow/{{ .BindingPrefix }}refinery' "$dir/calls.log" >/dev/null || # gc-bd-argv-tail: stub call log, not an invocation
++    grep -F 'bd update winnow-iaroy --assignee=winnow/gastown.refinery' "$dir/calls.log" >/dev/null || # gc-bd-argv-tail: stub call log, not an invocation
+         fail "the step was not restored to the refinery: $(cat "$dir/calls.log")"
+ }
+ 
+diff --git a/gastown/tests/test_polecat_resume_reverify.sh b/gastown/tests/test_polecat_resume_reverify.sh
+index a451cadc..b7f9679f 100755
+--- a/gastown/tests/test_polecat_resume_reverify.sh
++++ b/gastown/tests/test_polecat_resume_reverify.sh
+@@ -20,6 +20,7 @@ set -euo pipefail
+ 
+ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+ PROMPT="$ROOT/gastown/agents/polecat/prompt.template.md"
++CLAIM_SH="$ROOT/gastown/assets/scripts/polecat-claim.sh"
+ 
+ TMPROOT=$(mktemp -d)
+ trap 'rm -rf "$TMPROOT"' EXIT
+@@ -29,17 +30,17 @@ fail() {
+     exit 1
+ }
+ 
+-# extract_guard pulls a guard verbatim out of the prompt template, so the code
+-# under test is the code that ships. A drifted or deleted guard fails here
+-# rather than passing against a stale copy.
++# extract_guard pulls a guard verbatim out of <file> (the prompt template or the
++# claim script), so the code under test is the code that ships. A drifted or
++# deleted guard fails here rather than passing against a stale copy.
+ extract_guard() {
+-    local name="$1" out="$2"
+-    [[ "$(grep -c "^# GUARD_BEGIN $name\$" "$PROMPT")" == 1 ]] ||
+-        fail "expected exactly one '# GUARD_BEGIN $name' in $PROMPT"
+-    [[ "$(grep -c "^# GUARD_END $name\$" "$PROMPT")" == 1 ]] ||
+-        fail "expected exactly one '# GUARD_END $name' in $PROMPT"
+-    awk -v b="# GUARD_BEGIN $name" -v e="# GUARD_END $name" '$0 == b {f=1} $0 == e {f=0} f' "$PROMPT" >"$out"
+-    [[ -s "$out" ]] || fail "could not extract the $name guard from $PROMPT"
++    local name="$1" out="$2" file="$3"
++    [[ "$(grep -c "^# GUARD_BEGIN $name\$" "$file")" == 1 ]] ||
++        fail "expected exactly one '# GUARD_BEGIN $name' in $file"
++    [[ "$(grep -c "^# GUARD_END $name\$" "$file")" == 1 ]] ||
++        fail "expected exactly one '# GUARD_END $name' in $file"
++    awk -v b="# GUARD_BEGIN $name" -v e="# GUARD_END $name" '$0 == b {f=1} $0 == e {f=0} f' "$file" >"$out"
++    [[ -s "$out" ]] || fail "could not extract the $name guard from $file"
+     bash -n "$out" || fail "extracted $name guard is not valid shell"
+ }
+ 
+@@ -101,7 +102,7 @@ new_case() {
+     dir=$(mktemp -d "$TMPROOT/case.XXXXXX")
+     mkdir -p "$dir/bin" "$dir/beads"
+     write_gc_stub "$dir/bin"
+-    extract_guard resume-reverify "$dir/guard.sh"
++    extract_guard resume-reverify "$dir/guard.sh" "$PROMPT"
+     : >"$dir/calls.log"
+     : >"$dir/sleeps.log"
+     printf '%s' "$dir"
+@@ -373,17 +374,17 @@ test_reverify_writes_nothing() {
+ test_identity_set_matches_the_live_owner_guard() {
+     local dir claim_fn resume_fn
+     dir=$(new_case)
+-    extract_guard live-owner "$dir/live-owner.sh"
++    extract_guard live-owner "$dir/live-owner.sh" "$CLAIM_SH"
+     claim_fn="$dir/claim-fn.sh"
+     resume_fn="$dir/resume-fn.sh"
+     awk '/^claim_assignee_is_ours\(\) \{$/ {f=1} f {print} f && /^}$/ {exit}' "$dir/live-owner.sh" >"$claim_fn"
+     awk '/^claim_assignee_is_ours\(\) \{$/ {f=1} f {print} f && /^}$/ {exit}' "$dir/guard.sh" >"$resume_fn"
+-    [[ -s "$claim_fn" ]] || fail "could not extract claim_assignee_is_ours from the GC_CLAIM block"
++    [[ -s "$claim_fn" ]] || fail "could not extract claim_assignee_is_ours from polecat-claim.sh"
+     [[ -s "$resume_fn" ]] || fail "could not extract claim_assignee_is_ours from the resume-reverify block"
+     [[ "$(grep -c 'GC_ALIAS' "$claim_fn")" -ge 1 ]] ||
+-        fail "the extracted GC_CLAIM copy does not hold the identity set"
++        fail "the extracted polecat-claim.sh copy does not hold the identity set"
+     diff "$claim_fn" "$resume_fn" ||
+-        fail "claim_assignee_is_ours differs between the GC_CLAIM block and the resume-reverify block"
++        fail "claim_assignee_is_ours differs between polecat-claim.sh and the resume-reverify block"
+ }
+ 
+ test_resumed_session_holding_its_step_proceeds
+diff --git a/tests/test_no_bare_bd_commands.py b/tests/test_no_bare_bd_commands.py
+index 9952513d..35c9c417 100644
+--- a/tests/test_no_bare_bd_commands.py
++++ b/tests/test_no_bare_bd_commands.py
+@@ -182,7 +182,7 @@ GC_BD_ARGV_TAIL_ALLOWLIST: dict[Path, set[str]] = {
+         "! grep -F 'bd update' \"$dir/calls.log\" >/dev/null ||"
+         " # gc-bd-argv-tail: stub call log, not an invocation",
+         "grep -F 'bd update winnow-iaroy"
+-        " --assignee=winnow/{{ .BindingPrefix }}refinery' \"$dir/calls.log\" >/dev/null ||"
++        " --assignee=winnow/gastown.refinery' \"$dir/calls.log\" >/dev/null ||"
+         " # gc-bd-argv-tail: stub call log, not an invocation",
+     },
+     Path("gastown/tests/test_refinery_find_work.sh"): {
+-- 
+2.54.0 (Apple Git-157)
+

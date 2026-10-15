@@ -9,7 +9,7 @@
 # claimed it cleanly at 20:37:51Z. Nothing in the machinery refused — the
 # duplicate backed off because it happened to notice.
 #
-# These tests run the live-owner guard out of the polecat prompt's claim block
+# These tests run the live-owner guard out of the polecat claim script
 # against a stubbed `gc` and assert that the refusal is now mechanical: a live
 # owner is declined and the step restored, a dead owner is not (that is the
 # ordinary post-restart resume, and stalling it would stall the engine).
@@ -21,20 +21,20 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-PROMPT="$ROOT/gastown/agents/polecat/prompt.template.md"
+CLAIM_SH="$ROOT/gastown/assets/scripts/polecat-claim.sh"
 
 fail() {
     echo "FAIL: $*" >&2
     exit 1
 }
 
-# extract_guard pulls the guard verbatim out of the prompt template, so the code
+# extract_guard pulls the guard verbatim out of the claim script, so the code
 # under test is the code that ships. A drifted or deleted guard fails here
 # rather than passing against a stale copy.
 extract_guard() {
     local out="$1"
-    awk '/^# GUARD_BEGIN live-owner$/{f=1} /^# GUARD_END live-owner$/{f=0} f' "$PROMPT" >"$out"
-    [[ -s "$out" ]] || fail "could not extract the live-owner guard from $PROMPT"
+    awk '/^# GUARD_BEGIN live-owner$/{f=1} /^# GUARD_END live-owner$/{f=0} f' "$CLAIM_SH" >"$out"
+    [[ -s "$out" ]] || fail "could not extract the live-owner guard from $CLAIM_SH"
     grep -F 'CLAIM_DECLINED_LIVE_OWNER' "$out" >/dev/null ||
         fail "extracted guard does not contain the decline path"
     bash -n "$out" || fail "extracted guard is not valid shell"
@@ -113,6 +113,7 @@ STEP_REF="$step_ref"
 CLAIM_REASON="$claim_reason"
 SHOW_JSON='[{"id":"winnow-iaroy","status":"in_progress","assignee":"$me","metadata":{${root_meta}${tag_meta}"gc.step_ref":"$step_ref"}}]'
 GC_RIG="winnow"
+BINDING_PREFIX="gastown."
 HARNESS
     cat "$dir/guard.sh" >>"$dir/guard-harness.sh"
     echo 'echo GUARD_PROCEEDED' >>"$dir/guard-harness.sh"
@@ -137,10 +138,10 @@ new_case() {
 live_sessions() {
     cat >"$1/sessions.json" <<'JSON'
 {"sessions":[
-  {"id":"gc-8a4d","name":"winnow/gastown.furiosa","session_name":"gastown__polecat-gc-8a4d","alias":"winnow/gastown.furiosa","template":"winnow/{{ .BindingPrefix }}polecat","state":"active","closed":false},
-  {"id":"gc-psfm","name":"winnow/gastown.nux","session_name":"gastown__polecat-gc-psfm","alias":"winnow/gastown.nux","template":"winnow/{{ .BindingPrefix }}polecat","state":"active","closed":false},
+  {"id":"gc-8a4d","name":"winnow/gastown.furiosa","session_name":"gastown__polecat-gc-8a4d","alias":"winnow/gastown.furiosa","template":"winnow/gastown.polecat","state":"active","closed":false},
+  {"id":"gc-psfm","name":"winnow/gastown.nux","session_name":"gastown__polecat-gc-psfm","alias":"winnow/gastown.nux","template":"winnow/gastown.polecat","state":"active","closed":false},
   {"id":"gc-crw1","name":"winnow/specialists.thomas","session_name":"winnow--specialists__thomas","alias":"winnow/specialists.thomas","template":"winnow/specialists.spec","state":"active","closed":false},
-  {"id":"gc-ref1","name":"winnow/{{ .BindingPrefix }}refinery","session_name":"winnow--gastown__refinery","alias":"winnow/{{ .BindingPrefix }}refinery","template":"winnow/{{ .BindingPrefix }}refinery","state":"active","closed":false}
+  {"id":"gc-ref1","name":"winnow/gastown.refinery","session_name":"winnow--gastown__refinery","alias":"winnow/gastown.refinery","template":"winnow/gastown.refinery","state":"active","closed":false}
 ]}
 JSON
 }
@@ -169,7 +170,7 @@ test_live_owner_is_declined_and_the_step_restored() {
         fail "declining polecat did not restore the owner's session binding"
     grep -F 'runtime drain-ack' "$dir/calls.log" >/dev/null ||
         fail "declining polecat did not drain"
-    grep -F 'session nudge winnow/{{ .BindingPrefix }}witness' "$dir/calls.log" >/dev/null ||
+    grep -F 'session nudge winnow/gastown.witness' "$dir/calls.log" >/dev/null ||
         fail "declining polecat did not report the duplicate pour to the witness"
 }
 
@@ -452,13 +453,13 @@ test_live_refinery_owner_is_still_declined() {
     dir=$(new_case)
     live_sessions "$dir"
 
-    out=$(run_guard "$dir" "winnow/{{ .BindingPrefix }}refinery" "winnow/gastown.nux")
+    out=$(run_guard "$dir" "winnow/gastown.refinery" "winnow/gastown.nux")
 
     grep -F 'CLAIM_DECLINED_LIVE_OWNER winnow-iaroy' <<<"$out" >/dev/null ||
         fail "a live refinery owner was not declined: $out"
     ! grep -F 'GUARD_PROCEEDED' <<<"$out" >/dev/null ||
         fail "guard declined but still fell through to the work"
-    grep -F 'bd update winnow-iaroy --assignee=winnow/{{ .BindingPrefix }}refinery' "$dir/calls.log" >/dev/null || # gc-bd-argv-tail: stub call log, not an invocation
+    grep -F 'bd update winnow-iaroy --assignee=winnow/gastown.refinery' "$dir/calls.log" >/dev/null || # gc-bd-argv-tail: stub call log, not an invocation
         fail "the step was not restored to the refinery: $(cat "$dir/calls.log")"
 }
 

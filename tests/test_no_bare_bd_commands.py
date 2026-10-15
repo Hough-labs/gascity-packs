@@ -182,7 +182,7 @@ GC_BD_ARGV_TAIL_ALLOWLIST: dict[Path, set[str]] = {
         "! grep -F 'bd update' \"$dir/calls.log\" >/dev/null ||"
         " # gc-bd-argv-tail: stub call log, not an invocation",
         "grep -F 'bd update winnow-iaroy"
-        " --assignee=winnow/{{ .BindingPrefix }}refinery' \"$dir/calls.log\" >/dev/null ||"
+        " --assignee=winnow/gastown.refinery' \"$dir/calls.log\" >/dev/null ||"
         " # gc-bd-argv-tail: stub call log, not an invocation",
     },
     Path("gastown/tests/test_refinery_find_work.sh"): {

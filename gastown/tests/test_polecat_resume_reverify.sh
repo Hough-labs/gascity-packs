@@ -20,6 +20,7 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 PROMPT="$ROOT/gastown/agents/polecat/prompt.template.md"
+CLAIM_SH="$ROOT/gastown/assets/scripts/polecat-claim.sh"
 
 TMPROOT=$(mktemp -d)
 trap 'rm -rf "$TMPROOT"' EXIT
@@ -29,17 +30,17 @@ fail() {
     exit 1
 }
 
-# extract_guard pulls a guard verbatim out of the prompt template, so the code
-# under test is the code that ships. A drifted or deleted guard fails here
-# rather than passing against a stale copy.
+# extract_guard pulls a guard verbatim out of <file> (the prompt template or the
+# claim script), so the code under test is the code that ships. A drifted or
+# deleted guard fails here rather than passing against a stale copy.
 extract_guard() {
-    local name="$1" out="$2"
-    [[ "$(grep -c "^# GUARD_BEGIN $name\$" "$PROMPT")" == 1 ]] ||
-        fail "expected exactly one '# GUARD_BEGIN $name' in $PROMPT"
-    [[ "$(grep -c "^# GUARD_END $name\$" "$PROMPT")" == 1 ]] ||
-        fail "expected exactly one '# GUARD_END $name' in $PROMPT"
-    awk -v b="# GUARD_BEGIN $name" -v e="# GUARD_END $name" '$0 == b {f=1} $0 == e {f=0} f' "$PROMPT" >"$out"
-    [[ -s "$out" ]] || fail "could not extract the $name guard from $PROMPT"
+    local name="$1" out="$2" file="$3"
+    [[ "$(grep -c "^# GUARD_BEGIN $name\$" "$file")" == 1 ]] ||
+        fail "expected exactly one '# GUARD_BEGIN $name' in $file"
+    [[ "$(grep -c "^# GUARD_END $name\$" "$file")" == 1 ]] ||
+        fail "expected exactly one '# GUARD_END $name' in $file"
+    awk -v b="# GUARD_BEGIN $name" -v e="# GUARD_END $name" '$0 == b {f=1} $0 == e {f=0} f' "$file" >"$out"
+    [[ -s "$out" ]] || fail "could not extract the $name guard from $file"
     bash -n "$out" || fail "extracted $name guard is not valid shell"
 }
 
@@ -101,7 +102,7 @@ new_case() {
     dir=$(mktemp -d "$TMPROOT/case.XXXXXX")
     mkdir -p "$dir/bin" "$dir/beads"
     write_gc_stub "$dir/bin"
-    extract_guard resume-reverify "$dir/guard.sh"
+    extract_guard resume-reverify "$dir/guard.sh" "$PROMPT"
     : >"$dir/calls.log"
     : >"$dir/sleeps.log"
     printf '%s' "$dir"
@@ -373,17 +374,17 @@ test_reverify_writes_nothing() {
 test_identity_set_matches_the_live_owner_guard() {
     local dir claim_fn resume_fn
     dir=$(new_case)
-    extract_guard live-owner "$dir/live-owner.sh"
+    extract_guard live-owner "$dir/live-owner.sh" "$CLAIM_SH"
     claim_fn="$dir/claim-fn.sh"
     resume_fn="$dir/resume-fn.sh"
     awk '/^claim_assignee_is_ours\(\) \{$/ {f=1} f {print} f && /^}$/ {exit}' "$dir/live-owner.sh" >"$claim_fn"
     awk '/^claim_assignee_is_ours\(\) \{$/ {f=1} f {print} f && /^}$/ {exit}' "$dir/guard.sh" >"$resume_fn"
-    [[ -s "$claim_fn" ]] || fail "could not extract claim_assignee_is_ours from the GC_CLAIM block"
+    [[ -s "$claim_fn" ]] || fail "could not extract claim_assignee_is_ours from polecat-claim.sh"
     [[ -s "$resume_fn" ]] || fail "could not extract claim_assignee_is_ours from the resume-reverify block"
     [[ "$(grep -c 'GC_ALIAS' "$claim_fn")" -ge 1 ]] ||
-        fail "the extracted GC_CLAIM copy does not hold the identity set"
+        fail "the extracted polecat-claim.sh copy does not hold the identity set"
     diff "$claim_fn" "$resume_fn" ||
-        fail "claim_assignee_is_ours differs between the GC_CLAIM block and the resume-reverify block"
+        fail "claim_assignee_is_ours differs between polecat-claim.sh and the resume-reverify block"
 }
 
 test_resumed_session_holding_its_step_proceeds

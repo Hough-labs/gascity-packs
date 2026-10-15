@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sat, 10 Oct 2026 16:23:30 -0400
-Subject: [PATCH 142/169] fix(refinery): clear handoff_stage when reject mode
+Subject: [PATCH 142/170] fix(refinery): clear handoff_stage when reject mode
  returns a MISS to the pool (gcp-fooz4)
 
 Upstream #322 (b43abe63) requires every rejection to unset handoff_stage: the
