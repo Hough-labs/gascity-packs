@@ -33,7 +33,7 @@ set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 FORMULA="${FORMULA:-$ROOT/gastown/formulas/mol-refinery-patrol.toml}"
-EXPECTED_CASES=16
+EXPECTED_CASES=17
 
 REFINERY_AGENT=testrig/gastown.refinery
 HEAD_ID=wa-head
@@ -463,7 +463,7 @@ EXPECTED_RUBRIC
 
 write_sentence() {
     cat >"$1" <<'EXPECTED_SENTENCE'
-Run the fence in ONE shell, with `$WORK` set to the work bead find-work found.
+Run the fence in ONE Bash call, never inside `bash -c`, with `$WORK` set to the work bead find-work found.
 EXPECTED_SENTENCE
 }
 
@@ -548,7 +548,7 @@ ACK_ITEMS
 A `record` that exits 1 or 2 is a WARN: name it in patrol-summary and proceed. With no `READ` line, close this
 step and proceed to rebase.
 
-After the last `record`, run this block ONCE, in one shell, with `$WORK` set as above. Outside reject mode it
+After the last `record`, run this block ONCE, in ONE Bash call, never inside `bash -c`, with `$WORK` set as above. Outside reject mode it
 prints nothing and changes nothing. In reject mode `record` has already returned each MISS to the polecat pool,
 and this block takes every bead no longer assigned to you out of this iteration:
 ```bash
@@ -832,6 +832,36 @@ $found"
     end_case
 }
 
+# one_shell_sites <formula> — "<line>:<text>" for each run site that still says
+# "in one shell" (any case). A session reads that as "wrap the fence in bash -c",
+# and Claude Code's rm safety check denies a wrapped fence ~24x as often as one
+# run directly (gcp-xg2mh). The run sites name the Bash TOOL call instead.
+one_shell_sites() {
+    grep -ni 'in one shell' "$1"
+}
+
+case_fences_name_one_bash_call() {
+    new_case fences_name_one_bash_call
+    local found new="in ONE Bash call, never inside \`bash -c\`" text sites
+    found=$(one_shell_sites "$FORMULA")
+    if [ -n "$found" ]; then
+        fail "run sites still say \"in one shell\"; write \"$new\" (line:text):
+$found"
+        end_case
+        return
+    fi
+    sites=$(grep -cF "$new" "$FORMULA")
+    [ "$sites" -ge 7 ] || fail "expected at least 7 run sites naming one Bash call, found $sites"
+
+    # The check must be able to FAIL: put the first site back to "in ONE shell".
+    text=$(<"$FORMULA")
+    printf '%s\n' "${text/"$new"/"in ONE shell"}" >"$T/formula-oneshell.toml"
+    cmp -s "$FORMULA" "$T/formula-oneshell.toml" && fail "harness bug: the formula copy was not changed"
+    [ -n "$(one_shell_sites "$T/formula-oneshell.toml")" ] ||
+        fail "the one-shell check passed with a run site put back to \"in ONE shell\""
+    end_case
+}
+
 # The acceptance-reject block: after the last record it takes every bead the
 # refinery no longer holds out of the iteration. R is the refinery agent.
 case_reject_block() {
@@ -939,6 +969,7 @@ case_stale_files
 case_rubric_verbatim
 case_prose
 case_rm_targets_guarded
+case_fences_name_one_bash_call
 case_reject_block
 case_head_left_pour
 

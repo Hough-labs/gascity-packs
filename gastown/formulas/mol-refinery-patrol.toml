@@ -316,7 +316,7 @@ fi
 
 Search for work beads assigned to you — unclaimed, or already claimed by you —
 then for work merely routed to you, then decide whether this iteration batches.
-Run the whole fence in ONE shell: the query reads `LANE_WEDGE_ONLY` and
+Run the whole fence in ONE Bash call, never inside `bash -c`: the query reads `LANE_WEDGE_ONLY` and
 `LANE_WEDGE_SKIP` from the lane-wedge block above it, and the batch block reads
 `WORK` and `ROUTED` from the query.
 ```bash
@@ -569,7 +569,7 @@ not edit the manifest, reject a branch or hold a merge. Reject mode returns each
 to the polecat pool before rebase: a head that misses ends the iteration, and a
 member that misses leaves the batch.
 
-Run the fence in ONE shell, with `$WORK` set to the work bead find-work found.
+Run the fence in ONE Bash call, never inside `bash -c`, with `$WORK` set to the work bead find-work found.
 ```bash
 # --- acceptance-check:begin ---
 ACK_MODE="{{acceptance_check}}"
@@ -645,7 +645,7 @@ ACK_ITEMS
 A `record` that exits 1 or 2 is a WARN: name it in patrol-summary and proceed. With no `READ` line, close this
 step and proceed to rebase.
 
-After the last `record`, run this block ONCE, in one shell, with `$WORK` set as above. Outside reject mode it
+After the last `record`, run this block ONCE, in ONE Bash call, never inside `bash -c`, with `$WORK` set as above. Outside reject mode it
 prints nothing and changes nothing. In reject mode `record` has already returned each MISS to the polecat pool,
 and this block takes every bead no longer assigned to you out of this iteration:
 ```bash
@@ -1022,7 +1022,7 @@ proceed to run-tests.
 The block stacks the batch's other members onto the rebased head, and only when
 find-work recorded a manifest of more than one member. With no manifest, an
 unparseable one or a single member it does nothing. A stack error is not a
-blocker: it leaves a batch of 1. Run it in ONE shell with `$WORK` set as above:
+blocker: it leaves a batch of 1. Run it in ONE Bash call, never inside `bash -c` with `$WORK` set as above:
 ```bash
 # --- rebase-batch-stack:begin ---
 BATCH_DIR=$(git rev-parse --git-dir 2>/dev/null) || BATCH_DIR=""
@@ -1140,7 +1140,7 @@ description = """
 **Config: lint_command = {{lint_command}}**
 **Config: build_command = {{build_command}}**
 
-Run each configured check in order through `gate_run`, in ONE shell (empty
+Run each configured check in order through `gate_run`, in ONE Bash call, never inside `bash -c` (empty
 commands are skipped silently). Every gate runs even after one FAILs, and the
 tests run only when run_tests = "true". Each gate writes a segment of one gate
 log, named after the formula var that holds its command (setup, typecheck,
@@ -1214,7 +1214,7 @@ BRANCH=$(gc bd show $WORK --json | jq -r '.[0].metadata.branch')
 TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_branch}}"')
 ```
 
-0. Classify through known-red. Run this whole block in ONE shell, with `$WORK`
+0. Classify through known-red. Run this whole block in ONE Bash call, never inside `bash -c`, with `$WORK`
    and `$TARGET` set as above. It reads the gate log run-tests wrote and asks
    the pack's `known-red` whether each red is already carried by an open
    base-red bead. Only exit 0, every red KNOWN, merges past without a
@@ -1301,7 +1301,7 @@ fi
 2. If branch caused it:
    - A batch comes first. When the batch manifest in the git dir holds 2+
      members, the red is the BATCH's, not any one member's: reject nobody, skip
-     the rest of this step 2, and run the block below in ONE shell with `$WORK`
+     the rest of this step 2, and run the block below in ONE Bash call, never inside `bash -c` with `$WORK`
      set. It stamps every member to go serial, so each is merged alone on a later
      patrol. It prints `NOT A BATCH` when there is no such manifest: carry on with
      the rest of this step 2 as written. It prints `BATCH RED` when every member
