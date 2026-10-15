@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Tue, 13 Oct 2026 18:20:46 -0400
-Subject: [PATCH 153/171] test(gastown): mark live-owner guard call-log greps
+Subject: [PATCH 153/172] test(gastown): mark live-owner guard call-log greps
  as argv-tail data (gcp-4eb7j, gcp-qjkp)
 
 gcp-qjkp (a328f60f) added two assertions to test_polecat_live_owner_guard.sh

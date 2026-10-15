@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 15 Oct 2026 02:18:27 -0400
-Subject: [PATCH 166/171] fix(gastown): stop the deacon patrol prescribing from
+Subject: [PATCH 166/172] fix(gastown): stop the deacon patrol prescribing from
  one-shot readings (gcp-di7v)
 
 Two deacon-patrol steps turned a point-in-time reading into a confident order,

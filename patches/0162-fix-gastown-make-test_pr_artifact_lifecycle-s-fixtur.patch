@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Wed, 14 Oct 2026 15:27:27 -0400
-Subject: [PATCH 162/171] fix(gastown): make test_pr_artifact_lifecycle's
+Subject: [PATCH 162/172] fix(gastown): make test_pr_artifact_lifecycle's
  fixture TMP physical on darwin (gcp-xspkl)
 
 test_pr_artifact_lifecycle.sh took TMP straight from mktemp -d. On macOS

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Tue, 13 Oct 2026 20:19:51 -0400
-Subject: [PATCH 155/171] fix(gastown): shutdown-dance progress probe parses
+Subject: [PATCH 155/172] fix(gastown): shutdown-dance progress probe parses
  bead timestamps on macOS (gcp-uijsa)
 
 The progress probe in mol-shutdown-dance ages the target's claimed bead with

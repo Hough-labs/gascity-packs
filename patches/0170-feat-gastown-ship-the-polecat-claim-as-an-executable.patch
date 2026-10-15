@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 15 Oct 2026 06:23:03 -0400
-Subject: [PATCH 170/171] feat(gastown): ship the polecat claim as an
+Subject: [PATCH 170/172] feat(gastown): ship the polecat claim as an
  executable the prompt calls (gcp-zzb0)
 
 Every polecat session opened by retyping a 267-line GC_CLAIM heredoc as one

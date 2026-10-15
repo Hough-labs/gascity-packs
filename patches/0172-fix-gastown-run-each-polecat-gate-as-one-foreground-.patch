@@ -1,0 +1,151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 15 Oct 2026 08:33:18 -0400
+Subject: [PATCH 172/172] fix(gastown): run each polecat gate as one foreground
+ call, not a background poll (gcp-ypugs)
+
+A polecat spent 17-25 model calls on each gate step (preflight 18.7-24.7,
+self-review 16.8-18.2) for a step whose real work is one command, because the
+model chose run_in_background for the gate and then polled it. Each poll
+re-reads 70-100K tokens of context. The pack text never asked for
+backgrounding: Claude Code caps a foreground Bash call at 10 minutes, and gate
+steps often run longer (winnow self-review p50 10.0m, gascity-packs 21.4m), so
+a foreground gate was impossible.
+
+The polecat agent now sets env BASH_MAX_TIMEOUT_MS=3600000, which raises the
+cap only. The default stays at 120s, so an ordinary hung command still times
+out. Each gate stub in mol-polecat-work (preflight-tests and self-review) gets
+a four-line paragraph that asks for a FOREGROUND call with the Bash timeout
+parameter set to 3600000, no run_in_background and no polling. The stubs, the
+gate commands, polecat-gates.sh, the receipts and the refinery are unchanged.
+
+Two tests in test_polecat_gates.sh pin it: each gate step holds the paragraph
+once, directly before the stub fence, and the agent env equals the number in
+that paragraph and leaves BASH_DEFAULT_TIMEOUT_MS unset, so the two cannot
+drift apart. Both were seen failing against a broken edit before this commit.
+
+Not measured here: the per-gate call-count drop, which is a seat check after
+the city pin includes this change.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ gastown/agents/polecat/agent.toml      |  5 +++
+ gastown/formulas/mol-polecat-work.toml | 11 ++++++
+ gastown/tests/test_polecat_gates.sh    | 53 ++++++++++++++++++++++++++
+ 3 files changed, 69 insertions(+)
+
+diff --git a/gastown/agents/polecat/agent.toml b/gastown/agents/polecat/agent.toml
+index 0374c366..86f88a03 100644
+--- a/gastown/agents/polecat/agent.toml
++++ b/gastown/agents/polecat/agent.toml
+@@ -8,5 +8,10 @@ pre_start = ["{{.ConfigDir}}/assets/scripts/worktree-setup.sh {{.RigRoot}} {{.Wo
+ # ../../README.md ("Default Sling Formula").
+ default_sling_formula = "mol-polecat-work"
+ idle_timeout = "2h"
++# Claude Code caps a foreground Bash call at 10 minutes unless this is raised,
++# and a gate step often runs longer, so the model backgrounded the gate and
++# polled it (gcp-ypugs). mol-polecat-work asks for a 3600000 ms foreground call
++# on its gate stubs; keep the two numbers equal.
++env = { BASH_MAX_TIMEOUT_MS = "3600000" }
+ min_active_sessions = 0
+ max_active_sessions = 5
+diff --git a/gastown/formulas/mol-polecat-work.toml b/gastown/formulas/mol-polecat-work.toml
+index 95a3942d..d49b019e 100644
+--- a/gastown/formulas/mol-polecat-work.toml
++++ b/gastown/formulas/mol-polecat-work.toml
+@@ -595,6 +595,11 @@ red is never filed under any other name, because the skip keys on the name: a
+ pytest red filed as `phase=test` would silently skip `go test` on a rig whose
+ test_command is `go test` (gcp-98gh).
+ 
++Run it in the FOREGROUND, with the Bash tool's timeout parameter set to 3600000
++(60 minutes). Do not set run_in_background and do not poll: the call returns
++when every gate has finished, with the verdict. A gate prints nothing until it
++ends, so a quiet wait is normal.
++
+ ```bash
+ PG_SRC=$(gc formula list --json 2>/dev/null | jq -r '.formulas[]? | select(.name == "mol-polecat-work") | .source // empty' | head -1)
+ PG="${PG_SRC:+$(dirname "$(dirname "$PG_SRC")")/assets/scripts/polecat-gates.sh}"
+@@ -691,6 +696,12 @@ shell: every check and the test run append to the same gate log, which
+ `known-red` reads in §3. Tests are the rig's `affected_tests_command` when it
+ sets one, else its `test_command` as configured (which may itself select by
+ diff). Each phase is named after the formula var that holds its command.
++
++Run it in the FOREGROUND, with the Bash tool's timeout parameter set to 3600000
++(60 minutes). Do not set run_in_background and do not poll: the call returns
++when every gate has finished, with the verdict. A gate prints nothing until it
++ends, so a quiet wait is normal.
++
+ ```bash
+ : "${BASE_REF:?base ref not resolved — run step 1 of this step first}"
+ export BASE_REF
+diff --git a/gastown/tests/test_polecat_gates.sh b/gastown/tests/test_polecat_gates.sh
+index db1fa6de..1bcf291b 100755
+--- a/gastown/tests/test_polecat_gates.sh
++++ b/gastown/tests/test_polecat_gates.sh
+@@ -202,10 +202,63 @@ test_self_review_stub_exports_base_ref() {
+         fail "the affected-tests command must see BASE_REF, marker: '$(cat "$CASE/marker")'"
+ }
+ 
++# The two gate steps must tell the model to run the gate as one foreground call.
++# Left alone it backgrounds the gate and polls it, which costs a model call per
++# poll (gcp-ypugs). The paragraph sits directly before the stub's bash fence.
++test_gate_steps_ask_for_a_foreground_call() {
++    python3 -I - "$FORMULA" <<'PY' || fail "a gate step lacks the foreground-call paragraph"
++import sys
++import tomllib
++
++PARAGRAPH = (
++    "Run it in the FOREGROUND, with the Bash tool's timeout parameter set to 3600000\n"
++    "(60 minutes). Do not set run_in_background and do not poll: the call returns\n"
++    "when every gate has finished, with the verdict. A gate prints nothing until it\n"
++    "ends, so a quiet wait is normal.\n"
++)
++doc = tomllib.load(open(sys.argv[1], "rb"))
++for step in ("preflight-tests", "self-review"):
++    text = next(s["description"] for s in doc["steps"] if s["id"] == step)
++    if text.count(PARAGRAPH) != 1:
++        sys.exit(f"{step}: want the paragraph exactly once, found {text.count(PARAGRAPH)}")
++    after = text.split(PARAGRAPH, 1)[1]
++    if not after.startswith("\n```bash\n"):
++        sys.exit(f"{step}: want one blank line then a bash fence after the paragraph")
++    block = after[len("\n```bash\n"):].split("\n```", 1)[0]
++    if 'bash "$PG"' not in block:
++        sys.exit(f"{step}: the fence after the paragraph is not the gate stub")
++PY
++}
++
++# Claude Code caps a foreground Bash call at 10 minutes unless the polecat
++# agent raises the cap, so the formula's 3600000 and the agent env must agree.
++test_polecat_agent_raises_bash_max_timeout() {
++    python3 -I - "$ROOT/gastown/agents/polecat/agent.toml" "$FORMULA" <<'PY' || fail "the polecat agent env and the gate paragraph disagree"
++import re
++import sys
++import tomllib
++
++agent = tomllib.load(open(sys.argv[1], "rb"))
++env = agent.get("env", {})
++if env.get("BASH_MAX_TIMEOUT_MS") != "3600000":
++    sys.exit(f"want env.BASH_MAX_TIMEOUT_MS == '3600000', got {env.get('BASH_MAX_TIMEOUT_MS')!r}")
++if "BASH_DEFAULT_TIMEOUT_MS" in env:
++    sys.exit("BASH_DEFAULT_TIMEOUT_MS must stay unset, or every hung command blocks for an hour")
++doc = tomllib.load(open(sys.argv[2], "rb"))
++for step in ("preflight-tests", "self-review"):
++    text = next(s["description"] for s in doc["steps"] if s["id"] == step)
++    found = re.findall(r"timeout parameter set to (\d+)\n", text)
++    if found != [env["BASH_MAX_TIMEOUT_MS"]]:
++        sys.exit(f"{step}: want the paragraph's timeout to equal the agent env, got {found}")
++PY
++}
++
+ test_usage_rejects_unknown_mode
+ test_unset_required_var_stops
+ test_empty_affected_tests_runs_test_command
+ test_preflight_stub_stops_when_script_unresolved
+ test_self_review_stub_stops_when_script_unresolved
+ test_self_review_stub_exports_base_ref
++test_gate_steps_ask_for_a_foreground_call
++test_polecat_agent_raises_bash_max_timeout
+ echo "polecat gates tests passed"
+-- 
+2.54.0 (Apple Git-157)
+

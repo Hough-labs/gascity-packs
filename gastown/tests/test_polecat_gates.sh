@@ -202,10 +202,63 @@ test_self_review_stub_exports_base_ref() {
         fail "the affected-tests command must see BASE_REF, marker: '$(cat "$CASE/marker")'"
 }
 
+# The two gate steps must tell the model to run the gate as one foreground call.
+# Left alone it backgrounds the gate and polls it, which costs a model call per
+# poll (gcp-ypugs). The paragraph sits directly before the stub's bash fence.
+test_gate_steps_ask_for_a_foreground_call() {
+    python3 -I - "$FORMULA" <<'PY' || fail "a gate step lacks the foreground-call paragraph"
+import sys
+import tomllib
+
+PARAGRAPH = (
+    "Run it in the FOREGROUND, with the Bash tool's timeout parameter set to 3600000\n"
+    "(60 minutes). Do not set run_in_background and do not poll: the call returns\n"
+    "when every gate has finished, with the verdict. A gate prints nothing until it\n"
+    "ends, so a quiet wait is normal.\n"
+)
+doc = tomllib.load(open(sys.argv[1], "rb"))
+for step in ("preflight-tests", "self-review"):
+    text = next(s["description"] for s in doc["steps"] if s["id"] == step)
+    if text.count(PARAGRAPH) != 1:
+        sys.exit(f"{step}: want the paragraph exactly once, found {text.count(PARAGRAPH)}")
+    after = text.split(PARAGRAPH, 1)[1]
+    if not after.startswith("\n```bash\n"):
+        sys.exit(f"{step}: want one blank line then a bash fence after the paragraph")
+    block = after[len("\n```bash\n"):].split("\n```", 1)[0]
+    if 'bash "$PG"' not in block:
+        sys.exit(f"{step}: the fence after the paragraph is not the gate stub")
+PY
+}
+
+# Claude Code caps a foreground Bash call at 10 minutes unless the polecat
+# agent raises the cap, so the formula's 3600000 and the agent env must agree.
+test_polecat_agent_raises_bash_max_timeout() {
+    python3 -I - "$ROOT/gastown/agents/polecat/agent.toml" "$FORMULA" <<'PY' || fail "the polecat agent env and the gate paragraph disagree"
+import re
+import sys
+import tomllib
+
+agent = tomllib.load(open(sys.argv[1], "rb"))
+env = agent.get("env", {})
+if env.get("BASH_MAX_TIMEOUT_MS") != "3600000":
+    sys.exit(f"want env.BASH_MAX_TIMEOUT_MS == '3600000', got {env.get('BASH_MAX_TIMEOUT_MS')!r}")
+if "BASH_DEFAULT_TIMEOUT_MS" in env:
+    sys.exit("BASH_DEFAULT_TIMEOUT_MS must stay unset, or every hung command blocks for an hour")
+doc = tomllib.load(open(sys.argv[2], "rb"))
+for step in ("preflight-tests", "self-review"):
+    text = next(s["description"] for s in doc["steps"] if s["id"] == step)
+    found = re.findall(r"timeout parameter set to (\d+)\n", text)
+    if found != [env["BASH_MAX_TIMEOUT_MS"]]:
+        sys.exit(f"{step}: want the paragraph's timeout to equal the agent env, got {found}")
+PY
+}
+
 test_usage_rejects_unknown_mode
 test_unset_required_var_stops
 test_empty_affected_tests_runs_test_command
 test_preflight_stub_stops_when_script_unresolved
 test_self_review_stub_stops_when_script_unresolved
 test_self_review_stub_exports_base_ref
+test_gate_steps_ask_for_a_foreground_call
+test_polecat_agent_raises_bash_max_timeout
 echo "polecat gates tests passed"

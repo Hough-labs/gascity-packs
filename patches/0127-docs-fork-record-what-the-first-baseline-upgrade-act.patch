@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sat, 10 Oct 2026 16:23:14 -0400
-Subject: [PATCH 127/171] docs(fork): record what the first baseline upgrade
+Subject: [PATCH 127/172] docs(fork): record what the first baseline upgrade
  actually needed (gcp-fooz4)
 
 The v0.4.0 -> 520e95cb upgrade was the first time the baseline moved, and

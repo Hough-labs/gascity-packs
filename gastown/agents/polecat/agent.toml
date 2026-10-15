@@ -8,5 +8,10 @@ pre_start = ["{{.ConfigDir}}/assets/scripts/worktree-setup.sh {{.RigRoot}} {{.Wo
 # ../../README.md ("Default Sling Formula").
 default_sling_formula = "mol-polecat-work"
 idle_timeout = "2h"
+# Claude Code caps a foreground Bash call at 10 minutes unless this is raised,
+# and a gate step often runs longer, so the model backgrounded the gate and
+# polled it (gcp-ypugs). mol-polecat-work asks for a 3600000 ms foreground call
+# on its gate stubs; keep the two numbers equal.
+env = { BASH_MAX_TIMEOUT_MS = "3600000" }
 min_active_sessions = 0
 max_active_sessions = 5
