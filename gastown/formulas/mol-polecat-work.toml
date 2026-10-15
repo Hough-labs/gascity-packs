@@ -301,6 +301,7 @@ Empty setup_command → skip.
 **Exit criteria:** In your worktree, on a clean feature branch, rebased
 on latest {{base_branch}}, deps installed, worktree and branch recorded
 on the bead."""
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
 
 [[steps]]
 id = "preflight-tests"
@@ -389,6 +390,7 @@ gc mail send <rig>/witness -s "NOTICE: {{base_branch}} has failing pre-flights" 
 ```
 
 **Exit criteria:** Pre-flights pass (or pre-existing bug filed), ready to implement."""
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
 
 [[steps]]
 id = "self-review"
@@ -553,6 +555,7 @@ NEVER discard implementation changes with `git checkout -- .`
 
 **Exit criteria:** All checks pass (affected subset OR full suite), all
 changes committed, working tree clean."""
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
 
 [[steps]]
 id = "submit-and-exit"
@@ -960,3 +963,4 @@ reconciler only restarts you if the pool check command finds more work.
 You are GONE. Done means gone. There is no idle state.
 
 **Exit criteria:** Branch pushed, metadata set, bead reassigned, refinery signaled, this step closed, drain acknowledged, session exited."""
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }

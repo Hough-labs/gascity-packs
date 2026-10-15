@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 15 Oct 2026 15:33:04 -0400
-Subject: [PATCH 180/181] feat(gastown): ship the polecat resume re-verify and
+Subject: [PATCH 180/182] feat(gastown): ship the polecat resume re-verify and
  already-submitted guard as pack executables (gcp-wmcj9)
 
 The two remaining large fences in the polecat prompt (the 64-line resume /

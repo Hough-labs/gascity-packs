@@ -1,0 +1,219 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 15 Oct 2026 16:45:11 -0400
+Subject: [PATCH 182/182] fix(gastown): pin mol-polecat-work steps to one
+ continuation group (gcp-fm79v)
+
+A polecat that closed a step and ran gc hook --claim for the next one could be
+handed an older, higher-priority routed pool bead from another molecule instead
+of its own ready step (winnow-xd06q4: nux took winnow-w6k.4 while its own
+submit-and-exit step sat open and unassigned).
+
+Root cause: gascity #5622 (c91381b22) stopped stamping a blanket
+gc.continuation_group on pool-routed graph steps. Continuation is now
+formula-declared only, and mol-polecat-work declared none, so its steps stayed
+plain pool work, sorted by priority then created_at.
+
+Declare gc.continuation_group = "main" and gc.session_affinity = "require" on
+the four steps this formula defines (workspace-setup, preflight-tests,
+self-review, submit-and-exit), matching core's mol-scoped-work. A child step
+replaces its parent's wholesale, so the pack's overriding steps must carry the
+declaration themselves. The first claim of a grouped step then pins its grouped
+siblings to the claiming session and the continuation claim returns them as
+ready_assignment. Affinity is advisory, so a dead session's pinned steps still
+return to the open pool.
+
+load-context and implement live only in gc core's mol-polecat-base and stay
+unpinned until gcp-w4t8r lands the base-side half.
+
+tests/test_polecat_continuation_group.py pins the declaration in the TOML and,
+with GC_TEST_BIN set, in the workflow gc compiles from it.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ gastown/formulas/mol-polecat-work.toml   |   4 +
+ tests/test_polecat_continuation_group.py | 139 +++++++++++++++++++++++
+ 2 files changed, 143 insertions(+)
+ create mode 100644 tests/test_polecat_continuation_group.py
+
+diff --git a/gastown/formulas/mol-polecat-work.toml b/gastown/formulas/mol-polecat-work.toml
+index 2014746e..e8359a10 100644
+--- a/gastown/formulas/mol-polecat-work.toml
++++ b/gastown/formulas/mol-polecat-work.toml
+@@ -301,6 +301,7 @@ Empty setup_command → skip.
+ **Exit criteria:** In your worktree, on a clean feature branch, rebased
+ on latest {{base_branch}}, deps installed, worktree and branch recorded
+ on the bead."""
++metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+ 
+ [[steps]]
+ id = "preflight-tests"
+@@ -389,6 +390,7 @@ gc mail send <rig>/witness -s "NOTICE: {{base_branch}} has failing pre-flights"
+ ```
+ 
+ **Exit criteria:** Pre-flights pass (or pre-existing bug filed), ready to implement."""
++metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+ 
+ [[steps]]
+ id = "self-review"
+@@ -553,6 +555,7 @@ NEVER discard implementation changes with `git checkout -- .`
+ 
+ **Exit criteria:** All checks pass (affected subset OR full suite), all
+ changes committed, working tree clean."""
++metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+ 
+ [[steps]]
+ id = "submit-and-exit"
+@@ -960,3 +963,4 @@ reconciler only restarts you if the pool check command finds more work.
+ You are GONE. Done means gone. There is no idle state.
+ 
+ **Exit criteria:** Branch pushed, metadata set, bead reassigned, refinery signaled, this step closed, drain acknowledged, session exited."""
++metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+diff --git a/tests/test_polecat_continuation_group.py b/tests/test_polecat_continuation_group.py
+new file mode 100644
+index 00000000..d10d3b33
+--- /dev/null
++++ b/tests/test_polecat_continuation_group.py
+@@ -0,0 +1,139 @@
++"""mol-polecat-work declares one continuation group, "main", on every step it owns.
++
++Gas City no longer stamps a blanket `gc.continuation_group` on pool-routed graph
++steps (gascity #5622, c91381b22): continuation is formula-declared only. Without
++a declared group the steps of one polecat molecule are plain pool beads, so a
++polecat that closes a step and runs `gc hook --claim` for the next one can be
++handed an older routed pool bead that belongs to another molecule (gcp-fm79v).
++
++When a step declares the group, graphroute stamps `gc.continuation_group` and
++`gc.session_affinity=require` on it, and `gc hook --claim` pins the open
++siblings that share the molecule root and the group to the claiming session.
++The pin only holds if every step of the molecule names the same group, so a
++step that declares a different one splits the molecule across two groups.
++
++mol-polecat-work extends gc core's mol-polecat-base and overrides four of its
++steps. A child step with the same id replaces the parent's wholesale, so the
++declaration has to be on each of the four; the base's own load-context and
++implement are gascity's to declare and are deliberately not copied here.
++"""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++import tomllib
++
++import pytest
++
++from gc_live_city import (
++    REPO_ROOT,
++    gc_test_bin,  # noqa: F401 -- pytest fixture, used by name
++    run_gc,
++    write_city,
++)
++
++
++FORMULA = REPO_ROOT / "gastown" / "formulas" / "mol-polecat-work.toml"
++FORMULA_NAME = "mol-polecat-work"
++
++GROUP_KEY = "gc.continuation_group"
++AFFINITY_KEY = "gc.session_affinity"
++GROUP = "main"
++AFFINITY = "require"
++
++# The steps this formula defines itself. Each one must carry the declaration.
++DECLARING_STEPS = (
++    "workspace-setup",
++    "preflight-tests",
++    "self-review",
++    "submit-and-exit",
++)
++
++GASCITY_CORE_SOURCE = (
++    "https://github.com/gastownhall/gascity.git//internal/bootstrap/packs/core"
++)
++
++
++def formula_steps() -> list[dict]:
++    return tomllib.loads(FORMULA.read_text(encoding="utf-8"))["steps"]
++
++
++def formula_step(step_id: str) -> dict:
++    matches = [step for step in formula_steps() if step["id"] == step_id]
++    assert len(matches) == 1, (
++        f"{FORMULA.name} defines {len(matches)} steps with id {step_id!r}; "
++        "expected exactly one"
++    )
++    return matches[0]
++
++
++@pytest.mark.parametrize("step_id", DECLARING_STEPS)
++def test_overriding_step_declares_the_main_continuation_group(step_id: str) -> None:
++    metadata = formula_step(step_id).get("metadata", {})
++
++    assert metadata.get(GROUP_KEY) == GROUP, (
++        f"{FORMULA.name} step {step_id!r} does not declare "
++        f"{GROUP_KEY} = {GROUP!r} (metadata: {metadata}); a pool claim can then "
++        "return another molecule's bead in place of this molecule's next step"
++    )
++    assert metadata.get(AFFINITY_KEY) == AFFINITY, (
++        f"{FORMULA.name} step {step_id!r} does not declare "
++        f"{AFFINITY_KEY} = {AFFINITY!r} (metadata: {metadata})"
++    )
++
++
++def test_every_declared_continuation_group_is_main() -> None:
++    declared = {
++        step["id"]: step["metadata"][GROUP_KEY]
++        for step in formula_steps()
++        if GROUP_KEY in step.get("metadata", {})
++    }
++    # A scan that finds no declarations would make the equality below vacuous.
++    assert declared, f"{FORMULA.name} declares no {GROUP_KEY} on any step"
++
++    split = {step_id: group for step_id, group in declared.items() if group != GROUP}
++    assert not split, (
++        f"{FORMULA.name} steps declare a continuation group other than "
++        f"{GROUP!r}, which splits the molecule across groups: {split}"
++    )
++
++
++def test_compiled_workflow_steps_carry_the_continuation_group(
++    tmp_path: Path, gc_test_bin: Path  # noqa: F811
++) -> None:
++    """The TOML above is what we wrote; this is what gc compiles it into.
++
++    `extends` replaces a parent step wholesale by id, so the metadata has to
++    survive the merge with gc core's mol-polecat-base, not merely sit in our file.
++    """
++    workspace = write_city(tmp_path, {"gastown": REPO_ROOT / "gastown"})
++    pack_toml = workspace.city_dir / "pack.toml"
++    pack_toml.write_text(
++        pack_toml.read_text(encoding="utf-8")
++        + f"\n[imports.core]\nsource = {json.dumps(GASCITY_CORE_SOURCE)}\n",
++        encoding="utf-8",
++    )
++
++    result = run_gc(gc_test_bin, workspace, "formula", "show", FORMULA_NAME, "--json")
++    assert result.returncode == 0, (
++        f"gc formula show {FORMULA_NAME} exited {result.returncode}:\n"
++        f"{result.stdout}{result.stderr}"
++    )
++    compiled = {step["id"]: step for step in json.loads(result.stdout)["steps"]}
++
++    for step_id in DECLARING_STEPS:
++        recipe_id = f"{FORMULA_NAME}.{step_id}"
++        assert recipe_id in compiled, (
++            f"gc compiled {FORMULA_NAME} without step {recipe_id!r}; "
++            f"got {sorted(compiled)}"
++        )
++        metadata = compiled[recipe_id].get("metadata", {})
++        assert metadata.get(GROUP_KEY) == GROUP, (
++            f"compiled step {recipe_id!r} lost {GROUP_KEY} = {GROUP!r} "
++            f"(metadata: {metadata})"
++        )
++        assert metadata.get(AFFINITY_KEY) == AFFINITY, (
++            f"compiled step {recipe_id!r} lost {AFFINITY_KEY} = {AFFINITY!r} "
++            f"(metadata: {metadata})"
++        )
+-- 
+2.54.0 (Apple Git-157)
+
