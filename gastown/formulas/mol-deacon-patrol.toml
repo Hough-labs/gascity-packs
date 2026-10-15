@@ -233,13 +233,16 @@ warrant spawns a second shutdown dance racing the first (duplicate kills,
 wasted dog cycles). Skip filing if one is already open or in progress:
 ```bash
 TARGET_SESSION="<session>"
-EXISTING_WARRANT=$(gc bd list --label=warrant --json --limit=0 \
+WARRANT_CITY="${GC_CITY_PATH:-${GC_CITY:-}}"
+EXISTING_WARRANT=$(gc bd list --label=warrant --json --limit=0 --city "$WARRANT_CITY" \
   | jq -r --arg t "$TARGET_SESSION" \
       '[.[] | select((.status == "open" or .status == "in_progress") and (.metadata.target == $t))] | length')
-if [ "${EXISTING_WARRANT:-0}" -gt 0 ]; then
+if [ -z "$WARRANT_CITY" ]; then
+  echo "Warrant NOT filed for $TARGET_SESSION: GC_CITY_PATH and GC_CITY are unset, so the city store cannot be named. Report it; never file a warrant into a rig store."
+elif [ "${EXISTING_WARRANT:-0}" -gt 0 ]; then
   echo "Skipping warrant for $TARGET_SESSION — an open warrant already exists."
 else
-  gc bd create --type=task --labels=warrant \
+  gc bd create --type=task --labels=warrant --city "$WARRANT_CITY" \
     --title="Stuck: <session>" \
     --metadata '{"target":"<session>","reason":"<reason>","requester":"deacon","gc.kind":"workflow","gc.routed_to":"{{binding_prefix}}dog"}'
 fi
@@ -358,13 +361,16 @@ dance racing the first:
 
 ```bash
 TARGET_SESSION="<session>"
-EXISTING_WARRANT=$(gc bd list --label=warrant --json --limit=0 \
+WARRANT_CITY="${GC_CITY_PATH:-${GC_CITY:-}}"
+EXISTING_WARRANT=$(gc bd list --label=warrant --json --limit=0 --city "$WARRANT_CITY" \
     | jq -r --arg t "$TARGET_SESSION" \
         '[.[] | select((.status == "open" or .status == "in_progress") and (.metadata.target == $t))] | length')
-if [ "${EXISTING_WARRANT:-0}" -gt 0 ]; then
+if [ -z "$WARRANT_CITY" ]; then
+  echo "Warrant NOT filed for $TARGET_SESSION: GC_CITY_PATH and GC_CITY are unset, so the city store cannot be named. Report it; never file a warrant into a rig store."
+elif [ "${EXISTING_WARRANT:-0}" -gt 0 ]; then
     echo "Skipping warrant for $TARGET_SESSION — an open warrant already exists."
 else
-    gc bd create --type=task --labels=warrant \
+    gc bd create --type=task --labels=warrant --city "$WARRANT_CITY" \
         --title="Stuck queue: <session> — $ASSIGNED beads, no activity $duration" \
         --metadata '{"target":"<session>","reason":"queue starvation: N beads, no bead.updated_at progress","requester":"deacon","gc.kind":"workflow","gc.routed_to":"{{binding_prefix}}dog"}'
 fi
@@ -393,7 +399,8 @@ wisp timestamps.
 
 **Step 1: Find active utility agent work:**
 ```bash
-gc bd list --status=in_progress --metadata-field gc.routed_to={{binding_prefix}}dog --json --limit=0
+WARRANT_CITY="${GC_CITY_PATH:-${GC_CITY:-}}"
+gc bd list --status=in_progress --metadata-field gc.routed_to={{binding_prefix}}dog --json --limit=0 --city "$WARRANT_CITY"
 ```
 
 **Step 2: For each, assess progress:**
@@ -410,13 +417,16 @@ Check for an existing open warrant against the same target first — a duplicate
 warrant spawns a second shutdown dance racing the first:
 ```bash
 TARGET_SESSION="<session>"
-EXISTING_WARRANT=$(gc bd list --label=warrant --json --limit=0 \
+WARRANT_CITY="${GC_CITY_PATH:-${GC_CITY:-}}"
+EXISTING_WARRANT=$(gc bd list --label=warrant --json --limit=0 --city "$WARRANT_CITY" \
   | jq -r --arg t "$TARGET_SESSION" \
       '[.[] | select((.status == "open" or .status == "in_progress") and (.metadata.target == $t))] | length')
-if [ "${EXISTING_WARRANT:-0}" -gt 0 ]; then
+if [ -z "$WARRANT_CITY" ]; then
+  echo "Warrant NOT filed for $TARGET_SESSION: GC_CITY_PATH and GC_CITY are unset, so the city store cannot be named. Report it; never file a warrant into a rig store."
+elif [ "${EXISTING_WARRANT:-0}" -gt 0 ]; then
   echo "Skipping warrant for $TARGET_SESSION — an open warrant already exists."
 else
-  gc bd create --type=task --labels=warrant \
+  gc bd create --type=task --labels=warrant --city "$WARRANT_CITY" \
     --title="Stuck dog: <agent>" \
     --metadata '{"target":"<session>","reason":"<reason>","requester":"deacon","gc.kind":"workflow","gc.routed_to":"{{binding_prefix}}dog"}'
 fi

@@ -4,10 +4,11 @@ Shutdown dance — due process for stuck agents.
 Dispatched by filing a warrant bead routed to the dog pool:
 
 ```bash
+WARRANT_CITY="${GC_CITY_PATH:-${GC_CITY:-}}"
 gc bd create --type=task \
   --title="Stuck: <agent>" \
   --metadata '{"target":"<session>","reason":"<reason>","requester":"<who>","gc.kind":"workflow","gc.routed_to":"<binding-prefix>dog"}' \
-  --labels=warrant
+  --labels=warrant --city "$WARRANT_CITY"
 ```
 
 `gc.kind=workflow` is not decoration. Pool demand detection polls for a
@@ -18,6 +19,12 @@ label: no demand is ever signalled, no dog is ever spawned, and the bead
 sits open and unassigned forever while every status surface stays green.
 That is exactly what happened to gascity-9qfg, which sat routed to the dog
 pool with zero dog sessions ever appearing in `gc session list` (gcp-w310).
+
+`gc.kind=workflow` alone did not drain a warrant: gascity-6w4m and gcp-zq9r
+carried it and were never claimed, because they sat in RIG stores. The dog
+pool is city-scoped. Its demand and its work query read only the city store.
+A plain `gc bd create` from a rig session or a rig cwd writes to that rig's
+store, so every producer pins the city store with `--city` (gcp-1uod).
 
 The dog pool picks up the warrant and runs this formula against the
 claimed warrant bead. The claimed bead is the warrant id; use

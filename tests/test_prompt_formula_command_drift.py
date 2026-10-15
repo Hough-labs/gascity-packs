@@ -36,6 +36,15 @@ FENCE_CLOSE = re.compile(r"^\s*```\s*$")
 # create flag from --label to --labels (#330), so a detector keyed on the old
 # spelling would stop seeing every warrant it exists to check.
 WARRANT_LABEL = re.compile(r"--labels?[= ]warrant\b")
+# How a warrant producer names the city store (gcp-1uod). GC_CITY_PATH comes
+# first because it is path-only, while GC_CITY may hold a city NAME.
+WARRANT_CITY_DEF = 'WARRANT_CITY="${GC_CITY_PATH:-${GC_CITY:-}}"'
+WARRANT_CITY_FLAG = '--city "$WARRANT_CITY"'
+# The refusal arm that stops a producer filing when the city is unknown: an
+# empty `--city ""` silently falls back to the rig store.
+WARRANT_CITY_REFUSAL = 'if [ -z "$WARRANT_CITY" ]; then'
+# A work query for the dog pool's own beads, which also live in the city store.
+DOG_ROUTE = "gc.routed_to={{binding_prefix}}dog"
 
 POOL_RETURN_ASSIGNEE = re.compile(r"""--assignee=(?:""|'')""")
 
@@ -220,6 +229,78 @@ def warrant_workflow_kind_violations(path: Path, text: str) -> list[str]:
             f"{path.relative_to(REPO_ROOT)}:{number}: warrant routed to the "
             "pool without gc.kind=workflow"
         )
+    return violations
+
+
+def warrant_city_store_sites(
+    text: str,
+) -> tuple[list[tuple[int, str]], list[tuple[int, str]], list[tuple[int, str]]]:
+    """Split the warrant commands in `text` into (creates, dedupes, reads).
+
+    A create files a warrant, a dedupe is the EXISTING_WARRANT guard in front
+    of one, and a read is any other `gc bd list` over warrant or dog-routed
+    beads.
+    """
+    creates: list[tuple[int, str]] = []
+    dedupes: list[tuple[int, str]] = []
+    reads: list[tuple[int, str]] = []
+    for number, command in logical_commands(text):
+        if "gc bd create" in command and WARRANT_LABEL.search(command):
+            creates.append((number, command))
+        elif (
+            "EXISTING_WARRANT=$(gc bd list" in command
+            and "--label=warrant" in command
+        ):
+            dedupes.append((number, command))
+        elif "gc bd list" in command and (
+            "--label=warrant" in command or DOG_ROUTE in command
+        ):
+            reads.append((number, command))
+    return creates, dedupes, reads
+
+
+def warrant_city_store_violations(path: Path, text: str) -> list[str]:
+    """Every warrant create, dedupe and read must name the city store.
+
+    The dog pool is city-scoped: its demand and its work query read only the
+    city store. `gc bd` answers from a rig store whenever GC_RIG is set or the
+    cwd sits inside a rig, so a plain `gc bd create` from a witness session
+    files a warrant no dog will ever see. gc.kind=workflow alone did not fix
+    it: gascity-6w4m and gcp-zq9r carried it and were never claimed (gcp-1uod).
+
+    So each producer defines WARRANT_CITY, passes `--city "$WARRANT_CITY"` on
+    its create, its dedupe and its reads, and (where it dedupes) refuses to file
+    when the city is unknown, because an empty `--city ""` falls back to the rig
+    store without complaint. Reads write nothing and get no refusal arm.
+    """
+    where = path.relative_to(REPO_ROOT)
+    violations = []
+    creates, dedupes, reads = warrant_city_store_sites(text)
+    for kind, sites in (("create", creates), ("dedupe query", dedupes), ("read", reads)):
+        for number, command in sites:
+            if WARRANT_CITY_FLAG not in command:
+                violations.append(
+                    f"{where}:{number}: warrant {kind} does not pin the city "
+                    f"store with {WARRANT_CITY_FLAG}"
+                )
+    for _lang, start, body in fenced_blocks(text):
+        block_creates, _block_dedupes, block_reads = warrant_city_store_sites(body)
+        if not block_creates and not block_reads:
+            continue
+        if WARRANT_CITY_DEF not in body:
+            violations.append(
+                f"{where}:{start}: block uses {WARRANT_CITY_FLAG} without "
+                f"defining {WARRANT_CITY_DEF}"
+            )
+        if (
+            block_creates
+            and "EXISTING_WARRANT" in body
+            and WARRANT_CITY_REFUSAL not in body
+        ):
+            violations.append(
+                f"{where}:{start}: warrant create has no refusal arm for an "
+                "unknown city"
+            )
     return violations
 
 
@@ -417,6 +498,122 @@ def test_warrant_creation_declares_the_workflow_root_marker() -> None:
         "workflow root: no dog pool demand is signalled, no dog spawns, and the "
         "warrant sits open and unassigned forever:\n" + "\n".join(violations)
     )
+
+
+def test_warrant_city_store_detector_catches_rig_store_filing() -> None:
+    fixture = REPO_ROOT / "fixture.md"
+    # Built line-by-line for the same reason as the warrant fixtures in
+    # test_detectors_catch_the_drift_they_are_named_for.
+    city_def = WARRANT_CITY_DEF
+    create = "  gc bd create --type=task --labels=warrant --metadata '{\"target\":\"x\"}'"
+    flagged_create = (
+        "  gc bd create --type=task --labels=warrant "
+        + WARRANT_CITY_FLAG
+        + " --metadata '{\"target\":\"x\"}'"
+    )
+    dedupe = "EXISTING_WARRANT=$(gc bd list --label=warrant --json --limit=0"
+    flagged_dedupe = dedupe + " " + WARRANT_CITY_FLAG
+    jq_tail = "  | jq -r '[.[]] | length')"
+    refusal_arm = [
+        WARRANT_CITY_REFUSAL,
+        '  echo "Warrant NOT filed: the city store cannot be named."',
+        'elif [ "${EXISTING_WARRANT:-0}" -gt 0 ]; then',
+    ]
+    plain_arm = ['if [ "${EXISTING_WARRANT:-0}" -gt 0 ]; then']
+
+    def block(*lines: str) -> str:
+        return "\n".join(["```bash", *lines, "```"])
+
+    # F1: the city is named but the create never uses it.
+    f1 = block(city_def, create)
+    assert warrant_city_store_violations(fixture, f1)
+    # F2: the create carries the flag but nothing defines the variable.
+    f2 = block(flagged_create)
+    assert warrant_city_store_violations(fixture, f2)
+    # F3: a guarded block whose dedupe query reads the rig store.
+    f3 = block(
+        city_def,
+        dedupe + " \\",
+        jq_tail,
+        *refusal_arm,
+        "  echo skip",
+        "else",
+        flagged_create,
+        "fi",
+    )
+    assert warrant_city_store_violations(fixture, f3)
+    # F4: the full form is clean.
+    f4 = block(
+        city_def,
+        flagged_dedupe + " \\",
+        jq_tail,
+        *refusal_arm,
+        "  echo skip",
+        "else",
+        flagged_create,
+        "fi",
+    )
+    assert not warrant_city_store_violations(fixture, f4)
+    # F5: F4 without its refusal arm files into the rig store on an unknown city.
+    f5 = block(
+        city_def,
+        flagged_dedupe + " \\",
+        jq_tail,
+        *plain_arm,
+        "  echo skip",
+        "else",
+        flagged_create,
+        "fi",
+    )
+    assert warrant_city_store_violations(fixture, f5)
+    # F6: a read of the warrant label, and of the dog's own beads, needs the
+    # flag too; with it and the definition, it is clean.
+    f6 = block(city_def, "gc bd list --label=warrant --created-after=$SINCE --json")
+    assert warrant_city_store_violations(fixture, f6)
+    f6_dog = block(
+        city_def,
+        "gc bd list --status=in_progress --metadata-field "
+        + DOG_ROUTE
+        + " --json --limit=0",
+    )
+    assert warrant_city_store_violations(fixture, f6_dog)
+    f6_fixed = block(
+        city_def,
+        "gc bd list --label=warrant --created-after=$SINCE --json "
+        + WARRANT_CITY_FLAG,
+    )
+    assert not warrant_city_store_violations(fixture, f6_fixed)
+    f6_undefined = block(
+        "gc bd list --label=warrant --created-after=$SINCE --json "
+        + WARRANT_CITY_FLAG
+    )
+    assert warrant_city_store_violations(fixture, f6_undefined)
+
+
+def test_warrant_filing_pins_the_city_store() -> None:
+    violations = []
+    creates = dedupes = reads = 0
+    for path in gastown_assets():
+        text = path.read_text(encoding="utf-8")
+        violations.extend(warrant_city_store_violations(path, text))
+        found_creates, found_dedupes, found_reads = warrant_city_store_sites(text)
+        creates += len(found_creates)
+        dedupes += len(found_dedupes)
+        reads += len(found_reads)
+
+    assert not violations, (
+        "the dog pool is city-scoped and reads only the city store, but `gc bd` "
+        "answers from a rig store inside a rig session: a warrant filed or "
+        "queried without --city is stranded there and no dog ever claims it:\n"
+        + "\n".join(violations)
+    )
+    # The sites the detector must keep seeing: deacon x3, witness and boot create
+    # warrants; the same five dedupe first; the deacon dog query and the digest
+    # warrant listing are the two reads. A count that moves means a producer was
+    # added or reworded out of the detector's sight.
+    assert creates == 6
+    assert dedupes == 5
+    assert reads == 2
 
 
 def test_prompt_template_bail_paths_drain_ack() -> None:

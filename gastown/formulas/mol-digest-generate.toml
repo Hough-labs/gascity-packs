@@ -126,7 +126,8 @@ gc bd list --label=escalation --created-after=$SINCE --json
 
 c) **Warrants filed:**
 ```bash
-gc bd list --label=warrant --created-after=$SINCE --json
+WARRANT_CITY="${GC_CITY_PATH:-${GC_CITY:-}}"
+gc bd list --label=warrant --created-after=$SINCE --json --city "$WARRANT_CITY"
 ```
 
 Continue to digest generation when all data is collected."""
