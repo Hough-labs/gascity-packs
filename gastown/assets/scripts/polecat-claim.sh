@@ -38,7 +38,14 @@ fi
 
 # Claim with retry. A hook-call failure (non-zero exit, malformed JSON) is a
 # transient CLI/daemon fault — NOT "no work" — so retry it before giving up.
-# Only action==drain, or a clean empty result, is genuine NO_ROUTED_WORK.
+# Malformed means a non-zero exit, or an exit 0 whose stdout is not one JSON
+# object: gc hook --claim --json writes exactly one object per call
+# (schemas/hook/result.schema.json), so anything else at exit 0 is a truncated
+# or corrupted result. It may be a claim gc already won, and the retry gets that
+# bead back as existing_assignment, where draining on it would park the bead
+# under a session that left. Only action==drain, or a clean empty result (no
+# output, or an object with neither action nor bead_id), is genuine
+# NO_ROUTED_WORK.
 WORK_ID=""
 CLAIM_TRY=0
 while [ "$CLAIM_TRY" -lt 3 ]; do
@@ -48,11 +55,16 @@ while [ "$CLAIM_TRY" -lt 3 ]; do
   CLAIM_CODE=$?
   CLAIM_ERR_TEXT="$(sed -n '1p' "$CLAIM_ERR")"
   rm -f "$CLAIM_ERR"
+  CLAIM_MALFORMED=0
+  if [ -n "$CLAIM_JSON" ] && ! printf '%s' "$CLAIM_JSON" | jq -e 'type == "object"' >/dev/null 2>&1; then
+    CLAIM_MALFORMED=1
+  fi
   ACTION="$(printf '%s' "$CLAIM_JSON" | jq -r '.action // empty' 2>/dev/null)"
   WORK_ID="$(printf '%s' "$CLAIM_JSON" | jq -r '.bead_id // empty' 2>/dev/null)"
   # `claimed` means this bead was open and UNASSIGNED and we took it out of the
   # pool. `existing_assignment` / `ready_assignment` mean it already carried our
-  # identity. The live-owner guard below only has to run in the first case.
+  # identity. The live-owner guard below skips exactly those two and checks every
+  # other reason, including one this script has never seen.
   CLAIM_REASON="$(printf '%s' "$CLAIM_JSON" | jq -r '.reason // empty' 2>/dev/null)"
   if [ "$ACTION" = "drain" ]; then
     echo "NO_ROUTED_WORK"
@@ -62,7 +74,7 @@ while [ "$CLAIM_TRY" -lt 3 ]; do
   if [ "$CLAIM_CODE" -eq 0 ] && [ -n "$WORK_ID" ]; then
     break
   fi
-  if [ "$CLAIM_CODE" -eq 0 ] && [ -z "$ACTION" ] && [ -z "$WORK_ID" ]; then
+  if [ "$CLAIM_CODE" -eq 0 ] && [ "$CLAIM_MALFORMED" -eq 0 ] && [ -z "$ACTION" ] && [ -z "$WORK_ID" ]; then
     echo "NO_ROUTED_WORK"
     gc runtime drain-ack
     exit 0
@@ -172,19 +184,36 @@ claim_assignee_is_ours() {
   return 1
 }
 
-# Only a `claimed` reason can be a duplicate pour. `existing_assignment` and
+# Which beads are molecule beads. A formula STEP carries gc.step_ref (and
+# gc.step_id and gc.root_bead_id). A workflow ROOT carries gc.step_id and
+# gc.kind=workflow but neither gc.step_ref nor gc.root_bead_id, and the pool
+# offers it as a launch fallback once no step is ready, which is the state a
+# controller restart leaves a live molecule in (gcp-x8jue). Keying on gc.step_ref
+# alone let a claim of a root report ownership while another live session held
+# the molecule's steps. A root is its own molecule.
+GUARD_STEP_ID="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].metadata."gc.step_id" // empty' 2>/dev/null)"
+GUARD_KIND="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].metadata."gc.kind" // empty' 2>/dev/null)"
+
+# Only a pool claim can be a duplicate pour. `existing_assignment` and
 # `ready_assignment` mean the bead already carried this session's identity
 # before the hook ran, and the release clears the assignee — so a released bead
-# can never reach us by those tiers. Skipping them keeps three `gc` round-trips
-# off the ordinary step-to-step path, where a molecule's own preassigned steps
-# come back as `ready_assignment` every time. An unknown reason still checks.
-if [ -n "$STEP_REF" ] && { [ -z "$CLAIM_REASON" ] || [ "$CLAIM_REASON" = "claimed" ]; }; then
-  # The molecule's last holder. Source 1 is the claimed step's own
+# can never reach us by those tiers. Skipping exactly those two keeps three `gc`
+# round-trips off the ordinary step-to-step path, where a molecule's own
+# preassigned steps come back as `ready_assignment` every time. Every other
+# reason checks: claimed, an absent reason, and one this script has never seen
+# (gcp-4b7ji). Wrongly checking costs round-trips; wrongly skipping costs a
+# stomped worktree.
+if { [ -n "$STEP_REF" ] || [ -n "$GUARD_STEP_ID" ] || [ "$GUARD_KIND" = "workflow" ]; } && [ "$CLAIM_REASON" != "existing_assignment" ] && [ "$CLAIM_REASON" != "ready_assignment" ]; then
+  # The molecule's last holder. Source 1 is the claimed bead's own
   # `polecat_session`, which gc's release and our hook claim both leave alone.
   # Source 2 is required because mid-run steps are claimed with a bare
   # `gc hook --claim` and carry no `polecat_session`: the most recently updated
-  # sibling step that still names an assignee stands in for it.
+  # sibling step that still names an assignee stands in for it. For a root the
+  # siblings are its steps (gc.root_bead_id=<root>), and the root is the molecule.
   GUARD_ROOT="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].metadata."gc.root_bead_id" // empty' 2>/dev/null)"
+  if [ -z "$GUARD_ROOT" ] && [ "$GUARD_KIND" = "workflow" ]; then
+    GUARD_ROOT="$WORK_ID"
+  fi
   GUARD_OWNER="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].metadata.polecat_session // empty' 2>/dev/null)"
   if [ -z "$GUARD_OWNER" ] && [ -n "$GUARD_ROOT" ]; then
     GUARD_OWNER="$(gc bd list --metadata-field "gc.root_bead_id=$GUARD_ROOT" --all --limit=0 --json 2>/dev/null |

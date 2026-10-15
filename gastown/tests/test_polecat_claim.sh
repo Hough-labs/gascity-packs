@@ -32,6 +32,9 @@ fail() {
 
 ME=gastown__polecat-gc-psfm
 SHOW_OK='[{"id":"w-1","status":"in_progress","assignee":"'$ME'","metadata":{"gc.step_ref":"mol-polecat-work.implement","gc.root_bead_id":"w-root"}}]'
+# A mol-polecat-work ROOT carries gc.kind=workflow and gc.step_id but neither
+# gc.step_ref nor gc.root_bead_id (gcp-x8jue), so it is its own molecule.
+SHOW_ROOT='[{"id":"w-1","status":"in_progress","assignee":"'$ME'","metadata":{"gc.kind":"workflow","gc.step_id":"mol-polecat-work"}}]'
 SESS='{"sessions":[{"id":"gc-8a4d","name":"winnow/gastown.furiosa","session_name":"gastown__polecat-gc-8a4d","alias":"winnow/gastown.furiosa","template":"winnow/gastown.polecat","closed":false},{"id":"gc-ref1","session_name":"winnow--gastown__refinery","alias":"winnow/gastown.refinery","name":"winnow/gastown.refinery","template":"winnow/gastown.refinery","closed":false},{"id":"gc-crw1","session_name":"winnow--specialists__thomas","alias":"winnow/specialists.thomas","name":"winnow/specialists.thomas","template":"winnow/specialists.spec","closed":false},{"id":"gc-nt","session_name":"nt-sess","alias":"winnow/x.nt","name":"winnow/x.nt","closed":false},{"id":"gc-dead","session_name":"dead-sess","alias":"winnow/gastown.dead","name":"winnow/gastown.dead","template":"winnow/gastown.polecat","closed":true}]}'
 
 # write_stubs answers only the reads and writes the claim makes and journals
@@ -113,9 +116,10 @@ assert_calls() {
     diff -u "$dir/want.calls" "$dir/calls.log" || fail "the gc/sleep call log differs from the heredoc's (diff above)"
 }
 
-# ok_hook <dir> [reason] has gc hook --claim hand back w-1.
+# ok_hook <dir> [reason] has gc hook --claim hand back w-1 in the shape gc
+# writes on success: action "work", with the reason saying which tier found it.
 ok_hook() {
-    printf '{"action":"claimed","bead_id":"w-1","reason":"%s"}' "${2-claimed}" >"$1/hook"
+    printf '{"action":"work","bead_id":"w-1","reason":"%s"}' "${2-claimed}" >"$1/hook"
 }
 
 # sib <assignee> prints the molecule's step list: an older sibling held by
@@ -124,10 +128,24 @@ sib() {
     printf '[{"id":"w-sib","assignee":"%s","updated_at":"2026-09-07T20:30:00Z"},{"id":"w-1","assignee":"%s","updated_at":"2026-09-07T20:40:00Z"}]' "$1" "$ME"
 }
 
+# rsib <assignee> prints the steps of a root's molecule: one step held by
+# <assignee>. The root itself is not among them.
+rsib() {
+    printf '[{"id":"w-step","assignee":"%s","updated_at":"2026-09-07T20:30:00Z"}]' "$1"
+}
+
 setup_noid() { echo 'unset BEADS_ACTOR' >"$1/env"; }
 setup_drain() { echo '{"action":"drain"}' >"$1/hook"; }
 setup_empty() { echo '{}' >"$1/hook"; }
 setup_garbage() { echo 'not json' >"$1/hook"; }
+setup_nonobject() { echo '[]' >"$1/hook"; }
+setup_blank() { : >"$1/hook"; }
+setup_garbageflaky() {
+    echo 'not json' >"$1/hook.1"
+    ok_hook "$1"
+    echo "$SHOW_OK" >"$1/show"
+    sib "$ME" >"$1/list"
+}
 setup_hookfail() {
     : >"$1/hook"
     echo 1 >"$1/hook.code"
@@ -174,6 +192,40 @@ setup_unknownrsn() {
     ok_hook "$1" weird
     echo "$SHOW_OK" >"$1/show"
     sib gastown__polecat-gc-8a4d >"$1/list"
+    echo "$SESS" >"$1/sessions"
+}
+setup_existing() {
+    ok_hook "$1" existing_assignment
+    echo "$SHOW_OK" >"$1/show"
+    sib gastown__polecat-gc-8a4d >"$1/list"
+    echo "$SESS" >"$1/sessions"
+}
+setup_rootlive() {
+    ok_hook "$1"
+    echo "$SHOW_ROOT" >"$1/show"
+    rsib gastown__polecat-gc-8a4d >"$1/list"
+    echo "$SESS" >"$1/sessions"
+}
+setup_roottag() {
+    ok_hook "$1"
+    echo '[{"id":"w-1","status":"in_progress","assignee":"'$ME'","metadata":{"gc.kind":"workflow","gc.step_id":"mol-polecat-work","polecat_session":"gastown__polecat-gc-8a4d"}}]' >"$1/show"
+    echo "$SESS" >"$1/sessions"
+}
+setup_rootdead() {
+    ok_hook "$1"
+    echo "$SHOW_ROOT" >"$1/show"
+    rsib winnow/gastown.dead >"$1/list"
+    echo "$SESS" >"$1/sessions"
+}
+setup_rootfresh() {
+    ok_hook "$1"
+    echo "$SHOW_ROOT" >"$1/show"
+    echo '[]' >"$1/list"
+}
+setup_rootexisting() {
+    ok_hook "$1" existing_assignment
+    echo "$SHOW_ROOT" >"$1/show"
+    rsib gastown__polecat-gc-8a4d >"$1/list"
     echo "$SESS" >"$1/sessions"
 }
 setup_noowner() {
@@ -313,10 +365,81 @@ gc runtime drain-ack
 EOF
 }
 
+# Stdout at exit 0 that is not one JSON object is a truncated or corrupted
+# result, not "no work": it is retried like a failed call, and only a run of
+# them ends in CLAIM_REJECTED.
 test_case_garbage() {
     local dir
     dir=$(new_case)
     setup_garbage "$dir"
+    run_claim "$dir"
+    assert_stdout "$dir" <<'EOF'
+CLAIM_RETRY hook call failed (code=0): malformed claim result
+CLAIM_RETRY hook call failed (code=0): malformed claim result
+CLAIM_RETRY hook call failed (code=0): malformed claim result
+CLAIM_REJECTED gc hook --claim returned no workable bead after retries
+EOF
+    assert_calls "$dir" <<'EOF'
+gc hook --claim --json
+sleep 2
+gc hook --claim --json
+sleep 2
+gc hook --claim --json
+sleep 2
+gc runtime drain-ack
+EOF
+}
+
+test_case_nonobject() {
+    local dir
+    dir=$(new_case)
+    setup_nonobject "$dir"
+    run_claim "$dir"
+    assert_stdout "$dir" <<'EOF'
+CLAIM_RETRY hook call failed (code=0): malformed claim result
+CLAIM_RETRY hook call failed (code=0): malformed claim result
+CLAIM_RETRY hook call failed (code=0): malformed claim result
+CLAIM_REJECTED gc hook --claim returned no workable bead after retries
+EOF
+    assert_calls "$dir" <<'EOF'
+gc hook --claim --json
+sleep 2
+gc hook --claim --json
+sleep 2
+gc hook --claim --json
+sleep 2
+gc runtime drain-ack
+EOF
+}
+
+test_case_garbageflaky() {
+    local dir
+    dir=$(new_case)
+    setup_garbageflaky "$dir"
+    run_claim "$dir"
+    assert_stdout "$dir" <<'EOF'
+CLAIM_RETRY hook call failed (code=0): malformed claim result
+CLAIMED_BEAD_ID=w-1
+{
+  "gc.step_ref": "mol-polecat-work.implement",
+  "gc.root_bead_id": "w-root"
+}
+EOF
+    assert_calls "$dir" <<'EOF'
+gc hook --claim --json
+sleep 2
+gc hook --claim --json
+gc bd show w-1 --json
+gc bd list --metadata-field gc.root_bead_id=w-root --all --limit=0 --json
+gc bd update w-1 --set-metadata polecat_session=gastown__polecat-gc-psfm
+EOF
+}
+
+# Empty stdout at exit 0 is a clean "no work", unlike a truncated object.
+test_case_blank() {
+    local dir
+    dir=$(new_case)
+    setup_blank "$dir"
     run_claim "$dir"
     assert_stdout "$dir" <<'EOF'
 NO_ROUTED_WORK
@@ -504,17 +627,148 @@ EOF
 test_case_unknownrsn() {
     local dir
     dir=$(new_case)
-    # Documents CURRENT behaviour: a hook reason other than "claimed" skips the
-    # live-owner guard, so the bead is claimed without reading the molecule, even
-    # though the guard's own comment says an unknown reason still checks. The
-    # script keeps that as the heredoc had it; gcp-4b7ji tracks the mismatch.
+    # The guard skips exactly existing_assignment and ready_assignment. A reason
+    # this script has never seen is checked like `claimed`, so a live polecat
+    # holder declines it (gcp-4b7ji).
     setup_unknownrsn "$dir"
+    run_claim "$dir"
+    assert_stdout "$dir" <<'EOF'
+CLAIM_DECLINED_LIVE_OWNER w-1
+  molecule w-root was last held by gastown__polecat-gc-8a4d, and this session is gastown__polecat-gc-psfm.
+  that owner is live (session gc-8a4d). This is a duplicate pour onto an in-flight molecule.
+  Restoring the step to its owner and draining. No code, branch, or worktree touched.
+EOF
+    assert_calls "$dir" <<'EOF'
+gc hook --claim --json
+gc bd show w-1 --json
+gc bd list --metadata-field gc.root_bead_id=w-root --all --limit=0 --json
+gc session list --json
+gc bd update w-1 --assignee=gastown__polecat-gc-8a4d --set-metadata gc.session_name=gastown__polecat-gc-8a4d --set-metadata polecat_session=gastown__polecat-gc-8a4d --set-metadata gc.session_id=gc-8a4d
+gc session nudge winnow/gastown.witness DUPLICATE_POUR declined: step w-1 poured onto gastown__polecat-gc-psfm while molecule w-root was last held by gastown__polecat-gc-8a4d. Step restored to its owner.
+gc runtime drain-ack
+EOF
+}
+
+# existing_assignment means the bead carried our identity before the hook ran,
+# and a release clears the assignee, so the guard does not read the molecule even
+# though a live holder is on it.
+test_case_existing() {
+    local dir
+    dir=$(new_case)
+    setup_existing "$dir"
     run_claim "$dir"
     assert_stdout "$dir" <<'EOF'
 CLAIMED_BEAD_ID=w-1
 {
   "gc.step_ref": "mol-polecat-work.implement",
   "gc.root_bead_id": "w-root"
+}
+EOF
+    assert_calls "$dir" <<'EOF'
+gc hook --claim --json
+gc bd show w-1 --json
+gc bd update w-1 --set-metadata polecat_session=gastown__polecat-gc-psfm
+EOF
+}
+
+# A molecule ROOT is its own molecule (gcp-x8jue): the pool offers one once no
+# step is ready, and claiming it must not stomp a live session holding the steps.
+test_case_rootlive() {
+    local dir
+    dir=$(new_case)
+    setup_rootlive "$dir"
+    run_claim "$dir"
+    assert_stdout "$dir" <<'EOF'
+CLAIM_DECLINED_LIVE_OWNER w-1
+  molecule w-1 was last held by gastown__polecat-gc-8a4d, and this session is gastown__polecat-gc-psfm.
+  that owner is live (session gc-8a4d). This is a duplicate pour onto an in-flight molecule.
+  Restoring the step to its owner and draining. No code, branch, or worktree touched.
+EOF
+    assert_calls "$dir" <<'EOF'
+gc hook --claim --json
+gc bd show w-1 --json
+gc bd list --metadata-field gc.root_bead_id=w-1 --all --limit=0 --json
+gc session list --json
+gc bd update w-1 --assignee=gastown__polecat-gc-8a4d --set-metadata gc.session_name=gastown__polecat-gc-8a4d --set-metadata polecat_session=gastown__polecat-gc-8a4d --set-metadata gc.session_id=gc-8a4d
+gc session nudge winnow/gastown.witness DUPLICATE_POUR declined: step w-1 poured onto gastown__polecat-gc-psfm while molecule w-1 was last held by gastown__polecat-gc-8a4d. Step restored to its owner.
+gc runtime drain-ack
+EOF
+}
+
+test_case_roottag() {
+    local dir
+    dir=$(new_case)
+    setup_roottag "$dir"
+    run_claim "$dir"
+    assert_stdout "$dir" <<'EOF'
+CLAIM_DECLINED_LIVE_OWNER w-1
+  molecule w-1 was last held by gastown__polecat-gc-8a4d, and this session is gastown__polecat-gc-psfm.
+  that owner is live (session gc-8a4d). This is a duplicate pour onto an in-flight molecule.
+  Restoring the step to its owner and draining. No code, branch, or worktree touched.
+EOF
+    assert_calls "$dir" <<'EOF'
+gc hook --claim --json
+gc bd show w-1 --json
+gc session list --json
+gc bd update w-1 --assignee=gastown__polecat-gc-8a4d --set-metadata gc.session_name=gastown__polecat-gc-8a4d --set-metadata polecat_session=gastown__polecat-gc-8a4d --set-metadata gc.session_id=gc-8a4d
+gc session nudge winnow/gastown.witness DUPLICATE_POUR declined: step w-1 poured onto gastown__polecat-gc-psfm while molecule w-1 was last held by gastown__polecat-gc-8a4d. Step restored to its owner.
+gc runtime drain-ack
+EOF
+}
+
+test_case_rootdead() {
+    local dir
+    dir=$(new_case)
+    setup_rootdead "$dir"
+    run_claim "$dir"
+    assert_stdout "$dir" <<'EOF'
+WARN molecule w-1 was last held by winnow/gastown.dead, but no live session holds that identity — treating this as a resume and proceeding.
+CLAIMED_BEAD_ID=w-1
+{
+  "gc.kind": "workflow",
+  "gc.step_id": "mol-polecat-work"
+}
+EOF
+    assert_calls "$dir" <<'EOF'
+gc hook --claim --json
+gc bd show w-1 --json
+gc bd list --metadata-field gc.root_bead_id=w-1 --all --limit=0 --json
+gc session list --json
+gc bd update w-1 --set-metadata polecat_session=gastown__polecat-gc-psfm
+EOF
+}
+
+test_case_rootfresh() {
+    local dir
+    dir=$(new_case)
+    setup_rootfresh "$dir"
+    run_claim "$dir"
+    assert_stdout "$dir" <<'EOF'
+WARN live-owner guard could not resolve an owner for this molecule; proceeding unguarded
+CLAIMED_BEAD_ID=w-1
+{
+  "gc.kind": "workflow",
+  "gc.step_id": "mol-polecat-work"
+}
+EOF
+    assert_calls "$dir" <<'EOF'
+gc hook --claim --json
+gc bd show w-1 --json
+gc bd list --metadata-field gc.root_bead_id=w-1 --all --limit=0 --json
+gc bd update w-1 --set-metadata polecat_session=gastown__polecat-gc-psfm
+EOF
+}
+
+test_case_rootexisting() {
+    local dir
+    dir=$(new_case)
+    setup_rootexisting "$dir"
+    run_claim "$dir"
+    assert_stdout "$dir" <<'EOF'
+CLAIMED_BEAD_ID=w-1
+{
+  "gc.kind": "workflow",
+  "gc.step_id": "mol-polecat-work"
 }
 EOF
     assert_calls "$dir" <<'EOF'
@@ -818,6 +1072,9 @@ test_case_noid
 test_case_drain
 test_case_empty
 test_case_garbage
+test_case_nonobject
+test_case_garbageflaky
+test_case_blank
 test_case_hookfail
 test_case_hookflaky
 test_case_unread
@@ -828,6 +1085,12 @@ test_case_notinprog
 test_case_nonstep
 test_case_ready
 test_case_unknownrsn
+test_case_existing
+test_case_rootlive
+test_case_roottag
+test_case_rootdead
+test_case_rootfresh
+test_case_rootexisting
 test_case_noowner
 test_case_self
 test_case_alias
