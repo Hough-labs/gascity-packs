@@ -52,6 +52,8 @@ CHECKED_STEPS = {
 # in gascity; see the ga-uppw56 follow-ups. Remove an entry when it is fixed.
 DEFERRED_STEPS = {
     ("gastown/formulas/mol-polecat-work.toml", "workspace-setup"),
+    # The gates-script-not-found STOP, the same mid-workflow early exit as self-review's.
+    ("gastown/formulas/mol-polecat-work.toml", "preflight-tests"),
     ("gastown/formulas/mol-polecat-work.toml", "self-review"),
     ("gastown/formulas/mol-review-leg.toml", "load-assignment"),
 }

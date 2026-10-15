@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 15 Oct 2026 05:15:46 -0400
-Subject: [PATCH 169/170] fix(gastown): re-key the polecat resume re-verify to
+Subject: [PATCH 169/171] fix(gastown): re-key the polecat resume re-verify to
  the step the session holds (gcp-o1nij)
 
 The resume re-verify in the polecat prompt drained every healthy resumed

@@ -9,10 +9,11 @@
 # The refinery's run-tests writes the same kind of log, and handle-failures
 # classifies it through known-red before it diagnoses or files anything.
 #
-# Every block is EXECUTED from the shipped formula text, never transcribed:
-# resolve-known-red, gate-run, known-red-phase-skip, preflight's own
-# preflight-phases and preflight-red, and the refinery's refinery-gates,
-# refinery-known-red-match and refinery-known-red-file. They run against a stub `gc` that answers
+# Every block is EXECUTED from the shipped text, never transcribed: the
+# polecat's resolve-known-red, gate-run, known-red-phase-skip, preflight-phases
+# and preflight-red come from assets/scripts/polecat-gates.sh (gcp-v9mvh), and
+# the refinery's refinery-gates, refinery-known-red-match and
+# refinery-known-red-file from mol-refinery-patrol. They run against a stub `gc` that answers
 # `gc formula list --json` from a canned file and forwards every ledger call to
 # tests/fixtures/known_red/fake_gc.py, and against the REAL
 # gastown/assets/scripts/known-red, so a drift between the formula and the
@@ -24,6 +25,7 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 FORMULA="$ROOT/gastown/formulas/mol-polecat-work.toml"
 REFINERY="$ROOT/gastown/formulas/mol-refinery-patrol.toml"
+GATES="$ROOT/gastown/assets/scripts/polecat-gates.sh"
 KNOWN_RED="$ROOT/gastown/assets/scripts/known-red"
 FAKE_GC="$ROOT/tests/fixtures/known_red/fake_gc.py"
 
@@ -36,13 +38,14 @@ fail() {
 }
 
 # (f) preflight-tests overrides the base step with the base's title and needs,
-# and the shared blocks are identical wherever they appear.
+# and the shared blocks live once, in the gates script, and in no formula step.
 test_f_structure() {
-    python3 - "$FORMULA" <<'PY' || fail "(f) the known-red blocks are misplaced or have drifted apart (see above)"
+    python3 - "$FORMULA" "$GATES" <<'PY' || fail "(f) the known-red blocks are misplaced (see above)"
 import sys
 import tomllib
 
 doc = tomllib.load(open(sys.argv[1], "rb"))
+script = open(sys.argv[2]).read()
 steps = {step["id"]: step for step in doc["steps"]}
 problems = []
 
@@ -58,34 +61,14 @@ else:
     if pre.get("needs") != ["workspace-setup"]:
         problems.append(f"preflight-tests needs {pre.get('needs')!r}, want ['workspace-setup']")
 
-
-def block(text, name):
-    begin, end = f"# --- {name}:begin ---", f"# --- {name}:end ---"
-    if text.count(begin) != 1 or text.count(end) != 1:
-        return None
-    body = text.split(begin, 1)[1].split(end, 1)[0]
-    return [line.lstrip() for line in body.strip().split("\n")]
-
-
 texts = {sid: step.get("description", "") for sid, step in steps.items()}
-for name, want in (
-    ("resolve-known-red", ["preflight-tests", "self-review"]),
-    ("gate-run", ["preflight-tests", "self-review"]),
-    ("known-red-phase-skip", ["preflight-tests"]),
-):
-    begin = f"# --- {name}:begin ---"
-    holders = sorted(sid for sid, text in texts.items() if begin in text)
-    if holders != sorted(want):
-        problems.append(f"{name} lives in {holders}, want exactly {sorted(want)}")
-        continue
-    copies = {sid: block(texts[sid], name) for sid in want}
-    for sid, lines in copies.items():
-        if lines is None:
-            problems.append(f"{sid}: want exactly one {name} begin and one end sentinel")
-    first = copies[want[0]]
-    for sid in want[1:]:
-        if first is not None and copies[sid] is not None and copies[sid] != first:
-            problems.append(f"{name}: {sid}'s copy differs from {want[0]}'s after stripping leading whitespace")
+for name in ("resolve-known-red", "gate-run", "known-red-phase-skip"):
+    begin, end = f"# --- {name}:begin ---", f"# --- {name}:end ---"
+    if script.count(begin) != 1 or script.count(end) != 1:
+        problems.append(f"polecat-gates.sh: want exactly one {name} begin and one end sentinel")
+    for sid in ("preflight-tests", "self-review"):
+        if begin in texts.get(sid, ""):
+            problems.append(f"{name} must not live in the {sid} step any more, it lives in polecat-gates.sh")
 
 for problem in problems:
     print(f"  {problem}", file=sys.stderr)
@@ -117,6 +100,21 @@ leftover = sorted(set(re.findall(r"\{\{[^}]*\}\}", block)))
 if leftover:
     sys.exit(f"{name} block has unrendered placeholders: {leftover}")
 open(out, "w").write(block)
+PY
+}
+
+# extract_gates_block <name> <outfile> — one sentinel block from the gates
+# script, as written: it holds no {{var}}, and reads its inputs from PG_* env.
+extract_gates_block() {
+    python3 - "$GATES" "$@" <<'PY'
+import sys
+
+script, name, out = sys.argv[1:]
+begin, end = f"# --- {name}:begin ---", f"# --- {name}:end ---"
+text = open(script).read()
+if text.count(begin) != 1 or text.count(end) != 1:
+    sys.exit(f"want exactly one {name} block in {script}")
+open(out, "w").write(text.split(begin, 1)[1].split(end, 1)[0])
 PY
 }
 
@@ -385,20 +383,22 @@ test_d_phase_covered() {
         fail "(d) a consistent stand-in answer must cover test, got $RUN_CODE: $(cat "$TMP/run.log")"
 }
 
-# preflight <env...> — the preflight §1 block rendered with stub phase
-# commands that record their invocation, then the §2/§3 block. typecheck uses
-# winnow's quoting shape. Preflight runs typecheck and lint only (gcp-zhbyb), so
-# a red is injected through PREFLIGHT_LINT. test_command stays a recording stub
-# so a test phase that comes back shows up in $INVOKED.
+# preflight <env...> — the preflight §1 blocks from the gates script, fed the
+# PG_* values the formula step would pass, with stub phase commands that record
+# their invocation, then the §2/§3 block. typecheck uses winnow's quoting shape.
+# Preflight runs typecheck and lint only (gcp-zhbyb), so a red is injected
+# through PREFLIGHT_LINT. PG_TEST_COMMAND stays a recording stub so a test phase
+# that comes back shows up in $INVOKED.
 preflight() {
     : >"$TMP/invoked"
     printf '#!/usr/bin/env bash\necho "$1" >>"$INVOKED"\n' >"$TMP/repo/stub-gate.sh"
-    extract_block "$FORMULA" preflight-tests preflight-phases "$TMP/phases.sh" \
-        typecheck_command='bash "$(pwd)/stub-gate.sh" typecheck' \
-        lint_command="${PREFLIGHT_LINT:-echo lint >>\"\$INVOKED\"}" \
-        test_command='echo test >>"$INVOKED"' || return 1
-    extract_block "$FORMULA" preflight-tests preflight-red "$TMP/red.sh" base_branch=integration convoy_id=gcp-convoy binding_prefix=gastown. || return 1
+    extract_gates_block preflight-phases "$TMP/phases.sh" || return 1
+    extract_gates_block preflight-red "$TMP/red.sh" || return 1
     run_blocks "$TMP/resolve.sh" "$TMP/gate.sh" "$TMP/skip.sh" "$TMP/phases.sh" "$TMP/red.sh" -- \
+        PG_BASE_BRANCH=integration PG_CONVOY_ID=gcp-convoy PG_BINDING_PREFIX=gastown. \
+        PG_TYPECHECK_COMMAND='bash "$(pwd)/stub-gate.sh" typecheck' \
+        PG_LINT_COMMAND="${PREFLIGHT_LINT:-echo lint >>\"\$INVOKED\"}" \
+        PG_TEST_COMMAND='echo test >>"$INVOKED"' \
         GC_STUB_FORMULAS="$TMP/formulas.json" INVOKED="$TMP/invoked" "$@"
 }
 
@@ -435,9 +435,12 @@ test_e_preflight_skips_only_the_covered_phase() {
         fail "(e) gcp-zhbyb: preflight must never run the test phase on base, invoked: $(cat "$TMP/invoked")"
     grep -q '^WARN known-red not found' "$TMP/run.log" || fail "(e) a missing known-red must WARN, got: $(cat "$TMP/run.log")"
 
-    # gcp-zhbyb: the formula carries no test phase in its preflight loop.
-    [ "$(grep -c 'preflight_phase test' "$FORMULA")" = "0" ] ||
-        fail "(e) gcp-zhbyb: $FORMULA must not contain 'preflight_phase test', found $(grep -c 'preflight_phase test' "$FORMULA")"
+    # gcp-zhbyb: the gates script carries no test phase in its preflight loop,
+    # and the count is not vacuous: the typecheck phase is there.
+    [ "$(grep -c 'preflight_phase test' "$GATES")" = "0" ] ||
+        fail "(e) gcp-zhbyb: $GATES must not contain 'preflight_phase test', found $(grep -c 'preflight_phase test' "$GATES")"
+    [ "$(grep -c 'preflight_phase typecheck' "$GATES")" = "1" ] ||
+        fail "(e) $GATES must hold exactly one 'preflight_phase typecheck', found $(grep -c 'preflight_phase typecheck' "$GATES")"
 }
 
 # The preflight red branch acts on known-red's exit code.
@@ -484,14 +487,15 @@ test_preflight_red_lookup_failure_files_nothing() {
     ! grep -q '"create"' "$TMP/fake_gc.log" || fail "a failed lookup must file nothing"
 }
 
-# (f2) The refinery reuses the polecat's blocks as identical copies, each in
-# the one step that needs it, and keeps its step ids and needs.
+# (f2) The refinery reuses the polecat's blocks (now in polecat-gates.sh) as
+# identical copies, each in the one step that needs it, and keeps its step ids and needs.
 test_f2_refinery_structure() {
-    python3 - "$REFINERY" "$FORMULA" <<'PY' || fail "(f2) the refinery's known-red blocks are misplaced or have drifted (see above)"
+    python3 - "$REFINERY" "$GATES" <<'PY' || fail "(f2) the refinery's known-red blocks are misplaced or have drifted (see above)"
 import sys
 import tomllib
 
-refinery, polecat = (tomllib.load(open(p, "rb")) for p in sys.argv[1:3])
+refinery = tomllib.load(open(sys.argv[1], "rb"))
+polecat = open(sys.argv[2]).read()
 problems = []
 
 # mol-refinery-patrol's steps at e585cda6, before this wiring.
@@ -517,7 +521,6 @@ def block(text, name):
 
 
 texts = {s["id"]: s.get("description", "") for s in refinery["steps"]}
-preflight = next(s.get("description", "") for s in polecat["steps"] if s["id"] == "preflight-tests")
 for name, want, shared in (
     ("gate-run", ["run-tests"], True),
     ("resolve-known-red", ["handle-failures"], True),
@@ -534,8 +537,8 @@ for name, want, shared in (
         lines = block(texts[sid], name)
         if lines is None:
             problems.append(f"{sid}: want exactly one {name} begin and one end sentinel")
-        elif shared and lines != block(preflight, name):
-            problems.append(f"{name}: {sid}'s copy differs from mol-polecat-work preflight-tests' after stripping leading whitespace")
+        elif shared and lines != block(polecat, name):
+            problems.append(f"{name}: {sid}'s copy differs from polecat-gates.sh's after stripping leading whitespace")
 
 for problem in problems:
     print(f"  {problem}", file=sys.stderr)
@@ -760,7 +763,7 @@ test_f2_refinery_structure
 
 POLECAT_OK=1
 for name in resolve-known-red:resolve gate-run:gate known-red-phase-skip:skip; do
-    extract_block "$FORMULA" preflight-tests "${name%%:*}" "$TMP/${name#*:}.sh" || { fail "could not extract ${name%%:*}"; POLECAT_OK=0; continue; }
+    extract_gates_block "${name%%:*}" "$TMP/${name#*:}.sh" || { fail "could not extract ${name%%:*}"; POLECAT_OK=0; continue; }
     bash -n "$TMP/${name#*:}.sh" || { fail "extracted ${name%%:*} block is not valid shell"; POLECAT_OK=0; }
 done
 if [ "$POLECAT_OK" -ne 1 ]; then

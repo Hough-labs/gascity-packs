@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sat, 10 Oct 2026 16:38:42 -0400
-Subject: [PATCH 132/170] fix(ci): name a go-install build's source from its
+Subject: [PATCH 132/171] fix(ci): name a go-install build's source from its
  module's .Origin.Hash (gcp-fooz4)
 
 A `go install pkg@REF` build is module mode and records no

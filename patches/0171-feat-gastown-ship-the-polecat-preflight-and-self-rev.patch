@@ -1,0 +1,973 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 15 Oct 2026 07:53:37 -0400
+Subject: [PATCH 171/171] feat(gastown): ship the polecat preflight and
+ self-review gates as one pack executable (gcp-v9mvh)
+
+The preflight-tests section-1 fence (136 lines) and the self-review
+section-2 fence (91 lines) were shell the model retyped on every polecat
+run: measured at 18.4K and 14.9K output tokens per bead, and four of four
+preflight runs between 22:06Z and 01:40Z dropped a space while retyping
+and reported a false raw:gate(test): FAIL (winnow-fwxxak).
+
+Both fences now run as gastown/assets/scripts/polecat-gates.sh with a
+`preflight` and a `self-review` mode and ONE copy of resolve-known-red,
+gate-run and known-red-phase-skip. Each formula step carries a short stub
+that finds the script the way resolve_known_red already finds known-red
+(gc formula list --json -> source -> dirname twice; formula step text gets
+no Go-template fields, and GC_PACK_DIR is not exported to agent shells) and
+passes the rig's commands as PG_* env, so no {{var}} survives in the script.
+The self-review stub also exports BASE_REF, so a set-but-unexported
+BASE_REF still reaches the script and affected_tests_command.
+
+Behaviour is identical on every path but one: when the formula cannot be
+resolved the step now stops (STOP + drain-ack + exit 1) where the old
+fence warned that known-red was missing and ran the gates anyway. The stub
+and the script ship together, so only a city layer overriding
+mol-polecat-work or a broken gc can reach it. preflight-tests joins
+self-review in DEFERRED_STEPS for that early exit.
+
+Validation: a throwaway identity harness (not committed) renders the old
+fence and the new stub from each tree and diffs stdout, stderr, exit code,
+the gc/known-red call log and the gate log over 26 paths: 26 same, 0 differ,
+and a one-word mutation of the script turns two of them into DIFF.
+test_known_red_wiring.sh now reads the polecat blocks from the script by
+sentinel; test_polecat_gates.sh covers usage, required-var handling, the
+empty affected-tests fallback and both stubs' unresolved-script stop.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ gastown/assets/scripts/polecat-gates.sh    | 211 ++++++++++++++++++
+ gastown/formulas/mol-polecat-work.toml     | 242 ++-------------------
+ gastown/tests/test_known_red_wiring.sh     | 111 +++++-----
+ gastown/tests/test_polecat_gates.sh        | 211 ++++++++++++++++++
+ tests/test_v2_drain_ack_closes_own_step.py |   2 +
+ 5 files changed, 500 insertions(+), 277 deletions(-)
+ create mode 100755 gastown/assets/scripts/polecat-gates.sh
+ create mode 100755 gastown/tests/test_polecat_gates.sh
+
+diff --git a/gastown/assets/scripts/polecat-gates.sh b/gastown/assets/scripts/polecat-gates.sh
+new file mode 100755
+index 00000000..5e5ebc17
+--- /dev/null
++++ b/gastown/assets/scripts/polecat-gates.sh
+@@ -0,0 +1,211 @@
++#!/usr/bin/env bash
++# polecat-gates.sh preflight|self-review
++#
++# The quality gates of mol-polecat-work, run as one script so the polecat makes
++# one short call and does not retype them. "preflight" is the preflight-tests
++# step's gates on the base branch; "self-review" is the self-review step's
++# section 2 (BASE_REF must be exported by the caller).
++#
++# Inputs, set by the formula step in the environment of this call (an empty
++# value is allowed; an unset one stops the script):
++#   preflight:   PG_BASE_BRANCH PG_BINDING_PREFIX PG_CONVOY_ID
++#                PG_TYPECHECK_COMMAND PG_LINT_COMMAND
++#   self-review: PG_SETUP_COMMAND PG_TYPECHECK_COMMAND PG_LINT_COMMAND
++#                PG_BUILD_COMMAND PG_TEST_COMMAND PG_AFFECTED_TESTS_COMMAND
++# Env also read: GC_CITY GC_CITY_PATH GC_PACK_DIR GC_RIG
++#
++# The resolve-known-red, gate-run and known-red-phase-skip blocks are shared by
++# both modes. Their sentinel lines let the tests extract them.
++
++if [ "$#" -ne 1 ] || { [ "$1" != preflight ] && [ "$1" != self-review ]; }; then
++    echo "GATES_USAGE polecat-gates.sh preflight|self-review"
++    exit 2
++fi
++# --- resolve-known-red:begin ---
++# resolve_known_red <formula> prints the path of the pack's known-red and
++# returns 0, or returns 1. The named formula's own source anchors the pack, so
++# the matcher is always the copy shipped beside the formula being run.
++# GC_PACK_DIR is only a fallback, because gc exports it to pack commands and
++# not to agent shells.
++resolve_known_red() {
++    rkr_rel="assets/scripts/known-red"
++    rkr_city="${GC_CITY:-${GC_CITY_PATH:-}}"
++    if [ -n "$rkr_city" ]; then
++        rkr_json=$(gc formula list --city "$rkr_city" --json 2>/dev/null)
++    else
++        rkr_json=$(gc formula list --json 2>/dev/null)
++    fi
++    rkr_src=$(printf '%s' "$rkr_json" |
++        jq -r --arg f "$1" '.formulas[]? | select(.name == $f) | .source // empty' 2>/dev/null |
++        head -1)
++    if [ -n "$rkr_src" ]; then
++        # <pack>/formulas/<formula>.toml -> <pack>
++        rkr_pack=$(dirname "$(dirname "$rkr_src")")
++        if [ -x "$rkr_pack/$rkr_rel" ]; then
++            echo "$rkr_pack/$rkr_rel"
++            return 0
++        fi
++    fi
++    if [ -n "${GC_PACK_DIR:-}" ] && [ -x "$GC_PACK_DIR/$rkr_rel" ]; then
++        echo "$GC_PACK_DIR/$rkr_rel"
++        return 0
++    fi
++    return 1
++}
++# --- resolve-known-red:end ---
++# --- gate-run:begin ---
++# gate_run <phase> '<command>' appends one segment known-red can read to
++# $GATE_LOG: a `gate(<phase>): RUN` header, the command's output, then
++# `gate(<phase>): PASS` or `gate(<phase>): FAIL`. An empty command is a phase
++# the rig does not configure: it writes nothing and returns 0. The command is
++# passed single-quoted and eval'd, so double quotes and $(...) in it work.
++gate_run() {
++    gr_phase="$1"
++    gr_cmd="$2"
++    [ -n "${gr_cmd//[[:space:]]/}" ] || return 0
++    echo "gate($gr_phase): RUN $(printf '%s' "$gr_cmd" | tr -s '[:space:]' ' ')" | tee -a "$GATE_LOG"
++    if ( eval "$gr_cmd" ) </dev/null >>"$GATE_LOG" 2>&1; then
++        echo "gate($gr_phase): PASS" | tee -a "$GATE_LOG"
++        return 0
++    fi
++    echo "gate($gr_phase): FAIL" >>"$GATE_LOG"
++    tail -n 40 "$GATE_LOG"
++    return 1
++}
++# --- gate-run:end ---
++# --- known-red-phase-skip:begin ---
++# kr_phase_covered <phase> prints the ids of the open base-red beads covering
++# that phase and returns 0, or returns 1. It returns 1 for no covering bead, a
++# failed lookup, and output it cannot parse: a phase is never skipped on an
++# answer nobody verified. Needs KR set to the known-red path.
++kr_phase_covered() {
++    kpc_out=$("$KR" list --phase "$1" 2>/dev/null) || return 1
++    printf '%s' "$kpc_out" | awk '
++        NR == 1 {
++            if ($0 !~ /^known-red: [0-9]+ base-red bead[(]s[)] in ledger /) { bad = 1; exit }
++            want = $2 + 0
++            next
++        }
++        /^[A-Za-z0-9]+-[A-Za-z0-9.]+ / { ids = ids (ids == "" ? "" : " ") $1; n++ }
++        END {
++            if (bad || NR == 0 || want == 0 || n != want) exit 1
++            print ids
++        }'
++}
++# --- known-red-phase-skip:end ---
++if [ "$1" = preflight ]; then
++: "${PG_BASE_BRANCH?not set (the formula step sets it; an empty value is allowed)}"
++: "${PG_BINDING_PREFIX?not set (the formula step sets it; an empty value is allowed)}"
++: "${PG_CONVOY_ID?not set (the formula step sets it; an empty value is allowed)}"
++: "${PG_TYPECHECK_COMMAND?not set (the formula step sets it; an empty value is allowed)}"
++: "${PG_LINT_COMMAND?not set (the formula step sets it; an empty value is allowed)}"
++# --- preflight-phases:begin ---
++KR=$(resolve_known_red mol-polecat-work) || KR=""
++GATE_LOG="$(git rev-parse --git-dir)/preflight-gate.log"
++: > "$GATE_LOG"
++[ -n "$KR" ] || echo "WARN known-red not found; running every phase and filing by hand"
++preflight_phase() {
++    [ -n "${2//[[:space:]]/}" ] || return 0
++    if [ -n "$KR" ] && pp_ids=$(kr_phase_covered "$1"); then
++        echo "phase $1 not re-run on base: known red $pp_ids" | tee -a "$GATE_LOG"
++        return 0
++    fi
++    gate_run "$1" "$2"
++}
++preflight_phase typecheck "$PG_TYPECHECK_COMMAND"
++preflight_phase lint "$PG_LINT_COMMAND"
++# --- preflight-phases:end ---
++# --- preflight-red:begin ---
++if ! grep -q '^gate([A-Za-z0-9_-]*): FAIL' "$GATE_LOG"; then
++    echo "PRE-FLIGHTS GREEN on ${PG_BASE_BRANCH} (log: $GATE_LOG)"
++else
++    CONVOY_STATUS=$(gc convoy status ${PG_CONVOY_ID} --json)
++    WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
++    WITNESS_TARGET="${GC_RIG:+$GC_RIG/}${PG_BINDING_PREFIX}witness"
++    if [ -z "$KR" ]; then
++        echo "PRE-FLIGHTS RED and known-red is unavailable: file by hand with the fallback block in §3."
++    else
++        KR_OUT=$("$KR" match "$GATE_LOG" 2>&1)
++        KR_CODE=$?
++        printf '%s\n' "$KR_OUT"
++        case "$KR_CODE" in
++        0|3)
++            KNOWN_IDS=$(printf '%s\n' "$KR_OUT" | awk '$1 == "KNOWN" { print $2 }' | sort -u | paste -sd ' ' -)
++            FIXED_IDS=$(printf '%s\n' "$KR_OUT" | awk '$1 == "FIXED-UPSTREAM" { print $2 }' | sort -u | paste -sd ' ' -)
++            gc bd note "$WORK_BEAD_ID" --stdin <<KNOWN_RED_NOTE
++Pre-flight on ${PG_BASE_BRANCH}: every red is already known (known-red match exit $KR_CODE). Filed nothing.
++KNOWN: ${KNOWN_IDS:-none}
++FIXED-UPSTREAM (the next rebase picks these up): ${FIXED_IDS:-none}
++KNOWN_RED_NOTE
++            echo "PRE-FLIGHTS RED, all KNOWN: ${KNOWN_IDS:-none}; FIXED-UPSTREAM: ${FIXED_IDS:-none}. Filed nothing. Proceed."
++            ;;
++        1)
++            FILE_OUT=$("$KR" file "$GATE_LOG" --summary "red in pre-flight on ${PG_BASE_BRANCH} at $(git rev-parse --short HEAD)" --from "$WORK_BEAD_ID" 2>&1)
++            FILE_CODE=$?
++            printf '%s\n' "$FILE_OUT"
++            FILED=$(printf '%s\n' "$FILE_OUT" | awk '$1 == "known-red:" && $2 == "filed" { print $3 }' | paste -sd ' ' -)
++            UNFILED=$(printf '%s\n' "$FILE_OUT" | awk '$1 ~ /^raw:/')
++            case "$FILE_CODE" in
++            0) FILE_NOTE="" ;;
++            1) FILE_NOTE="These reds have no stable id, so known-red cannot file them; quote them on $WORK_BEAD_ID: $UNFILED" ;;
++            *) FILE_NOTE="known-red file exited $FILE_CODE, so nothing may be filed. A create can land and still fail: run known-red list before filing again." ;;
++            esac
++            gc mail send "$WITNESS_TARGET" -s "NOTICE: ${PG_BASE_BRANCH} has failing pre-flights" -m "Filed: ${FILED:-none}. Proceeding with $WORK_BEAD_ID. $FILE_NOTE"
++            echo "PRE-FLIGHTS RED, NEW reds filed: ${FILED:-none}. Proceed. $FILE_NOTE"
++            ;;
++        *)
++            gc mail send "$WITNESS_TARGET" -s "NOTICE: ${PG_BASE_BRANCH} has failing pre-flights" -m "known-red lookup failed; not filed (match exit $KR_CODE). Log: $GATE_LOG. Proceeding with $WORK_BEAD_ID."
++            echo "PRE-FLIGHTS RED, known-red lookup failed (exit $KR_CODE); filed nothing. Proceed."
++            ;;
++        esac
++    fi
++fi
++# --- preflight-red:end ---
++else
++: "${BASE_REF:?base ref not resolved — run step 1 of this step first}"
++export BASE_REF
++: "${PG_SETUP_COMMAND?not set (the formula step sets it; an empty value is allowed)}"
++: "${PG_TYPECHECK_COMMAND?not set (the formula step sets it; an empty value is allowed)}"
++: "${PG_LINT_COMMAND?not set (the formula step sets it; an empty value is allowed)}"
++: "${PG_BUILD_COMMAND?not set (the formula step sets it; an empty value is allowed)}"
++: "${PG_TEST_COMMAND?not set (the formula step sets it; an empty value is allowed)}"
++: "${PG_AFFECTED_TESTS_COMMAND?not set (the formula step sets it; an empty value is allowed)}"
++# --- self-review-gates:begin ---
++KR=$(resolve_known_red mol-polecat-work) || KR=""
++GATE_LOG="$(git rev-parse --git-dir)/self-review-gate.log"
++: > "$GATE_LOG"
++gate_run setup "$PG_SETUP_COMMAND"
++gate_run typecheck "$PG_TYPECHECK_COMMAND"
++gate_run lint "$PG_LINT_COMMAND"
++gate_run build "$PG_BUILD_COMMAND"
++if [ -n "$PG_AFFECTED_TESTS_COMMAND" ]; then
++    # Rig has an affected-tests detector. Run only the tests our diff
++    # touches — same logic the rig's CI uses to dispatch test workflows.
++    # The command must read `git diff --name-only $BASE_REF...HEAD`
++    # internally (BASE_REF is exported in step 1) and execute the relevant
++    # subset. The guard above is load-bearing: fenced blocks run in separate
++    # shells, and an unset BASE_REF makes that diff read `HEAD...HEAD`, which
++    # exits 0 with no files — zero tests run, and the fail-closed clause
++    # below never fires. It must also fail closed: a pipe-style detector
++    # without `set -o pipefail` swallows a failed diff, runs zero tests,
++    # exits 0, and pushes untested work.
++    # The test above is single-quoted like gate_run's argument, so testing it
++    # never expands or runs any of it.
++    gate_run affected-tests "$PG_AFFECTED_TESTS_COMMAND"
++else
++    # No affected detector — run test_command as the rig configured it.
++    # That is not necessarily the full suite: a rig's test_command may
++    # itself select by diff.
++    gate_run test "$PG_TEST_COMMAND"
++fi
++if ! grep -q '^gate([A-Za-z0-9_-]*): FAIL' "$GATE_LOG"; then
++    echo "SELF-REVIEW GATES GREEN (log: $GATE_LOG)"
++elif [ -z "$KR" ]; then
++    echo "SELF-REVIEW RED (log: $GATE_LOG). known-red not found: attribute by hand, §3."
++else
++    echo "SELF-REVIEW RED (log: $GATE_LOG). known-red: $KR"
++    "$KR" match "$GATE_LOG"
++    echo "known-red match exit $?"
++fi
++# --- self-review-gates:end ---
++fi
+diff --git a/gastown/formulas/mol-polecat-work.toml b/gastown/formulas/mol-polecat-work.toml
+index 30fb1093..95a3942d 100644
+--- a/gastown/formulas/mol-polecat-work.toml
++++ b/gastown/formulas/mol-polecat-work.toml
+@@ -578,9 +578,10 @@ a full test sweep of the unchanged base would repeat that work (gcp-zhbyb).
+ **Skip this step if resuming a rejected branch** — pre-flights were
+ already verified on the prior attempt. Close this step and proceed.
+ 
+-**1. Run pre-flights (skip empty commands silently).** Run this whole block
+-in ONE shell. §2 and §3 need the functions and variables it sets, so they sit
+-at its end instead of in blocks of their own.
++**1. Run pre-flights (skip empty commands silently).** Run the block below as
++ONE Bash call, exactly as written. It runs the pack's gates script
++(`assets/scripts/polecat-gates.sh`), which prints what §2 and §3 act on. Do not
++retype the script or read it first.
+ 
+ A phase that an open base-red bead already covers is not re-run on base: all
+ that run could do is confirm a red the ledger already holds. A NEW typecheck
+@@ -595,140 +596,14 @@ pytest red filed as `phase=test` would silently skip `go test` on a rig whose
+ test_command is `go test` (gcp-98gh).
+ 
+ ```bash
+-# --- resolve-known-red:begin ---
+-# resolve_known_red <formula> prints the path of the pack's known-red and
+-# returns 0, or returns 1. The named formula's own source anchors the pack, so
+-# the matcher is always the copy shipped beside the formula being run.
+-# GC_PACK_DIR is only a fallback, because gc exports it to pack commands and
+-# not to agent shells.
+-resolve_known_red() {
+-    rkr_rel="assets/scripts/known-red"
+-    rkr_city="${GC_CITY:-${GC_CITY_PATH:-}}"
+-    if [ -n "$rkr_city" ]; then
+-        rkr_json=$(gc formula list --city "$rkr_city" --json 2>/dev/null)
+-    else
+-        rkr_json=$(gc formula list --json 2>/dev/null)
+-    fi
+-    rkr_src=$(printf '%s' "$rkr_json" |
+-        jq -r --arg f "$1" '.formulas[]? | select(.name == $f) | .source // empty' 2>/dev/null |
+-        head -1)
+-    if [ -n "$rkr_src" ]; then
+-        # <pack>/formulas/<formula>.toml -> <pack>
+-        rkr_pack=$(dirname "$(dirname "$rkr_src")")
+-        if [ -x "$rkr_pack/$rkr_rel" ]; then
+-            echo "$rkr_pack/$rkr_rel"
+-            return 0
+-        fi
+-    fi
+-    if [ -n "${GC_PACK_DIR:-}" ] && [ -x "$GC_PACK_DIR/$rkr_rel" ]; then
+-        echo "$GC_PACK_DIR/$rkr_rel"
+-        return 0
+-    fi
+-    return 1
+-}
+-# --- resolve-known-red:end ---
+-# --- gate-run:begin ---
+-# gate_run <phase> '<command>' appends one segment known-red can read to
+-# $GATE_LOG: a `gate(<phase>): RUN` header, the command's output, then
+-# `gate(<phase>): PASS` or `gate(<phase>): FAIL`. An empty command is a phase
+-# the rig does not configure: it writes nothing and returns 0. The command is
+-# passed single-quoted and eval'd, so double quotes and $(...) in it work.
+-gate_run() {
+-    gr_phase="$1"
+-    gr_cmd="$2"
+-    [ -n "${gr_cmd//[[:space:]]/}" ] || return 0
+-    echo "gate($gr_phase): RUN $(printf '%s' "$gr_cmd" | tr -s '[:space:]' ' ')" | tee -a "$GATE_LOG"
+-    if ( eval "$gr_cmd" ) </dev/null >>"$GATE_LOG" 2>&1; then
+-        echo "gate($gr_phase): PASS" | tee -a "$GATE_LOG"
+-        return 0
+-    fi
+-    echo "gate($gr_phase): FAIL" >>"$GATE_LOG"
+-    tail -n 40 "$GATE_LOG"
+-    return 1
+-}
+-# --- gate-run:end ---
+-# --- known-red-phase-skip:begin ---
+-# kr_phase_covered <phase> prints the ids of the open base-red beads covering
+-# that phase and returns 0, or returns 1. It returns 1 for no covering bead, a
+-# failed lookup, and output it cannot parse: a phase is never skipped on an
+-# answer nobody verified. Needs KR set to the known-red path.
+-kr_phase_covered() {
+-    kpc_out=$("$KR" list --phase "$1" 2>/dev/null) || return 1
+-    printf '%s' "$kpc_out" | awk '
+-        NR == 1 {
+-            if ($0 !~ /^known-red: [0-9]+ base-red bead[(]s[)] in ledger /) { bad = 1; exit }
+-            want = $2 + 0
+-            next
+-        }
+-        /^[A-Za-z0-9]+-[A-Za-z0-9.]+ / { ids = ids (ids == "" ? "" : " ") $1; n++ }
+-        END {
+-            if (bad || NR == 0 || want == 0 || n != want) exit 1
+-            print ids
+-        }'
+-}
+-# --- known-red-phase-skip:end ---
+-# --- preflight-phases:begin ---
+-KR=$(resolve_known_red mol-polecat-work) || KR=""
+-GATE_LOG="$(git rev-parse --git-dir)/preflight-gate.log"
+-: > "$GATE_LOG"
+-[ -n "$KR" ] || echo "WARN known-red not found; running every phase and filing by hand"
+-preflight_phase() {
+-    [ -n "${2//[[:space:]]/}" ] || return 0
+-    if [ -n "$KR" ] && pp_ids=$(kr_phase_covered "$1"); then
+-        echo "phase $1 not re-run on base: known red $pp_ids" | tee -a "$GATE_LOG"
+-        return 0
+-    fi
+-    gate_run "$1" "$2"
+-}
+-preflight_phase typecheck '{{typecheck_command}}'
+-preflight_phase lint '{{lint_command}}'
+-# --- preflight-phases:end ---
+-# --- preflight-red:begin ---
+-if ! grep -q '^gate([A-Za-z0-9_-]*): FAIL' "$GATE_LOG"; then
+-    echo "PRE-FLIGHTS GREEN on {{base_branch}} (log: $GATE_LOG)"
+-else
+-    CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
+-    WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
+-    WITNESS_TARGET="${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness"
+-    if [ -z "$KR" ]; then
+-        echo "PRE-FLIGHTS RED and known-red is unavailable: file by hand with the fallback block in §3."
+-    else
+-        KR_OUT=$("$KR" match "$GATE_LOG" 2>&1)
+-        KR_CODE=$?
+-        printf '%s\\n' "$KR_OUT"
+-        case "$KR_CODE" in
+-        0|3)
+-            KNOWN_IDS=$(printf '%s\\n' "$KR_OUT" | awk '$1 == "KNOWN" { print $2 }' | sort -u | paste -sd ' ' -)
+-            FIXED_IDS=$(printf '%s\\n' "$KR_OUT" | awk '$1 == "FIXED-UPSTREAM" { print $2 }' | sort -u | paste -sd ' ' -)
+-            gc bd note "$WORK_BEAD_ID" --stdin <<KNOWN_RED_NOTE
+-Pre-flight on {{base_branch}}: every red is already known (known-red match exit $KR_CODE). Filed nothing.
+-KNOWN: ${KNOWN_IDS:-none}
+-FIXED-UPSTREAM (the next rebase picks these up): ${FIXED_IDS:-none}
+-KNOWN_RED_NOTE
+-            echo "PRE-FLIGHTS RED, all KNOWN: ${KNOWN_IDS:-none}; FIXED-UPSTREAM: ${FIXED_IDS:-none}. Filed nothing. Proceed."
+-            ;;
+-        1)
+-            FILE_OUT=$("$KR" file "$GATE_LOG" --summary "red in pre-flight on {{base_branch}} at $(git rev-parse --short HEAD)" --from "$WORK_BEAD_ID" 2>&1)
+-            FILE_CODE=$?
+-            printf '%s\\n' "$FILE_OUT"
+-            FILED=$(printf '%s\\n' "$FILE_OUT" | awk '$1 == "known-red:" && $2 == "filed" { print $3 }' | paste -sd ' ' -)
+-            UNFILED=$(printf '%s\\n' "$FILE_OUT" | awk '$1 ~ /^raw:/')
+-            case "$FILE_CODE" in
+-            0) FILE_NOTE="" ;;
+-            1) FILE_NOTE="These reds have no stable id, so known-red cannot file them; quote them on $WORK_BEAD_ID: $UNFILED" ;;
+-            *) FILE_NOTE="known-red file exited $FILE_CODE, so nothing may be filed. A create can land and still fail: run known-red list before filing again." ;;
+-            esac
+-            gc mail send "$WITNESS_TARGET" -s "NOTICE: {{base_branch}} has failing pre-flights" -m "Filed: ${FILED:-none}. Proceeding with $WORK_BEAD_ID. $FILE_NOTE"
+-            echo "PRE-FLIGHTS RED, NEW reds filed: ${FILED:-none}. Proceed. $FILE_NOTE"
+-            ;;
+-        *)
+-            gc mail send "$WITNESS_TARGET" -s "NOTICE: {{base_branch}} has failing pre-flights" -m "known-red lookup failed; not filed (match exit $KR_CODE). Log: $GATE_LOG. Proceeding with $WORK_BEAD_ID."
+-            echo "PRE-FLIGHTS RED, known-red lookup failed (exit $KR_CODE); filed nothing. Proceed."
+-            ;;
+-        esac
+-    fi
++PG_SRC=$(gc formula list --json 2>/dev/null | jq -r '.formulas[]? | select(.name == "mol-polecat-work") | .source // empty' | head -1)
++PG="${PG_SRC:+$(dirname "$(dirname "$PG_SRC")")/assets/scripts/polecat-gates.sh}"
++if [ -z "$PG" ] || [ ! -f "$PG" ]; then
++    echo "STOP: gates script not found (resolved '${PG:-}'); the pack is broken. Do not run gates by hand."
++    gc runtime drain-ack
++    exit 1
+ fi
+-# --- preflight-red:end ---
++PG_BASE_BRANCH='{{base_branch}}' PG_BINDING_PREFIX='{{binding_prefix}}' PG_CONVOY_ID='{{convoy_id}}' PG_TYPECHECK_COMMAND='{{typecheck_command}}' PG_LINT_COMMAND='{{lint_command}}' bash "$PG" preflight
+ ```
+ 
+ **2. If pre-flights pass:** proceed. The block prints `PRE-FLIGHTS GREEN`
+@@ -818,94 +693,15 @@ sets one, else its `test_command` as configured (which may itself select by
+ diff). Each phase is named after the formula var that holds its command.
+ ```bash
+ : "${BASE_REF:?base ref not resolved — run step 1 of this step first}"
+-# --- resolve-known-red:begin ---
+-# resolve_known_red <formula> prints the path of the pack's known-red and
+-# returns 0, or returns 1. The named formula's own source anchors the pack, so
+-# the matcher is always the copy shipped beside the formula being run.
+-# GC_PACK_DIR is only a fallback, because gc exports it to pack commands and
+-# not to agent shells.
+-resolve_known_red() {
+-    rkr_rel="assets/scripts/known-red"
+-    rkr_city="${GC_CITY:-${GC_CITY_PATH:-}}"
+-    if [ -n "$rkr_city" ]; then
+-        rkr_json=$(gc formula list --city "$rkr_city" --json 2>/dev/null)
+-    else
+-        rkr_json=$(gc formula list --json 2>/dev/null)
+-    fi
+-    rkr_src=$(printf '%s' "$rkr_json" |
+-        jq -r --arg f "$1" '.formulas[]? | select(.name == $f) | .source // empty' 2>/dev/null |
+-        head -1)
+-    if [ -n "$rkr_src" ]; then
+-        # <pack>/formulas/<formula>.toml -> <pack>
+-        rkr_pack=$(dirname "$(dirname "$rkr_src")")
+-        if [ -x "$rkr_pack/$rkr_rel" ]; then
+-            echo "$rkr_pack/$rkr_rel"
+-            return 0
+-        fi
+-    fi
+-    if [ -n "${GC_PACK_DIR:-}" ] && [ -x "$GC_PACK_DIR/$rkr_rel" ]; then
+-        echo "$GC_PACK_DIR/$rkr_rel"
+-        return 0
+-    fi
+-    return 1
+-}
+-# --- resolve-known-red:end ---
+-# --- gate-run:begin ---
+-# gate_run <phase> '<command>' appends one segment known-red can read to
+-# $GATE_LOG: a `gate(<phase>): RUN` header, the command's output, then
+-# `gate(<phase>): PASS` or `gate(<phase>): FAIL`. An empty command is a phase
+-# the rig does not configure: it writes nothing and returns 0. The command is
+-# passed single-quoted and eval'd, so double quotes and $(...) in it work.
+-gate_run() {
+-    gr_phase="$1"
+-    gr_cmd="$2"
+-    [ -n "${gr_cmd//[[:space:]]/}" ] || return 0
+-    echo "gate($gr_phase): RUN $(printf '%s' "$gr_cmd" | tr -s '[:space:]' ' ')" | tee -a "$GATE_LOG"
+-    if ( eval "$gr_cmd" ) </dev/null >>"$GATE_LOG" 2>&1; then
+-        echo "gate($gr_phase): PASS" | tee -a "$GATE_LOG"
+-        return 0
+-    fi
+-    echo "gate($gr_phase): FAIL" >>"$GATE_LOG"
+-    tail -n 40 "$GATE_LOG"
+-    return 1
+-}
+-# --- gate-run:end ---
+-KR=$(resolve_known_red mol-polecat-work) || KR=""
+-GATE_LOG="$(git rev-parse --git-dir)/self-review-gate.log"
+-: > "$GATE_LOG"
+-gate_run setup '{{setup_command}}'
+-gate_run typecheck '{{typecheck_command}}'
+-gate_run lint '{{lint_command}}'
+-gate_run build '{{build_command}}'
+-if [ -n '{{affected_tests_command}}' ]; then
+-    # Rig has an affected-tests detector. Run only the tests our diff
+-    # touches — same logic the rig's CI uses to dispatch test workflows.
+-    # The command must read `git diff --name-only $BASE_REF...HEAD`
+-    # internally (BASE_REF is exported in step 1) and execute the relevant
+-    # subset. The guard above is load-bearing: fenced blocks run in separate
+-    # shells, and an unset BASE_REF makes that diff read `HEAD...HEAD`, which
+-    # exits 0 with no files — zero tests run, and the fail-closed clause
+-    # below never fires. It must also fail closed: a pipe-style detector
+-    # without `set -o pipefail` swallows a failed diff, runs zero tests,
+-    # exits 0, and pushes untested work.
+-    # The test above is single-quoted like gate_run's argument, so testing it
+-    # never expands or runs any of it.
+-    gate_run affected-tests '{{affected_tests_command}}'
+-else
+-    # No affected detector — run test_command as the rig configured it.
+-    # That is not necessarily the full suite: a rig's test_command may
+-    # itself select by diff.
+-    gate_run test '{{test_command}}'
+-fi
+-if ! grep -q '^gate([A-Za-z0-9_-]*): FAIL' "$GATE_LOG"; then
+-    echo "SELF-REVIEW GATES GREEN (log: $GATE_LOG)"
+-elif [ -z "$KR" ]; then
+-    echo "SELF-REVIEW RED (log: $GATE_LOG). known-red not found: attribute by hand, §3."
+-else
+-    echo "SELF-REVIEW RED (log: $GATE_LOG). known-red: $KR"
+-    "$KR" match "$GATE_LOG"
+-    echo "known-red match exit $?"
++export BASE_REF
++PG_SRC=$(gc formula list --json 2>/dev/null | jq -r '.formulas[]? | select(.name == "mol-polecat-work") | .source // empty' | head -1)
++PG="${PG_SRC:+$(dirname "$(dirname "$PG_SRC")")/assets/scripts/polecat-gates.sh}"
++if [ -z "$PG" ] || [ ! -f "$PG" ]; then
++    echo "STOP: gates script not found (resolved '${PG:-}'); the pack is broken. Do not run gates by hand."
++    gc runtime drain-ack
++    exit 1
+ fi
++PG_SETUP_COMMAND='{{setup_command}}' PG_TYPECHECK_COMMAND='{{typecheck_command}}' PG_LINT_COMMAND='{{lint_command}}' PG_BUILD_COMMAND='{{build_command}}' PG_TEST_COMMAND='{{test_command}}' PG_AFFECTED_TESTS_COMMAND='{{affected_tests_command}}' bash "$PG" self-review
+ ```
+ 
+ **3. ALL CHECKS MUST PASS.** If your change caused the failure, fix it. A red
+diff --git a/gastown/tests/test_known_red_wiring.sh b/gastown/tests/test_known_red_wiring.sh
+index 6533d819..b0f90b88 100644
+--- a/gastown/tests/test_known_red_wiring.sh
++++ b/gastown/tests/test_known_red_wiring.sh
+@@ -9,10 +9,11 @@
+ # The refinery's run-tests writes the same kind of log, and handle-failures
+ # classifies it through known-red before it diagnoses or files anything.
+ #
+-# Every block is EXECUTED from the shipped formula text, never transcribed:
+-# resolve-known-red, gate-run, known-red-phase-skip, preflight's own
+-# preflight-phases and preflight-red, and the refinery's refinery-gates,
+-# refinery-known-red-match and refinery-known-red-file. They run against a stub `gc` that answers
++# Every block is EXECUTED from the shipped text, never transcribed: the
++# polecat's resolve-known-red, gate-run, known-red-phase-skip, preflight-phases
++# and preflight-red come from assets/scripts/polecat-gates.sh (gcp-v9mvh), and
++# the refinery's refinery-gates, refinery-known-red-match and
++# refinery-known-red-file from mol-refinery-patrol. They run against a stub `gc` that answers
+ # `gc formula list --json` from a canned file and forwards every ledger call to
+ # tests/fixtures/known_red/fake_gc.py, and against the REAL
+ # gastown/assets/scripts/known-red, so a drift between the formula and the
+@@ -24,6 +25,7 @@ set -uo pipefail
+ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+ FORMULA="$ROOT/gastown/formulas/mol-polecat-work.toml"
+ REFINERY="$ROOT/gastown/formulas/mol-refinery-patrol.toml"
++GATES="$ROOT/gastown/assets/scripts/polecat-gates.sh"
+ KNOWN_RED="$ROOT/gastown/assets/scripts/known-red"
+ FAKE_GC="$ROOT/tests/fixtures/known_red/fake_gc.py"
+ 
+@@ -36,13 +38,14 @@ fail() {
+ }
+ 
+ # (f) preflight-tests overrides the base step with the base's title and needs,
+-# and the shared blocks are identical wherever they appear.
++# and the shared blocks live once, in the gates script, and in no formula step.
+ test_f_structure() {
+-    python3 - "$FORMULA" <<'PY' || fail "(f) the known-red blocks are misplaced or have drifted apart (see above)"
++    python3 - "$FORMULA" "$GATES" <<'PY' || fail "(f) the known-red blocks are misplaced (see above)"
+ import sys
+ import tomllib
+ 
+ doc = tomllib.load(open(sys.argv[1], "rb"))
++script = open(sys.argv[2]).read()
+ steps = {step["id"]: step for step in doc["steps"]}
+ problems = []
+ 
+@@ -58,34 +61,14 @@ else:
+     if pre.get("needs") != ["workspace-setup"]:
+         problems.append(f"preflight-tests needs {pre.get('needs')!r}, want ['workspace-setup']")
+ 
+-
+-def block(text, name):
+-    begin, end = f"# --- {name}:begin ---", f"# --- {name}:end ---"
+-    if text.count(begin) != 1 or text.count(end) != 1:
+-        return None
+-    body = text.split(begin, 1)[1].split(end, 1)[0]
+-    return [line.lstrip() for line in body.strip().split("\n")]
+-
+-
+ texts = {sid: step.get("description", "") for sid, step in steps.items()}
+-for name, want in (
+-    ("resolve-known-red", ["preflight-tests", "self-review"]),
+-    ("gate-run", ["preflight-tests", "self-review"]),
+-    ("known-red-phase-skip", ["preflight-tests"]),
+-):
+-    begin = f"# --- {name}:begin ---"
+-    holders = sorted(sid for sid, text in texts.items() if begin in text)
+-    if holders != sorted(want):
+-        problems.append(f"{name} lives in {holders}, want exactly {sorted(want)}")
+-        continue
+-    copies = {sid: block(texts[sid], name) for sid in want}
+-    for sid, lines in copies.items():
+-        if lines is None:
+-            problems.append(f"{sid}: want exactly one {name} begin and one end sentinel")
+-    first = copies[want[0]]
+-    for sid in want[1:]:
+-        if first is not None and copies[sid] is not None and copies[sid] != first:
+-            problems.append(f"{name}: {sid}'s copy differs from {want[0]}'s after stripping leading whitespace")
++for name in ("resolve-known-red", "gate-run", "known-red-phase-skip"):
++    begin, end = f"# --- {name}:begin ---", f"# --- {name}:end ---"
++    if script.count(begin) != 1 or script.count(end) != 1:
++        problems.append(f"polecat-gates.sh: want exactly one {name} begin and one end sentinel")
++    for sid in ("preflight-tests", "self-review"):
++        if begin in texts.get(sid, ""):
++            problems.append(f"{name} must not live in the {sid} step any more, it lives in polecat-gates.sh")
+ 
+ for problem in problems:
+     print(f"  {problem}", file=sys.stderr)
+@@ -120,6 +103,21 @@ open(out, "w").write(block)
+ PY
+ }
+ 
++# extract_gates_block <name> <outfile> — one sentinel block from the gates
++# script, as written: it holds no {{var}}, and reads its inputs from PG_* env.
++extract_gates_block() {
++    python3 - "$GATES" "$@" <<'PY'
++import sys
++
++script, name, out = sys.argv[1:]
++begin, end = f"# --- {name}:begin ---", f"# --- {name}:end ---"
++text = open(script).read()
++if text.count(begin) != 1 or text.count(end) != 1:
++    sys.exit(f"want exactly one {name} block in {script}")
++open(out, "w").write(text.split(begin, 1)[1].split(end, 1)[0])
++PY
++}
++
+ # The stub gc. `formula list` answers from $GC_STUB_FORMULAS (or fails when it
+ # is unset), `convoy status` names one work bead, `mail send`, `session
+ # nudge`, `runtime drain-ack` and a ledger `note` are journalled to
+@@ -385,20 +383,22 @@ test_d_phase_covered() {
+         fail "(d) a consistent stand-in answer must cover test, got $RUN_CODE: $(cat "$TMP/run.log")"
+ }
+ 
+-# preflight <env...> — the preflight §1 block rendered with stub phase
+-# commands that record their invocation, then the §2/§3 block. typecheck uses
+-# winnow's quoting shape. Preflight runs typecheck and lint only (gcp-zhbyb), so
+-# a red is injected through PREFLIGHT_LINT. test_command stays a recording stub
+-# so a test phase that comes back shows up in $INVOKED.
++# preflight <env...> — the preflight §1 blocks from the gates script, fed the
++# PG_* values the formula step would pass, with stub phase commands that record
++# their invocation, then the §2/§3 block. typecheck uses winnow's quoting shape.
++# Preflight runs typecheck and lint only (gcp-zhbyb), so a red is injected
++# through PREFLIGHT_LINT. PG_TEST_COMMAND stays a recording stub so a test phase
++# that comes back shows up in $INVOKED.
+ preflight() {
+     : >"$TMP/invoked"
+     printf '#!/usr/bin/env bash\necho "$1" >>"$INVOKED"\n' >"$TMP/repo/stub-gate.sh"
+-    extract_block "$FORMULA" preflight-tests preflight-phases "$TMP/phases.sh" \
+-        typecheck_command='bash "$(pwd)/stub-gate.sh" typecheck' \
+-        lint_command="${PREFLIGHT_LINT:-echo lint >>\"\$INVOKED\"}" \
+-        test_command='echo test >>"$INVOKED"' || return 1
+-    extract_block "$FORMULA" preflight-tests preflight-red "$TMP/red.sh" base_branch=integration convoy_id=gcp-convoy binding_prefix=gastown. || return 1
++    extract_gates_block preflight-phases "$TMP/phases.sh" || return 1
++    extract_gates_block preflight-red "$TMP/red.sh" || return 1
+     run_blocks "$TMP/resolve.sh" "$TMP/gate.sh" "$TMP/skip.sh" "$TMP/phases.sh" "$TMP/red.sh" -- \
++        PG_BASE_BRANCH=integration PG_CONVOY_ID=gcp-convoy PG_BINDING_PREFIX=gastown. \
++        PG_TYPECHECK_COMMAND='bash "$(pwd)/stub-gate.sh" typecheck' \
++        PG_LINT_COMMAND="${PREFLIGHT_LINT:-echo lint >>\"\$INVOKED\"}" \
++        PG_TEST_COMMAND='echo test >>"$INVOKED"' \
+         GC_STUB_FORMULAS="$TMP/formulas.json" INVOKED="$TMP/invoked" "$@"
+ }
+ 
+@@ -435,9 +435,12 @@ test_e_preflight_skips_only_the_covered_phase() {
+         fail "(e) gcp-zhbyb: preflight must never run the test phase on base, invoked: $(cat "$TMP/invoked")"
+     grep -q '^WARN known-red not found' "$TMP/run.log" || fail "(e) a missing known-red must WARN, got: $(cat "$TMP/run.log")"
+ 
+-    # gcp-zhbyb: the formula carries no test phase in its preflight loop.
+-    [ "$(grep -c 'preflight_phase test' "$FORMULA")" = "0" ] ||
+-        fail "(e) gcp-zhbyb: $FORMULA must not contain 'preflight_phase test', found $(grep -c 'preflight_phase test' "$FORMULA")"
++    # gcp-zhbyb: the gates script carries no test phase in its preflight loop,
++    # and the count is not vacuous: the typecheck phase is there.
++    [ "$(grep -c 'preflight_phase test' "$GATES")" = "0" ] ||
++        fail "(e) gcp-zhbyb: $GATES must not contain 'preflight_phase test', found $(grep -c 'preflight_phase test' "$GATES")"
++    [ "$(grep -c 'preflight_phase typecheck' "$GATES")" = "1" ] ||
++        fail "(e) $GATES must hold exactly one 'preflight_phase typecheck', found $(grep -c 'preflight_phase typecheck' "$GATES")"
+ }
+ 
+ # The preflight red branch acts on known-red's exit code.
+@@ -484,14 +487,15 @@ test_preflight_red_lookup_failure_files_nothing() {
+     ! grep -q '"create"' "$TMP/fake_gc.log" || fail "a failed lookup must file nothing"
+ }
+ 
+-# (f2) The refinery reuses the polecat's blocks as identical copies, each in
+-# the one step that needs it, and keeps its step ids and needs.
++# (f2) The refinery reuses the polecat's blocks (now in polecat-gates.sh) as
++# identical copies, each in the one step that needs it, and keeps its step ids and needs.
+ test_f2_refinery_structure() {
+-    python3 - "$REFINERY" "$FORMULA" <<'PY' || fail "(f2) the refinery's known-red blocks are misplaced or have drifted (see above)"
++    python3 - "$REFINERY" "$GATES" <<'PY' || fail "(f2) the refinery's known-red blocks are misplaced or have drifted (see above)"
+ import sys
+ import tomllib
+ 
+-refinery, polecat = (tomllib.load(open(p, "rb")) for p in sys.argv[1:3])
++refinery = tomllib.load(open(sys.argv[1], "rb"))
++polecat = open(sys.argv[2]).read()
+ problems = []
+ 
+ # mol-refinery-patrol's steps at e585cda6, before this wiring.
+@@ -517,7 +521,6 @@ def block(text, name):
+ 
+ 
+ texts = {s["id"]: s.get("description", "") for s in refinery["steps"]}
+-preflight = next(s.get("description", "") for s in polecat["steps"] if s["id"] == "preflight-tests")
+ for name, want, shared in (
+     ("gate-run", ["run-tests"], True),
+     ("resolve-known-red", ["handle-failures"], True),
+@@ -534,8 +537,8 @@ for name, want, shared in (
+         lines = block(texts[sid], name)
+         if lines is None:
+             problems.append(f"{sid}: want exactly one {name} begin and one end sentinel")
+-        elif shared and lines != block(preflight, name):
+-            problems.append(f"{name}: {sid}'s copy differs from mol-polecat-work preflight-tests' after stripping leading whitespace")
++        elif shared and lines != block(polecat, name):
++            problems.append(f"{name}: {sid}'s copy differs from polecat-gates.sh's after stripping leading whitespace")
+ 
+ for problem in problems:
+     print(f"  {problem}", file=sys.stderr)
+@@ -760,7 +763,7 @@ test_f2_refinery_structure
+ 
+ POLECAT_OK=1
+ for name in resolve-known-red:resolve gate-run:gate known-red-phase-skip:skip; do
+-    extract_block "$FORMULA" preflight-tests "${name%%:*}" "$TMP/${name#*:}.sh" || { fail "could not extract ${name%%:*}"; POLECAT_OK=0; continue; }
++    extract_gates_block "${name%%:*}" "$TMP/${name#*:}.sh" || { fail "could not extract ${name%%:*}"; POLECAT_OK=0; continue; }
+     bash -n "$TMP/${name#*:}.sh" || { fail "extracted ${name%%:*} block is not valid shell"; POLECAT_OK=0; }
+ done
+ if [ "$POLECAT_OK" -ne 1 ]; then
+diff --git a/gastown/tests/test_polecat_gates.sh b/gastown/tests/test_polecat_gates.sh
+new file mode 100755
+index 00000000..db1fa6de
+--- /dev/null
++++ b/gastown/tests/test_polecat_gates.sh
+@@ -0,0 +1,211 @@
++#!/usr/bin/env bash
++# Tests for gastown/assets/scripts/polecat-gates.sh, the one script behind the
++# preflight-tests and self-review gate steps of mol-polecat-work (gcp-v9mvh).
++#
++# The two gate fences used to be 136 and 91 lines of shell that every polecat
++# retyped. They now ship as one script, and each formula step carries a short
++# stub that locates it and passes the rig's commands as PG_* env. These tests
++# run the real script and the real stubs, decoded from the formula, against a
++# stub `gc`. Their byte-for-byte identity with the old fences was proven by a
++# throwaway harness, which is not committed; test_known_red_wiring.sh covers
++# the shared blocks.
++#
++# No test depends on wall-clock time: every command is a stub or `true`, and
++# stdin is /dev/null.
++# shellcheck disable=SC2016  # the stub gate commands carry $MARK unexpanded
++set -euo pipefail
++
++ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
++GATES="$ROOT/gastown/assets/scripts/polecat-gates.sh"
++FORMULA="$ROOT/gastown/formulas/mol-polecat-work.toml"
++USAGE_LINE='GATES_USAGE polecat-gates.sh preflight|self-review'
++
++TMPROOT=$(mktemp -d)
++trap 'rm -rf "$TMPROOT"' EXIT
++
++# fail names the test that called it, so a red run says which case broke.
++fail() {
++    local fn name=""
++    for fn in "${FUNCNAME[@]}"; do
++        case "$fn" in test_*) name=$fn; break ;; esac
++    done
++    echo "FAIL${name:+ $name}: $*" >&2
++    exit 1
++}
++
++# new_case <name> — a fresh sandbox $CASE with a git repo to run in ($CASE/repo,
++# the gates write their log under its git dir), a stub `gc` in $CASE/bin that
++# journals its calls to $CASE/calls.log, and $CASE/marker, the file the stub
++# gate commands append to. `gc formula list --json` prints $FORMULAS.
++new_case() {
++    CASE="$TMPROOT/$1"
++    mkdir -p "$CASE/bin" "$CASE/repo"
++    : >"$CASE/calls.log"
++    : >"$CASE/marker"
++    git -C "$CASE/repo" init -q
++    cat >"$CASE/bin/gc" <<'SH'
++#!/usr/bin/env bash
++printf 'gc %s\n' "$*" >>"$CASE/calls.log"
++case "${1:-} ${2:-}" in
++    "formula list") printf '%s\n' "$FORMULAS" ;;
++    "convoy status") printf '{"children":[{"id":"w-1"}]}\n' ;;
++esac
++exit 0
++SH
++    chmod +x "$CASE/bin/gc"
++    FORMULAS='{"formulas":[]}'
++}
++
++# run_gates <argv...> -- <env...> — runs the script from $CASE/repo with only the
++# given env, so a caller's PG_* or GC_* cannot leak in. Sets RC and leaves
++# stdout and stderr in $CASE/out and $CASE/err.
++run_gates() {
++    local -a args=()
++    while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do
++        args+=("$1")
++        shift
++    done
++    [ "$#" -gt 0 ] && shift
++    RC=0
++    (
++        cd "$CASE/repo" &&
++            env -i PATH="$CASE/bin:$PATH" HOME="$CASE" GIT_CONFIG_GLOBAL=/dev/null \
++                CASE="$CASE" FORMULAS="$FORMULAS" MARK="$CASE/marker" "$@" \
++                bash "$GATES" ${args[@]+"${args[@]}"} </dev/null
++    ) >"$CASE/out" 2>"$CASE/err" || RC=$?
++}
++
++# render_stub <step> <outfile> <var=value...> — the decoded stub of that step:
++# the bash fence that calls the gates script, with every {{var}} replaced the way
++# gc renders the step. A {{var}} left over is a hard error.
++render_stub() {
++    python3 -I - "$FORMULA" "$@" <<'PY'
++import re
++import sys
++import tomllib
++
++formula, step, out, *pairs = sys.argv[1:]
++values = dict(pair.split("=", 1) for pair in pairs)
++doc = tomllib.load(open(formula, "rb"))
++text = next(s["description"] for s in doc["steps"] if s["id"] == step)
++fences = re.findall(r"```bash\n(.*?)\n```", text, re.S)
++stub = next(f for f in fences if 'bash "$PG"' in f)
++rendered = re.sub(r"\{\{(\w+)\}\}", lambda m: values.get(m.group(1), m.group(0)), stub)
++left = sorted(set(re.findall(r"\{\{\w+\}\}", rendered)))
++if left:
++    sys.exit(f"unrendered placeholders in the {step} stub: {left}")
++open(out, "w").write(rendered + "\n")
++PY
++}
++
++# no_gate_ran — fails unless no stub gate command ran.
++no_gate_ran() {
++    [ ! -s "$CASE/marker" ] || fail "$1: a gate command ran: $(cat "$CASE/marker")"
++}
++
++test_usage_rejects_unknown_mode() {
++    local label
++    new_case usage
++    for label in none bogus extra; do
++        case "$label" in
++            none) run_gates -- ;;
++            bogus) run_gates bogus -- ;;
++            extra) run_gates preflight self-review -- ;;
++        esac
++        [ "$RC" -eq 2 ] || fail "$label: want exit 2, got $RC"
++        [ "$(cat "$CASE/out")" = "$USAGE_LINE" ] ||
++            fail "$label: want exactly '$USAGE_LINE' on stdout, got: $(cat "$CASE/out")"
++        [ ! -s "$CASE/err" ] || fail "$label: want empty stderr, got: $(cat "$CASE/err")"
++    done
++}
++
++test_unset_required_var_stops() {
++    new_case unset
++    # PG_LINT_COMMAND is the one var left out; the typecheck command would leave
++    # a mark if the script got as far as running a gate.
++    run_gates preflight -- PG_BASE_BRANCH=integration PG_BINDING_PREFIX=gastown. \
++        PG_CONVOY_ID=gcp-convoy PG_TYPECHECK_COMMAND='echo typecheck >>"$MARK"'
++    [ "$RC" -ne 0 ] || fail "want a non-zero exit with PG_LINT_COMMAND unset, got 0"
++    grep -q 'PG_LINT_COMMAND' "$CASE/err" || fail "want stderr to name PG_LINT_COMMAND, got: $(cat "$CASE/err")"
++    no_gate_ran "an unset PG_LINT_COMMAND"
++
++    # An EMPTY value is legal: it is a phase the rig does not configure.
++    run_gates preflight -- PG_BASE_BRANCH=integration PG_BINDING_PREFIX=gastown. \
++        PG_CONVOY_ID=gcp-convoy PG_TYPECHECK_COMMAND='' PG_LINT_COMMAND=''
++    [ "$RC" -eq 0 ] || fail "empty phase commands must pass, got $RC: $(cat "$CASE/err")"
++    grep -q '^PRE-FLIGHTS GREEN on integration' "$CASE/out" ||
++        fail "empty phase commands must print PRE-FLIGHTS GREEN, got: $(cat "$CASE/out")"
++}
++
++test_empty_affected_tests_runs_test_command() {
++    new_case affected
++    run_gates self-review -- BASE_REF=origin/integration \
++        PG_SETUP_COMMAND='' PG_TYPECHECK_COMMAND='' PG_LINT_COMMAND='' PG_BUILD_COMMAND='' \
++        PG_TEST_COMMAND='echo ran-test >>"$MARK"' PG_AFFECTED_TESTS_COMMAND=''
++    [ "$RC" -eq 0 ] || fail "want exit 0, got $RC: $(cat "$CASE/err")"
++    [ "$(cat "$CASE/marker")" = "ran-test" ] ||
++        fail "an empty PG_AFFECTED_TESTS_COMMAND must run PG_TEST_COMMAND exactly once, marker: $(cat "$CASE/marker")"
++    local log
++    log="$(git -C "$CASE/repo" rev-parse --absolute-git-dir)/self-review-gate.log"
++    grep -qx 'gate(test): PASS' "$log" || fail "want a gate(test) PASS in the log, got: $(cat "$log")"
++    ! grep -q '^gate(affected-tests)' "$log" || fail "want no affected-tests segment, got: $(cat "$log")"
++}
++
++test_preflight_stub_stops_when_script_unresolved() {
++    new_case preflight-stub
++    render_stub preflight-tests "$CASE/stub.sh" base_branch=integration binding_prefix=gastown. \
++        convoy_id=gcp-convoy typecheck_command='echo typecheck >>"$MARK"' lint_command='echo lint >>"$MARK"'
++    # `gc formula list --json` finds no formula, so the script cannot be located.
++    RC=0
++    (cd "$CASE/repo" && env -i PATH="$CASE/bin:$PATH" HOME="$CASE" CASE="$CASE" \
++        FORMULAS="$FORMULAS" MARK="$CASE/marker" bash "$CASE/stub.sh" </dev/null) \
++        >"$CASE/out" 2>"$CASE/err" || RC=$?
++    [ "$RC" -eq 1 ] || fail "want exit 1, got $RC"
++    grep -q '^STOP: gates script not found' "$CASE/out" ||
++        fail "want a line starting 'STOP: gates script not found', got: $(cat "$CASE/out")"
++    grep -qx 'gc runtime drain-ack' "$CASE/calls.log" || fail "want gc runtime drain-ack, calls: $(cat "$CASE/calls.log")"
++    no_gate_ran "an unresolved script"
++}
++
++test_self_review_stub_stops_when_script_unresolved() {
++    new_case self-review-stub
++    render_stub self-review "$CASE/stub.sh" base_branch=integration convoy_id=gcp-convoy \
++        setup_command='echo setup >>"$MARK"' typecheck_command='echo typecheck >>"$MARK"' \
++        lint_command='echo lint >>"$MARK"' build_command='echo build >>"$MARK"' \
++        test_command='echo test >>"$MARK"' affected_tests_command=''
++    RC=0
++    (cd "$CASE/repo" && env -i PATH="$CASE/bin:$PATH" HOME="$CASE" CASE="$CASE" \
++        FORMULAS="$FORMULAS" MARK="$CASE/marker" BASE_REF=origin/integration \
++        bash "$CASE/stub.sh" </dev/null) >"$CASE/out" 2>"$CASE/err" || RC=$?
++    [ "$RC" -eq 1 ] || fail "want exit 1, got $RC"
++    grep -q '^STOP: gates script not found' "$CASE/out" ||
++        fail "want a line starting 'STOP: gates script not found', got: $(cat "$CASE/out")"
++    grep -qx 'gc runtime drain-ack' "$CASE/calls.log" || fail "want gc runtime drain-ack, calls: $(cat "$CASE/calls.log")"
++    no_gate_ran "an unresolved script"
++}
++
++test_self_review_stub_exports_base_ref() {
++    new_case export-base-ref
++    FORMULAS='{"formulas":[{"name":"mol-polecat-work","source":"'"$FORMULA"'"}]}'
++    render_stub self-review "$CASE/stub.sh" base_branch=integration convoy_id=gcp-convoy \
++        setup_command='' typecheck_command='' lint_command='' build_command='' test_command='' \
++        affected_tests_command='echo "affected BASE_REF=$BASE_REF" >>"$MARK"'
++    # The caller sets BASE_REF without exporting it. The stub must export it, or
++    # the gates script and the affected-tests command never see it.
++    RC=0
++    (cd "$CASE/repo" && env -i PATH="$CASE/bin:$PATH" HOME="$CASE" CASE="$CASE" \
++        FORMULAS="$FORMULAS" MARK="$CASE/marker" GIT_CONFIG_GLOBAL=/dev/null \
++        bash -c 'BASE_REF=origin/integration; . "$1"' _ "$CASE/stub.sh" </dev/null) \
++        >"$CASE/out" 2>"$CASE/err" || RC=$?
++    [ "$RC" -eq 0 ] || fail "want exit 0, got $RC: $(cat "$CASE/out") $(cat "$CASE/err")"
++    [ "$(cat "$CASE/marker")" = "affected BASE_REF=origin/integration" ] ||
++        fail "the affected-tests command must see BASE_REF, marker: '$(cat "$CASE/marker")'"
++}
++
++test_usage_rejects_unknown_mode
++test_unset_required_var_stops
++test_empty_affected_tests_runs_test_command
++test_preflight_stub_stops_when_script_unresolved
++test_self_review_stub_stops_when_script_unresolved
++test_self_review_stub_exports_base_ref
++echo "polecat gates tests passed"
+diff --git a/tests/test_v2_drain_ack_closes_own_step.py b/tests/test_v2_drain_ack_closes_own_step.py
+index eb92e64b..b42649f9 100644
+--- a/tests/test_v2_drain_ack_closes_own_step.py
++++ b/tests/test_v2_drain_ack_closes_own_step.py
+@@ -52,6 +52,8 @@ CHECKED_STEPS = {
+ # in gascity; see the ga-uppw56 follow-ups. Remove an entry when it is fixed.
+ DEFERRED_STEPS = {
+     ("gastown/formulas/mol-polecat-work.toml", "workspace-setup"),
++    # The gates-script-not-found STOP, the same mid-workflow early exit as self-review's.
++    ("gastown/formulas/mol-polecat-work.toml", "preflight-tests"),
+     ("gastown/formulas/mol-polecat-work.toml", "self-review"),
+     ("gastown/formulas/mol-review-leg.toml", "load-assignment"),
+ }
+-- 
+2.54.0 (Apple Git-157)
+
