@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sat, 10 Oct 2026 16:27:33 -0400
-Subject: [PATCH 130/165] fix(ci): skip the nightly's source checkout on
+Subject: [PATCH 130/166] fix(ci): skip the nightly's source checkout on
  unselected matrix entries (gcp-fooz4)
 
 A manual Supported Pack Nightly dispatch for one pack still starts every

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sat, 10 Oct 2026 16:12:09 -0400
-Subject: [PATCH 124/165] refactor(witness): retire the per-bead worktree
+Subject: [PATCH 124/166] refactor(witness): retire the per-bead worktree
  reaper for upstream's task-artifact lifecycle (gcp-fooz4)
 
 The baseline move to 520e95cb brings upstream #245 (f709abe5), whose

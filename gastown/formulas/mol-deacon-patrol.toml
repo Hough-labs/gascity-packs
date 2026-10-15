@@ -322,8 +322,10 @@ gc session list --state active --json | jq -r --argjson q "$QUEUES" '
   | @tsv'
 ```
 
-Any assignee in `$QUEUES` that matches no active session is orphaned work —
-a queue whose owner is gone. Worth a look in the same pass.
+An assignee in `$QUEUES` that matches no active session may be asleep, suspended,
+or a configured seat parked on purpose. This step does not call it orphaned, and
+does not nudge, mail or prescribe anything about it: orphaned-bead recovery is the
+rig witness's job (recover-orphaned-beads), per the boundary list above (gcp-di7v).
 
 The latest bead.updated_at is the cheapest proxy for "did this session
 move work recently?" — every claim, status transition, metadata update,
@@ -604,6 +606,7 @@ if [ ! -x "$CHECK" ] && [ -n "${GC_PACK_DIR:-}" ]; then
     CHECK="$GC_PACK_DIR/assets/scripts/dolt-push-state-check.sh"
 fi
 if [ -x "$CHECK" ]; then
+    OBSERVED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     RESULT=$("$CHECK" --json)
 else
     # A detector that cannot be resolved is itself the finding. Nothing else in
@@ -686,20 +689,24 @@ bd's record of that fact, and the consequence is that the city's own outage
 detection is blind on that store — a real outage there would look identical to
 the state it is already in. Worth surfacing, worth fixing, not worth paging.
 
-The remedy is on the scope, not here: raise its `dolt.auto-push-timeout` in
-`.beads/config.yaml` so a routine push finishes inside the timer. Nudge (do not
+A longer dolt.auto-push-timeout is the likely remedy, but this step never
+prescribes it. A FROZEN reading often clears before the nudge is read, and the
+remedy edits a live rig's config. So the nudge reports what was observed, when,
+and how to re-measure. Nudge (do not
 mail — this recurs every cycle until someone tunes the store, and a mail per
 cycle commits a bead per cycle), and dedupe so it is said once per condition:
 
 ```bash
+# --- frozen-report:begin ---
 printf '%s\\n' "$RESULT" | jq -r 'select(.verdict == "FROZEN") | [.scope, .detail] | @tsv' |
 while IFS=$'\\t' read -r SCOPE DETAIL; do
     MARK="$GC_CITY/.gc/runtime/dolt-push-frozen-$SCOPE"
     if [ -f "$MARK" ]; then continue; fi
     mkdir -p "$(dirname "$MARK")"
-    gc session nudge mayor/ "Dolt push-state watermark frozen on $SCOPE (pushes ARE landing; bd is recording success as failure). Raise dolt.auto-push-timeout in $SCOPE's .beads/config.yaml — until then auto-push outage detection is blind on that store. $DETAIL"
+    gc session nudge mayor/ "Dolt push-state watermark frozen on $SCOPE, OBSERVED ${OBSERVED_AT:-unknown} (a snapshot; it often clears by itself before this is read). Pushes were landing while bd recorded them as failed, so auto-push outage detection is blind on that store. Before acting, re-run ${CHECK:-dolt-push-state-check.sh} --json and act only if $SCOPE still reads FROZEN. $DETAIL"
     date -u +"%Y-%m-%dT%H:%M:%SZ" >"$MARK"
 done
+# --- frozen-report:end ---
 ```
 
 **Step 4: Clear the markers when a scope recovers**, so the next outage escalates
