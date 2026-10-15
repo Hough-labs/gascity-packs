@@ -86,7 +86,8 @@ GASTOWN_FORMULA_CONTRACTS = {
         "--set-metadata branch=\"$BRANCH\"",
         "{{test_command}}",
         "REFINERY_TARGET=\"${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery\"",
-        "--assignee=\"$REFINERY_TARGET\"",
+        # The handoff write itself (--assignee="$REFINERY_TARGET") is
+        # polecat-submit.sh's: GASTOWN_SCRIPT_CONTRACTS holds that fragment.
     ),
     "mol-refinery-patrol": (
         "metadata.branch",
@@ -113,10 +114,15 @@ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
         'COMMITS_AHEAD=$(git rev-list --count "$BASE_REF..HEAD" 2>/dev/null)',
         "''|*[!0-9]*) HALT_REASON=content_gate_error ;;",
         "0) HALT_REASON=no_commits ;;",
-        "git push origin HEAD",
+        # The push gate and the refinery handoff are polecat-submit.sh's
+        # (gcp-nc8wg): GASTOWN_SCRIPT_CONTRACTS holds the fragments that moved
+        # with them. The step keeps only the calls, and a step that stops
+        # calling the script is a polecat that never pushes or never hands off.
+        "polecat-submit.sh",
+        'bash "$PS" push-gate',
+        'bash "$PS" reassign',
         "gc bd update \"$WORK_BEAD_ID\" \\",
         "--set-metadata target={{base_branch}}",
-        "--status=open --assignee=\"$REFINERY_TARGET\"",
         "gc session wake \"$REFINERY_TARGET\"",
         "gc runtime drain-ack",
     ),
@@ -256,11 +262,12 @@ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
 # parsed order. The gate only prevents a phantom handoff where it stands: after
 # the clean-state check has committed any leftovers (so it cannot fire on work
 # that merely had not been committed yet) and before the push that would create
-# the ref and let the handoff be stamped.
+# the ref and let the handoff be stamped. The push is polecat-submit.sh's
+# (gcp-nc8wg), so the step's anchor for it is the call that runs the push gate.
 POLECAT_BRANCH_CONTENT_GATE_ORDER = (
     ("clean-state commit", 'git commit -m "chore: capture remaining work ($WORK_BEAD_ID)"'),
     ("branch-content count", 'COMMITS_AHEAD=$(git rev-list --count "$BASE_REF..HEAD" 2>/dev/null)'),
-    ("branch push", "git push origin HEAD"),
+    ("branch push", 'bash "$PS" push-gate'),
 )
 # Required between the count and the push. `git rev-list` failing must halt on
 # its own reason instead of falling through to the push, and the halt must
@@ -298,12 +305,12 @@ POLECAT_BRANCH_CONTENT_GATE_HALT_PATH = (
     # so the close cannot move ahead of the escalation and skip it.
     ("halt close after escalation", "    done\n    STEP_BEAD_ID=$(gc hook current --id-only) || exit 1"),
     # Anchored to this gate's own close, whose `gc.failure_reason="$HALT_REASON"`
-    # occurs only here. The checked window runs to the push, so it also spans
-    # the auto_push=false halt further down: a bare "gc runtime drain-ack"
-    # fragment is satisfied by that sibling's copy, and stayed green with this
-    # gate's own copy deleted. The same anchor pins the `exit 1` -- without it
-    # the fence ends rc=0 and the agent walks on to the push it just refused,
-    # having already released the bead.
+    # occurs only here. The checked window runs to the push-gate call, so it also
+    # spans that call's script-not-found stop, which has a drain-ack of its own:
+    # a bare "gc runtime drain-ack" fragment is satisfied by that sibling's copy,
+    # and stays green with this gate's own copy deleted. The same anchor pins the
+    # `exit 1` -- without it the fence ends rc=0 and the agent walks on to the
+    # push it just refused, having already released the bead.
     (
         "halt exit",
         'gc.failure_reason="$HALT_REASON" --status=closed || exit 1\n    gc runtime drain-ack\n    exit 1',
@@ -393,6 +400,13 @@ GASTOWN_SCRIPT_CONTRACTS = {
     "assets/scripts/refinery/lane-wedge.sh": (
         "refinery-lane-wedged.json",
         "gc mail send mayor/ --notify",
+    ),
+    # The polecat's push gate and refinery handoff (gcp-nc8wg). Each fragment is
+    # the line that makes one guarantee real: the push, and the single write that
+    # hands the work bead to the refinery.
+    "assets/scripts/polecat-submit.sh": (
+        "git push origin HEAD",
+        '--status=open --assignee="$REFINERY_TARGET"',
     ),
 }
 METHODOLOGY_FLOW_CONTRACTS = {
@@ -3198,12 +3212,13 @@ def validate_polecat_branch_content_gate(pack_source: Path) -> None:
     """Pin the branch-content gate's position and its halt path, not just its text.
 
     The fragment pins above are substring containment over the whole file, so
-    they catch deletion and nothing else: a gate moved below `git push origin
-    HEAD`, or a halt path that quietly drops its escalation, keeps every pinned
-    fragment while gating nothing. Parse the step instead and require that the
-    commit count is taken after the clean-state commit and before the push, and
-    that everything between the count and the push still fails closed on an
-    unmeasurable branch and still escalates the halt.
+    they catch deletion and nothing else: a gate moved below the push (the step's
+    `bash "$PS" push-gate` call, which runs `git push origin HEAD`), or a halt
+    path that quietly drops its escalation, keeps every pinned fragment while
+    gating nothing. Parse the step instead and require that the commit count is
+    taken after the clean-state commit and before the push, and that everything
+    between the count and the push still fails closed on an unmeasurable branch
+    and still escalates the halt.
     """
     problems: list[str] = []
     path = pack_source / "formulas" / "mol-polecat-work.toml"

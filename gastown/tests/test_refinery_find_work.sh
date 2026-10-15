@@ -42,6 +42,8 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 FORMULA="$ROOT/gastown/formulas/mol-refinery-patrol.toml"
 REFINERY_PROMPT="$ROOT/gastown/agents/refinery/prompt.template.md"
 POLECAT_FORMULA="$ROOT/gastown/formulas/mol-polecat-work.toml"
+# The submit handoff (step 6) runs as this script's `reassign` mode (gcp-nc8wg).
+POLECAT_SUBMIT="$ROOT/gastown/assets/scripts/polecat-submit.sh"
 
 FAILURES=0
 
@@ -643,13 +645,16 @@ test_polecat_handoff_verifies_the_status_it_writes() {
     # The other half of gcp-s14g: the submit handoff writes --status=open and
     # that write was observed not to stick. It reads back and corrects once,
     # and it must never abort the handoff over bookkeeping — the branch is
-    # already pushed by then.
-    grep -F 'HANDOFF_STATUS=' "$POLECAT_FORMULA" >/dev/null ||
+    # already pushed by then. The handoff is polecat-submit.sh's reassign body.
+    grep -F 'HANDOFF_STATUS=' "$POLECAT_SUBMIT" >/dev/null ||
         fail "the polecat submit handoff should read back the status it wrote"
-    grep -F 'find-work scans open,in_progress' "$POLECAT_FORMULA" >/dev/null ||
+    grep -F 'find-work scans open,in_progress' "$POLECAT_SUBMIT" >/dev/null ||
         fail "the handoff warning should name the refinery behaviour that makes it non-fatal"
-    ! grep -A12 'HANDOFF_STATUS=' "$POLECAT_FORMULA" | grep -E 'exit [1-9]' >/dev/null ||
+    ! grep -A12 'HANDOFF_STATUS=' "$POLECAT_SUBMIT" | grep -E 'exit [1-9]' >/dev/null ||
         fail "a status that will not settle must not abort a handoff whose branch is already pushed"
+    # And the step must not carry a second copy of the read-back.
+    ! grep -F 'HANDOFF_STATUS=' "$POLECAT_FORMULA" >/dev/null ||
+        fail "the formula step must not carry its own copy of the handoff; it calls polecat-submit.sh"
 }
 
 # ── gcp-et7g: each priority band is served oldest-first-handoff ──────────────

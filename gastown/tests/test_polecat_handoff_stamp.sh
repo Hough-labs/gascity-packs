@@ -9,9 +9,10 @@
 # rewrite on resubmit sends a rejected bead to the back of its band instead of
 # back to its original place in line.
 #
-# The block under test is extracted from the shipped formula between its
-# handoff-stamp sentinels and EXECUTED against a stub `gc` that really mutates a
-# fixture, so every assertion reads what the block's writes left behind.
+# The block under test is extracted from the shipped polecat-submit.sh (the
+# reassign body moved there out of the formula, gcp-nc8wg) between its
+# handoff-stamp sentinels and EXECUTED against a stub `gc` that really mutates
+# a fixture, so every assertion reads what the block's writes left behind.
 # Assertions grep a literal shell snippet or the stub's call log, so
 # single-quoted `$VAR` is the point, not an error.
 # shellcheck disable=SC2016
@@ -19,6 +20,7 @@ set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 FORMULA="$ROOT/gastown/formulas/mol-polecat-work.toml"
+SUBMIT="$ROOT/gastown/assets/scripts/polecat-submit.sh"
 
 BEAD="gcp-et7g.1"
 REFINERY="gascity-packs/gastown.refinery"
@@ -32,24 +34,20 @@ fail() {
     FAILURES=$((FAILURES + 1))
 }
 
-# extract_stamp pulls the handoff block verbatim out of submit-and-exit. Any
+# extract_stamp pulls the handoff block verbatim out of polecat-submit.sh. Any
 # `{{placeholder}}` left in it is a hard error: the harness cannot render it, and
-# an unrendered one would make the test pass against text the formula never runs.
+# an unrendered one would make the test pass against text nothing ever runs.
 extract_stamp() {
-    python3 - "$FORMULA" "$1" <<'PY'
+    python3 - "$SUBMIT" "$1" <<'PY'
 import re
 import sys
-import tomllib
 
-formula, out = sys.argv[1:3]
+script, out = sys.argv[1:3]
 begin = "# --- handoff-stamp:begin ---"
 end = "# --- handoff-stamp:end ---"
-with open(formula, "rb") as handle:
-    doc = tomllib.load(handle)
-step = next(s for s in doc["steps"] if s["id"] == "submit-and-exit")
-text = step["description"]
+text = open(script, encoding="utf-8").read()
 if text.count(begin) != 1 or text.count(end) != 1:
-    sys.exit("submit-and-exit must carry exactly one handoff-stamp block")
+    sys.exit("polecat-submit.sh must carry exactly one handoff-stamp block")
 block = text.split(begin, 1)[1].split(end, 1)[0]
 leftover = sorted(set(re.findall(r"\{\{[^}]*\}\}", block)))
 if leftover:
@@ -306,18 +304,20 @@ test_auto_push_halt_is_not_stamped() {
     # auto_push=false halts at branch-ready with no refinery handoff, so nothing
     # has joined the merge queue and nothing may be stamped. The stamp keys are
     # written only inside the handoff block.
-    python3 - "$FORMULA" <<'PY' || fail "the stamp keys must be written only in the handoff-stamp block, never on the auto_push=false halt"
+    python3 - "$FORMULA" "$SUBMIT" <<'PY' || fail "the stamp keys must be written only in the handoff-stamp block, never on the auto_push=false halt"
 import sys
 import tomllib
 
 doc = tomllib.load(open(sys.argv[1], "rb"))
-text = next(s for s in doc["steps"] if s["id"] == "submit-and-exit")["description"]
-halt = text[text.index('if [ "$AUTO_PUSH" = "false" ]'):]
+step = next(s for s in doc["steps"] if s["id"] == "submit-and-exit")["description"]
+script = open(sys.argv[2], encoding="utf-8").read()
+halt = script[script.index('if [ "$AUTO_PUSH" = "false" ]'):]
 halt = halt[: halt.index("\nfi\n")]
 if "submitted_at" in halt:
     raise SystemExit(1)
-outside = text.split("# --- handoff-stamp:begin ---")[0] + text.split("# --- handoff-stamp:end ---")[1]
-if "submitted_at=" in outside:
+# Nothing else in the script, and nothing in the step text, writes a stamp.
+outside = script.split("# --- handoff-stamp:begin ---")[0] + script.split("# --- handoff-stamp:end ---")[1]
+if "submitted_at=" in outside or "submitted_at=" in step:
     raise SystemExit(1)
 PY
 }

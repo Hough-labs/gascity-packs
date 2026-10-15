@@ -18,15 +18,17 @@
 #      reported "no key" on a ledger serving metadata as a JSON string and the
 #      EXPLICIT auto_push=false opt-out silently stopped firing (gci-to0l).
 #
-# Properties 1-4 assert what the gate SAYS. The last block runs it: the gate's
-# bash is lifted out of the shipped step and executed against stubbed `gc` and
-# `git`, so what is tested is the text an agent reads at pour time, never a
-# retyped copy. "The words are all present" is a weaker claim than "it does not
-# push" for a gate whose failure mode is a push to a customer estate.
+# Properties 1-4 assert what the gate SAYS. The last block runs it: the gate is
+# the push-gate body of gastown/assets/scripts/polecat-submit.sh (gcp-nc8wg;
+# the step used to carry it as a fence), and it is executed against stubbed
+# `gc` and `git`, so what is tested is the shipped script, never a retyped
+# copy. "The words are all present" is a weaker claim than "it does not push"
+# for a gate whose failure mode is a push to a customer estate.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 FORMULA="$ROOT/gastown/formulas/mol-polecat-work.toml"
+SUBMIT="$ROOT/gastown/assets/scripts/polecat-submit.sh"
 MAYOR_PROMPT="$ROOT/gastown/agents/mayor/prompt.template.md"
 
 fail() {
@@ -35,11 +37,13 @@ fail() {
 }
 
 [[ -f "$FORMULA" ]] || fail "formula not found: $FORMULA"
+[[ -f "$SUBMIT" ]] || fail "submit script not found: $SUBMIT"
 [[ -f "$MAYOR_PROMPT" ]] || fail "mayor prompt not found: $MAYOR_PROMPT"
 
 # --- 1. structure -----------------------------------------------------------
 
-# Scoped to the submit-and-exit gate block, like every sibling property. This
+# Scoped to the push-gate block of polecat-submit.sh (between its push-gate
+# sentinels), like every sibling property. This
 # one used to grep the WHOLE FILE: it counted `gc mail send` across every step
 # and required exactly 2, and took first-occurrence line numbers for the
 # ordering. Both are green today only by accident of the file's contents — a
@@ -55,19 +59,16 @@ fail() {
 # deliberately silent; only the two halts that mean "the gate could not tell"
 # page anyone.
 test_gate_structure() {
-    python3 - "$FORMULA" <<'PY' || fail "the gate's halts, their escalations and their order are wrong"
+    python3 - "$SUBMIT" <<'PY' || fail "the gate's halts, their escalations and their order are wrong"
 import re
 import sys
-import tomllib
 
-with open(sys.argv[1], "rb") as handle:
-    steps = tomllib.load(handle)["steps"]
-step = [s for s in steps if s["id"] == "submit-and-exit"][0]["description"]
-blocks = [b for b in re.findall(r"^```bash\n(.*?)^```$", step, re.S | re.M)
-          if "git push origin HEAD" in b]
-if len(blocks) != 1:
-    raise SystemExit("expected exactly 1 gate block, got %d" % len(blocks))
-body = "\n".join(l for l in blocks[0].split("\n") if not l.lstrip().startswith("#"))
+script = open(sys.argv[1], encoding="utf-8").read()
+begin, end = "# --- push-gate:begin ---", "# --- push-gate:end ---"
+if script.count(begin) != 1 or script.count(end) != 1:
+    raise SystemExit("expected exactly 1 push-gate block in the submit script")
+block = script.split(begin, 1)[1].split(end, 1)[0]
+body = "\n".join(l for l in block.split("\n") if not l.lstrip().startswith("#"))
 
 HALTS = {
     "metadata_unreadable": ("the fail-closed unreadable-metadata halt (gci-to0l)", True),
@@ -131,11 +132,12 @@ PY
 # recorded its rail properly AS METADATA and said nothing in prose is exactly
 # the bead the (b) prose scan cannot save.
 #
-# Asserted over the step's EXECUTABLE lines, for the same reason the notes check
-# is: the step names the old probe shape in its prose, and a check over the whole
-# step text would be red on a correct patch.
+# Asserted over the step's EXECUTABLE lines (its bash fences plus the submit
+# script), for the same reason the notes check is: the step names the old probe
+# shape in its prose, and a check over the whole step text would be red on a
+# correct patch.
 test_metadata_probe_shape() {
-    python3 - "$FORMULA" <<'PY' || fail "the metadata probe must decode object/null/string and halt on the rest"
+    python3 - "$FORMULA" "$SUBMIT" <<'PY' || fail "the metadata probe must decode object/null/string and halt on the rest"
 import sys
 import tomllib
 
@@ -150,6 +152,10 @@ for line in step.split("\n"):
         continue
     if inside and not line.lstrip().startswith("#"):
         code.append(line)
+# The push gate and the handoff run as polecat-submit.sh now (gcp-nc8wg), so the
+# executable lines of the step are its fences plus every non-comment script line.
+code += [l for l in open(sys.argv[2], encoding="utf-8").read().split("\n")
+         if not l.lstrip().startswith("#")]
 body = "\n".join(code)
 
 problems = []
@@ -165,12 +171,12 @@ if '[ -z "$WORK_JSON" ]' not in body:
     # jq prints nothing for empty input and exits 0, so a dead ledger cannot be
     # caught on jq's exit status alone.
     problems.append("no explicit guard for an empty payload from the ledger read")
-# Five halts write halt_reason in this step: the push gate's three
-# (metadata_unreadable, auto_push_false, no_push_rail_unresolved), the
-# branch-content gate's single write of "$HALT_REASON", which carries either
-# no_commits or content_gate_error, and the refinery precondition's
-# base_branch_local_only. The count is pinned, not floored, so a sixth
-# unaccounted halt -- or a deleted one -- still reports here.
+# Five halts write halt_reason across the step and polecat-submit.sh: the push
+# gate's three (metadata_unreadable, auto_push_false, no_push_rail_unresolved),
+# the branch-content gate's single write of "$HALT_REASON" (in the step), which
+# carries either no_commits or content_gate_error, and the refinery
+# precondition's base_branch_local_only. The count is pinned, not floored, so a
+# sixth unaccounted halt -- or a deleted one -- still reports here.
 if body.count("halt_reason=") != 5:
     problems.append("expected exactly five halt_reason writes, found %d" % body.count("halt_reason="))
 if "ascii_downcase" not in body:
@@ -199,12 +205,12 @@ PY
 # --- 2. rail detection ------------------------------------------------------
 
 # Lift the shipped strip/match pair straight out of the gate so this test can
-# never drift from the code it is testing. The lift is ANCHORED: tomllib parses
-# the formula, the submit-and-exit bash block containing `git push origin HEAD`
-# is selected, comments are dropped, and the pattern must occur exactly ONCE in
-# what remains. A position-based lift over the raw file (the first `grep -E..`
-# anywhere in it) starts testing some other step's regex the day one is added
-# above the gate, and stays green while doing it.
+# never drift from the code it is testing. The lift is ANCHORED: the push-gate
+# block of polecat-submit.sh is selected by its begin/end sentinels, comments
+# are dropped, and the pattern must occur exactly ONCE in what remains. A
+# position-based lift over the raw file (the first `grep -E..` anywhere in it)
+# starts testing some other block's regex the day one is added above the gate,
+# and stays green while doing it.
 #
 # The extraction is also non-fatal on purpose. Under `set -euo pipefail` an
 # empty result aborted this whole suite at the assignment — before the guards
@@ -214,19 +220,16 @@ PY
 lift_gate_pattern() {
     # stderr is left connected: the reason ("got 2 matches", "no gate block")
     # is the useful half of the failure, and stdout stays clean either way.
-    python3 - "$FORMULA" "$1" <<'PY' || true
+    python3 - "$SUBMIT" "$1" <<'PY' || true
 import re
 import sys
-import tomllib
 
-with open(sys.argv[1], "rb") as handle:
-    steps = tomllib.load(handle)["steps"]
-step = [s for s in steps if s["id"] == "submit-and-exit"][0]["description"]
-blocks = [b for b in re.findall(r"^```bash\n(.*?)^```$", step, re.S | re.M)
-          if "git push origin HEAD" in b]
-if len(blocks) != 1:
-    raise SystemExit("expected exactly 1 gate block, got %d" % len(blocks))
-body = "\n".join(l for l in blocks[0].split("\n") if not l.lstrip().startswith("#"))
+script = open(sys.argv[1], encoding="utf-8").read()
+begin, end = "# --- push-gate:begin ---", "# --- push-gate:end ---"
+if script.count(begin) != 1 or script.count(end) != 1:
+    raise SystemExit("expected exactly 1 push-gate block in the submit script")
+block = script.split(begin, 1)[1].split(end, 1)[0]
+body = "\n".join(l for l in block.split("\n") if not l.lstrip().startswith("#"))
 hits = re.findall(sys.argv[2], body)
 if len(hits) != 1:
     raise SystemExit("expected exactly 1 match for %s, got %d" % (sys.argv[2], len(hits)))
@@ -374,19 +377,16 @@ test_rail_detection() {
 # Asserted over EXECUTABLE lines, like the notes and probe checks: the step
 # describes the old shape in its prose on purpose.
 test_rail_scan_shape() {
-    python3 - "$FORMULA" <<'PY' || fail "the rail scan must strip the push-to-main phrase and fail closed"
+    python3 - "$SUBMIT" <<'PY' || fail "the rail scan must strip the push-to-main phrase and fail closed"
 import re
 import sys
-import tomllib
 
-with open(sys.argv[1], "rb") as handle:
-    steps = tomllib.load(handle)["steps"]
-step = [s for s in steps if s["id"] == "submit-and-exit"][0]["description"]
-blocks = [b for b in re.findall(r"^```bash\n(.*?)^```$", step, re.S | re.M)
-          if "git push origin HEAD" in b]
-if len(blocks) != 1:
-    raise SystemExit("expected exactly 1 gate block, got %d" % len(blocks))
-body = "\n".join(l for l in blocks[0].split("\n") if not l.lstrip().startswith("#"))
+script = open(sys.argv[1], encoding="utf-8").read()
+begin, end = "# --- push-gate:begin ---", "# --- push-gate:end ---"
+if script.count(begin) != 1 or script.count(end) != 1:
+    raise SystemExit("expected exactly 1 push-gate block in the submit script")
+block = script.split(begin, 1)[1].split(end, 1)[0]
+body = "\n".join(l for l in block.split("\n") if not l.lstrip().startswith("#"))
 
 problems = []
 if "grep -Eiv" in body:
@@ -444,12 +444,12 @@ PY
 # rig via the auto_push=false halt, destroying a project lead's instruction text
 # (gci-3f5u); it is asserted here so the ambiguity halt cannot reintroduce it.
 #
-# Asserted over EXECUTABLE lines only. The step names `--notes` on purpose in
-# its prose and in two recipe comments, and a negative check over the whole step
-# text would fail on a correct patch — a guard that is red on correct input gets
+# Asserted over EXECUTABLE lines only (the step's fences and the submit script).
+# The step names `--notes` on purpose in its prose and in two recipe comments,
+# and a negative check over the whole step text would fail on a correct patch — a guard that is red on correct input gets
 # deleted for being noisy.
 test_halt_notes_append() {
-    python3 - "$FORMULA" <<'PY' || fail "submit-and-exit must append its notes, never replace them"
+    python3 - "$FORMULA" "$SUBMIT" <<'PY' || fail "submit-and-exit must append its notes, never replace them"
 import sys
 import tomllib
 
@@ -459,7 +459,8 @@ step = [s for s in steps if s["id"] == "submit-and-exit"]
 if len(step) != 1:
     raise SystemExit("submit-and-exit step not found")
 
-# The lines an agent RUNS: inside a bash fence, not a comment.
+# The lines an agent RUNS: inside a bash fence of the step, plus every line of
+# polecat-submit.sh (the halts live there now, gcp-nc8wg); never a comment.
 code, inside = [], False
 for line in step[0]["description"].split("\n"):
     if line.startswith("```"):
@@ -467,6 +468,8 @@ for line in step[0]["description"].split("\n"):
         continue
     if inside and not line.lstrip().startswith("#"):
         code.append(line)
+code += [l for l in open(sys.argv[2], encoding="utf-8").read().split("\n")
+         if not l.lstrip().startswith("#")]
 
 problems = []
 body = "\n".join(code)
@@ -510,11 +513,14 @@ PY
 
 # --- 4. the shipped gate recipe, executed -----------------------------------
 
-# Properties 1-3 assert what the gate SAYS. This one runs it. The gate's bash
-# block is lifted out of the shipped step, rendered, and executed against
-# stubbed `gc` and `git`, so what is tested is the SHIPPED TEXT an agent reads
-# at pour time and never a retyped copy. Retyping is how a tested rule drifts
-# from the rule that actually runs.
+# Properties 1-3 assert what the gate SAYS. This one runs it. The shipped
+# `polecat-submit.sh push-gate` is executed as it is, against stubbed `gc` and
+# `git`, so what is tested is the SHIPPED SCRIPT and never a retyped copy.
+# Retyping is how a tested rule drifts from the rule that actually runs.
+#
+# It runs with no WORK_BEAD_ID or CURRENT_BRANCH in the environment: the script
+# derives both (from the convoy and from git), which is what lets the polecat
+# call it from a fresh shell.
 
 test_gate_execution() {
     if ! command -v jq >/dev/null 2>&1; then
@@ -527,24 +533,7 @@ test_gate_execution() {
     REAL_JQ=$(command -v jq)
     trap 'rm -rf "$tmp"' RETURN
 
-    # Render the two formula variables the gate uses. Everything else verbatim.
-    python3 - "$FORMULA" >"$tmp/gate.sh" <<'PY' || fail "could not lift the gate recipe out of $FORMULA"
-import re
-import sys
-import tomllib
-
-with open(sys.argv[1], "rb") as handle:
-    steps = tomllib.load(handle)["steps"]
-step = [s for s in steps if s["id"] == "submit-and-exit"][0]["description"]
-blocks = [b for b in re.findall(r"^```bash\n(.*?)^```$", step, re.S | re.M)
-          if "git push origin HEAD" in b]
-if len(blocks) != 1:
-    raise SystemExit("expected exactly 1 gate block, got %d" % len(blocks))
-sys.stdout.write(blocks[0].replace("{{base_branch}}", "main")
-                          .replace("{{binding_prefix}}", "gastown."))
-PY
-
-    bash -n "$tmp/gate.sh" || fail "the rendered gate is not valid bash"
+    bash -n "$SUBMIT" || fail "the submit script is not valid bash"
 
     # run_gate <label> <bead-json> [jq-calls-that-succeed] -> action log on stdout
     run_gate() {
@@ -555,6 +544,7 @@ PY
         cat >"$d/bin/gc" <<'GCSTUB'
 #!/usr/bin/env bash
 if [ "$1" = "bd" ] && [ "$2" = "show" ]; then cat "$GATE_DIR/bead.json"; exit 0; fi
+if [ "$1" = "convoy" ]; then echo '{"children":[{"id":"test-1"}]}'; exit 0; fi
 case "$1" in
   bd)      printf 'BD_UPDATE %s\n' "$*" >>"$GATE_DIR/log" ;;
   mail)    printf 'MAIL %s\n' "$*" >>"$GATE_DIR/log" ;;
@@ -574,7 +564,8 @@ exit 0
 GITSTUB
         chmod +x "$d/bin/gc" "$d/bin/git"
         # Optional fault injection: let the first N jq calls through, then fail
-        # them. The metadata probe is call 1; the prose extraction is call 2.
+        # them. The script's own work-bead lookup is call 1, the metadata probe
+        # is call 2, and the prose extraction is call 3.
         if [[ -n "${3:-}" ]]; then
             cat >"$d/bin/jq" <<'JQSTUB'
 #!/usr/bin/env bash
@@ -588,10 +579,11 @@ exec "$REAL_JQ" "$@"
 JQSTUB
             chmod +x "$d/bin/jq"
         fi
-        GATE_DIR="$d" PATH="$d/bin:$PATH" WORK_BEAD_ID=test-1 \
-            CURRENT_BRANCH=polecat/test-1 GC_RIG=testrig \
+        env -u WORK_BEAD_ID -u CURRENT_BRANCH \
+            GATE_DIR="$d" PATH="$d/bin:$PATH" GC_RIG=testrig \
+            PS_CONVOY_ID=conv-1 PS_BASE_BRANCH=main PS_BINDING_PREFIX=gastown. \
             JQ_OK_CALLS="${3:-}" REAL_JQ="$REAL_JQ" \
-            bash "$tmp/gate.sh" >"$d/out" 2>&1 || true
+            bash "$SUBMIT" push-gate >"$d/out" 2>&1 || true
         cat "$d/log"
     }
 
@@ -754,7 +746,7 @@ JQSTUB
     # was split into checked stages a mid-pipe death arrived at the match grep
     # as an empty stream, counted 0 rails, and PUSHED — the fail-closed comment
     # held only for a grep binary that was missing outright.
-    log=$(run_gate h '[{"metadata":{},"description":"Add a retry to the ingest job when the API 429s.","notes":""}]' 1)
+    log=$(run_gate h '[{"metadata":{},"description":"Add a retry to the ingest job when the API 429s.","notes":""}]' 2)
     saw   "(h) prose extraction failed" "$log" "halt_reason=no_push_rail_unresolved"
     never "(h) prose extraction failed" "$log" "PUSH"
 

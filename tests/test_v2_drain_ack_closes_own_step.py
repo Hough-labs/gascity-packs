@@ -150,6 +150,18 @@ def test_terminal_step_closes_itself_before_drain_ack(rel, step_id):
     )
 
 
+def test_submit_script_closes_itself_before_drain_ack():
+    """Every drain-ack in polecat-submit.sh sits behind the guarded own-step close.
+
+    The script is one bash block, so this reads it the way a fence is read; the
+    run_drain_site tests below execute each ack site on its own.
+    """
+    script = (REPO_ROOT / POLECAT_SUBMIT_SCRIPT).read_text()
+    assert "gc runtime drain-ack" in script, "the script no longer drain-acks; drop this test"
+    violations = drain_ack_violations(f"```bash\n{script}\n```", "submit-and-exit")
+    assert not violations, f"{POLECAT_SUBMIT_SCRIPT}: unguarded drain-acks: {violations}"
+
+
 GUARDED = (
     'STEP_BEAD_ID=$(gc hook current --id-only) || exit 1\n'
     'STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1\n'
@@ -192,6 +204,9 @@ def test_checker_recognizes_the_guarded_close(block, ok):
 # it. Upstream #490's guard closes exactly that step and refuses, without a
 # drain-ack, when the hook names anything else or cannot answer.
 POLECAT_FORMULA = "gastown/formulas/mol-polecat-work.toml"
+# The push gate and the refinery handoff of submit-and-exit run as this script
+# (gcp-nc8wg). Its halts close the step and ack the drain on the step's behalf.
+POLECAT_SUBMIT_SCRIPT = "gastown/assets/scripts/polecat-submit.sh"
 SUBMIT_STEP_REF = "mol-polecat-work.submit-and-exit"
 ME = "winnow/gastown.furiosa"
 WORK = "winnow-w1"
@@ -261,7 +276,8 @@ def submit_and_exit_drain_sites() -> list[str]:
     data = tomllib.loads((REPO_ROOT / POLECAT_FORMULA).read_text())
     step = next(s for s in data["steps"] if s["id"] == "submit-and-exit")
     sites = []
-    for block in bash_blocks(step["description"]):
+    script = (REPO_ROOT / POLECAT_SUBMIT_SCRIPT).read_text()
+    for block in [*bash_blocks(step["description"]), script]:
         lines = block.split("\n")
         for i, line in enumerate(lines):
             if "gc runtime drain-ack" not in line:

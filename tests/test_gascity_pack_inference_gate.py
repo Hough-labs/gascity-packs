@@ -1443,10 +1443,29 @@ def test_validate_gastown_orchestration_contract_accepts_the_fixture_pack(tmp_pa
 
 
 def test_validate_gastown_orchestration_contract_rejects_missing_build_handoff(tmp_path) -> None:
+    # The handoff write moved out of the formula into polecat-submit.sh (gcp-nc8wg),
+    # so the contract that pins it reads the script.
+    pack = write_gastown_contract_pack(
+        tmp_path,
+        script_edit=lambda path, text: (
+            text.replace("--assignee=\"$REFINERY_TARGET\"", "") if path.endswith("polecat-submit.sh") else text
+        ),
+    )
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="polecat-submit.sh"):
+        gascity_pack_inference_gate.validate_gastown_orchestration_contract(pack)
+
+
+@pytest.mark.parametrize("call", ['bash "$PS" push-gate', 'bash "$PS" reassign'])
+def test_validate_gastown_orchestration_contract_rejects_a_polecat_step_that_stops_calling_the_script(
+    tmp_path, call
+) -> None:
+    # The step keeps only the calls; a step that stops running the push gate or
+    # the handoff is a polecat that never pushes or never hands off.
     pack = write_gastown_contract_pack(
         tmp_path,
         formula_edit=lambda name, text: (
-            text.replace("--assignee=\"$REFINERY_TARGET\"", "") if name == "mol-polecat-work" else text
+            text.replace(call, "true", 1) if name == "mol-polecat-work" else text
         ),
     )
 
@@ -1534,7 +1553,9 @@ def test_validate_polecat_branch_content_gate_rejects_gate_moved_after_the_push(
     end = text.index("**3. ", start)
     gate = text[start:end]
     remainder = text[:start] + text[end:]
-    push_line = "git push origin HEAD\n"
+    # The push is polecat-submit.sh's; the step's anchor for it is the call that
+    # runs the push gate, which is the last line of its fence.
+    push_line = 'bash "$PS" push-gate\n'
     anchor = remainder.index(push_line) + len(push_line)
     path.write_text(remainder[:anchor] + gate + remainder[anchor:], encoding="utf-8")
 
@@ -2000,6 +2021,16 @@ def test_gastown_build_workflow_contract_covers_orchestration_roles() -> None:
         "mol-idea-to-plan",
     }
     assert "gc session wake \"$REFINERY_TARGET\"" in contracts["mol-polecat-work"]
+    # The push gate and the handoff are the script's (gcp-nc8wg): the step keeps
+    # the calls, and the script's own contract holds what moved with them.
+    for fragment in ("polecat-submit.sh", 'bash "$PS" push-gate', 'bash "$PS" reassign'):
+        assert fragment in contracts["mol-polecat-work"]
+    submit_contracts = gascity_pack_inference_gate.GASTOWN_SCRIPT_CONTRACTS["assets/scripts/polecat-submit.sh"]
+    assert "git push origin HEAD" in submit_contracts
+    assert '--status=open --assignee="$REFINERY_TARGET"' in submit_contracts
+    assert not {"git push origin HEAD", '--status=open --assignee="$REFINERY_TARGET"'} & set(
+        contracts["mol-polecat-work"]
+    )
     assert (
         'COMMITS_AHEAD=$(git rev-list --count "$BASE_REF..HEAD" 2>/dev/null)'
         in contracts["mol-polecat-work"]

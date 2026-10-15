@@ -1071,12 +1071,16 @@ test_dolt_push_outage_detection_is_wired() {
 }
 
 test_submit_and_exit_cannot_be_replayed() {
-    local formula prompt fragment submit_block
+    local formula prompt fragment submit_block script script_text
     formula="$GASTOWN/formulas/mol-polecat-work.toml"
     prompt="$GASTOWN/agents/polecat/prompt.template.md"
     fragment="$GASTOWN/template-fragments/approval-fallacy.template.md"
+    # The push gate and the refinery handoff run as this script (gcp-nc8wg).
+    script="$GASTOWN/assets/scripts/polecat-submit.sh"
 
     parse_toml "$formula"
+    [[ -f "$script" ]] || fail "polecat-submit.sh is missing: $script"
+    script_text=$(cat "$script")
 
     submit_block=$(python3 - "$formula" <<'PY'
 import sys
@@ -1094,25 +1098,22 @@ PY
     # drain-ack in this step, and tests/test_v2_drain_ack_closes_own_step.py
     # pins that. What stays pinned here is that the close never targets the
     # convoy or the work bead.
-    [[ "$submit_block" != *'gc bd close "$GC_BEAD_ID"'* ]] ||
+    [[ "$submit_block$script_text" != *'gc bd close "$GC_BEAD_ID"'* ]] ||
         fail "for a polecat \$GC_BEAD_ID is the convoy, not this step; closing it closes live work"
-    [[ "$submit_block" != *'gc bd close "$WORK_BEAD_ID"'* ]] ||
+    [[ "$submit_block$script_text" != *'gc bd close "$WORK_BEAD_ID"'* ]] ||
         fail "the polecat never closes the work bead; only the refinery does"
 
     # gcp-rz8a's severity line: a replayed step 6 clears gc.routed_to="human",
     # which is how a bead the refinery refused to land gets pulled back out of an
     # operator escalation. The guard must be
     # read and acted on BEFORE the update that clears the routing.
-    [[ "$submit_block" == *'[ "$ROUTED_TO" = "human" ]'* ]] ||
+    [[ "$script_text" == *'[ "$ROUTED_TO" = "human" ]'* ]] ||
         fail "the refinery handoff must refuse to run when gc.routed_to is human"
-    python3 - "$formula" <<'PY' || fail "the human-routing guard must precede the update that clears gc.routed_to"
+    python3 - "$script" <<'PY' || fail "the human-routing guard must precede the update that clears gc.routed_to"
 import sys
-import tomllib
 
-data = tomllib.load(open(sys.argv[1], "rb"))
-step = next(s for s in data["steps"] if s["id"] == "submit-and-exit")
-reassign = step["description"]
-reassign = reassign[reassign.index("**6. Reassign to refinery"):]
+script = open(sys.argv[1], encoding="utf-8").read()
+reassign = script[script.index("# --- reassign:begin ---"):]
 if reassign.index('[ "$ROUTED_TO" = "human" ]') >= reassign.index('--set-metadata gc.routed_to=""'):
     raise SystemExit(1)
 PY
@@ -1144,10 +1145,16 @@ PY
     [[ "$submit_block" != *'[ "$SUBMITTED_ASSIGNEE" != "$STEP_SESSION" ]'* ]] ||
         fail "assignee != this session is not proof of a refinery handoff (gcp-0pa4)"
 
-    # The resolve has to sit inside the guard's own block: every fenced block in
-    # this step re-derives its ids because an agent may run each in a fresh
-    # shell, and an empty REFINERY_TARGET here silently turns the identity test
-    # into "assignee is empty", which never fires and never bails out.
+    # The resolve has to sit inside the guard's own block: the guard (section 0)
+    # and the branch-shape gate (section 1) re-derive their ids because an agent
+    # may run each fenced block in a fresh shell, and an empty REFINERY_TARGET
+    # here silently turns the identity test into "assignee is empty", which never
+    # fires and never bails out. The two scripts that replaced the push gate and
+    # the handoff fences derive theirs too (WORK_BEAD_ID from the convoy, and
+    # CURRENT_BRANCH from git for push-gate), so a fresh shell is enough for
+    # them: test_polecat_submit.sh pins that. Sections 2, 2b and 5 are not so
+    # self-contained: they still read WORK_BEAD_ID, BASE_REF and EXPECTED_BRANCH
+    # from the shell that ran section 1. That predates gcp-nc8wg and is unchanged.
     python3 - "$formula" <<'PY' || fail "the already-submitted guard must resolve REFINERY_TARGET in its own block rather than inherit it"
 import sys
 import tomllib
@@ -1217,25 +1224,29 @@ test_work_bead_is_never_claimed() {
     # the work bead back, which is what forced STEP_REPOINTED, the
     # `gc.step_ref` close fallback and the `--if-assignee` takeover. All of that
     # stays gone.
-    local formula prompt claim fragment
+    local formula prompt claim fragment submit
     formula="$GASTOWN/formulas/mol-polecat-work.toml"
     prompt="$GASTOWN/agents/polecat/prompt.template.md"
     claim="$GASTOWN/assets/scripts/polecat-claim.sh"
     fragment="$GASTOWN/template-fragments/approval-fallacy.template.md"
+    # The push gate and the refinery handoff moved out of the formula into this
+    # script (gcp-nc8wg), so it is scanned like a step.
+    submit="$GASTOWN/assets/scripts/polecat-submit.sh"
 
     parse_toml "$formula"
 
     # No step claims the work bead: no in_progress status, no --claim, and no
     # --assignee other than the refinery handoff and the release back to the
     # pool. A logical statement is a line plus its backslash continuations.
-    python3 - "$formula" <<'PY' || fail "a step of mol-polecat-work claims the WORK bead; only the refinery handoff may write its status and assignee"
+    python3 - "$formula" "$submit" <<'PY' || fail "a step of mol-polecat-work claims the WORK bead; only the refinery handoff may write its status and assignee"
 import re
 import sys
 import tomllib
 
 data = tomllib.load(open(sys.argv[1], "rb"))
 bad = []
-for step in data["steps"]:
+scanned = list(data["steps"]) + [{"id": "polecat-submit.sh", "description": open(sys.argv[2], encoding="utf-8").read()}]
+for step in scanned:
     text = re.sub(r"\\\n\s*", " ", step["description"])
     for stmt in re.findall(r'gc bd update "\$WORK_BEAD_ID"[^\n]*', text):
         if "--status=in_progress" in stmt or "--claim" in stmt:
@@ -1253,15 +1264,18 @@ PY
     # compare-and-set takeover, and the close fallback that tolerated a hook
     # that named the work bead.
     local file
-    for file in "$prompt" "$claim" "$formula"; do
+    # polecat-submit.sh carries the push gate and handoff halts that used to be
+    # in the formula (gcp-nc8wg), so every negative pin on submit-and-exit's
+    # shell reads it too.
+    for file in "$prompt" "$claim" "$formula" "$submit"; do
         ! grep -F 'STEP_REPOINTED' "$file" >/dev/null ||
             fail "$(basename "$file") re-points a work-bead hook result onto a step; the work bead is never claimed, so the hook never returns it"
     done
-    ! grep -F -- '--if-assignee' "$prompt" "$claim" "$formula" >/dev/null ||
+    ! grep -F -- '--if-assignee' "$prompt" "$claim" "$formula" "$submit" >/dev/null ||
         fail "an --if-assignee takeover is back; there is no claim on the work bead to take over"
-    ! grep -F 'tier 2' "$formula" >/dev/null ||
+    ! grep -F 'tier 2' "$formula" "$submit" >/dev/null ||
         fail "submit-and-exit regained its gc.step_ref close fallback"
-    ! grep -F 'gc hook current --id-only 2>/dev/null' "$formula" >/dev/null ||
+    ! grep -F 'gc hook current --id-only 2>/dev/null' "$formula" "$submit" >/dev/null ||
         fail "submit-and-exit tolerates an unreadable gc hook current; it must fail closed"
     ! grep -F 'CLAIM_GUARD_BEGIN' "$formula" >/dev/null ||
         fail "workspace-setup regained the work-bead claim block"
@@ -1269,15 +1283,20 @@ PY
     # What carries the handoff is still there: the single step-6 write that
     # moves the bead to the refinery, and the done-sequence guards that tell a
     # completed handoff by the refinery's identity.
-    python3 - "$formula" <<'PY' || fail "submit-and-exit must hand the work bead straight to the refinery"
+    python3 - "$formula" "$submit" <<'PY' || fail "submit-and-exit must hand the work bead straight to the refinery"
 import sys
 import tomllib
 
 data = tomllib.load(open(sys.argv[1], "rb"))
 step = next(s for s in data["steps"] if s["id"] == "submit-and-exit")
-if 'gc bd update "$WORK_BEAD_ID" --status=open --assignee="$REFINERY_TARGET"' not in step["description"]:
+script = open(sys.argv[2], encoding="utf-8").read()
+# The write is the script's; the step calls the script and tells the polecat
+# what to do when it prints HANDOFF_FAILED.
+if 'gc bd update "$WORK_BEAD_ID" --status=open --assignee="$REFINERY_TARGET"' not in script:
     raise SystemExit(1)
-if "HANDOFF_FAILED" not in step["description"]:
+if 'bash "$PS" reassign' not in step["description"]:
+    raise SystemExit(1)
+if "HANDOFF_FAILED" not in step["description"] or "HANDOFF_FAILED" not in script:
     raise SystemExit(1)
 PY
     local guard

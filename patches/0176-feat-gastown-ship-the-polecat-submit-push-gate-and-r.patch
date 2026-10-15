@@ -1,0 +1,2173 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 15 Oct 2026 11:56:10 -0400
+Subject: [PATCH 176/176] feat(gastown): ship the polecat submit push-gate and
+ reassign fences as a pack executable (gcp-nc8wg)
+
+submit-and-exit cost ~13.4K output tokens and 8.3 calls per bead because the model retyped the 302-line push-gate fence and the 64-line reassign fence at the end of every bead, for a step that is entirely deterministic.
+
+Both fences now live in gastown/assets/scripts/polecat-submit.sh (modes push-gate and reassign), lifted verbatim between sentinels. Every formula substitution inside them became an explicit PS_* env var (PS_CONVOY_ID, PS_BASE_BRANCH, PS_BINDING_PREFIX); the script carries no {{. It derives WORK_BEAD_ID from the convoy with the same jq expression sections 0 and 1 use, and CURRENT_BRANCH from git. Each fence in mol-polecat-work.toml is now a 12-line stub using the v9mvh locator (gc formula list --json .source, dirname twice) and a single PS_<NAME>=... bash "$PS" <mode> call. The not-found path does the guarded own-step close before drain-ack, so the drain-ack-closes-own-step contract still holds. The step text drops from 689 to 391 lines.
+
+Intentional behaviour additions, all fail-safe: a missing script stops with submit_script_missing; a convoy without exactly one child stops with exit 1 before any write; target is now quoted.
+
+The tests that pinned text in the old fences are re-pointed to the script in the same change (test_polecat_push_gate, test_polecat_handoff_stamp, test_gastown_pack_assets, test_refinery_find_work, the inference gate and its test, test_v2_drain_ack_closes_own_step), and test_polecat_submit.sh adds the behavioural cases. The stale test comment claiming every submit block re-derives its ids now says what is true.
+
+Applied verbatim from the seat-verified artifact in gcp-dy5es (sha256 2d2f6859). Validation: see the acceptance notes on gcp-nc8wg.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ gastown/assets/scripts/polecat-submit.sh    | 417 ++++++++++++++++
+ gastown/formulas/mol-polecat-work.toml      | 377 +--------------
+ gastown/tests/test_gastown_pack_assets.sh   |  67 ++-
+ gastown/tests/test_polecat_handoff_stamp.sh |  36 +-
+ gastown/tests/test_polecat_push_gate.sh     | 162 +++----
+ gastown/tests/test_polecat_submit.sh        | 509 ++++++++++++++++++++
+ gastown/tests/test_refinery_find_work.sh    |  13 +-
+ scripts/gascity_pack_inference_gate.py      |  49 +-
+ tests/test_gascity_pack_inference_gate.py   |  35 +-
+ tests/test_v2_drain_ack_closes_own_step.py  |  18 +-
+ 10 files changed, 1178 insertions(+), 505 deletions(-)
+ create mode 100755 gastown/assets/scripts/polecat-submit.sh
+ create mode 100755 gastown/tests/test_polecat_submit.sh
+
+diff --git a/gastown/assets/scripts/polecat-submit.sh b/gastown/assets/scripts/polecat-submit.sh
+new file mode 100755
+index 00000000..8d1bbf25
+--- /dev/null
++++ b/gastown/assets/scripts/polecat-submit.sh
+@@ -0,0 +1,417 @@
++#!/usr/bin/env bash
++# polecat-submit.sh push-gate|reassign
++#
++# The deterministic shell of mol-polecat-work's submit-and-exit step, run as one
++# script so the polecat makes a short call and does not retype it (gcp-nc8wg).
++# "push-gate" is the step's section 3: the auto_push / no-push-rail gate, the
++# base-branch precondition, the push and its verification. "reassign" is its
++# section 6: the refinery handoff. Both bodies are the shell the step used to
++# carry, moved as written: every halt still closes the running step bead and
++# acks the drain itself, and still exits with the code it always did.
++# Sections 0, 1, 2, 2b, 4, 5, 7 and 8 stay in the formula step, because the
++# model reads and fills them.
++#
++# Inputs, set by the formula step in the environment of this call (an empty
++# value is allowed only where it says so; an unset one stops the script):
++#   push-gate: PS_CONVOY_ID PS_BASE_BRANCH PS_BINDING_PREFIX
++#   reassign:  PS_CONVOY_ID PS_BINDING_PREFIX
++#   PS_CONVOY_ID and PS_BASE_BRANCH must not be empty. PS_BINDING_PREFIX may be:
++#   it is the import binding prefix, empty when the pack is not bound.
++# Env also read: GC_RIG
++#
++# The ids the old fences inherited from earlier fences of the step are derived
++# here, the way sections 0 and 1 derive them, so a fresh shell is enough:
++#   WORK_BEAD_ID   the convoy's only child (gc convoy status PS_CONVOY_ID)
++#   CURRENT_BRANCH git branch --show-current, push-gate only
++# A convoy that does not name exactly one work bead stops the call before any
++# bead is written and without a drain, so the call can simply be run again.
++
++if [ "$#" -ne 1 ] || { [ "$1" != push-gate ] && [ "$1" != reassign ]; }; then
++    echo "SUBMIT_USAGE polecat-submit.sh push-gate|reassign"
++    exit 2
++fi
++: "${PS_CONVOY_ID:?not set or empty (the formula step sets it)}"
++: "${PS_BINDING_PREFIX?not set (the formula step sets it; an empty value is allowed)}"
++if [ "$1" = push-gate ]; then
++    : "${PS_BASE_BRANCH:?not set or empty (the formula step sets it)}"
++fi
++CONVOY_STATUS=$(gc convoy status "$PS_CONVOY_ID" --json)
++WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
++if [ -z "$WORK_BEAD_ID" ]; then
++    echo "STOP: convoy $PS_CONVOY_ID does not name exactly one work bead; nothing was changed. Run this call again."
++    exit 1
++fi
++if [ "$1" = push-gate ]; then
++CURRENT_BRANCH=$(git branch --show-current)
++# --- push-gate:begin ---
++WORK_JSON=$(gc bd show "$WORK_BEAD_ID" --json)
++BRANCH=$(git branch --show-current)
++
++# The metadata probe — NORMALISED, and fail CLOSED on a payload it cannot read.
++#
++# jq's has() ERRORS on a string, printing nothing to stdout, so the old probe
++# turned a string-shaped metadata payload into "" — and "" is not "false", so
++# outcome (a), the EXPLICIT opt-out, silently stopped firing and control
++# reached git push. A fail-OPEN on the one outcome nobody expects to be
++# conditional, and it inverted the incentive the whole no-push-rail arc has
++# been pushing: a bead that recorded its rail properly AS METADATA, and said
++# nothing in prose, is exactly the bead with no prose for (b) to match on.
++# Reproduced against this gate's own shipped text, 2026-09-05: explicit
++# auto_push=false + string-shaped metadata -> PUSH.
++#
++# MEASURED 2026-09-05 across all 7 active ledgers (control, sb, sb-app,
++# gas-city, flinders, arnotts, detmold) through this gate's own probe shape
++# (gc bd show <id> --json | jq of .[0].metadata | type): every one serves an
++# OBJECT when metadata is present and NULL when it is absent. No ledger serves
++# a string today, so this is a latent trap rather than a live hole — but the
++# shape is not a guarantee this gate owns: metadata is whatever the ledger
++# binding serialises, it varied by rig when the detector this arc grew out of
++# was written (that detector normalises object / string / null for exactly this
++# reason), and nothing pins it. The normalisation is lifted here now rather
++# than on the day it bites.
++#
++#   object -> read it.
++#   null   -> the bead carries no metadata. A legitimate live shape on every
++#             rig and the MAJORITY of beads (308 of the 410 open/in_progress
++#             beads across the six queryable ledgers), so it must fall through
++#             to (b) and never halt.
++#   string -> a JSON-encoded object. Parse it, then read it.
++#   anything else, a string that does not parse to an object, an auto_push
++#             value outside the closed vocabulary, or a probe that fails
++#             outright -> UNREADABLE, handled at (a0) below. The vocabulary is
++#             closed on purpose: the key is hand-written by humans, and reading
++#             `False` or `no` as "any other value -> explicit consent" fails
++#             open on the beads that tried hardest to say no. Note this is
++#             the OPPOSITE default to the (b) prose scan's empty INPUT case:
++#             there, nothing said is a legitimate "no rail"; here, nothing read
++#             is a failure to retrieve a decision that may well exist.
++AUTO_PUSH=""
++META_UNREADABLE=""
++if [ -z "$WORK_JSON" ]; then
++  META_UNREADABLE=1
++elif ! AUTO_PUSH=$(printf '%s' "$WORK_JSON" | jq -r '
++      if (type != "array") or (length == 0) or ((.[0] | type) != "object")
++      then error("no bead record in the payload")
++      else (.[0].metadata
++            | if   type == "object" then .
++              elif type == "null"   then {}
++              elif type == "string" then (fromjson? // "unparseable")
++              else "not-an-object" end)
++           | if type != "object" then error("metadata is not an object")
++             elif has("auto_push") then (.auto_push | tostring | ascii_downcase
++                   | if   . == "false" or . == "no"  or . == "0" then "false"
++                     elif . == "true"  or . == "yes" or . == "1" then "true"
++                     elif . == "null" then ""
++                     else error("auto_push value is outside the vocabulary")
++                     end)
++             else "" end
++      end' 2>/dev/null); then
++  META_UNREADABLE=1
++fi
++
++# (a0) The payload could not be read. Absent metadata is not consent, and
++# UNREADABLE metadata is not absent metadata — it is a bead whose recorded
++# decision the gate failed to retrieve. Reading the prose instead would be
++# guessing, so halt and hand it to a human.
++if [ -n "$META_UNREADABLE" ]; then
++  echo "metadata unreadable: halting at branch-ready (fail closed) and escalating."
++  # --append-notes, NEVER --notes — same rule as the other two halts (gci-3f5u).
++  gc bd update "$WORK_BEAD_ID" \
++    --status=open --assignee="" \
++    --set-metadata branch="$BRANCH" \
++    --set-metadata target="$PS_BASE_BRANCH" \
++    --set-metadata branch_ready=true \
++    --set-metadata halt_reason=metadata_unreadable \
++    --set-metadata gc.routed_to="" \
++    --append-notes "Branch ready: the push gate could not read this bead's push decision — the ledger read returned no bead record, the metadata came in a shape the probe cannot decode, or auto_push carried a value outside the vocabulary (false/no/0 to halt, true/yes/1 to push). A decision that cannot be read cannot be shown to lack auto_push=false, so the gate halted instead of pushing. Re-record the push decision in the vocabulary, then re-sling."
++  gc mail send "${GC_RIG:+$GC_RIG/}${PS_BINDING_PREFIX}witness" \
++    -s "HELP: push-gate metadata unreadable on $WORK_BEAD_ID [HIGH]" \
++    -m "Halted at branch-ready instead of pushing.
++
++Bead:   $WORK_BEAD_ID
++Branch: $BRANCH (local only — NOT pushed)
++Reason: the ledger read returned no readable bead record, served the metadata
++        in a shape the gate cannot decode (expected an object, a JSON string,
++        or null), or carried an auto_push value outside the vocabulary
++        (false/no/0 halt, true/yes/1 push, case-folded). The gate cannot tell
++        'halt' from 'go', so it halted.
++
++Resolve: check the ledger is healthy, then record the decision as metadata —
++  gc bd update $WORK_BEAD_ID --set-metadata auto_push=false   # confirm the halt
++  gc bd update $WORK_BEAD_ID --set-metadata auto_push=true    # authorise the push
++and re-sling. Use --set-metadata so branch and gc.routed_to survive."
++  STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
++  STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
++  printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
++  gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=metadata_unreadable --status=closed || exit 1
++  gc runtime drain-ack
++  exit 0
++fi
++
++# (a) Explicit opt-out. Never read the prose — the metadata already decided.
++if [ "$AUTO_PUSH" = "false" ]; then
++  echo "auto_push=false: halting at branch-ready (no push, no refinery handoff)"
++  # --append-notes, NEVER --notes. --notes REPLACES the entire notes field, so a
++  # halt note written with it destroys whatever the requester left on the bead.
++  gc bd update "$WORK_BEAD_ID" \
++    --status=open --assignee="" \
++    --set-metadata branch="$BRANCH" \
++    --set-metadata target="$PS_BASE_BRANCH" \
++    --set-metadata branch_ready=true \
++    --set-metadata halt_reason=auto_push_false \
++    --set-metadata gc.routed_to="" \
++    --append-notes "Branch ready: auto_push=false (no push, no refinery handoff)"
++  STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
++  STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
++  printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
++  gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=auto_push_false --status=closed || exit 1
++  gc runtime drain-ack
++  exit 0
++fi
++
++# (b) No decision recorded. Scan DESCRIPTION + NOTES for a no-push rail.
++# Lines about pushing *to main* are a DIFFERENT rail — one every polecat
++# already obeys, since it pushes a feature branch and never main — so the
++# PHRASE that states it is stripped out and the REMAINDER is matched. Without
++# that every bead quoting the standing "polecats do not push to main" rule
++# would halt, and a gate that cries wolf gets routed around.
++#
++# Strip the PHRASE, not the LINE. A line-granular exclusion took any real rail
++# that shared a line with a push-to-main mention down with it, and its target
++# list included bare `origin` — the remote this gate is about to push to — so
++# "do not push to origin" was read as the standing rule. MEASURED 2026-09-08
++# against this gate's own shipped patterns: 7 real rail wordings scored zero
++# hits and the gate PUSHED, among them "never push to origin — the customer
++# tenant is frozen" and "Polecats do not push to main. HALT branch-ready for
++# this bead." Narrowing the destination alone closes only 5 of those 7; the
++# other 2 need the strip, because rail and quote share one line. All 15
++# rail-detection rows keep their verdicts under the strip.
++#
++# The destination must end on a word boundary, or "never push to
++# origin/main-line-customer" loses its rail to the `origin/main` prefix. `/` is
++# in the protected class for the same reason `-` and `_` are: "never push to
++# main/customer" names a branch UNDER main, not main, and no English sentence
++# continues "main/…". `.` cannot join them — "Polecats never push to main. Open
++# a PR." would keep its quote and cry wolf — so the dotted-branch case stays in
++# the residual below. The text is downcased first because the strip has to catch
++# "Do Not Push To Main" and sed's case-insensitive flag is GNU-only; the match
++# grep is already -i, so downcasing upstream costs nothing.
++#
++# KNOWN RESIDUAL, two shapes, both measured 2026-09-09 and both ended by
++# recording the rail as auto_push=false:
++#   1. A rail whose ONLY signal sits inside the stripped phrase still reads as
++#      the standing rule — "never push to main or anywhere else" pushes. So does
++#      the dotted-branch form "never push to main.customer, it is frozen", which
++#      is the same shape: `.` is unprotectable without sentence semantics.
++#      Separating these needs sentence semantics, not a regex, and the cheap cure
++#      (keep the line whenever the strip would remove every signal) halts every
++#      bead that quotes the standing rule, which is the cry-wolf failure this
++#      filter exists to prevent.
++#   2. A NORMATIVE sentence about some other system's pushing — "Establish why
++#      the sync should not push twice" — halts, because the match arms below
++#      cannot tell a requirement about the subject under repair from a rail about
++#      this branch. Over-halting is the recoverable direction (a human records
++#      auto_push and re-slings) where a missed rail is not, so this is left as a
++#      halt rather than narrowed.
++#
++# Comments are deliberately out of scope: they are discussion, not standing
++# instructions, and they self-match on any bead that merely talks about
++# no-push rails.
++if [ -z "$AUTO_PUSH" ]; then
++  # Extract, downcase and strip in CHECKED stages. grep -c prints a count
++  # whenever it runs, so a failure INSIDE one long pipe arrives at the match
++  # grep as an empty stream and scores 0 — a push. Each stage that can fail is
++  # its own command and any failure sets RAIL_HIT=1: an undetermined rail is
++  # treated as an asserted one. ${RAIL_HIT:-1} then covers the last stage,
++  # where an empty result can only mean grep itself never ran.
++  RAIL_HIT=""
++  if ! PROSE=$(printf '%s' "$WORK_JSON" | jq -r '(.[0].description // ""), (.[0].notes // "")' 2>/dev/null); then
++    RAIL_HIT=1
++  elif ! LOWER=$(printf '%s' "$PROSE" | tr '[:upper:]' '[:lower:]'); then
++    RAIL_HIT=1
++  elif ! SCAN=$(printf '%s' "$LOWER" | sed -E 's#push(ing|es)?[[:space:]]+(directly[[:space:]]+)?to[[:space:]]+(origin/)?(main|master|trunk)([^-[:alnum:]_/]|$)# #g'); then
++    RAIL_HIT=1
++  else
++    # The match arms mirror the vocabulary this gate blesses elsewhere, or the
++    # gate fails open on the prose channel for words it accepts in metadata.
++    # `must not push`/`should not push` carry the same ([^e]|$) guard as
++    # `never push` for consistency, though a modal cannot take the -es/-ed form
++    # that guard exists for, so on those two arms it only catches ungrammatical
++    # prose. The value arm takes the FULL closed vocabulary — `no` and `0` are
++    # the same word as `false` at :450-455, and reading them as consent here
++    # while halting on them there is the mismatch this gate is about.
++    RAIL_HIT=$(printf '%s' "$SCAN" | grep -Eic 'no[- ]push([^e]|$)|do not push|don.t push|never push([^e]|$)|(must|should) not push([^e]|$)|(mayor|operator|human) publishes|halt[- ]*(at[- ]+)?branch[- ]ready|branch[- ]ready[- ]+halt|auto_push[[:space:]]*=[[:space:]]*(false|no|0)')
++  fi
++  if [ "${RAIL_HIT:-1}" -gt 0 ]; then
++    echo "NO-PUSH RAIL IN PROSE + auto_push ABSENT — halting at branch-ready (fail closed) and escalating."
++    # --append-notes, NEVER --notes. This halt cites a rail that is frequently
++    # written in the very notes a bare --notes would replace, so replacing them
++    # would delete the evidence the halt note tells the reader to go and read.
++    gc bd update "$WORK_BEAD_ID" \
++      --status=open --assignee="" \
++      --set-metadata branch="$BRANCH" \
++      --set-metadata target="$PS_BASE_BRANCH" \
++      --set-metadata branch_ready=true \
++      --set-metadata halt_reason=no_push_rail_unresolved \
++      --set-metadata gc.routed_to="" \
++      --append-notes "Branch ready: DESCRIPTION/NOTES assert a no-push rail but the bead carries no auto_push metadata, so the rail is unenforceable. Halted instead of guessing. Whoever owns the rail: set auto_push=false to confirm the halt, or auto_push=true to authorise the push, then re-sling."
++    gc mail send "${GC_RIG:+$GC_RIG/}${PS_BINDING_PREFIX}witness" \
++      -s "HELP: no-push rail unresolved on $WORK_BEAD_ID [HIGH]" \
++      -m "Halted at branch-ready instead of pushing.
++
++Bead:   $WORK_BEAD_ID
++Branch: $BRANCH (local only — NOT pushed)
++Reason: DESCRIPTION/NOTES assert a no-push rail, but metadata.auto_push is
++        absent. The push gate cannot tell 'halt' from 'go', so it halted.
++
++Resolve: read the rail, then record the decision as metadata —
++  gc bd update $WORK_BEAD_ID --set-metadata auto_push=false   # confirm the halt
++  gc bd update $WORK_BEAD_ID --set-metadata auto_push=true    # authorise the push
++and re-sling. Use --set-metadata so branch and gc.routed_to survive."
++    STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
++    STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
++    printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
++    gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=no_push_rail_unresolved --status=closed || exit 1
++    gc runtime drain-ack
++    exit 0
++  fi
++fi
++
++# (c) Normal path.
++# Refinery hand-off precondition. mol-refinery-patrol resolves the merge
++# target through origin (rebase, ancestry check, merge worktree), so a base
++# that exists only in this clone cannot be resolved there — and the refinery
++# reads the resulting invalid-upstream error as a merge conflict: it deletes
++# the workflow, reopens the bead, stamps a rejection reason computed from the
++# same unresolvable ref, and bounces the work to a polecat that hits the same
++# wall. Hand over only a target the refinery can actually resolve.
++git fetch --prune origin >/dev/null 2>&1 || true
++if ! git show-ref --verify --quiet "refs/remotes/origin/${PS_BASE_BRANCH}"; then
++  echo "base branch ${PS_BASE_BRANCH} is local-only: halting at branch-ready (no push, no refinery handoff)"
++  BRANCH=$(git branch --show-current)
++  gc bd update "$WORK_BEAD_ID" \
++    --status=open --assignee="" \
++    --set-metadata branch="$BRANCH" \
++    --set-metadata target="$PS_BASE_BRANCH" \
++    --set-metadata branch_ready=true \
++    --set-metadata halt_reason=base_branch_local_only \
++    --set-metadata gc.routed_to="" \
++    --append-notes "Branch ready: base branch ${PS_BASE_BRANCH} does not exist on origin, so the refinery cannot merge it. Push the base branch, then re-run submit-and-exit."
++  gc mail send "${GC_RIG:+$GC_RIG/}${PS_BINDING_PREFIX}witness" -s "polecat halted: base_branch_local_only ($WORK_BEAD_ID)" -m "Work is committed on branch $BRANCH, but base branch ${PS_BASE_BRANCH} does not exist on origin, so the refinery cannot merge it. Push the base branch, then re-run submit-and-exit for $WORK_BEAD_ID."
++  STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
++  STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
++  printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
++  gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=base_branch_local_only --status=closed || exit 1
++  gc runtime drain-ack
++  exit 0
++fi
++git push origin HEAD
++PUSH_EXIT=$?
++if [ $PUSH_EXIT -ne 0 ]; then
++    echo "PUSH FAILED (exit $PUSH_EXIT)"
++    echo "Branch '$CURRENT_BRANCH' was NOT pushed to origin."
++    echo "Aborting handoff — bead stays with polecat."
++    echo ""
++    echo "Diagnose the push failure (network, auth, force-needed?) and re-run submit-and-exit."
++    STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
++    STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
++    printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
++    gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=push_failed --status=closed || exit 1
++    gc runtime drain-ack
++    exit 1
++fi
++# Verify the ref is reachable on origin before trusting the push succeeded.
++REMOTE_REF=$(git ls-remote origin "refs/heads/$CURRENT_BRANCH" 2>/dev/null | awk '{print $1}')
++LOCAL_HEAD=$(git rev-parse HEAD)
++if [ -z "$REMOTE_REF" ]; then
++    echo "PUSH VERIFICATION FAILED"
++    echo "  git push exited 0 but 'git ls-remote' returned no ref for '$CURRENT_BRANCH' on origin."
++    echo "  Branch is local-only. Aborting handoff."
++    STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
++    STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
++    printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
++    gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=push_verify_failed --status=closed || exit 1
++    gc runtime drain-ack
++    exit 1
++fi
++if [ "$REMOTE_REF" != "$LOCAL_HEAD" ]; then
++    echo "PUSH VERIFICATION FAILED"
++    echo "  origin/$CURRENT_BRANCH = $REMOTE_REF"
++    echo "  local HEAD             = $LOCAL_HEAD"
++    echo "  Branch tip on origin does not match local HEAD. Aborting handoff."
++    STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
++    STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
++    printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
++    gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=push_verify_failed --status=closed || exit 1
++    gc runtime drain-ack
++    exit 1
++fi
++# --- push-gate:end ---
++else
++# --- reassign:begin ---
++REFINERY_TARGET="${GC_RIG:+$GC_RIG/}${PS_BINDING_PREFIX}refinery"
++# NEVER clear gc.routed_to when it reads `human`. That value is an operator
++# escalation — the refinery writes it when it REFUSES to land a bead (an
++# existing PR it cannot use, a false completion). Reassigning to the refinery
++# there does not resume the work, it silently undoes the escalation
++# (gcp-rz8a). The branch is already pushed and recorded, so halting here loses
++# nothing: the human owns the next move.
++ROUTED_TO=$(gc bd show "$WORK_BEAD_ID" --json 2>/dev/null | jq -r '.[0].metadata."gc.routed_to" // empty')
++if [ "$ROUTED_TO" = "human" ]; then
++    echo "HANDOFF HALTED: $WORK_BEAD_ID is routed to human — an operator escalation."
++    echo "Branch is pushed and metadata.target is set; leaving assignee and gc.routed_to untouched."
++    gc bd note "$WORK_BEAD_ID" --stdin <<'HUMAN_HALT'
++Polecat submit-and-exit halted at the refinery handoff: gc.routed_to=human.
++Branch is pushed and metadata.target is recorded. Assignee and routing left as
++the escalation set them; a human decides whether this goes to the refinery.
++HUMAN_HALT
++    STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
++    STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
++    printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
++    gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=routed_to_human --status=closed || exit 1
++    gc runtime drain-ack
++    exit 0
++fi
++# --- handoff-stamp:begin ---
++# Stamp the handoff in THIS write, never a later one: once the assignee names
++# the refinery, find-work can take the bead, and it orders each priority band
++# by first_submitted_at (gcp-et7g). first_submitted_at is written once and kept
++# across rejections, so a resubmitted bead keeps its place in line;
++# last_submitted_at moves on every handoff and is for observability only.
++# Only a read that returned this bead proves the key is absent. An unreadable
++# bead gets no first stamp, so a transient read failure cannot overwrite an
++# original stamp and send a resubmit to the back of its band.
++HANDOFF_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
++HANDOFF_STAMP=(--set-metadata last_submitted_at="$HANDOFF_AT")
++STAMP_JSON=$(gc bd show "$WORK_BEAD_ID" --json 2>/dev/null)
++if [ "$(printf '%s' "$STAMP_JSON" | jq -r '.[0].id // empty' 2>/dev/null)" = "$WORK_BEAD_ID" ] &&
++   [ -z "$(printf '%s' "$STAMP_JSON" | jq -r '.[0].metadata.first_submitted_at // empty' 2>/dev/null)" ]; then
++    HANDOFF_STAMP+=(--set-metadata first_submitted_at="$HANDOFF_AT")
++fi
++# A refused write is not a handoff. Stop before steps 7 and 8: they would drain
++# the session with the branch pushed and the refinery never told.
++if ! gc bd update "$WORK_BEAD_ID" --status=open --assignee="$REFINERY_TARGET" --set-metadata gc.routed_to="" \
++    "${HANDOFF_STAMP[@]}"; then
++    echo "HANDOFF_FAILED $WORK_BEAD_ID was NOT handed to $REFINERY_TARGET: the update was refused."
++    echo "  The branch is pushed and metadata.target is recorded, but the refinery will not see this bead."
++    echo "  Do NOT run steps 7 and 8 and do NOT drain-ack: this session still holds the handoff."
++    echo "  See who holds it (gc bd show $WORK_BEAD_ID --json | jq '.[0] | {status, assignee}'),"
++    echo "  then mail the witness a HELP escalation with that output."
++    exit 1
++fi
++# --- handoff-stamp:end ---
++# The handoff is the assignee write; `--status=open` is bookkeeping that has
++# been observed not to stick (gcp-s14g). Read it back and correct it once, so
++# the bead does not sit in_progress with nobody working it. This is best-effort
++# on purpose: the refinery's find-work scans open,in_progress precisely so a
++# status that refuses to settle cannot hide the bead again. Never abort the
++# handoff over it — the branch is already pushed.
++HANDOFF_STATUS=$(gc bd show "$WORK_BEAD_ID" --json 2>/dev/null | jq -r '.[0].status // empty')
++if [ "$HANDOFF_STATUS" != "open" ]; then
++    gc bd update "$WORK_BEAD_ID" --status=open >/dev/null 2>&1
++    HANDOFF_STATUS=$(gc bd show "$WORK_BEAD_ID" --json 2>/dev/null | jq -r '.[0].status // empty')
++    [ "$HANDOFF_STATUS" = "open" ] ||
++        echo "WARN $WORK_BEAD_ID handed off to $REFINERY_TARGET with status=${HANDOFF_STATUS:-unreadable}, not open; the refinery still sees it (find-work scans open,in_progress)."
++fi
++# --- reassign:end ---
++fi
+diff --git a/gastown/formulas/mol-polecat-work.toml b/gastown/formulas/mol-polecat-work.toml
+index d49b019e..5bca5e3b 100644
+--- a/gastown/formulas/mol-polecat-work.toml
++++ b/gastown/formulas/mol-polecat-work.toml
+@@ -1071,309 +1071,24 @@ Five outcomes, evaluated in order:
+ | absent, or present with a null value | no rail | push + refinery handoff — the normal path |
+ | `true`, `yes`, `1` (any case) | not read | push + refinery handoff — explicit consent |
+ 
+-```bash
+-WORK_JSON=$(gc bd show "$WORK_BEAD_ID" --json)
+-BRANCH=$(git branch --show-current)
+-
+-# The metadata probe — NORMALISED, and fail CLOSED on a payload it cannot read.
+-#
+-# jq's has() ERRORS on a string, printing nothing to stdout, so the old probe
+-# turned a string-shaped metadata payload into "" — and "" is not "false", so
+-# outcome (a), the EXPLICIT opt-out, silently stopped firing and control
+-# reached git push. A fail-OPEN on the one outcome nobody expects to be
+-# conditional, and it inverted the incentive the whole no-push-rail arc has
+-# been pushing: a bead that recorded its rail properly AS METADATA, and said
+-# nothing in prose, is exactly the bead with no prose for (b) to match on.
+-# Reproduced against this gate's own shipped text, 2026-09-05: explicit
+-# auto_push=false + string-shaped metadata -> PUSH.
+-#
+-# MEASURED 2026-09-05 across all 7 active ledgers (control, sb, sb-app,
+-# gas-city, flinders, arnotts, detmold) through this gate's own probe shape
+-# (gc bd show <id> --json | jq of .[0].metadata | type): every one serves an
+-# OBJECT when metadata is present and NULL when it is absent. No ledger serves
+-# a string today, so this is a latent trap rather than a live hole — but the
+-# shape is not a guarantee this gate owns: metadata is whatever the ledger
+-# binding serialises, it varied by rig when the detector this arc grew out of
+-# was written (that detector normalises object / string / null for exactly this
+-# reason), and nothing pins it. The normalisation is lifted here now rather
+-# than on the day it bites.
+-#
+-#   object -> read it.
+-#   null   -> the bead carries no metadata. A legitimate live shape on every
+-#             rig and the MAJORITY of beads (308 of the 410 open/in_progress
+-#             beads across the six queryable ledgers), so it must fall through
+-#             to (b) and never halt.
+-#   string -> a JSON-encoded object. Parse it, then read it.
+-#   anything else, a string that does not parse to an object, an auto_push
+-#             value outside the closed vocabulary, or a probe that fails
+-#             outright -> UNREADABLE, handled at (a0) below. The vocabulary is
+-#             closed on purpose: the key is hand-written by humans, and reading
+-#             `False` or `no` as "any other value -> explicit consent" fails
+-#             open on the beads that tried hardest to say no. Note this is
+-#             the OPPOSITE default to the (b) prose scan's empty INPUT case:
+-#             there, nothing said is a legitimate "no rail"; here, nothing read
+-#             is a failure to retrieve a decision that may well exist.
+-AUTO_PUSH=""
+-META_UNREADABLE=""
+-if [ -z "$WORK_JSON" ]; then
+-  META_UNREADABLE=1
+-elif ! AUTO_PUSH=$(printf '%s' "$WORK_JSON" | jq -r '
+-      if (type != "array") or (length == 0) or ((.[0] | type) != "object")
+-      then error("no bead record in the payload")
+-      else (.[0].metadata
+-            | if   type == "object" then .
+-              elif type == "null"   then {}
+-              elif type == "string" then (fromjson? // "unparseable")
+-              else "not-an-object" end)
+-           | if type != "object" then error("metadata is not an object")
+-             elif has("auto_push") then (.auto_push | tostring | ascii_downcase
+-                   | if   . == "false" or . == "no"  or . == "0" then "false"
+-                     elif . == "true"  or . == "yes" or . == "1" then "true"
+-                     elif . == "null" then ""
+-                     else error("auto_push value is outside the vocabulary")
+-                     end)
+-             else "" end
+-      end' 2>/dev/null); then
+-  META_UNREADABLE=1
+-fi
+-
+-# (a0) The payload could not be read. Absent metadata is not consent, and
+-# UNREADABLE metadata is not absent metadata — it is a bead whose recorded
+-# decision the gate failed to retrieve. Reading the prose instead would be
+-# guessing, so halt and hand it to a human.
+-if [ -n "$META_UNREADABLE" ]; then
+-  echo "metadata unreadable: halting at branch-ready (fail closed) and escalating."
+-  # --append-notes, NEVER --notes — same rule as the other two halts (gci-3f5u).
+-  gc bd update "$WORK_BEAD_ID" \
+-    --status=open --assignee="" \
+-    --set-metadata branch="$BRANCH" \
+-    --set-metadata target={{base_branch}} \
+-    --set-metadata branch_ready=true \
+-    --set-metadata halt_reason=metadata_unreadable \
+-    --set-metadata gc.routed_to="" \
+-    --append-notes "Branch ready: the push gate could not read this bead's push decision — the ledger read returned no bead record, the metadata came in a shape the probe cannot decode, or auto_push carried a value outside the vocabulary (false/no/0 to halt, true/yes/1 to push). A decision that cannot be read cannot be shown to lack auto_push=false, so the gate halted instead of pushing. Re-record the push decision in the vocabulary, then re-sling."
+-  gc mail send "${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness" \
+-    -s "HELP: push-gate metadata unreadable on $WORK_BEAD_ID [HIGH]" \
+-    -m "Halted at branch-ready instead of pushing.
+-
+-Bead:   $WORK_BEAD_ID
+-Branch: $BRANCH (local only — NOT pushed)
+-Reason: the ledger read returned no readable bead record, served the metadata
+-        in a shape the gate cannot decode (expected an object, a JSON string,
+-        or null), or carried an auto_push value outside the vocabulary
+-        (false/no/0 halt, true/yes/1 push, case-folded). The gate cannot tell
+-        'halt' from 'go', so it halted.
+-
+-Resolve: check the ledger is healthy, then record the decision as metadata —
+-  gc bd update $WORK_BEAD_ID --set-metadata auto_push=false   # confirm the halt
+-  gc bd update $WORK_BEAD_ID --set-metadata auto_push=true    # authorise the push
+-and re-sling. Use --set-metadata so branch and gc.routed_to survive."
+-  STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
+-  STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
+-  printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
+-  gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=metadata_unreadable --status=closed || exit 1
+-  gc runtime drain-ack
+-  exit 0
+-fi
+-
+-# (a) Explicit opt-out. Never read the prose — the metadata already decided.
+-if [ "$AUTO_PUSH" = "false" ]; then
+-  echo "auto_push=false: halting at branch-ready (no push, no refinery handoff)"
+-  # --append-notes, NEVER --notes. --notes REPLACES the entire notes field, so a
+-  # halt note written with it destroys whatever the requester left on the bead.
+-  gc bd update "$WORK_BEAD_ID" \
+-    --status=open --assignee="" \
+-    --set-metadata branch="$BRANCH" \
+-    --set-metadata target={{base_branch}} \
+-    --set-metadata branch_ready=true \
+-    --set-metadata halt_reason=auto_push_false \
+-    --set-metadata gc.routed_to="" \
+-    --append-notes "Branch ready: auto_push=false (no push, no refinery handoff)"
+-  STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
+-  STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
+-  printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
+-  gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=auto_push_false --status=closed || exit 1
+-  gc runtime drain-ack
+-  exit 0
+-fi
+-
+-# (b) No decision recorded. Scan DESCRIPTION + NOTES for a no-push rail.
+-# Lines about pushing *to main* are a DIFFERENT rail — one every polecat
+-# already obeys, since it pushes a feature branch and never main — so the
+-# PHRASE that states it is stripped out and the REMAINDER is matched. Without
+-# that every bead quoting the standing "polecats do not push to main" rule
+-# would halt, and a gate that cries wolf gets routed around.
+-#
+-# Strip the PHRASE, not the LINE. A line-granular exclusion took any real rail
+-# that shared a line with a push-to-main mention down with it, and its target
+-# list included bare `origin` — the remote this gate is about to push to — so
+-# "do not push to origin" was read as the standing rule. MEASURED 2026-09-08
+-# against this gate's own shipped patterns: 7 real rail wordings scored zero
+-# hits and the gate PUSHED, among them "never push to origin — the customer
+-# tenant is frozen" and "Polecats do not push to main. HALT branch-ready for
+-# this bead." Narrowing the destination alone closes only 5 of those 7; the
+-# other 2 need the strip, because rail and quote share one line. All 15
+-# rail-detection rows keep their verdicts under the strip.
+-#
+-# The destination must end on a word boundary, or "never push to
+-# origin/main-line-customer" loses its rail to the `origin/main` prefix. `/` is
+-# in the protected class for the same reason `-` and `_` are: "never push to
+-# main/customer" names a branch UNDER main, not main, and no English sentence
+-# continues "main/…". `.` cannot join them — "Polecats never push to main. Open
+-# a PR." would keep its quote and cry wolf — so the dotted-branch case stays in
+-# the residual below. The text is downcased first because the strip has to catch
+-# "Do Not Push To Main" and sed's case-insensitive flag is GNU-only; the match
+-# grep is already -i, so downcasing upstream costs nothing.
+-#
+-# KNOWN RESIDUAL, two shapes, both measured 2026-09-09 and both ended by
+-# recording the rail as auto_push=false:
+-#   1. A rail whose ONLY signal sits inside the stripped phrase still reads as
+-#      the standing rule — "never push to main or anywhere else" pushes. So does
+-#      the dotted-branch form "never push to main.customer, it is frozen", which
+-#      is the same shape: `.` is unprotectable without sentence semantics.
+-#      Separating these needs sentence semantics, not a regex, and the cheap cure
+-#      (keep the line whenever the strip would remove every signal) halts every
+-#      bead that quotes the standing rule, which is the cry-wolf failure this
+-#      filter exists to prevent.
+-#   2. A NORMATIVE sentence about some other system's pushing — "Establish why
+-#      the sync should not push twice" — halts, because the match arms below
+-#      cannot tell a requirement about the subject under repair from a rail about
+-#      this branch. Over-halting is the recoverable direction (a human records
+-#      auto_push and re-slings) where a missed rail is not, so this is left as a
+-#      halt rather than narrowed.
+-#
+-# Comments are deliberately out of scope: they are discussion, not standing
+-# instructions, and they self-match on any bead that merely talks about
+-# no-push rails.
+-if [ -z "$AUTO_PUSH" ]; then
+-  # Extract, downcase and strip in CHECKED stages. grep -c prints a count
+-  # whenever it runs, so a failure INSIDE one long pipe arrives at the match
+-  # grep as an empty stream and scores 0 — a push. Each stage that can fail is
+-  # its own command and any failure sets RAIL_HIT=1: an undetermined rail is
+-  # treated as an asserted one. ${RAIL_HIT:-1} then covers the last stage,
+-  # where an empty result can only mean grep itself never ran.
+-  RAIL_HIT=""
+-  if ! PROSE=$(printf '%s' "$WORK_JSON" | jq -r '(.[0].description // ""), (.[0].notes // "")' 2>/dev/null); then
+-    RAIL_HIT=1
+-  elif ! LOWER=$(printf '%s' "$PROSE" | tr '[:upper:]' '[:lower:]'); then
+-    RAIL_HIT=1
+-  elif ! SCAN=$(printf '%s' "$LOWER" | sed -E 's#push(ing|es)?[[:space:]]+(directly[[:space:]]+)?to[[:space:]]+(origin/)?(main|master|trunk)([^-[:alnum:]_/]|$)# #g'); then
+-    RAIL_HIT=1
+-  else
+-    # The match arms mirror the vocabulary this gate blesses elsewhere, or the
+-    # gate fails open on the prose channel for words it accepts in metadata.
+-    # `must not push`/`should not push` carry the same ([^e]|$) guard as
+-    # `never push` for consistency, though a modal cannot take the -es/-ed form
+-    # that guard exists for, so on those two arms it only catches ungrammatical
+-    # prose. The value arm takes the FULL closed vocabulary — `no` and `0` are
+-    # the same word as `false` at :450-455, and reading them as consent here
+-    # while halting on them there is the mismatch this gate is about.
+-    RAIL_HIT=$(printf '%s' "$SCAN" | grep -Eic 'no[- ]push([^e]|$)|do not push|don.t push|never push([^e]|$)|(must|should) not push([^e]|$)|(mayor|operator|human) publishes|halt[- ]*(at[- ]+)?branch[- ]ready|branch[- ]ready[- ]+halt|auto_push[[:space:]]*=[[:space:]]*(false|no|0)')
+-  fi
+-  if [ "${RAIL_HIT:-1}" -gt 0 ]; then
+-    echo "NO-PUSH RAIL IN PROSE + auto_push ABSENT — halting at branch-ready (fail closed) and escalating."
+-    # --append-notes, NEVER --notes. This halt cites a rail that is frequently
+-    # written in the very notes a bare --notes would replace, so replacing them
+-    # would delete the evidence the halt note tells the reader to go and read.
+-    gc bd update "$WORK_BEAD_ID" \
+-      --status=open --assignee="" \
+-      --set-metadata branch="$BRANCH" \
+-      --set-metadata target={{base_branch}} \
+-      --set-metadata branch_ready=true \
+-      --set-metadata halt_reason=no_push_rail_unresolved \
+-      --set-metadata gc.routed_to="" \
+-      --append-notes "Branch ready: DESCRIPTION/NOTES assert a no-push rail but the bead carries no auto_push metadata, so the rail is unenforceable. Halted instead of guessing. Whoever owns the rail: set auto_push=false to confirm the halt, or auto_push=true to authorise the push, then re-sling."
+-    gc mail send "${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness" \
+-      -s "HELP: no-push rail unresolved on $WORK_BEAD_ID [HIGH]" \
+-      -m "Halted at branch-ready instead of pushing.
+-
+-Bead:   $WORK_BEAD_ID
+-Branch: $BRANCH (local only — NOT pushed)
+-Reason: DESCRIPTION/NOTES assert a no-push rail, but metadata.auto_push is
+-        absent. The push gate cannot tell 'halt' from 'go', so it halted.
+-
+-Resolve: read the rail, then record the decision as metadata —
+-  gc bd update $WORK_BEAD_ID --set-metadata auto_push=false   # confirm the halt
+-  gc bd update $WORK_BEAD_ID --set-metadata auto_push=true    # authorise the push
+-and re-sling. Use --set-metadata so branch and gc.routed_to survive."
+-    STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
+-    STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
+-    printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
+-    gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=no_push_rail_unresolved --status=closed || exit 1
+-    gc runtime drain-ack
+-    exit 0
+-  fi
+-fi
++Run the block below as ONE Bash call, exactly as written. It runs the pack's
++submit script (`assets/scripts/polecat-submit.sh push-gate`), which reads the
++bead, applies the five outcomes above in that order, and only then pushes and
++verifies the push. Do not retype the script or read it first.
+ 
+-# (c) Normal path.
+-# Refinery hand-off precondition. mol-refinery-patrol resolves the merge
+-# target through origin (rebase, ancestry check, merge worktree), so a base
+-# that exists only in this clone cannot be resolved there — and the refinery
+-# reads the resulting invalid-upstream error as a merge conflict: it deletes
+-# the workflow, reopens the bead, stamps a rejection reason computed from the
+-# same unresolvable ref, and bounces the work to a polecat that hits the same
+-# wall. Hand over only a target the refinery can actually resolve.
+-git fetch --prune origin >/dev/null 2>&1 || true
+-if ! git show-ref --verify --quiet "refs/remotes/origin/{{base_branch}}"; then
+-  echo "base branch {{base_branch}} is local-only: halting at branch-ready (no push, no refinery handoff)"
+-  BRANCH=$(git branch --show-current)
+-  gc bd update "$WORK_BEAD_ID" \
+-    --status=open --assignee="" \
+-    --set-metadata branch="$BRANCH" \
+-    --set-metadata target={{base_branch}} \
+-    --set-metadata branch_ready=true \
+-    --set-metadata halt_reason=base_branch_local_only \
+-    --set-metadata gc.routed_to="" \
+-    --append-notes "Branch ready: base branch {{base_branch}} does not exist on origin, so the refinery cannot merge it. Push the base branch, then re-run submit-and-exit."
+-  gc mail send "${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness" -s "polecat halted: base_branch_local_only ($WORK_BEAD_ID)" -m "Work is committed on branch $BRANCH, but base branch {{base_branch}} does not exist on origin, so the refinery cannot merge it. Push the base branch, then re-run submit-and-exit for $WORK_BEAD_ID."
+-  STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
+-  STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
+-  printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
+-  gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=base_branch_local_only --status=closed || exit 1
+-  gc runtime drain-ack
+-  exit 0
+-fi
+-git push origin HEAD
+-PUSH_EXIT=$?
+-if [ $PUSH_EXIT -ne 0 ]; then
+-    echo "PUSH FAILED (exit $PUSH_EXIT)"
+-    echo "Branch '$CURRENT_BRANCH' was NOT pushed to origin."
+-    echo "Aborting handoff — bead stays with polecat."
+-    echo ""
+-    echo "Diagnose the push failure (network, auth, force-needed?) and re-run submit-and-exit."
+-    STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
+-    STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
+-    printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
+-    gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=push_failed --status=closed || exit 1
+-    gc runtime drain-ack
+-    exit 1
+-fi
+-# Verify the ref is reachable on origin before trusting the push succeeded.
+-REMOTE_REF=$(git ls-remote origin "refs/heads/$CURRENT_BRANCH" 2>/dev/null | awk '{print $1}')
+-LOCAL_HEAD=$(git rev-parse HEAD)
+-if [ -z "$REMOTE_REF" ]; then
+-    echo "PUSH VERIFICATION FAILED"
+-    echo "  git push exited 0 but 'git ls-remote' returned no ref for '$CURRENT_BRANCH' on origin."
+-    echo "  Branch is local-only. Aborting handoff."
+-    STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
+-    STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
+-    printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
+-    gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=push_verify_failed --status=closed || exit 1
+-    gc runtime drain-ack
+-    exit 1
+-fi
+-if [ "$REMOTE_REF" != "$LOCAL_HEAD" ]; then
+-    echo "PUSH VERIFICATION FAILED"
+-    echo "  origin/$CURRENT_BRANCH = $REMOTE_REF"
+-    echo "  local HEAD             = $LOCAL_HEAD"
+-    echo "  Branch tip on origin does not match local HEAD. Aborting handoff."
++```bash
++PS_SRC=$(gc formula list --json 2>/dev/null | jq -r '.formulas[]? | select(.name == "mol-polecat-work") | .source // empty' | head -1)
++PS="${PS_SRC:+$(dirname "$(dirname "$PS_SRC")")/assets/scripts/polecat-submit.sh}"
++if [ -z "$PS" ] || [ ! -f "$PS" ]; then
++    echo "STOP: submit script not found (resolved '${PS:-}'); the pack is broken. Do not push or hand off by hand."
+     STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
+     STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
+     printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
+-    gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=push_verify_failed --status=closed || exit 1
++    gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=submit_script_missing --status=closed || exit 1
+     gc runtime drain-ack
+     exit 1
+ fi
++PS_CONVOY_ID='{{convoy_id}}' PS_BASE_BRANCH='{{base_branch}}' PS_BINDING_PREFIX='{{binding_prefix}}' bash "$PS" push-gate
+ ```
+ 
+ **4. Clean up local branch (prevent stale branch accumulation):**
+@@ -1431,71 +1146,25 @@ before this step, as do the push-failure paths, so an unpushed branch never
+ carries the marker.
+ 
+ **6. Reassign to refinery:**
++
++Run the block below as ONE Bash call, exactly as written. It runs the pack's
++submit script (`assets/scripts/polecat-submit.sh reassign`), which refuses to
++touch a bead routed to `human`, then hands the work bead to the refinery in one
++write. Do not retype the script or read it first.
++
+ ```bash
+-REFINERY_TARGET="${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery"
+-# NEVER clear gc.routed_to when it reads `human`. That value is an operator
+-# escalation — the refinery writes it when it REFUSES to land a bead (an
+-# existing PR it cannot use, a false completion). Reassigning to the refinery
+-# there does not resume the work, it silently undoes the escalation
+-# (gcp-rz8a). The branch is already pushed and recorded, so halting here loses
+-# nothing: the human owns the next move.
+-ROUTED_TO=$(gc bd show "$WORK_BEAD_ID" --json 2>/dev/null | jq -r '.[0].metadata."gc.routed_to" // empty')
+-if [ "$ROUTED_TO" = "human" ]; then
+-    echo "HANDOFF HALTED: $WORK_BEAD_ID is routed to human — an operator escalation."
+-    echo "Branch is pushed and metadata.target is set; leaving assignee and gc.routed_to untouched."
+-    gc bd note "$WORK_BEAD_ID" --stdin <<'HUMAN_HALT'
+-Polecat submit-and-exit halted at the refinery handoff: gc.routed_to=human.
+-Branch is pushed and metadata.target is recorded. Assignee and routing left as
+-the escalation set them; a human decides whether this goes to the refinery.
+-HUMAN_HALT
++PS_SRC=$(gc formula list --json 2>/dev/null | jq -r '.formulas[]? | select(.name == "mol-polecat-work") | .source // empty' | head -1)
++PS="${PS_SRC:+$(dirname "$(dirname "$PS_SRC")")/assets/scripts/polecat-submit.sh}"
++if [ -z "$PS" ] || [ ! -f "$PS" ]; then
++    echo "STOP: submit script not found (resolved '${PS:-}'); the pack is broken. Do not hand off by hand."
+     STEP_BEAD_ID=$(gc hook current --id-only) || exit 1  # drain-ack gives back every claim this session still holds, so close this step first
+     STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1
+     printf '%s' "$STEP_BEAD" | jq -e '(if type == "array" then .[0] else . end) | .status == "in_progress" and ((.metadata["gc.step_ref"] // "") | endswith(".submit-and-exit"))' >/dev/null || { echo "submit-and-exit: current claim $STEP_BEAD_ID is not this in-progress step; not acknowledging drain" >&2; exit 1; }
+-    gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=routed_to_human --status=closed || exit 1
++    gc bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=submit_script_missing --status=closed || exit 1
+     gc runtime drain-ack
+-    exit 0
+-fi
+-# --- handoff-stamp:begin ---
+-# Stamp the handoff in THIS write, never a later one: once the assignee names
+-# the refinery, find-work can take the bead, and it orders each priority band
+-# by first_submitted_at (gcp-et7g). first_submitted_at is written once and kept
+-# across rejections, so a resubmitted bead keeps its place in line;
+-# last_submitted_at moves on every handoff and is for observability only.
+-# Only a read that returned this bead proves the key is absent. An unreadable
+-# bead gets no first stamp, so a transient read failure cannot overwrite an
+-# original stamp and send a resubmit to the back of its band.
+-HANDOFF_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+-HANDOFF_STAMP=(--set-metadata last_submitted_at="$HANDOFF_AT")
+-STAMP_JSON=$(gc bd show "$WORK_BEAD_ID" --json 2>/dev/null)
+-if [ "$(printf '%s' "$STAMP_JSON" | jq -r '.[0].id // empty' 2>/dev/null)" = "$WORK_BEAD_ID" ] &&
+-   [ -z "$(printf '%s' "$STAMP_JSON" | jq -r '.[0].metadata.first_submitted_at // empty' 2>/dev/null)" ]; then
+-    HANDOFF_STAMP+=(--set-metadata first_submitted_at="$HANDOFF_AT")
+-fi
+-# A refused write is not a handoff. Stop before steps 7 and 8: they would drain
+-# the session with the branch pushed and the refinery never told.
+-if ! gc bd update "$WORK_BEAD_ID" --status=open --assignee="$REFINERY_TARGET" --set-metadata gc.routed_to="" \
+-    "${HANDOFF_STAMP[@]}"; then
+-    echo "HANDOFF_FAILED $WORK_BEAD_ID was NOT handed to $REFINERY_TARGET: the update was refused."
+-    echo "  The branch is pushed and metadata.target is recorded, but the refinery will not see this bead."
+-    echo "  Do NOT run steps 7 and 8 and do NOT drain-ack: this session still holds the handoff."
+-    echo "  See who holds it (gc bd show $WORK_BEAD_ID --json | jq '.[0] | {status, assignee}'),"
+-    echo "  then mail the witness a HELP escalation with that output."
+     exit 1
+ fi
+-# --- handoff-stamp:end ---
+-# The handoff is the assignee write; `--status=open` is bookkeeping that has
+-# been observed not to stick (gcp-s14g). Read it back and correct it once, so
+-# the bead does not sit in_progress with nobody working it. This is best-effort
+-# on purpose: the refinery's find-work scans open,in_progress precisely so a
+-# status that refuses to settle cannot hide the bead again. Never abort the
+-# handoff over it — the branch is already pushed.
+-HANDOFF_STATUS=$(gc bd show "$WORK_BEAD_ID" --json 2>/dev/null | jq -r '.[0].status // empty')
+-if [ "$HANDOFF_STATUS" != "open" ]; then
+-    gc bd update "$WORK_BEAD_ID" --status=open >/dev/null 2>&1
+-    HANDOFF_STATUS=$(gc bd show "$WORK_BEAD_ID" --json 2>/dev/null | jq -r '.[0].status // empty')
+-    [ "$HANDOFF_STATUS" = "open" ] ||
+-        echo "WARN $WORK_BEAD_ID handed off to $REFINERY_TARGET with status=${HANDOFF_STATUS:-unreadable}, not open; the refinery still sees it (find-work scans open,in_progress)."
+-fi
++PS_CONVOY_ID='{{convoy_id}}' PS_BINDING_PREFIX='{{binding_prefix}}' bash "$PS" reassign
+ ```
+ 
+ `${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery` resolves to
+diff --git a/gastown/tests/test_gastown_pack_assets.sh b/gastown/tests/test_gastown_pack_assets.sh
+index 65e92a29..40f32f53 100755
+--- a/gastown/tests/test_gastown_pack_assets.sh
++++ b/gastown/tests/test_gastown_pack_assets.sh
+@@ -1071,12 +1071,16 @@ test_dolt_push_outage_detection_is_wired() {
+ }
+ 
+ test_submit_and_exit_cannot_be_replayed() {
+-    local formula prompt fragment submit_block
++    local formula prompt fragment submit_block script script_text
+     formula="$GASTOWN/formulas/mol-polecat-work.toml"
+     prompt="$GASTOWN/agents/polecat/prompt.template.md"
+     fragment="$GASTOWN/template-fragments/approval-fallacy.template.md"
++    # The push gate and the refinery handoff run as this script (gcp-nc8wg).
++    script="$GASTOWN/assets/scripts/polecat-submit.sh"
+ 
+     parse_toml "$formula"
++    [[ -f "$script" ]] || fail "polecat-submit.sh is missing: $script"
++    script_text=$(cat "$script")
+ 
+     submit_block=$(python3 - "$formula" <<'PY'
+ import sys
+@@ -1094,25 +1098,22 @@ PY
+     # drain-ack in this step, and tests/test_v2_drain_ack_closes_own_step.py
+     # pins that. What stays pinned here is that the close never targets the
+     # convoy or the work bead.
+-    [[ "$submit_block" != *'gc bd close "$GC_BEAD_ID"'* ]] ||
++    [[ "$submit_block$script_text" != *'gc bd close "$GC_BEAD_ID"'* ]] ||
+         fail "for a polecat \$GC_BEAD_ID is the convoy, not this step; closing it closes live work"
+-    [[ "$submit_block" != *'gc bd close "$WORK_BEAD_ID"'* ]] ||
++    [[ "$submit_block$script_text" != *'gc bd close "$WORK_BEAD_ID"'* ]] ||
+         fail "the polecat never closes the work bead; only the refinery does"
+ 
+     # gcp-rz8a's severity line: a replayed step 6 clears gc.routed_to="human",
+     # which is how a bead the refinery refused to land gets pulled back out of an
+     # operator escalation. The guard must be
+     # read and acted on BEFORE the update that clears the routing.
+-    [[ "$submit_block" == *'[ "$ROUTED_TO" = "human" ]'* ]] ||
++    [[ "$script_text" == *'[ "$ROUTED_TO" = "human" ]'* ]] ||
+         fail "the refinery handoff must refuse to run when gc.routed_to is human"
+-    python3 - "$formula" <<'PY' || fail "the human-routing guard must precede the update that clears gc.routed_to"
++    python3 - "$script" <<'PY' || fail "the human-routing guard must precede the update that clears gc.routed_to"
+ import sys
+-import tomllib
+ 
+-data = tomllib.load(open(sys.argv[1], "rb"))
+-step = next(s for s in data["steps"] if s["id"] == "submit-and-exit")
+-reassign = step["description"]
+-reassign = reassign[reassign.index("**6. Reassign to refinery"):]
++script = open(sys.argv[1], encoding="utf-8").read()
++reassign = script[script.index("# --- reassign:begin ---"):]
+ if reassign.index('[ "$ROUTED_TO" = "human" ]') >= reassign.index('--set-metadata gc.routed_to=""'):
+     raise SystemExit(1)
+ PY
+@@ -1144,10 +1145,16 @@ PY
+     [[ "$submit_block" != *'[ "$SUBMITTED_ASSIGNEE" != "$STEP_SESSION" ]'* ]] ||
+         fail "assignee != this session is not proof of a refinery handoff (gcp-0pa4)"
+ 
+-    # The resolve has to sit inside the guard's own block: every fenced block in
+-    # this step re-derives its ids because an agent may run each in a fresh
+-    # shell, and an empty REFINERY_TARGET here silently turns the identity test
+-    # into "assignee is empty", which never fires and never bails out.
++    # The resolve has to sit inside the guard's own block: the guard (section 0)
++    # and the branch-shape gate (section 1) re-derive their ids because an agent
++    # may run each fenced block in a fresh shell, and an empty REFINERY_TARGET
++    # here silently turns the identity test into "assignee is empty", which never
++    # fires and never bails out. The two scripts that replaced the push gate and
++    # the handoff fences derive theirs too (WORK_BEAD_ID from the convoy, and
++    # CURRENT_BRANCH from git for push-gate), so a fresh shell is enough for
++    # them: test_polecat_submit.sh pins that. Sections 2, 2b and 5 are not so
++    # self-contained: they still read WORK_BEAD_ID, BASE_REF and EXPECTED_BRANCH
++    # from the shell that ran section 1. That predates gcp-nc8wg and is unchanged.
+     python3 - "$formula" <<'PY' || fail "the already-submitted guard must resolve REFINERY_TARGET in its own block rather than inherit it"
+ import sys
+ import tomllib
+@@ -1217,25 +1224,29 @@ test_work_bead_is_never_claimed() {
+     # the work bead back, which is what forced STEP_REPOINTED, the
+     # `gc.step_ref` close fallback and the `--if-assignee` takeover. All of that
+     # stays gone.
+-    local formula prompt claim fragment
++    local formula prompt claim fragment submit
+     formula="$GASTOWN/formulas/mol-polecat-work.toml"
+     prompt="$GASTOWN/agents/polecat/prompt.template.md"
+     claim="$GASTOWN/assets/scripts/polecat-claim.sh"
+     fragment="$GASTOWN/template-fragments/approval-fallacy.template.md"
++    # The push gate and the refinery handoff moved out of the formula into this
++    # script (gcp-nc8wg), so it is scanned like a step.
++    submit="$GASTOWN/assets/scripts/polecat-submit.sh"
+ 
+     parse_toml "$formula"
+ 
+     # No step claims the work bead: no in_progress status, no --claim, and no
+     # --assignee other than the refinery handoff and the release back to the
+     # pool. A logical statement is a line plus its backslash continuations.
+-    python3 - "$formula" <<'PY' || fail "a step of mol-polecat-work claims the WORK bead; only the refinery handoff may write its status and assignee"
++    python3 - "$formula" "$submit" <<'PY' || fail "a step of mol-polecat-work claims the WORK bead; only the refinery handoff may write its status and assignee"
+ import re
+ import sys
+ import tomllib
+ 
+ data = tomllib.load(open(sys.argv[1], "rb"))
+ bad = []
+-for step in data["steps"]:
++scanned = list(data["steps"]) + [{"id": "polecat-submit.sh", "description": open(sys.argv[2], encoding="utf-8").read()}]
++for step in scanned:
+     text = re.sub(r"\\\n\s*", " ", step["description"])
+     for stmt in re.findall(r'gc bd update "\$WORK_BEAD_ID"[^\n]*', text):
+         if "--status=in_progress" in stmt or "--claim" in stmt:
+@@ -1253,15 +1264,18 @@ PY
+     # compare-and-set takeover, and the close fallback that tolerated a hook
+     # that named the work bead.
+     local file
+-    for file in "$prompt" "$claim" "$formula"; do
++    # polecat-submit.sh carries the push gate and handoff halts that used to be
++    # in the formula (gcp-nc8wg), so every negative pin on submit-and-exit's
++    # shell reads it too.
++    for file in "$prompt" "$claim" "$formula" "$submit"; do
+         ! grep -F 'STEP_REPOINTED' "$file" >/dev/null ||
+             fail "$(basename "$file") re-points a work-bead hook result onto a step; the work bead is never claimed, so the hook never returns it"
+     done
+-    ! grep -F -- '--if-assignee' "$prompt" "$claim" "$formula" >/dev/null ||
++    ! grep -F -- '--if-assignee' "$prompt" "$claim" "$formula" "$submit" >/dev/null ||
+         fail "an --if-assignee takeover is back; there is no claim on the work bead to take over"
+-    ! grep -F 'tier 2' "$formula" >/dev/null ||
++    ! grep -F 'tier 2' "$formula" "$submit" >/dev/null ||
+         fail "submit-and-exit regained its gc.step_ref close fallback"
+-    ! grep -F 'gc hook current --id-only 2>/dev/null' "$formula" >/dev/null ||
++    ! grep -F 'gc hook current --id-only 2>/dev/null' "$formula" "$submit" >/dev/null ||
+         fail "submit-and-exit tolerates an unreadable gc hook current; it must fail closed"
+     ! grep -F 'CLAIM_GUARD_BEGIN' "$formula" >/dev/null ||
+         fail "workspace-setup regained the work-bead claim block"
+@@ -1269,15 +1283,20 @@ PY
+     # What carries the handoff is still there: the single step-6 write that
+     # moves the bead to the refinery, and the done-sequence guards that tell a
+     # completed handoff by the refinery's identity.
+-    python3 - "$formula" <<'PY' || fail "submit-and-exit must hand the work bead straight to the refinery"
++    python3 - "$formula" "$submit" <<'PY' || fail "submit-and-exit must hand the work bead straight to the refinery"
+ import sys
+ import tomllib
+ 
+ data = tomllib.load(open(sys.argv[1], "rb"))
+ step = next(s for s in data["steps"] if s["id"] == "submit-and-exit")
+-if 'gc bd update "$WORK_BEAD_ID" --status=open --assignee="$REFINERY_TARGET"' not in step["description"]:
++script = open(sys.argv[2], encoding="utf-8").read()
++# The write is the script's; the step calls the script and tells the polecat
++# what to do when it prints HANDOFF_FAILED.
++if 'gc bd update "$WORK_BEAD_ID" --status=open --assignee="$REFINERY_TARGET"' not in script:
++    raise SystemExit(1)
++if 'bash "$PS" reassign' not in step["description"]:
+     raise SystemExit(1)
+-if "HANDOFF_FAILED" not in step["description"]:
++if "HANDOFF_FAILED" not in step["description"] or "HANDOFF_FAILED" not in script:
+     raise SystemExit(1)
+ PY
+     local guard
+diff --git a/gastown/tests/test_polecat_handoff_stamp.sh b/gastown/tests/test_polecat_handoff_stamp.sh
+index 29197022..c55b628b 100755
+--- a/gastown/tests/test_polecat_handoff_stamp.sh
++++ b/gastown/tests/test_polecat_handoff_stamp.sh
+@@ -9,9 +9,10 @@
+ # rewrite on resubmit sends a rejected bead to the back of its band instead of
+ # back to its original place in line.
+ #
+-# The block under test is extracted from the shipped formula between its
+-# handoff-stamp sentinels and EXECUTED against a stub `gc` that really mutates a
+-# fixture, so every assertion reads what the block's writes left behind.
++# The block under test is extracted from the shipped polecat-submit.sh (the
++# reassign body moved there out of the formula, gcp-nc8wg) between its
++# handoff-stamp sentinels and EXECUTED against a stub `gc` that really mutates
++# a fixture, so every assertion reads what the block's writes left behind.
+ # Assertions grep a literal shell snippet or the stub's call log, so
+ # single-quoted `$VAR` is the point, not an error.
+ # shellcheck disable=SC2016
+@@ -19,6 +20,7 @@ set -uo pipefail
+ 
+ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+ FORMULA="$ROOT/gastown/formulas/mol-polecat-work.toml"
++SUBMIT="$ROOT/gastown/assets/scripts/polecat-submit.sh"
+ 
+ BEAD="gcp-et7g.1"
+ REFINERY="gascity-packs/gastown.refinery"
+@@ -32,24 +34,20 @@ fail() {
+     FAILURES=$((FAILURES + 1))
+ }
+ 
+-# extract_stamp pulls the handoff block verbatim out of submit-and-exit. Any
++# extract_stamp pulls the handoff block verbatim out of polecat-submit.sh. Any
+ # `{{placeholder}}` left in it is a hard error: the harness cannot render it, and
+-# an unrendered one would make the test pass against text the formula never runs.
++# an unrendered one would make the test pass against text nothing ever runs.
+ extract_stamp() {
+-    python3 - "$FORMULA" "$1" <<'PY'
++    python3 - "$SUBMIT" "$1" <<'PY'
+ import re
+ import sys
+-import tomllib
+ 
+-formula, out = sys.argv[1:3]
++script, out = sys.argv[1:3]
+ begin = "# --- handoff-stamp:begin ---"
+ end = "# --- handoff-stamp:end ---"
+-with open(formula, "rb") as handle:
+-    doc = tomllib.load(handle)
+-step = next(s for s in doc["steps"] if s["id"] == "submit-and-exit")
+-text = step["description"]
++text = open(script, encoding="utf-8").read()
+ if text.count(begin) != 1 or text.count(end) != 1:
+-    sys.exit("submit-and-exit must carry exactly one handoff-stamp block")
++    sys.exit("polecat-submit.sh must carry exactly one handoff-stamp block")
+ block = text.split(begin, 1)[1].split(end, 1)[0]
+ leftover = sorted(set(re.findall(r"\{\{[^}]*\}\}", block)))
+ if leftover:
+@@ -306,18 +304,20 @@ test_auto_push_halt_is_not_stamped() {
+     # auto_push=false halts at branch-ready with no refinery handoff, so nothing
+     # has joined the merge queue and nothing may be stamped. The stamp keys are
+     # written only inside the handoff block.
+-    python3 - "$FORMULA" <<'PY' || fail "the stamp keys must be written only in the handoff-stamp block, never on the auto_push=false halt"
++    python3 - "$FORMULA" "$SUBMIT" <<'PY' || fail "the stamp keys must be written only in the handoff-stamp block, never on the auto_push=false halt"
+ import sys
+ import tomllib
+ 
+ doc = tomllib.load(open(sys.argv[1], "rb"))
+-text = next(s for s in doc["steps"] if s["id"] == "submit-and-exit")["description"]
+-halt = text[text.index('if [ "$AUTO_PUSH" = "false" ]'):]
++step = next(s for s in doc["steps"] if s["id"] == "submit-and-exit")["description"]
++script = open(sys.argv[2], encoding="utf-8").read()
++halt = script[script.index('if [ "$AUTO_PUSH" = "false" ]'):]
+ halt = halt[: halt.index("\nfi\n")]
+ if "submitted_at" in halt:
+     raise SystemExit(1)
+-outside = text.split("# --- handoff-stamp:begin ---")[0] + text.split("# --- handoff-stamp:end ---")[1]
+-if "submitted_at=" in outside:
++# Nothing else in the script, and nothing in the step text, writes a stamp.
++outside = script.split("# --- handoff-stamp:begin ---")[0] + script.split("# --- handoff-stamp:end ---")[1]
++if "submitted_at=" in outside or "submitted_at=" in step:
+     raise SystemExit(1)
+ PY
+ }
+diff --git a/gastown/tests/test_polecat_push_gate.sh b/gastown/tests/test_polecat_push_gate.sh
+index 6d7ad35e..3796bf01 100755
+--- a/gastown/tests/test_polecat_push_gate.sh
++++ b/gastown/tests/test_polecat_push_gate.sh
+@@ -18,15 +18,17 @@
+ #      reported "no key" on a ledger serving metadata as a JSON string and the
+ #      EXPLICIT auto_push=false opt-out silently stopped firing (gci-to0l).
+ #
+-# Properties 1-4 assert what the gate SAYS. The last block runs it: the gate's
+-# bash is lifted out of the shipped step and executed against stubbed `gc` and
+-# `git`, so what is tested is the text an agent reads at pour time, never a
+-# retyped copy. "The words are all present" is a weaker claim than "it does not
+-# push" for a gate whose failure mode is a push to a customer estate.
++# Properties 1-4 assert what the gate SAYS. The last block runs it: the gate is
++# the push-gate body of gastown/assets/scripts/polecat-submit.sh (gcp-nc8wg;
++# the step used to carry it as a fence), and it is executed against stubbed
++# `gc` and `git`, so what is tested is the shipped script, never a retyped
++# copy. "The words are all present" is a weaker claim than "it does not push"
++# for a gate whose failure mode is a push to a customer estate.
+ set -euo pipefail
+ 
+ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+ FORMULA="$ROOT/gastown/formulas/mol-polecat-work.toml"
++SUBMIT="$ROOT/gastown/assets/scripts/polecat-submit.sh"
+ MAYOR_PROMPT="$ROOT/gastown/agents/mayor/prompt.template.md"
+ 
+ fail() {
+@@ -35,11 +37,13 @@ fail() {
+ }
+ 
+ [[ -f "$FORMULA" ]] || fail "formula not found: $FORMULA"
++[[ -f "$SUBMIT" ]] || fail "submit script not found: $SUBMIT"
+ [[ -f "$MAYOR_PROMPT" ]] || fail "mayor prompt not found: $MAYOR_PROMPT"
+ 
+ # --- 1. structure -----------------------------------------------------------
+ 
+-# Scoped to the submit-and-exit gate block, like every sibling property. This
++# Scoped to the push-gate block of polecat-submit.sh (between its push-gate
++# sentinels), like every sibling property. This
+ # one used to grep the WHOLE FILE: it counted `gc mail send` across every step
+ # and required exactly 2, and took first-occurrence line numbers for the
+ # ordering. Both are green today only by accident of the file's contents — a
+@@ -55,19 +59,16 @@ fail() {
+ # deliberately silent; only the two halts that mean "the gate could not tell"
+ # page anyone.
+ test_gate_structure() {
+-    python3 - "$FORMULA" <<'PY' || fail "the gate's halts, their escalations and their order are wrong"
++    python3 - "$SUBMIT" <<'PY' || fail "the gate's halts, their escalations and their order are wrong"
+ import re
+ import sys
+-import tomllib
+ 
+-with open(sys.argv[1], "rb") as handle:
+-    steps = tomllib.load(handle)["steps"]
+-step = [s for s in steps if s["id"] == "submit-and-exit"][0]["description"]
+-blocks = [b for b in re.findall(r"^```bash\n(.*?)^```$", step, re.S | re.M)
+-          if "git push origin HEAD" in b]
+-if len(blocks) != 1:
+-    raise SystemExit("expected exactly 1 gate block, got %d" % len(blocks))
+-body = "\n".join(l for l in blocks[0].split("\n") if not l.lstrip().startswith("#"))
++script = open(sys.argv[1], encoding="utf-8").read()
++begin, end = "# --- push-gate:begin ---", "# --- push-gate:end ---"
++if script.count(begin) != 1 or script.count(end) != 1:
++    raise SystemExit("expected exactly 1 push-gate block in the submit script")
++block = script.split(begin, 1)[1].split(end, 1)[0]
++body = "\n".join(l for l in block.split("\n") if not l.lstrip().startswith("#"))
+ 
+ HALTS = {
+     "metadata_unreadable": ("the fail-closed unreadable-metadata halt (gci-to0l)", True),
+@@ -131,11 +132,12 @@ PY
+ # recorded its rail properly AS METADATA and said nothing in prose is exactly
+ # the bead the (b) prose scan cannot save.
+ #
+-# Asserted over the step's EXECUTABLE lines, for the same reason the notes check
+-# is: the step names the old probe shape in its prose, and a check over the whole
+-# step text would be red on a correct patch.
++# Asserted over the step's EXECUTABLE lines (its bash fences plus the submit
++# script), for the same reason the notes check is: the step names the old probe
++# shape in its prose, and a check over the whole step text would be red on a
++# correct patch.
+ test_metadata_probe_shape() {
+-    python3 - "$FORMULA" <<'PY' || fail "the metadata probe must decode object/null/string and halt on the rest"
++    python3 - "$FORMULA" "$SUBMIT" <<'PY' || fail "the metadata probe must decode object/null/string and halt on the rest"
+ import sys
+ import tomllib
+ 
+@@ -150,6 +152,10 @@ for line in step.split("\n"):
+         continue
+     if inside and not line.lstrip().startswith("#"):
+         code.append(line)
++# The push gate and the handoff run as polecat-submit.sh now (gcp-nc8wg), so the
++# executable lines of the step are its fences plus every non-comment script line.
++code += [l for l in open(sys.argv[2], encoding="utf-8").read().split("\n")
++         if not l.lstrip().startswith("#")]
+ body = "\n".join(code)
+ 
+ problems = []
+@@ -165,12 +171,12 @@ if '[ -z "$WORK_JSON" ]' not in body:
+     # jq prints nothing for empty input and exits 0, so a dead ledger cannot be
+     # caught on jq's exit status alone.
+     problems.append("no explicit guard for an empty payload from the ledger read")
+-# Five halts write halt_reason in this step: the push gate's three
+-# (metadata_unreadable, auto_push_false, no_push_rail_unresolved), the
+-# branch-content gate's single write of "$HALT_REASON", which carries either
+-# no_commits or content_gate_error, and the refinery precondition's
+-# base_branch_local_only. The count is pinned, not floored, so a sixth
+-# unaccounted halt -- or a deleted one -- still reports here.
++# Five halts write halt_reason across the step and polecat-submit.sh: the push
++# gate's three (metadata_unreadable, auto_push_false, no_push_rail_unresolved),
++# the branch-content gate's single write of "$HALT_REASON" (in the step), which
++# carries either no_commits or content_gate_error, and the refinery
++# precondition's base_branch_local_only. The count is pinned, not floored, so a
++# sixth unaccounted halt -- or a deleted one -- still reports here.
+ if body.count("halt_reason=") != 5:
+     problems.append("expected exactly five halt_reason writes, found %d" % body.count("halt_reason="))
+ if "ascii_downcase" not in body:
+@@ -199,12 +205,12 @@ PY
+ # --- 2. rail detection ------------------------------------------------------
+ 
+ # Lift the shipped strip/match pair straight out of the gate so this test can
+-# never drift from the code it is testing. The lift is ANCHORED: tomllib parses
+-# the formula, the submit-and-exit bash block containing `git push origin HEAD`
+-# is selected, comments are dropped, and the pattern must occur exactly ONCE in
+-# what remains. A position-based lift over the raw file (the first `grep -E..`
+-# anywhere in it) starts testing some other step's regex the day one is added
+-# above the gate, and stays green while doing it.
++# never drift from the code it is testing. The lift is ANCHORED: the push-gate
++# block of polecat-submit.sh is selected by its begin/end sentinels, comments
++# are dropped, and the pattern must occur exactly ONCE in what remains. A
++# position-based lift over the raw file (the first `grep -E..` anywhere in it)
++# starts testing some other block's regex the day one is added above the gate,
++# and stays green while doing it.
+ #
+ # The extraction is also non-fatal on purpose. Under `set -euo pipefail` an
+ # empty result aborted this whole suite at the assignment — before the guards
+@@ -214,19 +220,16 @@ PY
+ lift_gate_pattern() {
+     # stderr is left connected: the reason ("got 2 matches", "no gate block")
+     # is the useful half of the failure, and stdout stays clean either way.
+-    python3 - "$FORMULA" "$1" <<'PY' || true
++    python3 - "$SUBMIT" "$1" <<'PY' || true
+ import re
+ import sys
+-import tomllib
+ 
+-with open(sys.argv[1], "rb") as handle:
+-    steps = tomllib.load(handle)["steps"]
+-step = [s for s in steps if s["id"] == "submit-and-exit"][0]["description"]
+-blocks = [b for b in re.findall(r"^```bash\n(.*?)^```$", step, re.S | re.M)
+-          if "git push origin HEAD" in b]
+-if len(blocks) != 1:
+-    raise SystemExit("expected exactly 1 gate block, got %d" % len(blocks))
+-body = "\n".join(l for l in blocks[0].split("\n") if not l.lstrip().startswith("#"))
++script = open(sys.argv[1], encoding="utf-8").read()
++begin, end = "# --- push-gate:begin ---", "# --- push-gate:end ---"
++if script.count(begin) != 1 or script.count(end) != 1:
++    raise SystemExit("expected exactly 1 push-gate block in the submit script")
++block = script.split(begin, 1)[1].split(end, 1)[0]
++body = "\n".join(l for l in block.split("\n") if not l.lstrip().startswith("#"))
+ hits = re.findall(sys.argv[2], body)
+ if len(hits) != 1:
+     raise SystemExit("expected exactly 1 match for %s, got %d" % (sys.argv[2], len(hits)))
+@@ -374,19 +377,16 @@ test_rail_detection() {
+ # Asserted over EXECUTABLE lines, like the notes and probe checks: the step
+ # describes the old shape in its prose on purpose.
+ test_rail_scan_shape() {
+-    python3 - "$FORMULA" <<'PY' || fail "the rail scan must strip the push-to-main phrase and fail closed"
++    python3 - "$SUBMIT" <<'PY' || fail "the rail scan must strip the push-to-main phrase and fail closed"
+ import re
+ import sys
+-import tomllib
+ 
+-with open(sys.argv[1], "rb") as handle:
+-    steps = tomllib.load(handle)["steps"]
+-step = [s for s in steps if s["id"] == "submit-and-exit"][0]["description"]
+-blocks = [b for b in re.findall(r"^```bash\n(.*?)^```$", step, re.S | re.M)
+-          if "git push origin HEAD" in b]
+-if len(blocks) != 1:
+-    raise SystemExit("expected exactly 1 gate block, got %d" % len(blocks))
+-body = "\n".join(l for l in blocks[0].split("\n") if not l.lstrip().startswith("#"))
++script = open(sys.argv[1], encoding="utf-8").read()
++begin, end = "# --- push-gate:begin ---", "# --- push-gate:end ---"
++if script.count(begin) != 1 or script.count(end) != 1:
++    raise SystemExit("expected exactly 1 push-gate block in the submit script")
++block = script.split(begin, 1)[1].split(end, 1)[0]
++body = "\n".join(l for l in block.split("\n") if not l.lstrip().startswith("#"))
+ 
+ problems = []
+ if "grep -Eiv" in body:
+@@ -444,12 +444,12 @@ PY
+ # rig via the auto_push=false halt, destroying a project lead's instruction text
+ # (gci-3f5u); it is asserted here so the ambiguity halt cannot reintroduce it.
+ #
+-# Asserted over EXECUTABLE lines only. The step names `--notes` on purpose in
+-# its prose and in two recipe comments, and a negative check over the whole step
+-# text would fail on a correct patch — a guard that is red on correct input gets
++# Asserted over EXECUTABLE lines only (the step's fences and the submit script).
++# The step names `--notes` on purpose in its prose and in two recipe comments,
++# and a negative check over the whole step text would fail on a correct patch — a guard that is red on correct input gets
+ # deleted for being noisy.
+ test_halt_notes_append() {
+-    python3 - "$FORMULA" <<'PY' || fail "submit-and-exit must append its notes, never replace them"
++    python3 - "$FORMULA" "$SUBMIT" <<'PY' || fail "submit-and-exit must append its notes, never replace them"
+ import sys
+ import tomllib
+ 
+@@ -459,7 +459,8 @@ step = [s for s in steps if s["id"] == "submit-and-exit"]
+ if len(step) != 1:
+     raise SystemExit("submit-and-exit step not found")
+ 
+-# The lines an agent RUNS: inside a bash fence, not a comment.
++# The lines an agent RUNS: inside a bash fence of the step, plus every line of
++# polecat-submit.sh (the halts live there now, gcp-nc8wg); never a comment.
+ code, inside = [], False
+ for line in step[0]["description"].split("\n"):
+     if line.startswith("```"):
+@@ -467,6 +468,8 @@ for line in step[0]["description"].split("\n"):
+         continue
+     if inside and not line.lstrip().startswith("#"):
+         code.append(line)
++code += [l for l in open(sys.argv[2], encoding="utf-8").read().split("\n")
++         if not l.lstrip().startswith("#")]
+ 
+ problems = []
+ body = "\n".join(code)
+@@ -510,11 +513,14 @@ PY
+ 
+ # --- 4. the shipped gate recipe, executed -----------------------------------
+ 
+-# Properties 1-3 assert what the gate SAYS. This one runs it. The gate's bash
+-# block is lifted out of the shipped step, rendered, and executed against
+-# stubbed `gc` and `git`, so what is tested is the SHIPPED TEXT an agent reads
+-# at pour time and never a retyped copy. Retyping is how a tested rule drifts
+-# from the rule that actually runs.
++# Properties 1-3 assert what the gate SAYS. This one runs it. The shipped
++# `polecat-submit.sh push-gate` is executed as it is, against stubbed `gc` and
++# `git`, so what is tested is the SHIPPED SCRIPT and never a retyped copy.
++# Retyping is how a tested rule drifts from the rule that actually runs.
++#
++# It runs with no WORK_BEAD_ID or CURRENT_BRANCH in the environment: the script
++# derives both (from the convoy and from git), which is what lets the polecat
++# call it from a fresh shell.
+ 
+ test_gate_execution() {
+     if ! command -v jq >/dev/null 2>&1; then
+@@ -527,24 +533,7 @@ test_gate_execution() {
+     REAL_JQ=$(command -v jq)
+     trap 'rm -rf "$tmp"' RETURN
+ 
+-    # Render the two formula variables the gate uses. Everything else verbatim.
+-    python3 - "$FORMULA" >"$tmp/gate.sh" <<'PY' || fail "could not lift the gate recipe out of $FORMULA"
+-import re
+-import sys
+-import tomllib
+-
+-with open(sys.argv[1], "rb") as handle:
+-    steps = tomllib.load(handle)["steps"]
+-step = [s for s in steps if s["id"] == "submit-and-exit"][0]["description"]
+-blocks = [b for b in re.findall(r"^```bash\n(.*?)^```$", step, re.S | re.M)
+-          if "git push origin HEAD" in b]
+-if len(blocks) != 1:
+-    raise SystemExit("expected exactly 1 gate block, got %d" % len(blocks))
+-sys.stdout.write(blocks[0].replace("{{base_branch}}", "main")
+-                          .replace("{{binding_prefix}}", "gastown."))
+-PY
+-
+-    bash -n "$tmp/gate.sh" || fail "the rendered gate is not valid bash"
++    bash -n "$SUBMIT" || fail "the submit script is not valid bash"
+ 
+     # run_gate <label> <bead-json> [jq-calls-that-succeed] -> action log on stdout
+     run_gate() {
+@@ -555,6 +544,7 @@ PY
+         cat >"$d/bin/gc" <<'GCSTUB'
+ #!/usr/bin/env bash
+ if [ "$1" = "bd" ] && [ "$2" = "show" ]; then cat "$GATE_DIR/bead.json"; exit 0; fi
++if [ "$1" = "convoy" ]; then echo '{"children":[{"id":"test-1"}]}'; exit 0; fi
+ case "$1" in
+   bd)      printf 'BD_UPDATE %s\n' "$*" >>"$GATE_DIR/log" ;;
+   mail)    printf 'MAIL %s\n' "$*" >>"$GATE_DIR/log" ;;
+@@ -574,7 +564,8 @@ exit 0
+ GITSTUB
+         chmod +x "$d/bin/gc" "$d/bin/git"
+         # Optional fault injection: let the first N jq calls through, then fail
+-        # them. The metadata probe is call 1; the prose extraction is call 2.
++        # them. The script's own work-bead lookup is call 1, the metadata probe
++        # is call 2, and the prose extraction is call 3.
+         if [[ -n "${3:-}" ]]; then
+             cat >"$d/bin/jq" <<'JQSTUB'
+ #!/usr/bin/env bash
+@@ -588,10 +579,11 @@ exec "$REAL_JQ" "$@"
+ JQSTUB
+             chmod +x "$d/bin/jq"
+         fi
+-        GATE_DIR="$d" PATH="$d/bin:$PATH" WORK_BEAD_ID=test-1 \
+-            CURRENT_BRANCH=polecat/test-1 GC_RIG=testrig \
++        env -u WORK_BEAD_ID -u CURRENT_BRANCH \
++            GATE_DIR="$d" PATH="$d/bin:$PATH" GC_RIG=testrig \
++            PS_CONVOY_ID=conv-1 PS_BASE_BRANCH=main PS_BINDING_PREFIX=gastown. \
+             JQ_OK_CALLS="${3:-}" REAL_JQ="$REAL_JQ" \
+-            bash "$tmp/gate.sh" >"$d/out" 2>&1 || true
++            bash "$SUBMIT" push-gate >"$d/out" 2>&1 || true
+         cat "$d/log"
+     }
+ 
+@@ -754,7 +746,7 @@ JQSTUB
+     # was split into checked stages a mid-pipe death arrived at the match grep
+     # as an empty stream, counted 0 rails, and PUSHED — the fail-closed comment
+     # held only for a grep binary that was missing outright.
+-    log=$(run_gate h '[{"metadata":{},"description":"Add a retry to the ingest job when the API 429s.","notes":""}]' 1)
++    log=$(run_gate h '[{"metadata":{},"description":"Add a retry to the ingest job when the API 429s.","notes":""}]' 2)
+     saw   "(h) prose extraction failed" "$log" "halt_reason=no_push_rail_unresolved"
+     never "(h) prose extraction failed" "$log" "PUSH"
+ 
+diff --git a/gastown/tests/test_polecat_submit.sh b/gastown/tests/test_polecat_submit.sh
+new file mode 100755
+index 00000000..93e4ae19
+--- /dev/null
++++ b/gastown/tests/test_polecat_submit.sh
+@@ -0,0 +1,509 @@
++#!/usr/bin/env bash
++# Tests for gastown/assets/scripts/polecat-submit.sh, the one script behind the
++# push gate and the refinery handoff of mol-polecat-work's submit-and-exit step
++# (gcp-nc8wg).
++#
++# The two fences used to be 302 and 64 lines of shell that every polecat
++# retyped. They now ship as one script with a `push-gate` and a `reassign`
++# mode, and the step carries a short stub for each that locates the script and
++# passes {{convoy_id}}, {{base_branch}} and {{binding_prefix}} as PS_* env.
++# These tests run the real script and the real stubs, decoded from the formula,
++# against stub `gc` and `git`. Their identity with the old fences was proven by a
++# throwaway harness, which is not committed; test_polecat_push_gate.sh covers
++# the gate's outcomes and test_polecat_handoff_stamp.sh the handoff stamp.
++#
++# What is pinned here is what those two do not reach: the interface (usage,
++# required env), the ids the script derives for itself (the old fences inherited
++# WORK_BEAD_ID and CURRENT_BRANCH from earlier fences, which a fresh shell does
++# not have), the arguments reaching the writes, and the stubs' unresolved-script
++# stop, which must close the step before it acks the drain.
++#
++# No test depends on wall-clock time or on a network: every external command is
++# a stub, and stdin is /dev/null.
++# shellcheck disable=SC2016  # the assertions grep literal $VAR text
++set -euo pipefail
++
++ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
++SUBMIT="$ROOT/gastown/assets/scripts/polecat-submit.sh"
++FORMULA="$ROOT/gastown/formulas/mol-polecat-work.toml"
++USAGE_LINE='SUBMIT_USAGE polecat-submit.sh push-gate|reassign'
++
++if ! command -v jq >/dev/null 2>&1; then
++    echo "  skip  jq not available (the script's own probes need it)"
++    exit 0
++fi
++
++TMPROOT=$(mktemp -d)
++trap 'rm -rf "$TMPROOT"' EXIT
++
++# fail names the test that called it, so a red run says which case broke.
++fail() {
++    local fn name=""
++    for fn in "${FUNCNAME[@]}"; do
++        case "$fn" in test_*) name=$fn; break ;; esac
++    done
++    echo "FAIL${name:+ $name}: $*" >&2
++    exit 1
++}
++
++STEP_REF='mol-polecat-work.submit-and-exit'
++WORK_OPEN='[{"id":"w-1","status":"open","assignee":"","metadata":{},"description":"Add a retry to the ingest job when the API 429s.","notes":""}]'
++
++# new_case <name> — a fresh sandbox $CASE with a stub `gc` and `git` in
++# $CASE/bin that journal every call to $CASE/calls.log. The work bead the stubs
++# serve is $CASE/work.json (set_work), the step bead is $CASE/step.json, and the
++# convoy names one child, w-1. `gc formula list --json` prints $FORMULAS.
++new_case() {
++    CASE="$TMPROOT/$1"
++    mkdir -p "$CASE/bin" "$CASE/cwd"
++    : >"$CASE/calls.log"
++    printf '[{"id":"w-1.s9","status":"in_progress","metadata":{"gc.step_ref":"%s"}}]' "$STEP_REF" >"$CASE/step.json"
++    printf '%s' "$WORK_OPEN" >"$CASE/work.json"
++    cat >"$CASE/bin/gc" <<'SH'
++#!/usr/bin/env bash
++printf 'gc %s\n' "$*" >>"$CASE/calls.log"
++case "${1:-}:${2:-}" in
++    formula:list) printf '%s\n' "$FORMULAS" ;;
++    convoy:status) printf '%s\n' "$CONVOY" ;;
++    hook:current) printf '%s\n' "${HOOK_CURRENT-w-1.s9}" ;;
++    bd:show)
++        case "$3" in
++            w-1.s9) cat "$CASE/step.json" ;;
++            *) cat "$CASE/work.json" ;;
++        esac ;;
++    bd:note) cat >>"$CASE/note.txt" ;;
++    bd:update)
++        if [ -n "${REFUSE_HANDOFF:-}" ]; then
++            case "$*" in
++                *"--assignee=testrig/"* | *"--assignee=gastown."*) echo "Error: another actor holds the claim" >&2; exit 1 ;;
++            esac
++        fi ;;
++esac
++exit 0
++SH
++    cat >"$CASE/bin/git" <<'SH'
++#!/usr/bin/env bash
++printf 'git %s\n' "$*" >>"$CASE/calls.log"
++case "${1:-} ${2:-}" in
++    "branch --show-current") echo "${GIT_BRANCH-polecat/w-1}" ;;
++    "show-ref --verify") [ "${BASE_REMOTE:-1}" = 1 ] || exit 1 ;;
++    "push origin") exit "${PUSH_RC:-0}" ;;
++    "ls-remote origin") printf 'deadbeef\t%s\n' "$3" ;;
++    "rev-parse HEAD") echo deadbeef ;;
++esac
++exit 0
++SH
++    chmod +x "$CASE/bin/gc" "$CASE/bin/git"
++    FORMULAS='{"formulas":[]}'
++    CONVOY='{"children":[{"id":"w-1"}]}'
++}
++
++set_work() { printf '%s' "$1" >"$CASE/work.json"; }
++
++# run_submit <argv...> -- <env...> — runs the script from $CASE/cwd with only the
++# given env (plus the stub plumbing), so a caller's PS_*, WORK_BEAD_ID or
++# GC_RIG cannot leak in. Sets RC and leaves stdout and stderr in $CASE/out and
++# $CASE/err.
++run_submit() {
++    local -a args=()
++    while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do
++        args+=("$1")
++        shift
++    done
++    [ "$#" -gt 0 ] && shift
++    RC=0
++    (
++        cd "$CASE/cwd" &&
++            env -i PATH="$CASE/bin:$PATH" HOME="$CASE" GIT_CONFIG_GLOBAL=/dev/null \
++                CASE="$CASE" FORMULAS="$FORMULAS" CONVOY="$CONVOY" "$@" \
++                bash "$SUBMIT" ${args[@]+"${args[@]}"} </dev/null
++    ) >"$CASE/out" 2>"$CASE/err" || RC=$?
++}
++
++# The env the stubs pass for a normal pour of the push gate and the handoff.
++PUSH_ENV=(PS_CONVOY_ID=gcp-convoy PS_BASE_BRANCH=main PS_BINDING_PREFIX=gastown. GC_RIG=testrig)
++REASSIGN_ENV=(PS_CONVOY_ID=gcp-convoy PS_BINDING_PREFIX=gastown. GC_RIG=testrig)
++
++calls() { cat "$CASE/calls.log"; }
++
++# called <fixed-string> — fails unless some call in the log contains it.
++called() {
++    grep -qF -- "$1" "$CASE/calls.log" || fail "want a call containing '$1', calls: $(calls)"
++}
++never_called() {
++    ! grep -qF -- "$1" "$CASE/calls.log" || fail "want no call containing '$1', calls: $(calls)"
++}
++# line_of <fixed-string> — the line number of the first call containing it, or 0.
++line_of() {
++    local n
++    n=$(grep -nF -- "$1" "$CASE/calls.log" | head -1 | cut -d: -f1) || true
++    echo "${n:-0}"
++}
++
++# own_step_closed_before_drain — the guarded close of the running step, then the ack.
++own_step_closed_before_drain() {
++    local hook show close drain
++    hook=$(line_of 'gc hook current --id-only')
++    show=$(line_of 'gc bd show w-1.s9 --json')
++    close=$(line_of 'gc bd update w-1.s9 --set-metadata gc.outcome=fail')
++    drain=$(line_of 'gc runtime drain-ack')
++    [ "$hook" -gt 0 ] && [ "$show" -gt "$hook" ] && [ "$close" -gt "$show" ] && [ "$drain" -gt "$close" ] ||
++        fail "$1: want hook current < show step < close step < drain-ack, got $hook $show $close $drain: $(calls)"
++    grep -qF -- "gc bd update w-1.s9 --set-metadata gc.outcome=fail --set-metadata gc.failure_class=hard --set-metadata gc.failure_reason=$2 --status=closed" "$CASE/calls.log" ||
++        fail "$1: want the step closed with gc.failure_reason=$2, calls: $(calls)"
++}
++
++test_script_holds_no_formula_placeholder() {
++    [ "$(grep -c '{{' "$SUBMIT")" = 0 ] || fail "$SUBMIT must hold no {{...}}: gc renders the step text, not the script"
++    bash -n "$SUBMIT" || fail "the script is not valid bash"
++}
++
++# The shell the script replaced must not also stay in the step: two copies drift.
++test_step_text_carries_no_second_copy() {
++    python3 -I - "$FORMULA" <<'PY' || fail "the step still carries shell the script now runs"
++import sys
++import tomllib
++
++doc = tomllib.load(open(sys.argv[1], "rb"))
++text = next(s["description"] for s in doc["steps"] if s["id"] == "submit-and-exit")
++problems = [m for m in (
++    "git push origin HEAD", "RAIL_HIT", "META_UNREADABLE", "HANDOFF_STAMP", "handoff-stamp:begin",
++    "PUSH VERIFICATION FAILED", 'HANDOFF_STATUS=',
++) if m in text]
++if problems:
++    sys.exit(f"still in the step text: {problems}")
++if text.count('bash "$PS" push-gate') != 1 or text.count('bash "$PS" reassign') != 1:
++    sys.exit("want exactly one push-gate call and one reassign call")
++PY
++}
++
++test_usage_rejects_unknown_mode() {
++    local label
++    new_case usage
++    for label in none bogus extra; do
++        : >"$CASE/calls.log"
++        case "$label" in
++            none) run_submit -- "${PUSH_ENV[@]}" ;;
++            bogus) run_submit bogus -- "${PUSH_ENV[@]}" ;;
++            extra) run_submit push-gate reassign -- "${PUSH_ENV[@]}" ;;
++        esac
++        [ "$RC" -eq 2 ] || fail "$label: want exit 2, got $RC"
++        [ "$(cat "$CASE/out")" = "$USAGE_LINE" ] ||
++            fail "$label: want exactly '$USAGE_LINE' on stdout, got: $(cat "$CASE/out")"
++        [ ! -s "$CASE/err" ] || fail "$label: want empty stderr, got: $(cat "$CASE/err")"
++        [ ! -s "$CASE/calls.log" ] || fail "$label: a usage error must run nothing, calls: $(calls)"
++    done
++}
++
++test_unset_required_var_stops() {
++    new_case unset
++    # PS_CONVOY_ID unset: the script cannot tell which bead it is for.
++    run_submit push-gate -- PS_BASE_BRANCH=main PS_BINDING_PREFIX=gastown. GC_RIG=testrig
++    [ "$RC" -ne 0 ] || fail "want a non-zero exit with PS_CONVOY_ID unset, got 0"
++    grep -q 'PS_CONVOY_ID' "$CASE/err" || fail "want stderr to name PS_CONVOY_ID, got: $(cat "$CASE/err")"
++    [ ! -s "$CASE/calls.log" ] || fail "an unset PS_CONVOY_ID must run nothing, calls: $(calls)"
++
++    # PS_BASE_BRANCH empty: push-gate would test refs/remotes/origin/ and push anyway.
++    run_submit push-gate -- PS_CONVOY_ID=gcp-convoy PS_BASE_BRANCH= PS_BINDING_PREFIX=gastown. GC_RIG=testrig
++    [ "$RC" -ne 0 ] || fail "want a non-zero exit with PS_BASE_BRANCH empty, got 0"
++    grep -q 'PS_BASE_BRANCH' "$CASE/err" || fail "want stderr to name PS_BASE_BRANCH, got: $(cat "$CASE/err")"
++    [ ! -s "$CASE/calls.log" ] || fail "an empty PS_BASE_BRANCH must run nothing, calls: $(calls)"
++
++    # PS_BINDING_PREFIX unset is an error, but EMPTY is a legal value: the pack
++    # is not bound, and the refinery's identity has no prefix.
++    run_submit reassign -- PS_CONVOY_ID=gcp-convoy GC_RIG=testrig
++    [ "$RC" -ne 0 ] || fail "want a non-zero exit with PS_BINDING_PREFIX unset, got 0"
++    grep -q 'PS_BINDING_PREFIX' "$CASE/err" || fail "want stderr to name PS_BINDING_PREFIX, got: $(cat "$CASE/err")"
++    [ ! -s "$CASE/calls.log" ] || fail "an unset PS_BINDING_PREFIX must run nothing, calls: $(calls)"
++
++    set_work "$WORK_OPEN"
++    run_submit reassign -- PS_CONVOY_ID=gcp-convoy PS_BINDING_PREFIX= GC_RIG=testrig
++    [ "$RC" -eq 0 ] || fail "an empty PS_BINDING_PREFIX must pass, got $RC: $(cat "$CASE/err")"
++    called 'gc bd update w-1 --status=open --assignee=testrig/refinery'
++}
++
++# The old fences read WORK_BEAD_ID and CURRENT_BRANCH from the section-1 fence.
++# The script gets them itself, so it runs from a fresh shell, and a stale value
++# in the caller's environment never reaches a write.
++test_ids_are_derived_not_inherited() {
++    new_case ids
++    CONVOY='{"children":[{"id":"w-7"}]}'
++    run_submit push-gate -- "${PUSH_ENV[@]}" WORK_BEAD_ID=poison CURRENT_BRANCH=poison GIT_BRANCH=polecat/w-7
++    [ "$RC" -eq 0 ] || fail "want exit 0, got $RC: $(cat "$CASE/err")"
++    called 'gc convoy status gcp-convoy --json'
++    called 'gc bd show w-7 --json'
++    called 'git push origin HEAD'
++    called 'git ls-remote origin refs/heads/polecat/w-7'
++    never_called poison
++
++    new_case ids-reassign
++    CONVOY='{"children":[{"id":"w-7"}]}'
++    run_submit reassign -- "${REASSIGN_ENV[@]}" WORK_BEAD_ID=poison
++    [ "$RC" -eq 0 ] || fail "want exit 0, got $RC: $(cat "$CASE/err")"
++    called 'gc bd update w-7 --status=open --assignee=testrig/gastown.refinery'
++    never_called poison
++}
++
++# A convoy that does not name exactly one work bead is not a state the old flow
++# could reach (sections 0 and 1 stop on it), so the script stops before it
++# writes anything and without a drain: the call can be run again.
++test_convoy_without_one_work_bead_stops_before_any_write() {
++    local mode label
++    for mode in push-gate reassign; do
++        for label in no-child two-children unreadable; do
++            new_case "convoy-$mode-$label"
++            case "$label" in
++                no-child) CONVOY='{"children":[]}' ;;
++                two-children) CONVOY='{"children":[{"id":"w-1"},{"id":"w-2"}]}' ;;
++                unreadable) CONVOY='' ;;
++            esac
++            if [ "$mode" = push-gate ]; then
++                run_submit "$mode" -- "${PUSH_ENV[@]}"
++            else
++                run_submit "$mode" -- "${REASSIGN_ENV[@]}"
++            fi
++            [ "$RC" -eq 1 ] || fail "$mode/$label: want exit 1, got $RC"
++            grep -q '^STOP: convoy gcp-convoy does not name exactly one work bead' "$CASE/out" ||
++                fail "$mode/$label: want the STOP line, got: $(cat "$CASE/out")"
++            never_called 'gc bd update'
++            never_called 'drain-ack'
++            never_called 'git push'
++            never_called 'mail send'
++        done
++    done
++}
++
++test_push_gate_pushes_on_the_normal_path() {
++    new_case normal
++    run_submit push-gate -- "${PUSH_ENV[@]}"
++    [ "$RC" -eq 0 ] || fail "want exit 0, got $RC: $(cat "$CASE/err")"
++    called 'git fetch --prune origin'
++    called 'git show-ref --verify --quiet refs/remotes/origin/main'
++    called 'git push origin HEAD'
++    never_called 'halt_reason'
++    never_called 'drain-ack'
++    never_called 'mail send'
++}
++
++# {{base_branch}} reaches the base-branch precondition, the recorded target and
++# the local-only message through PS_BASE_BRANCH, and nothing else stands in.
++test_push_gate_uses_the_base_branch_it_is_given() {
++    new_case base
++    run_submit push-gate -- PS_CONVOY_ID=gcp-convoy PS_BASE_BRANCH=release/2.x PS_BINDING_PREFIX=gastown. GC_RIG=testrig
++    [ "$RC" -eq 0 ] || fail "want exit 0, got $RC: $(cat "$CASE/err")"
++    called 'git show-ref --verify --quiet refs/remotes/origin/release/2.x'
++    called 'git push origin HEAD'
++
++    new_case base-optout
++    set_work '[{"id":"w-1","status":"in_progress","assignee":"","metadata":{"auto_push":"false"},"description":"","notes":""}]'
++    run_submit push-gate -- PS_CONVOY_ID=gcp-convoy PS_BASE_BRANCH=release/2.x PS_BINDING_PREFIX=gastown. GC_RIG=testrig
++    called '--set-metadata target=release/2.x'
++    called '--set-metadata branch=polecat/w-1'
++    never_called 'git push'
++
++    new_case base-local-only
++    run_submit push-gate -- PS_CONVOY_ID=gcp-convoy PS_BASE_BRANCH=release/2.x PS_BINDING_PREFIX=gastown. GC_RIG=testrig BASE_REMOTE=0
++    [ "$RC" -eq 0 ] || fail "want exit 0, got $RC: $(cat "$CASE/err")"
++    grep -qx 'base branch release/2.x is local-only: halting at branch-ready (no push, no refinery handoff)' "$CASE/out" ||
++        fail "want the local-only line naming release/2.x, got: $(cat "$CASE/out")"
++    called '--set-metadata target=release/2.x'
++    called '--set-metadata halt_reason=base_branch_local_only'
++    called 'Branch ready: base branch release/2.x does not exist on origin'
++    never_called 'git push'
++    own_step_closed_before_drain "base-local-only" base_branch_local_only
++}
++
++# {{binding_prefix}} and GC_RIG build the witness the escalations go to.
++test_witness_target_follows_the_rig_and_the_binding_prefix() {
++    new_case witness
++    set_work ''
++    run_submit push-gate -- "${PUSH_ENV[@]}"
++    [ "$RC" -eq 0 ] || fail "want exit 0, got $RC: $(cat "$CASE/err")"
++    called 'gc mail send testrig/gastown.witness -s HELP: push-gate metadata unreadable on w-1 [HIGH]'
++
++    new_case witness-no-rig
++    set_work ''
++    run_submit push-gate -- PS_CONVOY_ID=gcp-convoy PS_BASE_BRANCH=main PS_BINDING_PREFIX=gastown.
++    called 'gc mail send gastown.witness -s HELP: push-gate metadata unreadable on w-1 [HIGH]'
++
++    new_case witness-unbound
++    set_work ''
++    run_submit push-gate -- PS_CONVOY_ID=gcp-convoy PS_BASE_BRANCH=main PS_BINDING_PREFIX= GC_RIG=testrig
++    called 'gc mail send testrig/witness -s HELP: push-gate metadata unreadable on w-1 [HIGH]'
++}
++
++# A rail scan that cannot finish is an asserted rail: grep that dies prints
++# nothing, RAIL_HIT stays empty, and the empty-result default must halt.
++test_rail_scan_fails_closed_when_the_match_stage_dies() {
++    new_case rail-default
++    printf '#!/usr/bin/env bash\nexit 2\n' >"$CASE/bin/grep"
++    chmod +x "$CASE/bin/grep"
++    run_submit push-gate -- "${PUSH_ENV[@]}"
++    [ "$RC" -eq 0 ] || fail "want exit 0, got $RC: $(cat "$CASE/err")"
++    grep -q '^NO-PUSH RAIL IN PROSE + auto_push ABSENT' "$CASE/out" ||
++        fail "want the no-push-rail halt, got: $(cat "$CASE/out")"
++    called '--set-metadata halt_reason=no_push_rail_unresolved'
++    never_called 'git push'
++    own_step_closed_before_drain "rail-default" no_push_rail_unresolved
++}
++
++# Every halt closes the running step before it acks the drain, and refuses to
++# ack when the hook names anything but this in-progress submit-and-exit step.
++test_halts_close_the_step_before_draining() {
++    new_case halt-close
++    set_work '[{"id":"w-1","status":"in_progress","assignee":"","metadata":{"auto_push":"no"},"description":"","notes":""}]'
++    run_submit push-gate -- "${PUSH_ENV[@]}"
++    [ "$RC" -eq 0 ] || fail "want exit 0, got $RC: $(cat "$CASE/err")"
++    called '--set-metadata halt_reason=auto_push_false'
++    own_step_closed_before_drain "opt-out halt" auto_push_false
++
++    new_case halt-wrong-step
++    set_work '[{"id":"w-1","status":"in_progress","assignee":"","metadata":{"auto_push":"no"},"description":"","notes":""}]'
++    run_submit push-gate -- "${PUSH_ENV[@]}" HOOK_CURRENT=w-1
++    [ "$RC" -eq 1 ] || fail "a hook that names the work bead must stop with exit 1, got $RC"
++    grep -q 'is not this in-progress step; not acknowledging drain' "$CASE/err" ||
++        fail "want the not-this-step message on stderr, got: $(cat "$CASE/err")"
++    never_called 'drain-ack'
++    never_called 'gc bd update w-1.s9'
++
++    new_case push-failed
++    run_submit push-gate -- "${PUSH_ENV[@]}" PUSH_RC=1
++    [ "$RC" -eq 1 ] || fail "a failed push must exit 1, got $RC"
++    grep -q '^PUSH FAILED (exit 1)' "$CASE/out" || fail "want PUSH FAILED, got: $(cat "$CASE/out")"
++    own_step_closed_before_drain "push failed" push_failed
++}
++
++test_reassign_hands_the_work_bead_to_the_refinery() {
++    new_case handoff
++    run_submit reassign -- "${REASSIGN_ENV[@]}"
++    [ "$RC" -eq 0 ] || fail "want exit 0, got $RC: $(cat "$CASE/err")"
++    local update
++    update=$(grep -F 'gc bd update w-1 --status=open --assignee=testrig/gastown.refinery' "$CASE/calls.log") ||
++        fail "want the handoff write to testrig/gastown.refinery, calls: $(calls)"
++    [[ "$update" == *'--set-metadata gc.routed_to= '* ]] || fail "the handoff must clear gc.routed_to: $update"
++    [[ "$update" == *'--set-metadata last_submitted_at='* && "$update" == *'--set-metadata first_submitted_at='* ]] ||
++        fail "the first handoff must carry both stamps: $update"
++    never_called 'drain-ack'
++    never_called 'gc bd note'
++
++    new_case handoff-unbound-no-rig
++    run_submit reassign -- PS_CONVOY_ID=gcp-convoy PS_BINDING_PREFIX=gastown.
++    called 'gc bd update w-1 --status=open --assignee=gastown.refinery'
++}
++
++test_reassign_leaves_a_human_routed_bead_alone() {
++    new_case human
++    set_work '[{"id":"w-1","status":"open","assignee":"","metadata":{"gc.routed_to":"human"},"description":"","notes":""}]'
++    run_submit reassign -- "${REASSIGN_ENV[@]}"
++    [ "$RC" -eq 0 ] || fail "want exit 0, got $RC: $(cat "$CASE/err")"
++    grep -q '^HANDOFF HALTED: w-1 is routed to human' "$CASE/out" || fail "want HANDOFF HALTED, got: $(cat "$CASE/out")"
++    never_called '--assignee='
++    called 'gc bd note w-1 --stdin'
++    grep -q 'gc.routed_to=human' "$CASE/note.txt" || fail "want the note to name the escalation, got: $(cat "$CASE/note.txt")"
++    own_step_closed_before_drain "human halt" routed_to_human
++}
++
++test_reassign_refused_write_is_a_failed_handoff() {
++    new_case refused
++    run_submit reassign -- "${REASSIGN_ENV[@]}" REFUSE_HANDOFF=1
++    [ "$RC" -eq 1 ] || fail "a refused handoff must exit 1, got $RC"
++    grep -q '^HANDOFF_FAILED w-1 was NOT handed to testrig/gastown.refinery' "$CASE/out" ||
++        fail "want HANDOFF_FAILED naming the refinery, got: $(cat "$CASE/out")"
++    never_called 'drain-ack'
++    never_called 'gc bd update w-1.s9'
++}
++
++# render_stub <call-fragment> <outfile> — the bash fence of the step that holds
++# that call, with every {{var}} replaced the way gc renders the step. A {{var}}
++# left over is a hard error.
++render_stub() {
++    python3 -I - "$FORMULA" "$@" <<'PY'
++import re
++import sys
++import tomllib
++
++formula, call, out = sys.argv[1:4]
++values = {"base_branch": "main", "binding_prefix": "gastown.", "convoy_id": "gcp-convoy"}
++doc = tomllib.load(open(formula, "rb"))
++text = next(s["description"] for s in doc["steps"] if s["id"] == "submit-and-exit")
++stubs = [f for f in re.findall(r"```bash\n(.*?)\n```", text, re.S) if call in f]
++if len(stubs) != 1:
++    sys.exit(f"want exactly one fence calling {call!r}, found {len(stubs)}")
++rendered = re.sub(r"\{\{(\w+)\}\}", lambda m: values.get(m.group(1), m.group(0)), stubs[0])
++left = sorted(set(re.findall(r"\{\{\w+\}\}", rendered)))
++if left:
++    sys.exit(f"unrendered placeholders in the stub: {left}")
++open(out, "w").write(rendered + "\n")
++PY
++}
++
++# run_stub <stubfile> <env...> — runs a rendered stub from $CASE/cwd.
++run_stub() {
++    local stub="$1"
++    shift
++    RC=0
++    (
++        cd "$CASE/cwd" &&
++            env -i PATH="$CASE/bin:$PATH" HOME="$CASE" GIT_CONFIG_GLOBAL=/dev/null \
++                CASE="$CASE" FORMULAS="$FORMULAS" CONVOY="$CONVOY" GC_RIG=testrig "$@" \
++                bash "$stub" </dev/null
++    ) >"$CASE/out" 2>"$CASE/err" || RC=$?
++}
++
++# The drain-ack contract (tests/test_v2_drain_ack_closes_own_step.py): a stub
++# that cannot find the script closes its own step, fail, and then acks.
++test_stubs_stop_and_close_the_step_when_the_script_is_unresolved() {
++    local call mode reason
++    for call in 'bash "$PS" push-gate' 'bash "$PS" reassign'; do
++        mode=${call##* }
++        new_case "stub-missing-$mode"
++        render_stub "$call" "$CASE/stub.sh" || fail "$mode: could not render the stub"
++        # `gc formula list --json` finds no formula, so the script cannot be located.
++        run_stub "$CASE/stub.sh"
++        [ "$RC" -eq 1 ] || fail "$mode: want exit 1, got $RC: $(cat "$CASE/err")"
++        grep -q '^STOP: submit script not found' "$CASE/out" ||
++            fail "$mode: want a line starting 'STOP: submit script not found', got: $(cat "$CASE/out")"
++        own_step_closed_before_drain "$mode stub" submit_script_missing
++        never_called 'git push'
++        never_called 'gc bd update w-1 '
++        never_called 'convoy status'
++        reason=$(grep -c 'drain-ack' "$CASE/calls.log")
++        [ "$reason" = 1 ] || fail "$mode: want exactly one drain-ack, got $reason"
++    done
++}
++
++test_stubs_run_the_script_the_formula_resolves() {
++    new_case stub-resolves
++    FORMULAS='{"formulas":[{"name":"mol-polecat-work","source":"'"$FORMULA"'"}]}'
++    render_stub 'bash "$PS" push-gate' "$CASE/push.sh" || fail "could not render the push-gate stub"
++    run_stub "$CASE/push.sh"
++    [ "$RC" -eq 0 ] || fail "push-gate stub: want exit 0, got $RC: $(cat "$CASE/out") $(cat "$CASE/err")"
++    called 'gc convoy status gcp-convoy --json'
++    called 'git show-ref --verify --quiet refs/remotes/origin/main'
++    called 'git push origin HEAD'
++
++    new_case stub-resolves-reassign
++    FORMULAS='{"formulas":[{"name":"mol-polecat-work","source":"'"$FORMULA"'"}]}'
++    render_stub 'bash "$PS" reassign' "$CASE/reassign.sh" || fail "could not render the reassign stub"
++    run_stub "$CASE/reassign.sh"
++    [ "$RC" -eq 0 ] || fail "reassign stub: want exit 0, got $RC: $(cat "$CASE/out") $(cat "$CASE/err")"
++    called 'gc bd update w-1 --status=open --assignee=testrig/gastown.refinery'
++}
++
++test_script_holds_no_formula_placeholder
++test_step_text_carries_no_second_copy
++test_usage_rejects_unknown_mode
++test_unset_required_var_stops
++test_ids_are_derived_not_inherited
++test_convoy_without_one_work_bead_stops_before_any_write
++test_push_gate_pushes_on_the_normal_path
++test_push_gate_uses_the_base_branch_it_is_given
++test_witness_target_follows_the_rig_and_the_binding_prefix
++test_rail_scan_fails_closed_when_the_match_stage_dies
++test_halts_close_the_step_before_draining
++test_reassign_hands_the_work_bead_to_the_refinery
++test_reassign_leaves_a_human_routed_bead_alone
++test_reassign_refused_write_is_a_failed_handoff
++test_stubs_stop_and_close_the_step_when_the_script_is_unresolved
++test_stubs_run_the_script_the_formula_resolves
++echo "polecat submit tests passed"
+diff --git a/gastown/tests/test_refinery_find_work.sh b/gastown/tests/test_refinery_find_work.sh
+index c73d57a0..a1d8243c 100755
+--- a/gastown/tests/test_refinery_find_work.sh
++++ b/gastown/tests/test_refinery_find_work.sh
+@@ -42,6 +42,8 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+ FORMULA="$ROOT/gastown/formulas/mol-refinery-patrol.toml"
+ REFINERY_PROMPT="$ROOT/gastown/agents/refinery/prompt.template.md"
+ POLECAT_FORMULA="$ROOT/gastown/formulas/mol-polecat-work.toml"
++# The submit handoff (step 6) runs as this script's `reassign` mode (gcp-nc8wg).
++POLECAT_SUBMIT="$ROOT/gastown/assets/scripts/polecat-submit.sh"
+ 
+ FAILURES=0
+ 
+@@ -643,13 +645,16 @@ test_polecat_handoff_verifies_the_status_it_writes() {
+     # The other half of gcp-s14g: the submit handoff writes --status=open and
+     # that write was observed not to stick. It reads back and corrects once,
+     # and it must never abort the handoff over bookkeeping — the branch is
+-    # already pushed by then.
+-    grep -F 'HANDOFF_STATUS=' "$POLECAT_FORMULA" >/dev/null ||
++    # already pushed by then. The handoff is polecat-submit.sh's reassign body.
++    grep -F 'HANDOFF_STATUS=' "$POLECAT_SUBMIT" >/dev/null ||
+         fail "the polecat submit handoff should read back the status it wrote"
+-    grep -F 'find-work scans open,in_progress' "$POLECAT_FORMULA" >/dev/null ||
++    grep -F 'find-work scans open,in_progress' "$POLECAT_SUBMIT" >/dev/null ||
+         fail "the handoff warning should name the refinery behaviour that makes it non-fatal"
+-    ! grep -A12 'HANDOFF_STATUS=' "$POLECAT_FORMULA" | grep -E 'exit [1-9]' >/dev/null ||
++    ! grep -A12 'HANDOFF_STATUS=' "$POLECAT_SUBMIT" | grep -E 'exit [1-9]' >/dev/null ||
+         fail "a status that will not settle must not abort a handoff whose branch is already pushed"
++    # And the step must not carry a second copy of the read-back.
++    ! grep -F 'HANDOFF_STATUS=' "$POLECAT_FORMULA" >/dev/null ||
++        fail "the formula step must not carry its own copy of the handoff; it calls polecat-submit.sh"
+ }
+ 
+ # ── gcp-et7g: each priority band is served oldest-first-handoff ──────────────
+diff --git a/scripts/gascity_pack_inference_gate.py b/scripts/gascity_pack_inference_gate.py
+index 27196807..71e28fa4 100644
+--- a/scripts/gascity_pack_inference_gate.py
++++ b/scripts/gascity_pack_inference_gate.py
+@@ -86,7 +86,8 @@ GASTOWN_FORMULA_CONTRACTS = {
+         "--set-metadata branch=\"$BRANCH\"",
+         "{{test_command}}",
+         "REFINERY_TARGET=\"${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery\"",
+-        "--assignee=\"$REFINERY_TARGET\"",
++        # The handoff write itself (--assignee="$REFINERY_TARGET") is
++        # polecat-submit.sh's: GASTOWN_SCRIPT_CONTRACTS holds that fragment.
+     ),
+     "mol-refinery-patrol": (
+         "metadata.branch",
+@@ -113,10 +114,15 @@ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
+         'COMMITS_AHEAD=$(git rev-list --count "$BASE_REF..HEAD" 2>/dev/null)',
+         "''|*[!0-9]*) HALT_REASON=content_gate_error ;;",
+         "0) HALT_REASON=no_commits ;;",
+-        "git push origin HEAD",
++        # The push gate and the refinery handoff are polecat-submit.sh's
++        # (gcp-nc8wg): GASTOWN_SCRIPT_CONTRACTS holds the fragments that moved
++        # with them. The step keeps only the calls, and a step that stops
++        # calling the script is a polecat that never pushes or never hands off.
++        "polecat-submit.sh",
++        'bash "$PS" push-gate',
++        'bash "$PS" reassign',
+         "gc bd update \"$WORK_BEAD_ID\" \\",
+         "--set-metadata target={{base_branch}}",
+-        "--status=open --assignee=\"$REFINERY_TARGET\"",
+         "gc session wake \"$REFINERY_TARGET\"",
+         "gc runtime drain-ack",
+     ),
+@@ -256,11 +262,12 @@ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
+ # parsed order. The gate only prevents a phantom handoff where it stands: after
+ # the clean-state check has committed any leftovers (so it cannot fire on work
+ # that merely had not been committed yet) and before the push that would create
+-# the ref and let the handoff be stamped.
++# the ref and let the handoff be stamped. The push is polecat-submit.sh's
++# (gcp-nc8wg), so the step's anchor for it is the call that runs the push gate.
+ POLECAT_BRANCH_CONTENT_GATE_ORDER = (
+     ("clean-state commit", 'git commit -m "chore: capture remaining work ($WORK_BEAD_ID)"'),
+     ("branch-content count", 'COMMITS_AHEAD=$(git rev-list --count "$BASE_REF..HEAD" 2>/dev/null)'),
+-    ("branch push", "git push origin HEAD"),
++    ("branch push", 'bash "$PS" push-gate'),
+ )
+ # Required between the count and the push. `git rev-list` failing must halt on
+ # its own reason instead of falling through to the push, and the halt must
+@@ -298,12 +305,12 @@ POLECAT_BRANCH_CONTENT_GATE_HALT_PATH = (
+     # so the close cannot move ahead of the escalation and skip it.
+     ("halt close after escalation", "    done\n    STEP_BEAD_ID=$(gc hook current --id-only) || exit 1"),
+     # Anchored to this gate's own close, whose `gc.failure_reason="$HALT_REASON"`
+-    # occurs only here. The checked window runs to the push, so it also spans
+-    # the auto_push=false halt further down: a bare "gc runtime drain-ack"
+-    # fragment is satisfied by that sibling's copy, and stayed green with this
+-    # gate's own copy deleted. The same anchor pins the `exit 1` -- without it
+-    # the fence ends rc=0 and the agent walks on to the push it just refused,
+-    # having already released the bead.
++    # occurs only here. The checked window runs to the push-gate call, so it also
++    # spans that call's script-not-found stop, which has a drain-ack of its own:
++    # a bare "gc runtime drain-ack" fragment is satisfied by that sibling's copy,
++    # and stays green with this gate's own copy deleted. The same anchor pins the
++    # `exit 1` -- without it the fence ends rc=0 and the agent walks on to the
++    # push it just refused, having already released the bead.
+     (
+         "halt exit",
+         'gc.failure_reason="$HALT_REASON" --status=closed || exit 1\n    gc runtime drain-ack\n    exit 1',
+@@ -394,6 +401,13 @@ GASTOWN_SCRIPT_CONTRACTS = {
+         "refinery-lane-wedged.json",
+         "gc mail send mayor/ --notify",
+     ),
++    # The polecat's push gate and refinery handoff (gcp-nc8wg). Each fragment is
++    # the line that makes one guarantee real: the push, and the single write that
++    # hands the work bead to the refinery.
++    "assets/scripts/polecat-submit.sh": (
++        "git push origin HEAD",
++        '--status=open --assignee="$REFINERY_TARGET"',
++    ),
+ }
+ METHODOLOGY_FLOW_CONTRACTS = {
+     "superpowers": {
+@@ -3198,12 +3212,13 @@ def validate_polecat_branch_content_gate(pack_source: Path) -> None:
+     """Pin the branch-content gate's position and its halt path, not just its text.
+ 
+     The fragment pins above are substring containment over the whole file, so
+-    they catch deletion and nothing else: a gate moved below `git push origin
+-    HEAD`, or a halt path that quietly drops its escalation, keeps every pinned
+-    fragment while gating nothing. Parse the step instead and require that the
+-    commit count is taken after the clean-state commit and before the push, and
+-    that everything between the count and the push still fails closed on an
+-    unmeasurable branch and still escalates the halt.
++    they catch deletion and nothing else: a gate moved below the push (the step's
++    `bash "$PS" push-gate` call, which runs `git push origin HEAD`), or a halt
++    path that quietly drops its escalation, keeps every pinned fragment while
++    gating nothing. Parse the step instead and require that the commit count is
++    taken after the clean-state commit and before the push, and that everything
++    between the count and the push still fails closed on an unmeasurable branch
++    and still escalates the halt.
+     """
+     problems: list[str] = []
+     path = pack_source / "formulas" / "mol-polecat-work.toml"
+diff --git a/tests/test_gascity_pack_inference_gate.py b/tests/test_gascity_pack_inference_gate.py
+index 5cabeaed..0cac8053 100644
+--- a/tests/test_gascity_pack_inference_gate.py
++++ b/tests/test_gascity_pack_inference_gate.py
+@@ -1443,10 +1443,29 @@ def test_validate_gastown_orchestration_contract_accepts_the_fixture_pack(tmp_pa
+ 
+ 
+ def test_validate_gastown_orchestration_contract_rejects_missing_build_handoff(tmp_path) -> None:
++    # The handoff write moved out of the formula into polecat-submit.sh (gcp-nc8wg),
++    # so the contract that pins it reads the script.
++    pack = write_gastown_contract_pack(
++        tmp_path,
++        script_edit=lambda path, text: (
++            text.replace("--assignee=\"$REFINERY_TARGET\"", "") if path.endswith("polecat-submit.sh") else text
++        ),
++    )
++
++    with pytest.raises(gascity_pack_inference_gate.GateError, match="polecat-submit.sh"):
++        gascity_pack_inference_gate.validate_gastown_orchestration_contract(pack)
++
++
++@pytest.mark.parametrize("call", ['bash "$PS" push-gate', 'bash "$PS" reassign'])
++def test_validate_gastown_orchestration_contract_rejects_a_polecat_step_that_stops_calling_the_script(
++    tmp_path, call
++) -> None:
++    # The step keeps only the calls; a step that stops running the push gate or
++    # the handoff is a polecat that never pushes or never hands off.
+     pack = write_gastown_contract_pack(
+         tmp_path,
+         formula_edit=lambda name, text: (
+-            text.replace("--assignee=\"$REFINERY_TARGET\"", "") if name == "mol-polecat-work" else text
++            text.replace(call, "true", 1) if name == "mol-polecat-work" else text
+         ),
+     )
+ 
+@@ -1534,7 +1553,9 @@ def test_validate_polecat_branch_content_gate_rejects_gate_moved_after_the_push(
+     end = text.index("**3. ", start)
+     gate = text[start:end]
+     remainder = text[:start] + text[end:]
+-    push_line = "git push origin HEAD\n"
++    # The push is polecat-submit.sh's; the step's anchor for it is the call that
++    # runs the push gate, which is the last line of its fence.
++    push_line = 'bash "$PS" push-gate\n'
+     anchor = remainder.index(push_line) + len(push_line)
+     path.write_text(remainder[:anchor] + gate + remainder[anchor:], encoding="utf-8")
+ 
+@@ -2000,6 +2021,16 @@ def test_gastown_build_workflow_contract_covers_orchestration_roles() -> None:
+         "mol-idea-to-plan",
+     }
+     assert "gc session wake \"$REFINERY_TARGET\"" in contracts["mol-polecat-work"]
++    # The push gate and the handoff are the script's (gcp-nc8wg): the step keeps
++    # the calls, and the script's own contract holds what moved with them.
++    for fragment in ("polecat-submit.sh", 'bash "$PS" push-gate', 'bash "$PS" reassign'):
++        assert fragment in contracts["mol-polecat-work"]
++    submit_contracts = gascity_pack_inference_gate.GASTOWN_SCRIPT_CONTRACTS["assets/scripts/polecat-submit.sh"]
++    assert "git push origin HEAD" in submit_contracts
++    assert '--status=open --assignee="$REFINERY_TARGET"' in submit_contracts
++    assert not {"git push origin HEAD", '--status=open --assignee="$REFINERY_TARGET"'} & set(
++        contracts["mol-polecat-work"]
++    )
+     assert (
+         'COMMITS_AHEAD=$(git rev-list --count "$BASE_REF..HEAD" 2>/dev/null)'
+         in contracts["mol-polecat-work"]
+diff --git a/tests/test_v2_drain_ack_closes_own_step.py b/tests/test_v2_drain_ack_closes_own_step.py
+index b42649f9..4a5ab2e2 100644
+--- a/tests/test_v2_drain_ack_closes_own_step.py
++++ b/tests/test_v2_drain_ack_closes_own_step.py
+@@ -150,6 +150,18 @@ def test_terminal_step_closes_itself_before_drain_ack(rel, step_id):
+     )
+ 
+ 
++def test_submit_script_closes_itself_before_drain_ack():
++    """Every drain-ack in polecat-submit.sh sits behind the guarded own-step close.
++
++    The script is one bash block, so this reads it the way a fence is read; the
++    run_drain_site tests below execute each ack site on its own.
++    """
++    script = (REPO_ROOT / POLECAT_SUBMIT_SCRIPT).read_text()
++    assert "gc runtime drain-ack" in script, "the script no longer drain-acks; drop this test"
++    violations = drain_ack_violations(f"```bash\n{script}\n```", "submit-and-exit")
++    assert not violations, f"{POLECAT_SUBMIT_SCRIPT}: unguarded drain-acks: {violations}"
++
++
+ GUARDED = (
+     'STEP_BEAD_ID=$(gc hook current --id-only) || exit 1\n'
+     'STEP_BEAD=$(gc bd show "$STEP_BEAD_ID" --json) || exit 1\n'
+@@ -192,6 +204,9 @@ def test_checker_recognizes_the_guarded_close(block, ok):
+ # it. Upstream #490's guard closes exactly that step and refuses, without a
+ # drain-ack, when the hook names anything else or cannot answer.
+ POLECAT_FORMULA = "gastown/formulas/mol-polecat-work.toml"
++# The push gate and the refinery handoff of submit-and-exit run as this script
++# (gcp-nc8wg). Its halts close the step and ack the drain on the step's behalf.
++POLECAT_SUBMIT_SCRIPT = "gastown/assets/scripts/polecat-submit.sh"
+ SUBMIT_STEP_REF = "mol-polecat-work.submit-and-exit"
+ ME = "winnow/gastown.furiosa"
+ WORK = "winnow-w1"
+@@ -261,7 +276,8 @@ def submit_and_exit_drain_sites() -> list[str]:
+     data = tomllib.loads((REPO_ROOT / POLECAT_FORMULA).read_text())
+     step = next(s for s in data["steps"] if s["id"] == "submit-and-exit")
+     sites = []
+-    for block in bash_blocks(step["description"]):
++    script = (REPO_ROOT / POLECAT_SUBMIT_SCRIPT).read_text()
++    for block in [*bash_blocks(step["description"]), script]:
+         lines = block.split("\n")
+         for i, line in enumerate(lines):
+             if "gc runtime drain-ack" not in line:
+-- 
+2.54.0 (Apple Git-157)
+
